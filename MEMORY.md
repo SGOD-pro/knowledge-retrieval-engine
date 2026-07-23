@@ -21,12 +21,45 @@ Read:  checked before any retrieval stage runs
 
 ---
 
-## FAISS Index
-- **Built:** offline, during ingestion.
-- **Loaded:** at service startup into memory.
-- **NOT rebuilt per query.**
-- **NOT rebuilt on single document updates** (incremental add).
-- **Full rebuild:** only on model change or corpus exceeding 10k pages.
+## Semantic Cache — pgvector-backed (replaces FAISS cache_key_index)
+
+Table: cache_entries
+  query_embedding  vector(2048)  -- or 1024 if prod/Titan
+  redis_key        text
+  doc_scope_hash   text
+  provider         text   -- which embedding provider generated this,
+                           -- prevents dev/prod embedding mixing
+  created_at       timestamptz
+
+Lookup query:
+  SELECT redis_key, query_embedding <=> %(query_vec)s AS distance
+  FROM cache_entries
+  WHERE doc_scope_hash = %(scope)s
+    AND provider = %(current_provider)s
+  ORDER BY distance ASC LIMIT 1;
+
+  Threshold: distance corresponding to cosine_sim >= 0.95 (unchanged
+  logic from rev 3, now a WHERE/ORDER BY instead of FAISS search).
+
+HNSW index on cache_entries.query_embedding for fast lookup at scale
+(matters once cache_entries exceeds a few thousand rows).
+
+Invalidation: unchanged logic (purge on re-ingestion by doc_scope),
+now a DELETE statement instead of a FAISS index rebuild.
+
+---
+
+## Vector Store — pgvector (replaces "FAISS Index" section entirely)
+
+All chunk embeddings: single `chunks.embedding vector(N)` column.
+  N = 2048 (Nemotron, dev) or 1024 (Titan, prod) — see DECISION.md
+  provider-mismatch warning. Two Postgres columns if both providers
+  are ever live simultaneously (e.g. during a migration):
+  `embedding_dev vector(2048)`, `embedding_prod vector(1024)`.
+
+HNSW index built on ingestion, incrementally maintained by Postgres
+as new chunks are inserted — no manual rebuild step required, unlike
+FAISS's load-and-rebuild pattern.
 
 ---
 
@@ -37,10 +70,20 @@ Read:  checked before any retrieval stage runs
 
 ---
 
-## OKF Knowledge Layer
-- **Concepts + Properties + Relations:** PostgreSQL (persistent).
-- **In-memory:** adjacency dict loaded at startup for graph traversal.
-- **Refresh:** on any re-ingestion, reload affected concept subgraph. Do not reload full graph on every query.
+## OKF Graph — Postgres only (replaces "in-memory adjacency dict")
+
+No startup load step exists in this architecture. `relations` table
+is queried directly via recursive CTE per request (see ARCHITECTURE.md).
+Add an index on `relations(from_concept_id, relation_weight)` to keep
+the recursive CTE fast at the 5000-node / 50000-edge ceiling.
+
+---
+
+## Redis — ElastiCache Serverless (deployment detail, logic unchanged)
+
+Same TTL, same write-guard conditions as rev 3. Only the hosting
+changes: ElastiCache Serverless instead of a self-managed Redis,
+to match the fully-managed, scale-to-Lambda-traffic deployment model.
 
 ---
 
@@ -87,4 +130,6 @@ CREATE TABLE feedback (
 - No query logging to persistent storage (privacy default).
 
 *Reason:* v1 targets regulated industry deployment. Data retention is a compliance question, not a feature decision.
+
+
 

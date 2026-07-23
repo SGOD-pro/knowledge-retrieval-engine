@@ -1,5 +1,99 @@
 # DECISION.md — Planner Rules and System Decisions
 
+## Provider Routing (NEW)
+
+provider_client.py reads MODEL_PROVIDER env var (dev|prod).
+  dev:  OpenRouter free-tier models (see Model Provider Matrix)
+  prod: Bedrock managed models (see Model Provider Matrix)
+
+RULE: No retrieval or LLM module ever imports an OpenRouter or
+Bedrock SDK directly. All calls route through providers/*.py.
+This is what makes the free-tier deprecation risk containable —
+if OpenRouter kills a free model, only provider config changes,
+not application logic.
+
+Retry/fallback behavior:
+  If dev provider call fails (rate limit, deprecation, timeout):
+    1. Retry once with exponential backoff (max 2s wait).
+    2. On second failure: fall back to prod provider for THIS call
+       only, log a warning with cost implication.
+    3. Never silently fail a query — degrade to prod cost before
+       returning an error to the user.
+
+## Reranker Model Choice — documented compromise (NEW)
+
+Dev: nvidia/llama-nemotron-rerank-vl-1b-v2 (free, OpenRouter)
+  This is a vision-language reranker (Eagle VLM architecture,
+  SigLIP2 + Llama 3.2 1B) built primarily for ViDoRe-style visual
+  document retrieval (screenshots of pages with charts/tables).
+  KRE uses it in TEXT-ONLY mode (query + text passage, no image
+  input) — a supported but not primary use case for this model.
+  Accepted because: free, and 10,240 token context is sufficient
+  for reranking 40 candidate chunks at ~250 tokens each.
+
+Prod: cohere.rerank-v3-5 (Bedrock)
+  Purpose-built text cross-encoder, no VL mismatch, managed API,
+  no deprecation risk under Bedrock's SLA.
+
+If dev-mode reranker quality (measured via BENCHMARK.md Precision@3)
+falls more than 5% below prod-mode reranker on the same test set:
+  Switch dev default to a local bge-reranker-base fallback for
+  non-Lambda dev environments only (e.g., local Docker Compose dev
+  loop), while keeping Lambda prod on Cohere Rerank. Document this
+  as a known dev/prod parity gap, not a silent inconsistency.
+
+## Single Embedding Model (UPDATED from rev 3's two-tier)
+
+Both fast path and full path use the SAME embedding model:
+  nvidia/nemotron-3-embed-1b (dev) / amazon.titan-embed-text-v2 (prod)
+
+Fast path stays fast by SKIPPING stages (OKF, Graph, Reranker, LLM),
+not by using a cheaper embedding model. This was the wrong lever
+in rev 2/3 — dimensionality tradeoffs only matter for local inference
+cost, and there is no local inference anymore.
+
+Titan Embed v2 (Bedrock prod) dimension note: configurable at
+256/512/1024. Use 1024 to stay close to Nemotron's 2048 in relative
+semantic capacity without doubling storage cost. Document this as
+a dev/prod embedding dimension mismatch — DO NOT mix dev-generated
+and prod-generated embeddings in the same pgvector column. Ingestion
+pipeline must tag which provider generated each embedding and the
+query pipeline must use the matching provider for that corpus.
+
+## OKF Extraction — Provider Update
+
+Tier 3 dev: nvidia/nemotron-3-nano-30b-a3b (OpenRouter, free)
+  MoE architecture, structured extraction task, same schema contract
+  as previously specified for Nova Micro (rev 2/3).
+Tier 3 prod: amazon.nova-micro-v1 (Bedrock), unchanged from rev 3.
+
+Quality gate (unchanged): precision >= 85% on 10-doc validation set,
+run separately for dev and prod models before either goes live.
+Because these are two different models, run the gate TWICE —
+passing on Nova Micro does not imply passing on Nemotron Nano.
+
+## Lambda Cold Start Budget (NEW)
+
+Lambda cold start adds ~200-800ms for Python runtime + dependency
+import (psycopg2, requests, etc.) before the handler even begins.
+This is a real cost not present in the always-on FastAPI deployment
+assumed in rev 1-3.
+
+Mitigation:
+  - Provisioned concurrency for the query Lambda (keeps N warm
+    instances ready) if traffic justifies the added cost.
+  - Keep deployment package minimal (<50MB) — smaller package,
+    faster cold start.
+  - Do NOT import heavy unused libraries. Audit requirements.txt
+    every phase — this is now a latency-relevant file, not just
+    a dependency list.
+
+Fast path p95 < 400ms target assumes WARM Lambda. Cold start p95
+will exceed this — track cold start latency as a SEPARATE metric
+in BENCHMARK.md, not blended into the main p95 figure.
+
+---
+
 ## Query Complexity Score
 
 Computed deterministically in `preprocess.py`. No LLM call. No ML model.  

@@ -4,9 +4,13 @@
 
 | Metric | Target | Method |
 | :--- | :--- | :--- |
-| Fast path p95 latency | <200ms | 200 runs on local hardware |
-| Full pipeline p95 latency | <3000ms | 200 runs on local hardware |
-| Graph traversal p95 | <150ms | 200 runs, relationship queries only |
+| Fast path p95 latency (warm) | <400ms | 200 runs, Lambda warm path |
+| Fast path p95 latency (cold start) | <1500ms | 200 runs, first invocation after >15 min idle |
+| Full pipeline p95 latency (warm) | <4000ms | 200 runs, Lambda warm path |
+| Decomposed path p95 | <5500ms | 200 runs, decomposed query path |
+| Graph traversal p95 (2-hop CTE) | <200ms | 200 runs, relationship queries only |
+| Graph traversal p95 (3-hop CTE) | <350ms | 200 runs, relationship queries only |
+| Cold start delta | <1200ms | p95_cold - p95_warm |
 | Recall@3 (fast path) | >0.75 | 40-query factual test set |
 | Recall@5 (full path) | >0.85 | 80-query complex test set |
 | MRR@5 | >0.70 | Full 120-query test set |
@@ -22,6 +26,40 @@
 | LLM activation rate | <60% | % queries reaching LLM call |
 | Cache hit rate (post-warmup) | >30% | Redis hit/miss counter |
 | PageIndex candidate reduction | >60% | candidate_pages / total_pages |
+
+---
+
+## Updated Latency Targets
+
+| Metric | Target (rev 4) | Prior (rev 3) | Reason for change |
+| :--- | :--- | :--- | :--- |
+| Fast path p95 (warm) | <400ms | <200ms | API calls replace local inference |
+| Fast path p95 (cold start) | <1500ms (tracked separately) | n/a | New metric — Lambda-specific |
+| Full pipeline p95 (warm) | <4000ms | <3000ms | Multiple sequential API calls |
+| Decomposed path p95 | <5500ms | <4000ms | Same reason, plus parallel calls |
+| Graph traversal p95 (2-hop CTE) | <200ms | <150ms | Postgres query vs in-memory dict |
+| Graph traversal p95 (3-hop CTE) | <350ms | <250ms | Same |
+
+## New Metric — Cold Start Overhead
+
+Measure separately from warm-path latency. Report both:
+- p95_warm: standard latency benchmark (Lambda kept warm)
+- p95_cold: first invocation after >15 min idle
+- cold_start_delta = p95_cold - p95_warm
+
+Target: cold_start_delta < 1200ms. If exceeded, evaluate provisioned
+concurrency cost-benefit before Phase 5 sign-off.
+
+## Dev vs Prod Provider Parity Check (NEW)
+
+Before Phase 5 sign-off, run the full 120-query benchmark TWICE:
+- once with MODEL_PROVIDER=dev (OpenRouter free models)
+- once with MODEL_PROVIDER=prod (Bedrock models)
+
+Report both result sets side by side. If dev-mode Recall@5 or
+Faithfulness falls more than 5% below prod-mode: dev is not a
+reliable stand-in for prod testing, and pre-launch QA must run
+exclusively on prod provider from that point forward.
 
 ---
 

@@ -1,243 +1,196 @@
-# ARCHITECTURE.md — KRE Technical Architecture
+## ARCHITECTURE.md (rev 4) — API-First, Lambda-Compatible
 
-## Hard Constraints (violation = blocked PR)
-- Maximum ONE LLM call per query, end to end.
-- Fast path (BGE-only): p95 < 200ms.
-- Full pipeline: p95 < 3000ms.
-- Every module logs `latency_ms` and `confidence_score`.
+## Deployment Model Change (breaking change from rev 3)
+
+REMOVED: all local model inference (BGE-small local, Nemotron-1B NVFP4
+local, bge-reranker-base local). REMOVED: FAISS in-memory index loaded
+at Lambda startup — incompatible with Lambda's stateless execution model.
+
+NEW: fully API-first architecture. Lambda function contains ONLY:
+  - Orchestration logic (planner, decomposer, fidelity check, compressor)
+  - HTTP clients to external model APIs
+  - DB clients (Postgres/pgvector, Redis)
+  Deployment package target: <50MB zipped. No model weights ship in the zip.
+
+## Hard Constraints (updated)
+- Maximum ONE LLM call per query (unchanged).
+- Fast path: p95 < 400ms (relaxed from 200ms — network calls replace
+  local inference; 200ms was only achievable with local BGE-small).
+- Full pipeline: p95 < 4000ms (relaxed from 3000ms — same reason,
+  multiple sequential API calls now carry network latency each).
+- Every module logs latency_ms and confidence_score.
 - LLM receives only compressed context. Never raw chunks.
 - Max tokens to LLM: 1200.
-- Graph traversal: `MAX_HOPS = 2`, `MAX_NODES = 40` (hardcoded, not config).
-- Graph activated ONLY when query planner detects relationship intent.
-- Cheapest retrieval stage always runs before expensive ones.
+- Graph: MAX_NODES=40 absolute. MAX_HOPS=2 default, 3 on deep_causal_flag.
+- No model weights in the Lambda deployment package. Zero exceptions.
+- Every external model call has a Bedrock fallback config. OpenRouter
+  free tier is dev/staging default; production defaults to Bedrock.
 
 ---
 
-## Staged Retrieval Principle
+## Model Provider Matrix (NEW — the core of this revision)
 
-**Wrong:**
-```text
-Query → [BM25 ∥ Vector ∥ Graph ∥ PageIndex] → Merge → Rerank → LLM
-```
+| Function          | Dev/Staging (free/cheap)              | Production (reliable)          |
+|--------------------|----------------------------------------|----------------------------------|
+| Embedding          | nvidia/nemotron-3-embed-1b (OpenRouter, free) | amazon.titan-embed-text-v2 (Bedrock) |
+| Reranker           | nvidia/llama-nemotron-rerank-vl-1b-v2 (OpenRouter, free, text-only mode) | cohere.rerank-v3-5 (Bedrock) |
+| OKF extraction     | nvidia/nemotron-3-nano-30b-a3b (OpenRouter, free) | amazon.nova-micro-v1 (Bedrock) |
+| Query LLM          | openai/gpt-oss-20b (OpenRouter, free) or nvidia/nemotron-nano-9b-v2 (free) | amazon.nova-lite-v1 or anthropic.claude-haiku (Bedrock) |
+| CI faithfulness judge | — | amazon.nova-lite-v1 (Bedrock, unchanged from rev 3) |
 
-**Right:**
-```text
-Query → BM25 → PageIndex → Vector → OKF → Graph? → Rerank → LLM
-```
+Provider selection: config flag `MODEL_PROVIDER=dev|prod`. Never
+hardcode a specific provider in retrieval/llm modules — always route
+through `provider_client.py` which reads this flag.
 
-Each stage reduces the search space for the next stage.
-You never run a GPU-model search across the full corpus.
-Graph only activates when the planner flags relationship intent.
-
----
-
-## Ingestion Pipeline (Offline, Batch)
-
-```mermaid
-flowchart TD
-    A[PDF Batch Input] --> B[opendataloader-pdf<br/>format='json,markdown']
-    B --> C[parse_service.py<br/>Doc -> Page -> Section -> Paragraph -> Chunk]
-    C --> D[(PostgreSQL)]
-    
-    C --> E[page_index_service.py<br/>PageIndex Builder]
-    C --> F[concept_service.py<br/>Concept Extractor]
-    C --> G[embed_service.py<br/>BGE-small Embedder]
-    
-    F --> H[normalize_service.py<br/>BGE-small Similarity Clustering]
-    H --> I[okf_builder.py<br/>OKF Knowledge Layer]
-    
-    E --> J[(PostgreSQL + FAISS + Redis)]
-    I --> J
-    G --> J
-```
+Rationale for single embedding model (dropped dual-tier from rev 2/3):
+  The BGE-small/Nemotron-1B split existed to trade local compute cost
+  for speed on a local-inference deployment. On an API-first
+  architecture, both paths pay network latency regardless of model
+  size — the "cheap fast model" advantage evaporates. One model
+  (Nemotron-3-Embed-1B, 2048-dim) for both paths removes an entire
+  index, removes consistency-check code, and removes a class of bugs.
+  Fast path stays fast by skipping stages (Graph, OKF, Reranker,
+  LLM), not by using a smaller embedding model.
 
 ---
 
-## PageIndex — Precise Definition
+## Vector Store — pgvector on Aurora Serverless v2 (replaces FAISS)
 
-A PageIndex is NOT a page-level BM25 index.  
-A BM25 inverted index maps: `term → [(doc_id, frequency, positions)]`  
-A PageIndex maps:
-```text
-term → [(doc_id, page_num, section_heading, section_depth,
-         element_type, structural_weight, chunk_id)]
-```
+Why FAISS is removed:
+  FAISS requires loading the full index into process memory at
+  startup. Lambda has no persistent startup — every cold start would
+  require re-downloading and re-loading the index from S3, adding
+  1-3+ seconds before the first query can even run. This directly
+  breaks the fast-path latency target and makes cold starts unusable.
 
-The difference is `structural_weight`, computed as:
+Replacement: PostgreSQL + pgvector extension, on Aurora Serverless v2.
+  - Chunks table gets an `embedding vector(2048)` column.
+  - HNSW index on embedding column for approximate nearest neighbor.
+  - Query: standard SQL with `<=>` cosine distance operator.
+  - No index loading step. No cold-start penalty for vector search.
+  - Aurora Serverless v2 scales to zero-ish cost during idle (scales
+    down to 0.5 ACU minimum, not fully zero, but far cheaper than
+    always-on RDS for spiky Lambda-driven traffic).
 
-```text
-structural_weight = base_tf_idf
-  * element_type_multiplier[element_type]
-  * section_depth_decay(section_depth)
-  * heading_anchor_bonus(is_in_heading)
-```
+Semantic cache (from rev 3) also moves to pgvector:
+  cache_entries table: {query_embedding vector(2048), redis_key,
+  doc_scope_hash, created_at}. Same 0.95 cosine threshold logic,
+  now a SQL query instead of a FAISS lookup.
+  `SELECT redis_key FROM cache_entries
+   WHERE doc_scope_hash = %s
+   ORDER BY query_embedding <=> %s LIMIT 1`
+  then check returned distance against threshold in application code.
 
-```text
-element_type_multiplier:
-  heading:   2.5
-  table:     2.0
-  paragraph: 1.0
-  caption:   1.2
-  list_item: 1.1
-  footnote:  0.6
+## OKF Graph Storage — Postgres recursive CTE (replaces adjacency dict)
 
-section_depth_decay(depth):
-  depth 1 (top-level section):  1.0
-  depth 2 (subsection):         0.85
-  depth 3+:                     0.70
+Why the in-memory adjacency dict is removed:
+  Same reason as FAISS — "load into memory at startup" doesn't exist
+  as a pattern in Lambda. Every invocation is a fresh process.
 
-heading_anchor_bonus:
-  If query term appears in section heading for this page: +0.5
-```
+Replacement: `relations` table in Postgres, traversal via recursive CTE.
 
-This means a keyword in a section heading scores 3x higher than
-the same keyword in a footnote. BM25 cannot express this. That is
-what makes PageIndex a distinct retrieval primitive.
+  WITH RECURSIVE graph_walk AS (
+    SELECT to_concept_id, relation_type, relation_weight, 1 AS hop
+    FROM relations
+    WHERE from_concept_id = ANY(%(start_entities)s)
+      AND relation_weight >= 0.3
+    UNION ALL
+    SELECT r.to_concept_id, r.relation_type, r.relation_weight, g.hop + 1
+    FROM relations r
+    JOIN graph_walk g ON r.from_concept_id = g.to_concept_id
+    WHERE g.hop < %(max_hops)s
+      AND r.relation_weight >= 0.3
+  )
+  SELECT DISTINCT to_concept_id, relation_type, relation_weight, hop
+  FROM graph_walk
+  LIMIT 40;
 
-PageIndex also stores:
-- `section_start_page`, `section_end_page` (for locality expansion)
-- `cross_reference_targets`: pages where this section is cited/referenced
-- `element_sequence_position`: position of element within page (for proximity scoring between co-occurring terms)
-
----
-
-## OKF — Ontology-driven Knowledge Framework
-
-The Knowledge Graph is ONE VIEW over OKF. OKF is the knowledge itself.
-
-OKF stores:
-
-```yaml
-Concept:
-  concept_id: str
-  name: str
-  canonical_name: str
-  aliases: list[str]
-  concept_type: Enum
-  source_chunk_ids: list[str]
-  confidence: float
-  low_confidence: bool
-
-concept_type enum:
-  [PRODUCT, PERSON, ORGANIZATION, METRIC, POLICY, PROCESS, DATE_PERIOD, LOCATION, ISSUE, REGULATION, TERM]
-```
-
-```yaml
-Property:
-  concept_id: str
-  property_name: str
-  property_value: str
-  value_type: str
-  source_chunk_id: str
-  confidence: float
-
-  Example:
-    concept: "Battery Model X"
-    type: PRODUCT
-    properties:
-      failure_rate: "12%", source: DOC001-P4-S2
-      failure_mode: "overheating", source: DOC001-P5-S3
-      affected_period: "Q2 2024", source: DOC001-P5-S1
-```
-
-```yaml
-Relation:
-  from_concept_id: str
-  relation_type: Enum
-  to_concept_id: str
-  relation_weight: float
-  source_chunk_id: str
-
-relation_type enum:
-  [CAUSES, AFFECTS, DEPENDS_ON, PART_OF, REPORTS_TO, MENTIONS, VIOLATES, DEFINES, SUPERSEDES, CONTRADICTS]
-```
-
-Graph view (derived, not primary):
-- **Nodes** = Concepts
-- **Edges** = Relations
-
-This distinction matters for query time:
-
-```text
-"What caused battery overheating?"
-  Graph answer: Battery →[CAUSES]→ Overheating  (an edge)
-  OKF answer:   Battery.failure_mode = "overheating" (a property)
-                Battery.failure_rate = "12%" (a property)
-                Battery →[CAUSES]→ Returns (a relation chain)
-```
-
-OKF supports: *"What is the failure rate of the product with the highest return rate in Q2?"*  
-Graph alone cannot express that query — it has no typed properties.
-
-```python
-# Graph (adjacency list, dict-based):
-# NOT NetworkX in production.
-# Implementation: Dict[concept_id, List[Relation]]
-# Persisted to PostgreSQL relations table.
-# Loaded at startup into memory as adjacency dict.
-# Max nodes: 5000 per corpus.
-# Max edges: 50000 per corpus.
-# Above these limits: partition by document cluster.
-```
+  max_hops parameter: 2 default, 3 on deep_causal_flag (unchanged logic
+  from rev 3, now expressed as a query parameter instead of Python loop).
+  LIMIT 40 enforces MAX_NODES directly in SQL — cheaper than
+  post-filtering in application code.
 
 ---
 
-## Query Pipeline (Online, Per Query)
+## Query Pipeline (updated stage implementations, same stage order)
 
-```mermaid
-flowchart TD
-    UserQuery[User Query] --> Preprocess[preprocess.py<br/>Normalize, spaCy entities, complexity score]
-    Preprocess --> Planner[planner.py Router]
-    
-    Planner -->|fast_path = True| FastPath[Fast Path<br/>Stage 1: BM25 top-50<br/>Stage 2: PageIndex top-20<br/>Stage 3: Vector Search within top-20]
-    FastPath --> FastResult[Top-3 results + citations<br/>No LLM call, <200ms]
-    
-    Planner -->|fast_path = False| S1[Stage 1: BM25 top-50]
-    S1 --> S2[Stage 2: PageIndex Filter & Expansion top-20]
-    S2 --> S3[Stage 3: Vector Search top-20 candidates]
-    S3 --> S4[Stage 4: OKF Knowledge Lookup]
-    S4 --> S5{Stage 5: Graph Expansion<br/>use_graph = True?}
-    S5 -->|Yes| S5Graph[Graph Traversal Max 2 hops]
-    S5 -->|No| S6[Stage 6: Cross-Encoder Reranker top-6]
-    S5Graph --> S6
-    S6 --> S7[Stage 7: Compression Fidelity Check]
-    S7 --> S8[Stage 8: Context Compression max 1200 tokens]
-    S8 --> S9[Stage 9: Single LLM Call]
-    S9 --> S10[Stage 10: Deterministic Confidence Scoring]
-    S10 --> Response[response_builder.py]
-```
+Stage 0 — Semantic Cache Check
+  pgvector query against cache_entries. Cosine >= 0.95 → return cached.
+
+Stage 1 — BM25
+  Unchanged logic (rank-bm25), but corpus loaded from Postgres per
+  query rather than an in-memory structure. For corpora under 10k
+  pages this is fast enough (<50ms) — benchmark to confirm per Phase 2.
+
+Stage 2 — PageIndex
+  Unchanged. Already Postgres-backed, no change needed.
+
+Stage 3 — Vector Search
+  API call to embedding provider (per Model Provider Matrix) to embed
+  the query, then pgvector HNSW search scoped to PageIndex candidates.
+  Network latency now included in this stage's budget: ~50-150ms
+  for embedding API call + ~10-30ms for pgvector query.
+
+Stage 4 — OKF Lookup
+  Unchanged, Postgres property lookup, no model call.
+
+Stage 5 — Graph Expansion (conditional)
+  Recursive CTE per above. No in-memory traversal.
+
+Stage 6 — Reranker
+  API call to reranker provider. Batches all candidates (max 40) in
+  ONE API call, not one call per candidate — check provider supports
+  batch scoring (both Cohere Rerank and Nemotron Rerank do).
+
+Stage 7 — Fidelity Check
+  Unchanged, pure Python, no model call.
+
+Stage 8 — Compression
+  Unchanged, pure Python, no model call.
+
+Stage 9 — Single LLM Call
+  API call per Model Provider Matrix. Unchanged contract (Rule 2-15).
+
+Stage 10 — Confidence Scoring
+  Unchanged, deterministic formula.
 
 ---
 
-## Module Map
+## Module Map (rev 4)
 
-```text
 kre/
+├── providers/
+│   ├── provider_client.py        # NEW: routes dev/prod per MODEL_PROVIDER flag
+│   ├── embedding_provider.py     # NEW: OpenRouter Nemotron / Bedrock Titan
+│   ├── reranker_provider.py      # NEW: OpenRouter Nemotron VL / Bedrock Cohere
+│   └── llm_provider.py           # NEW: OpenRouter free models / Bedrock Nova
 ├── ingestion/
-│   ├── parse_service.py          # opendataloader-pdf wrapper
-│   ├── page_index_service.py     # PageIndex builder (structural)
-│   ├── concept_service.py        # Entity/concept extractor (spaCy)
-│   ├── normalize_service.py      # BGE-small entity deduplication
-│   ├── okf_builder.py            # OKF Knowledge Layer builder
-│   └── embed_service.py          # BGE-small FAISS indexer
+│   ├── format_router.py
+│   ├── adapters/ (pdf/docx/xlsx/pptx, unchanged)
+│   ├── parse_service.py
+│   ├── page_index_service.py
+│   ├── concept_service.py        # Tier1 regex + Tier1.5 SVO + Tier3 API extraction
+│   ├── normalize_service.py      # now calls embedding_provider.py, not local model
+│   └── okf_builder.py
 ├── retrieval/
-│   ├── planner.py                # Deterministic retrieval router
-│   ├── bm25_retriever.py         # rank-bm25, stage 1
-│   ├── page_index_retriever.py   # Structural scoring, stage 2
-│   ├── vector_retriever.py       # FAISS BGE-small, stage 3
-│   ├── okf_retriever.py          # OKF property lookup, stage 4
-│   ├── graph_retriever.py        # Adjacency dict traversal, stage 5
-│   ├── reranker.py               # bge-reranker-base, stage 6
-│   ├── fidelity_check.py         # Entity coverage check, stage 7
-│   └── compressor.py             # Context compression, stage 8
+│   ├── planner.py
+│   ├── decomposer.py
+│   ├── bm25_retriever.py         # queries Postgres per-request
+│   ├── page_index_retriever.py
+│   ├── vector_retriever.py       # calls embedding_provider.py + pgvector query
+│   ├── okf_retriever.py
+│   ├── graph_retriever.py        # recursive CTE, no adjacency dict
+│   ├── reranker.py                # calls reranker_provider.py
+│   ├── fidelity_check.py
+│   └── compressor.py
 ├── llm/
-│   └── llm_service.py            # Single LLM call, structured output
+│   └── llm_service.py             # calls llm_provider.py
 ├── api/
-│   └── main.py                   # FastAPI endpoints
+│   └── main.py                    # FastAPI locally / Lambda handler in prod
 ├── graph/
-│   └── langgraph_pipeline.py     # LangGraph stage orchestration
+│   └── langgraph_pipeline.py
 └── db/
-    ├── postgres.py
-    ├── faiss_store.py
-    └── redis_cache.py
-```
+    ├── postgres.py                # includes pgvector helpers
+    └── redis_cache.py             # ElastiCache Serverless in Lambda deployment
+
+
