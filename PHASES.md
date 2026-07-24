@@ -1,4 +1,4 @@
-# PHASES.md — Build Sequence (rev 4)
+# PHASES.md — Build Sequence
 
 ## Rules (unchanged)
 - Do not start Phase N+1 until Phase N exit criteria pass.

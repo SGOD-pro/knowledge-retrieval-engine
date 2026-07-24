@@ -192,5 +192,3 @@ kre/
 └── db/
     ├── postgres.py                # includes pgvector helpers
     └── redis_cache.py             # ElastiCache Serverless in Lambda deployment
-
-

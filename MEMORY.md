@@ -131,5 +131,26 @@ CREATE TABLE feedback (
 
 *Reason:* v1 targets regulated industry deployment. Data retention is a compliance question, not a feature decision.
 
+---
+
+## Session State — Phase 1 Backend (2026-07-24)
+
+- Implemented the Phase 1 backend scaffold under `backend/src/kre`.
+- Added format routing for PDF, DOCX, XLSX, and PPTX.
+- Added DOCX paragraph/heading parsing, XLSX computed-value parsing,
+  PPTX shape and speaker-notes parsing, and an opendataloader-pdf JSON
+  batch adapter.
+- Added the unified nullable-bounding-box `Chunk` schema and `Document`
+  model.
+- Added the PostgreSQL/pgvector schema and repository persistence layer.
+- Added deterministic PageIndex structural scoring and ranking.
+- Added `POST /ingest` and `GET /documents/{id}`.
+- Added five focused Phase 1 tests; all passed.
+- Source compilation passed.
+- Phase 1 performance and PageIndex corpus exit gates remain unverified
+  because the repository contains no benchmark corpus or PostgreSQL
+  connection configuration.
+- The pre-existing backend `.venv` is incomplete on Windows; verification
+  used uv isolated execution without modifying or deleting that environment.
 
 

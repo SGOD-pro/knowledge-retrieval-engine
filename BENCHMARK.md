@@ -150,7 +150,7 @@ Document the delta. KRE's value claims must be backed by these numbers, not arch
 
 ## Regression Policy
 
-Any change to these files requires full benchmark re-run before merge:
+Any change to these filesy requires full benchmark re-run before merge:
 - `planner.py`
 - `page_index_retriever.py`
 - `reranker.py`
@@ -160,4 +160,3 @@ Any change to these files requires full benchmark re-run before merge:
 
 - **CI gate:** benchmark regresses >5% on ANY metric → block merge.
 - **Baseline numbers:** recorded in `benchmark_baseline.json` after Phase 3. Never update baseline without team review.
-

@@ -423,5 +423,3 @@ def test_r20_all_citations_have_location():
             else:
                 ASSERT citation.location_reference is not None
                 ASSERT citation.location_reference != ""
-
-
