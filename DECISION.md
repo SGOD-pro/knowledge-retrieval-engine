@@ -37,8 +37,9 @@ Prod: cohere.rerank-v3-5 (Bedrock)
 
 If dev-mode reranker quality (measured via BENCHMARK.md Precision@3)
 falls more than 5% below prod-mode reranker on the same test set:
-  Switch dev default to a local bge-reranker-base fallback for
-  non-Lambda dev environments only (e.g., local Docker Compose dev
+- **Constraint:** Cohere Rerank 3.5 / NVIDIA API (API-based)
+  Switch dev default to a Cohere Rerank 3.5 / NVIDIA API fallback for
+  non-prod environments. (e.g., local Docker Compose dev
   loop), while keeping Lambda prod on Cohere Rerank. Document this
   as a known dev/prod parity gap, not a silent inconsistency.
 
@@ -125,8 +126,8 @@ AND relationship_flag == False
 AND temporal_flag == False
 AND comparison_flag == False
 → fast_path = True, use_graph = False
-→ stages = [BM25, PageIndex, Vector]
-→ No LLM call. Return top-3 BGE results with citations.
+  → Uses fast path (BM25 -> PageIndex -> Vector).
+  → No LLM call. Return top-3 vector results with citations.
 ```
 *Examples that route here:*
 - "What is the refund policy?"
@@ -223,12 +224,9 @@ Reviewed weekly. Not a blocking step for ingestion.
 
 ## Confidence Score (deterministic, post-LLM)
 
-```python
-confidence = (reranker_score_avg * 0.6) + (coverage_ratio * 0.4)
-```
-
-- `reranker_score_avg`: mean `bge-reranker-base` score across top-6 chunks.
-- `coverage_ratio`: `query_entities_in_context / total_query_entities`.
+**Confidence Score Definition:**
+- `reranker_score_avg`: mean API reranker score across top-6 chunks.
+- `coverage_ratio`: (query entities in context) / (total query entities).
 
 ### Bands:
 - `>= 0.75` → **HIGH** (green badge)

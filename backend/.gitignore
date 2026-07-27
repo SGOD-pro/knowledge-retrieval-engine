@@ -1,0 +1,25 @@
+# Python-generated files
+__pycache__
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Temporary files
+tmp/
+
+.vscode
+mcp_config.json
+
+node_modules
+
+.env
+.env.development
+.env.production
+.venv
+.aws-sam
+deploy/src

@@ -96,19 +96,13 @@ def test_nova_micro_property_precision_gate():
         "Do not ship OKF. Remove typed-property claims from PROJECT.md."
     )
 
-### Nemotron-1B embedding dimension test
+### Titan V2 embedding dimension test
 
-def test_nemotron_embeddings_are_2048_dim():
+def test_titan_embeddings_are_1024_dim():
     chunks = [get_chunk(c) for c in SAMPLE_CHUNK_IDS[:5]]
-    embeddings = embed_service.embed_nemotron(chunks)
+    embeddings = embed_service.embed_titan(chunks)
     for emb in embeddings:
-        ASSERT len(emb) == 2048
-
-def test_bge_embeddings_are_384_dim():
-    chunks = [get_chunk(c) for c in SAMPLE_CHUNK_IDS[:5]]
-    embeddings = embed_service.embed_bge(chunks)
-    for emb in embeddings:
-        ASSERT len(emb) == 384
+        ASSERT len(emb) == 1024
 
 ### RULE 1 — No unnecessary LLM calls
 

@@ -15,6 +15,8 @@ class Chunk:
     location_reference: str | None = None
     metadata: dict[str, Any] | None = None
     structural_weight: float = 0.0
+    provider: str = "dev"
+    embedding: list[float] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)

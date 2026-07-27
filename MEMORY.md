@@ -24,7 +24,7 @@ Read:  checked before any retrieval stage runs
 ## Semantic Cache — pgvector-backed (replaces FAISS cache_key_index)
 
 Table: cache_entries
-  query_embedding  vector(2048)  -- or 1024 if prod/Titan
+  query_embedding  vector(1024)  -- Titan V2
   redis_key        text
   doc_scope_hash   text
   provider         text   -- which embedding provider generated this,
@@ -52,10 +52,10 @@ now a DELETE statement instead of a FAISS index rebuild.
 ## Vector Store — pgvector (replaces "FAISS Index" section entirely)
 
 All chunk embeddings: single `chunks.embedding vector(N)` column.
-  N = 2048 (Nemotron, dev) or 1024 (Titan, prod) — see DECISION.md
+  N = 1024 (Titan V2) — see DECISION.md
   provider-mismatch warning. Two Postgres columns if both providers
   are ever live simultaneously (e.g. during a migration):
-  `embedding_dev vector(2048)`, `embedding_prod vector(1024)`.
+  `embedding_dev vector(1024)`, `embedding_prod vector(1024)`.
 
 HNSW index built on ingestion, incrementally maintained by Postgres
 as new chunks are inserted — no manual rebuild step required, unlike
@@ -152,5 +152,41 @@ CREATE TABLE feedback (
   connection configuration.
 - The pre-existing backend `.venv` is incomplete on Windows; verification
   used uv isolated execution without modifying or deleting that environment.
+
+---
+
+## Session State — Phase 2 Backend Fast Path (2026-07-27)
+
+- Added `rank-bm25` dependency to `backend/pyproject.toml`.
+- Implemented Phase 2 Fast Path retrieval stack under `backend/src/kre/retrieval`:
+  - `bm25_retriever.py`: Stage 1 BM25Okapi keyword retrieval.
+  - `page_index_retriever.py`: Stage 2 PageIndex structural ranking & candidate page scoping.
+  - `vector_retriever.py`: Stage 3 pgvector similarity search scoped to candidate pages/chunks.
+  - `planner.py`: Deterministic query complexity & rule-based planner (Rule 1 Fast Path, Rule 2 Relationship, Rule 3 Analytical, Rule 4 Full Path).
+  - `response_builder.py`: Citation formatting (bounding_box for PDF, location_reference for DOCX/XLSX/PPTX/CSV), confidence scoring, and FastPathResponse builder with zero LLM calls.
+- Updated `backend/src/kre/db/schema.sql` with pgvector HNSW index (`chunks_embedding_hnsw_idx`).
+- Updated `backend/src/kre/db/postgres.py` with `search_vector` pgvector query method and in-memory fallback for test environments.
+- Added `POST /query` fast path endpoint to `backend/src/kre/api/main.py`.
+- Added comprehensive unit tests in `backend/tests/test_phase2.py` covering Rule 1 zero LLM calls, Stage ordering (BM25 -> PageIndex -> Vector), module logging, citation location references, and provider matching.
+- **Verification:** Ran `pytest tests/test_phase2.py` and all 7 tests passed successfully.
+
+---
+
+## Session State — Phase 3 Backend Pipeline (2026-07-27)
+
+- Implemented provider integration for API-first architecture:
+  - `reranker_provider.py` & `reranker.py` using Cohere Rerank 3.5 on Bedrock (`prod`) and Nemotron (`dev`).
+  - `embedding_provider.py` & `embed_service.py` using Amazon Titan V2 (`prod`) with 8k token truncation.
+  - `llm_provider.py` & `llm_service.py` using Nova Lite v1 (`prod`) and Nemotron Nano (`dev`), enforcing T=0, 1200 max tokens, and markdown stripping.
+- Implemented `concept_service.py` for OKF extraction utilizing Amazon Nova Micro in batch mode and regex patterns.
+- Implemented `normalize_service.py` for entity clustering using cosine similarity.
+- Implemented `okf_builder.py` and `okf_retriever.py` to extract and query OKF properties from Postgres.
+- Implemented `graph_retriever.py` with recursive CTE graph traversal for complex queries.
+- Implemented `compressor.py` and `fidelity_check.py` to ensure high entity coverage and low context size.
+- Orchestrated the entire multi-path architecture in `langgraph_pipeline.py`.
+- **Verification:** Ran `pytest tests/test_phase3.py tests/test_phase2.py` and all 19 combined tests passed successfully. Phase 3 is complete.
+
+
+
 
 

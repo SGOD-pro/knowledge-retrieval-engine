@@ -47,7 +47,7 @@ Rationale for single embedding model (dropped dual-tier from rev 2/3):
   for speed on a local-inference deployment. On an API-first
   architecture, both paths pay network latency regardless of model
   size — the "cheap fast model" advantage evaporates. One model
-  (Nemotron-3-Embed-1B, 2048-dim) for both paths removes an entire
+  (amazon.titan-embed-text-v2, 1024-dim) for both paths removes an entire
   index, removes consistency-check code, and removes a class of bugs.
   Fast path stays fast by skipping stages (Graph, OKF, Reranker,
   LLM), not by using a smaller embedding model.
@@ -64,7 +64,7 @@ Why FAISS is removed:
   breaks the fast-path latency target and makes cold starts unusable.
 
 Replacement: PostgreSQL + pgvector extension, on Aurora Serverless v2.
-  - Chunks table gets an `embedding vector(2048)` column.
+  - Chunks table gets an `embedding vector(1024)` column.
   - HNSW index on embedding column for approximate nearest neighbor.
   - Query: standard SQL with `<=>` cosine distance operator.
   - No index loading step. No cold-start penalty for vector search.
@@ -73,7 +73,7 @@ Replacement: PostgreSQL + pgvector extension, on Aurora Serverless v2.
     always-on RDS for spiky Lambda-driven traffic).
 
 Semantic cache (from rev 3) also moves to pgvector:
-  cache_entries table: {query_embedding vector(2048), redis_key,
+  cache_entries table: {query_embedding vector(1024), redis_key,
   doc_scope_hash, created_at}. Same 0.95 cosine threshold logic,
   now a SQL query instead of a FAISS lookup.
   `SELECT redis_key FROM cache_entries

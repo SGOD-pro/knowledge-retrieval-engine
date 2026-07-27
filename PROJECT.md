@@ -17,7 +17,7 @@ Three things working together that no existing system combines correctly:
 ```text
 Backend:   FastAPI + LangGraph + Python
 Parsing:   opendataloader-pdf (Apache-2.0, local, CPU-only)
-Retrieval: BM25 (rank-bm25) → PageIndex → FAISS (BGE-small) → OKF Lookup → Graph (conditional) → bge-reranker-base
+Retrieval: BM25 (rank-bm25) → PageIndex → pgvector (Titan V2) → OKF Lookup → Graph (conditional) → Cohere Rerank 3.5 / NVIDIA API
 LLM:       Single call, structured output, max 1200 tokens context
 Storage:   PostgreSQL + FAISS (local) + Redis
 Frontend:  Next.js 3-pane workspace

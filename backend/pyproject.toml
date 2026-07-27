@@ -5,8 +5,10 @@ description = "Phase 1 parsing and structural indexing service for KRE"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "boto3>=1.43.56",
     "fastapi>=0.139.2",
     "httpx>=0.28.1",
+    "langgraph>=1.2.9",
     "openpyxl>=3.1.5",
     "psycopg[binary]>=3.3.4",
     "pydantic-settings>=2.14.2",
@@ -14,6 +16,8 @@ dependencies = [
     "python-docx>=1.2.0",
     "python-multipart>=0.0.32",
     "python-pptx>=1.0.2",
+    "rank-bm25>=0.2.2",
+    "requests>=2.34.2",
     "uvicorn[standard]>=0.51.0",
 ]
 

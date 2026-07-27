@@ -1,42 +1,15 @@
-# PHASES.md — Build Sequence
+# PHASES.md — Build Sequence (rev 3)
 
 ## Rules (unchanged)
 - Do not start Phase N+1 until Phase N exit criteria pass.
 - No graph code in Phase 1 or Phase 2.
 - Benchmark targets are exit criteria, not aspirations.
+- Every phase must have passing test cases defined in RULES.md before exit.
 
 ---
 
 ## Phase 1 — Parsing + PageIndex + Multi-Format (Days 1–10)
-Extended by 3 days to account for format_router.
-
-Goal: Ingest PDF/DOCX/XLSX/PPTX and query structurally.
-No embeddings. No LLM. No graph.
-
-Deliverables:
-  - format_router.py with pdf/docx/xlsx/pptx routing.
-  - pdf_adapter.py (opendataloader-pdf batch).
-  - docx_adapter.py (python-docx).
-  - xlsx_adapter.py (openpyxl, formula → computed value).
-  - pptx_adapter.py (python-pptx, speaker notes as caption chunks).
-  - parse_service.py: unified chunk schema with nullable bounding_box.
-  - PostgreSQL schema: all fields including source_format, bounding_box nullable.
-  - PostgreSQL schema now includes `embedding vector(N)` column and
-    pgvector extension enabled at database creation. No FAISS setup.
-  - page_index_service.py: structural_weight scoring.
-  - POST /ingest endpoint (accepts any supported format).
-  - GET /documents/{id} endpoint.
-
-Exit criteria (all must pass):
-  - 100-page PDF ingested in <30 seconds.
-  - 50-page DOCX ingested in <15 seconds.
-  - 10-sheet XLSX ingested in <10 seconds.
-  - 30-slide PPTX ingested in <10 seconds.
-  - PageIndex returns correct top-5 for 10/10 queries
-    across 3 PDF types AND 1 DOCX and 1 XLSX.
-  - structural_weight scores heading matches 2–3x footnote matches.
-  - bounding_box is non-null for all PDF chunks,
-    null for all XLSX chunks (correct nullable behavior).
+*(Unchanged from prior spec - Tests already defined and passing)*
 
 ---
 
@@ -60,6 +33,13 @@ Exit criteria (all must pass):
     (DOCX/XLSX/PPTX) — zero null location responses.
   - BM25 before vector search enforced by test.
   - Vector search scoped to PageIndex candidates.
+
+Test Cases Required to Pass:
+  - test_r01_fast_path_zero_llm_calls
+  - test_r05_bm25_before_pageindex_before_vector
+  - test_r05_vector_search_only_within_candidate_pages
+  - test_r20_all_citations_have_location
+  - test_fast_path_p95_under_400ms
 
 ---
 
@@ -105,10 +85,29 @@ Exit criteria (all must pass):
   - LLM call count == 1 for full path, 0 for fast path.
   - Nova Micro call count == 0 for any query (ingestion only).
 
+Test Cases Required to Pass:
+  - test_r02_full_path_exactly_one_llm_call
+  - test_r02_planner_zero_llm_calls
+  - test_r02_okf_lookup_zero_llm_calls
+  - test_r03_llm_receives_compressed_context
+  - test_r04_token_limit_never_exceeded
+  - test_r06_reranker_before_compressor
+  - test_r10_all_modules_log_required_fields
+  - test_r13_graph_max_2_hops_enforced
+  - test_r13_graph_max_40_nodes_enforced
+  - test_r13_low_weight_edges_pruned
+  - test_r14_fidelity_failure_blocks_llm
+  - test_r15_llm_output_has_no_confidence_field
+  - test_r15_confidence_computed_from_deterministic_formula
+  - test_r16_graph_not_activated_for_factual_query
+  - test_r16_graph_activated_for_relationship_query
+  - test_r18_nova_micro_zero_query_time_calls
+  - test_hallucination_citation_mismatch_rate
+
 ---
 
 ## Phase 4 — API + Frontend + Lambda Packaging (Days 31–42)
-Updated for Lambda deployment.
+Updated for Lambda deployment and Frontend Vitest integration.
 
 Deliverables (additions to prior spec):
   - Lambda handler wrapping the FastAPI app (via Mangum or similar
@@ -116,12 +115,28 @@ Deliverables (additions to prior spec):
   - Package size check in CI (<50MB zipped).
   - Provisioned concurrency configuration for query Lambda
     (decision deferred to Phase 5 cost analysis).
-  - PDF viewer: bounding_box highlight (unchanged).
-  - DOCX/XLSX/PPTX: location reference display
-    ("Sheet: Revenue, Row: 14" instead of PDF highlight).
-  - Source format badge on each citation chip.
+  - Frontend Setup:
+    - PDF viewer: bounding_box highlight (unchanged).
+    - DOCX/XLSX/PPTX: location reference display
+      ("Sheet: Revenue, Row: 14" instead of PDF highlight).
+    - Source format badge on each citation chip.
+  - Frontend Testing Suite (Vitest + React Testing Library):
+    - Configure Vitest in `frontend/vite.config.ts`.
+    - API Mock tests for POST /query (success, 404, 500 errors).
+    - Component snapshot/UI breakage tests (Citation chips, 3-pane layout).
 
-Exit criteria: unchanged from prior spec, plus packaging gate passes.
+Exit criteria: 
+  - Backend unchanged from prior spec, plus packaging gate passes (<50MB).
+  - All Vitest test suites pass with 0 UI breakage failures.
+  - Frontend successfully handles API responses with varying location_reference formats.
+  - CORS configuration verified via test (frontend origin explicitly allowed in FastAPI).
+
+Test Cases Required to Pass (Frontend/Vitest):
+  - test_api_query_success_renders_citations
+  - test_api_query_handles_not_found
+  - test_citation_chip_displays_bounding_box
+  - test_citation_chip_displays_location_reference
+  - test_cors_headers_present_on_api_response
 
 ---
 
@@ -137,4 +152,8 @@ Additional deliverables:
 Exit criteria: all BENCHMARK.md rev 4 targets met on BOTH warm-path
 and provider-parity runs.
 
-
+Test Cases Required to Pass:
+  - test_full_pipeline_p95_under_4000ms (prod provider)
+  - test_full_pipeline_p95_under_4000ms (dev provider)
+  - test_lambda_package_size_under_50mb
+  - test_cold_start_latency_under_5000ms
