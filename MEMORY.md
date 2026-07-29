@@ -17,119 +17,44 @@ Read:  checked before any retrieval stage runs
 
 ### Invalidation:
 - On re-ingestion of document `D`: `DELETE` all cache keys where `doc_scope_hash` includes `D`.
-- Implemented via: store `doc_ids` in cache value metadata, scan on re-ingestion. Not a full cache flush.
 
----
-
-## Semantic Cache — pgvector-backed (replaces FAISS cache_key_index)
+## Semantic Cache — pgvector-backed
 
 Table: cache_entries
-  query_embedding  vector(1024)  -- Titan V2
+  query_embedding  vector(1024)
   redis_key        text
   doc_scope_hash   text
-  provider         text   -- which embedding provider generated this,
-                           -- prevents dev/prod embedding mixing
+  provider         text
   created_at       timestamptz
 
-Lookup query:
-  SELECT redis_key, query_embedding <=> %(query_vec)s AS distance
-  FROM cache_entries
-  WHERE doc_scope_hash = %(scope)s
-    AND provider = %(current_provider)s
-  ORDER BY distance ASC LIMIT 1;
+Lookup query logic matching rev 5, via RDS PostgreSQL.
+Dev environment uses `floci` for emulation; prod uses real RDS.
 
-  Threshold: distance corresponding to cosine_sim >= 0.95 (unchanged
-  logic from rev 3, now a WHERE/ORDER BY instead of FAISS search).
+## Vector Store — pgvector
 
-HNSW index on cache_entries.query_embedding for fast lookup at scale
-(matters once cache_entries exceeds a few thousand rows).
-
-Invalidation: unchanged logic (purge on re-ingestion by doc_scope),
-now a DELETE statement instead of a FAISS index rebuild.
-
----
-
-## Vector Store — pgvector (replaces "FAISS Index" section entirely)
-
-All chunk embeddings: single `chunks.embedding vector(N)` column.
-  N = 1024 (Titan V2) — see DECISION.md
-  provider-mismatch warning. Two Postgres columns if both providers
-  are ever live simultaneously (e.g. during a migration):
-  `embedding_dev vector(1024)`, `embedding_prod vector(1024)`.
-
-HNSW index built on ingestion, incrementally maintained by Postgres
-as new chunks are inserted — no manual rebuild step required, unlike
-FAISS's load-and-rebuild pattern.
-
----
+All chunk embeddings stored in `chunks.embedding vector(1024)`.
+HNSW index built on ingestion, incrementally maintained by Postgres.
+No FAISS index is used.
 
 ## PageIndex
 - **Storage:** PostgreSQL (persistent).
-- **Load pattern:** queried per-request, indexed on `doc_id + keyword_hash`.
-- **Update:** on re-ingestion, `DELETE` old entries for `doc_id`, `INSERT` new.
 
----
+## OKF Graph — Postgres only
 
-## OKF Graph — Postgres only (replaces "in-memory adjacency dict")
+`relations` table queried directly via recursive CTE per request.
 
-No startup load step exists in this architecture. `relations` table
-is queried directly via recursive CTE per request (see ARCHITECTURE.md).
-Add an index on `relations(from_concept_id, relation_weight)` to keep
-the recursive CTE fast at the 5000-node / 50000-edge ceiling.
+## Redis — ElastiCache Serverless
 
----
-
-## Redis — ElastiCache Serverless (deployment detail, logic unchanged)
-
-Same TTL, same write-guard conditions as rev 3. Only the hosting
-changes: ElastiCache Serverless instead of a self-managed Redis,
-to match the fully-managed, scale-to-Lambda-traffic deployment model.
-
----
+Same TTL, same write-guard conditions. ElastiCache Serverless used in cloud, `floci` in dev.
 
 ## What Is Not Cached
-- Retrieval plans (fast to compute, query-specific).
-- Reranker scores (model-dependent, invalidated on model change).
-- LOW confidence responses.
-- `NOT_FOUND` responses.
-
----
+- Retrieval plans, Reranker scores, LOW confidence responses, `NOT_FOUND` responses.
 
 ## Feedback Storage (write now, act on it in v2)
-
-### Schema:
-```sql
-CREATE TABLE feedback (
-  id UUID PRIMARY KEY,
-  query_hash TEXT,
-  response_id UUID,
-  rating SMALLINT CHECK (rating IN (-1, 1)),
-  timestamp TIMESTAMPTZ DEFAULT NOW()
-);
-```
-
-- **v1:** Collect only. Do not wire to reranking weights.
-- **v2 trigger:** When feedback table reaches 500+ rated responses, run offline analysis:
-  - Which retrieval paths (fast/graph/analytical/full) correlate with positive ratings?
-  - Which OKF concept types appear in highly-rated answers?
-  - Which queries consistently route to wrong planner rule?
-- Use findings to update planner keyword lists and confidence thresholds. Validate offline before touching production routing.
-
-### Why Not Live Feedback-to-Weights in v1:
-- Live feedback → retrieval weights = popularity bias.
-- New documents get disadvantaged (cold start).
-- Regressions are invisible until benchmark run.
-- Collect data first. Tune offline. Ship validated changes only.
-
----
+Collect only. Do not wire to reranking weights.
 
 ## No Persistent User State in v1
-- No session store.
-- No conversation history.
-- No user preference store.
-- No query logging to persistent storage (privacy default).
-
-*Reason:* v1 targets regulated industry deployment. Data retention is a compliance question, not a feature decision.
+No session store, conversation history, query logging to persistent storage.
 
 ---
 
@@ -137,21 +62,15 @@ CREATE TABLE feedback (
 
 - Implemented the Phase 1 backend scaffold under `backend/src/kre`.
 - Added format routing for PDF, DOCX, XLSX, and PPTX.
-- Added DOCX paragraph/heading parsing, XLSX computed-value parsing,
-  PPTX shape and speaker-notes parsing, and an opendataloader-pdf JSON
-  batch adapter.
-- Added the unified nullable-bounding-box `Chunk` schema and `Document`
-  model.
+- Added DOCX paragraph/heading parsing, XLSX computed-value parsing, PPTX shape and speaker-notes parsing, and an opendataloader-pdf JSON batch adapter.
+- Added the unified nullable-bounding-box `Chunk` schema and `Document` model.
 - Added the PostgreSQL/pgvector schema and repository persistence layer.
 - Added deterministic PageIndex structural scoring and ranking.
 - Added `POST /ingest` and `GET /documents/{id}`.
 - Added five focused Phase 1 tests; all passed.
 - Source compilation passed.
-- Phase 1 performance and PageIndex corpus exit gates remain unverified
-  because the repository contains no benchmark corpus or PostgreSQL
-  connection configuration.
-- The pre-existing backend `.venv` is incomplete on Windows; verification
-  used uv isolated execution without modifying or deleting that environment.
+- Phase 1 performance and PageIndex corpus exit gates remain unverified because the repository contains no benchmark corpus or PostgreSQL connection configuration.
+- The pre-existing backend `.venv` is incomplete on Windows; verification used uv isolated execution without modifying or deleting that environment.
 
 ---
 
@@ -186,7 +105,10 @@ CREATE TABLE feedback (
 - Orchestrated the entire multi-path architecture in `langgraph_pipeline.py`.
 - **Verification:** Ran `pytest tests/test_phase3.py tests/test_phase2.py` and all 19 combined tests passed successfully. Phase 3 is complete.
 
+---
 
+## Session State — Phase 3 Invalidation (2026-07-30)
 
+Phase 3 completion status is INVALIDATED as of this revision. The 19 previously-passing tests were run against provider configuration and an ingestion architecture that predate the `odl-parser-lambda` integration, the `floci`-scoped dev/prod split, and the restored local BGE-small fast-path embedding. Phase 3 must be RE-RUN in full — including the Provider Configuration Checkpoint (8 live provider verification calls) — against the corrected architecture before its exit criteria can be considered met again. Do not treat the prior 19-test pass as current evidence of Phase 3 completion.
 
-
+*Note: `embed_service.py` now has TWO distinct code paths: local BGE-small ONNX inference for fast-path queries inside Query Lambda, and API calls for full-path/ingestion-time embedding.*

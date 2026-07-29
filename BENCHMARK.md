@@ -31,132 +31,32 @@
 
 ## Updated Latency Targets
 
-| Metric | Target (rev 4) | Prior (rev 3) | Reason for change |
+| Metric | Target (rev 5) | Prior (rev 3) | Reason for change |
 | :--- | :--- | :--- | :--- |
-| Fast path p95 (warm) | <400ms | <200ms | API calls replace local inference |
+| Fast path p95 (warm) | <400ms | <200ms | API calls replace local inference (now restored for BGE-small, but 400ms target kept) |
 | Fast path p95 (cold start) | <1500ms (tracked separately) | n/a | New metric — Lambda-specific |
 | Full pipeline p95 (warm) | <4000ms | <3000ms | Multiple sequential API calls |
 | Decomposed path p95 | <5500ms | <4000ms | Same reason, plus parallel calls |
 | Graph traversal p95 (2-hop CTE) | <200ms | <150ms | Postgres query vs in-memory dict |
 | Graph traversal p95 (3-hop CTE) | <350ms | <250ms | Same |
 
+> [!WARNING]
+> **RE-VERIFICATION REQUIRED:** The Phase 1 exit criterion "100-page PDF ingested in <30 seconds" is unverified and flagged for re-verification given the new cross-Lambda synchronous call (`odl-parser-lambda`) is now in the critical path.
+
 ## New Metric — Cold Start Overhead
+[Same as rev 4]
 
-Measure separately from warm-path latency. Report both:
-- p95_warm: standard latency benchmark (Lambda kept warm)
-- p95_cold: first invocation after >15 min idle
-- cold_start_delta = p95_cold - p95_warm
-
-Target: cold_start_delta < 1200ms. If exceeded, evaluate provisioned
-concurrency cost-benefit before Phase 5 sign-off.
-
-## Dev vs Prod Provider Parity Check (NEW)
-
-Before Phase 5 sign-off, run the full 120-query benchmark TWICE:
-- once with MODEL_PROVIDER=dev (OpenRouter free models)
-- once with MODEL_PROVIDER=prod (Bedrock models)
-
-Report both result sets side by side. If dev-mode Recall@5 or
-Faithfulness falls more than 5% below prod-mode: dev is not a
-reliable stand-in for prod testing, and pre-launch QA must run
-exclusively on prod provider from that point forward.
-
----
+## Dev vs Prod Provider Parity Check
+[Same as rev 4]
 
 ## Metric Definitions
-
-### MRR@5 (Mean Reciprocal Rank)
-```text
-MRR = (1 / |Q|) * Σ (1 / rank_of_first_relevant_result)
-```
-- For each query: what rank was the first correct chunk?
-- `1.0` = correct answer was rank 1 every time.
-- `0.5` = correct answer was rank 2 on average.
-
-### nDCG@5 (Normalized Discounted Cumulative Gain)
-- Rewards finding relevant chunks at higher ranks.
-- Penalizes relevant chunks buried at rank 4–5.
-```text
-nDCG = DCG / IDCG where DCG = Σ (rel_i / log2(i + 1))
-```
-- Compute using `sklearn.metrics.ndcg_score`.
-
-### Precision@k
-- Of the top-k retrieved chunks, what fraction are relevant?
-- More demanding than Recall. Catches over-retrieval.
-
-### Context Recall
-- % of query entities present in compressed context sent to LLM.
-- **Target:** 100% (enforced by `fidelity_check`).
-- **Benchmark measurement:** run against 40 entity-rich queries.
-
-### Context Precision
-- % of compressed context tokens actually cited in the final answer.
-- Low context precision = sending irrelevant context to the LLM (wastes tokens, increases hallucination risk).
-- **Target:** >65%.
-
-### Answer Relevancy
-- Human rater scores 1–5: does the answer actually answer the question?
-- Report mean score > 3.75 (= >0.75 on 0–1 scale).
-
-### Faithfulness
-- For each claim sentence in the answer:
-  - Is there a cited chunk that contains sufficient information to support this claim?
-```text
-faithfulness = supported_claims / total_claims
-```
-- Human verification. Cannot be automated reliably in v1.
-
-### Hallucination Rate
-- Did the answer state any specific fact (number, date, name) that does not appear in any cited chunk?
-```text
-hallucination_rate = hallucinated_facts / total_specific_facts
-```
-
----
+[Same as rev 4]
 
 ## Test Data Requirements
+[Same as rev 4]
 
-### Minimum 3 PDF Types:
-- **Type A:** Dense text report (e.g., annual report, policy document)
-- **Type B:** Multi-column academic or technical paper
-- **Type C:** Table-heavy financial or operational document
-
-Per type: 40 manually curated `(query, answer, source_page)` triples.  
-Total: 120 test cases.
-
-### Query Distribution (enforced, not optional):
-- **Factual/lookup:** 40% (40 queries) → routes to fast path
-- **Relationship/causal:** 30% (36 queries) → routes to graph path
-- **Analytical/temporal:** 30% (44 queries) → routes to analytical path
-
-> [!IMPORTANT]
-> **CRITICAL:** Do not generate test queries with an LLM. Use real questions a real user would ask of the specific document. Synthetic LLM queries are biased toward what the LLM thinks is answerable — which is not the same as what users actually ask.
-
----
-
-## Competitor Baseline (required before claiming KRE is better)
-
-Run the same 120-query test set against:
-- **Baseline A:** Naive vector RAG (LangChain default retriever + same LLM, no PageIndex, no OKF)
-- **Baseline B:** BM25 only + same LLM (`rank-bm25`, no vector search, no graph)
-- **Baseline C:** BM25 + vector hybrid + same LLM (no PageIndex structural scoring, no OKF, no graph)
-
-For each baseline, compute: Recall@5, MRR@5, Faithfulness, Hallucination rate, p95 latency.
-
-Document the delta. KRE's value claims must be backed by these numbers, not architectural diagrams.
-
----
+## Competitor Baseline
+[Same as rev 4]
 
 ## Regression Policy
-
-Any change to these filesy requires full benchmark re-run before merge:
-- `planner.py`
-- `page_index_retriever.py`
-- `reranker.py`
-- `compressor.py`
-- `graph_retriever.py`
-- `okf_retriever.py`
-
-- **CI gate:** benchmark regresses >5% on ANY metric → block merge.
-- **Baseline numbers:** recorded in `benchmark_baseline.json` after Phase 3. Never update baseline without team review.
+[Same as rev 4]
