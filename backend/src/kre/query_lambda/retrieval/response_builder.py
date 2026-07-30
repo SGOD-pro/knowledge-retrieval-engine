@@ -84,13 +84,13 @@ def build_fast_path_response(
     combined_answers = " ".join([c.text for c in top_chunks])
     answer = combined_answers[:500]
 
-    avg_score = sum(s for _, s in scored_chunks[:3]) / max(1, len(top_chunks))
+    vector_similarity_avg = sum(s for _, s in scored_chunks[:3]) / max(1, len(top_chunks))
     # Coverage ratio estimate
     query_words = set(query.lower().split())
     answer_words = set(answer.lower().split())
-    coverage = len(query_words.intersection(answer_words)) / max(1, len(query_words))
+    coverage_ratio = len(query_words.intersection(answer_words)) / max(1, len(query_words))
 
-    confidence = min(1.0, max(0.0, (avg_score * 0.6) + (coverage * 0.4)))
+    confidence = min(1.0, max(0.0, (vector_similarity_avg * 0.6) + (coverage_ratio * 0.4)))
 
     if confidence >= 0.75:
         band = "HIGH"

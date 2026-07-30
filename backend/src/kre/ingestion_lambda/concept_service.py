@@ -3,7 +3,8 @@ import json
 import logging
 import re
 from kre.shared.models import Chunk
-from kre.providers.provider_client import get_active_provider
+from kre.shared.providers.provider_client import get_active_provider
+from kre.shared.config import get_concept_model
 
 logger = logging.getLogger(__name__)
 
@@ -14,6 +15,7 @@ def extract_properties_nova_micro(chunks: list[Chunk], provider: str | None = No
     Expected output: [{concept, property_name, property_value, source_chunk_id, confidence}]
     """
     active = provider or get_active_provider()
+    model_id = get_concept_model(active)
     results = []
     
     # Process 20 chunks at a time
@@ -31,10 +33,10 @@ def extract_properties_nova_micro(chunks: list[Chunk], provider: str | None = No
         
         if active == "prod":
             try:
-                import boto3
-                client = boto3.client("bedrock-runtime", region_name=os.environ.get("AWS_REGION", "us-east-1"))
+                from kre.shared.config import get_boto3_client
+                client = get_boto3_client("bedrock-runtime")
                 response = client.converse(
-                    modelId="amazon.nova-micro-v1:0",
+                    modelId=model_id,
                     messages=[{"role": "user", "content": [{"text": user_prompt}]}],
                     system=[{"text": system_prompt}],
                     inferenceConfig={"temperature": 0.0}
@@ -64,7 +66,7 @@ def extract_properties_nova_micro(chunks: list[Chunk], provider: str | None = No
                         "Content-Type": "application/json",
                     },
                     json={
-                        "model": "nvidia/nemotron-3-nano-30b-a3b:free",
+                        "model": model_id,
                         "messages": [
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": user_prompt}
@@ -126,6 +128,54 @@ def extract_tier1_patterns(chunks: list[Chunk]) -> list[dict]:
                 "property_name": "Identifier",
                 "property_value": match.group(1),
                 "source_chunk_id": c.id,
-                "confidence": 1.0
+                "confidence": 1.0,
+                "extraction_tier": "tier1_regex"
             })
+    return results
+
+def extract_tier1_5_relations(chunks: list[Chunk], known_concepts: list[str]) -> list[dict]:
+    """
+    Tier 1.5 SVO Relation Extraction.
+    Matches predefined verb families (CAUSES, DEPENDS_ON, AFFECTS) between known concepts.
+    Stored with relation_weight=0.6, low_confidence=True, extraction_tier='tier1.5_regex'
+    """
+    results = []
+    if not known_concepts:
+        return results
+
+    # Sort known concepts by length descending to match longest phrases first
+    sorted_concepts = sorted(known_concepts, key=len, reverse=True)
+    # Escape concepts for regex safety
+    escaped_concepts = [re.escape(c) for c in sorted_concepts]
+    entities_pattern = r'(' + r'|'.join(escaped_concepts) + r')'
+
+    # Define verb families
+    families = {
+        "CAUSES": r'(?:causes|leads to|results in)',
+        "DEPENDS_ON": r'(?:depends on|relies on|requires)',
+        "AFFECTS": r'(?:affects|impacts|influences)'
+    }
+
+    for rel_type, verb_pattern in families.items():
+        # Entity1 + verb + Entity2 (with some optional words in between, up to 5 words)
+        # e.g., "ConceptA significantly impacts the new ConceptB"
+        pattern = re.compile(
+            entities_pattern + r'(?:\s+(?:\w+\s+){0,3})' + verb_pattern + r'(?:\s+(?:\w+\s+){0,3})' + entities_pattern,
+            re.IGNORECASE
+        )
+        for c in chunks:
+            for match in pattern.finditer(c.text):
+                entity1 = match.group(1)
+                entity2 = match.group(2)
+                if entity1.lower() != entity2.lower():
+                    # We found a relation!
+                    results.append({
+                        "from_concept": entity1,
+                        "to_concept": entity2,
+                        "relation_type": rel_type,
+                        "relation_weight": 0.6,
+                        "source_chunk_id": c.id,
+                        "low_confidence": True,
+                        "extraction_tier": "tier1.5_regex"
+                    })
     return results

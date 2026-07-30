@@ -125,6 +125,11 @@ sim < 0.85          → separate nodes, add to manual review queue
 
 ## Confidence Score (deterministic, post-LLM)
 
+Formulas:
+- Fast path: `confidence = (vector_similarity_avg * 0.6) + (coverage_ratio * 0.4)`
+- Full path: `confidence = (reranker_score_avg * 0.6) + (coverage_ratio * 0.4)`
+
+Bands:
 - `>= 0.75` → **HIGH**
 - `0.50 – 0.74` → **MEDIUM**
 - `< 0.50` → **LOW**

@@ -15,12 +15,9 @@ import logging
 import os
 
 from kre.shared.providers.provider_client import get_active_provider
+from kre.shared.config import get_llm_model
 
 logger = logging.getLogger(__name__)
-
-# Model IDs per ARCHITECTURE.md Model Provider Matrix
-_PROD_MODEL_ID = "amazon.nova-lite-v1:0"
-_DEV_MODEL_ID = "nvidia/nemotron-nano-9b-v2:free"
 
 # Hard constraint: max tokens to LLM (Rule 4)
 _MAX_TOKENS = 1200
@@ -37,6 +34,7 @@ def generate_completion(
     Returns the raw string output.
     """
     active = provider or get_active_provider()
+    model_id = get_llm_model(active)
 
     if active == "prod":
         try:
@@ -46,7 +44,7 @@ def generate_completion(
             messages = [{"role": "user", "content": [{"text": user_prompt}]}]
 
             response = client.converse(
-                modelId=_PROD_MODEL_ID,
+                modelId=model_id,
                 messages=messages,
                 system=[{"text": system_prompt}],
                 inferenceConfig={
@@ -74,7 +72,7 @@ def generate_completion(
                         "Content-Type": "application/json",
                     },
                     json={
-                        "model": _DEV_MODEL_ID,
+                        "model": model_id,
                         "messages": [
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": user_prompt},

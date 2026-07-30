@@ -13,12 +13,9 @@ import logging
 import os
 
 from kre.shared.providers.provider_client import get_active_provider
+from kre.shared.config import get_reranker_model
 
 logger = logging.getLogger(__name__)
-
-# Model IDs per ARCHITECTURE.md Model Provider Matrix
-_PROD_MODEL_ID = "cohere.rerank-v3-5:0"
-_DEV_MODEL_ID = "nvidia/llama-nemotron-rerank-vl-1b-v2"
 
 
 def rerank_documents(query: str, documents: list[str], provider: str | None = None) -> list[float]:
@@ -27,6 +24,7 @@ def rerank_documents(query: str, documents: list[str], provider: str | None = No
     Returns a list of relevance scores (floats) aligned with the input documents list.
     """
     active = provider or get_active_provider()
+    model_id = get_reranker_model(active)
 
     if active == "prod":
         try:
@@ -40,7 +38,7 @@ def rerank_documents(query: str, documents: list[str], provider: str | None = No
             }
 
             response = client.invoke_model(
-                modelId=_PROD_MODEL_ID,
+                modelId=model_id,
                 contentType="application/json",
                 accept="application/json",
                 body=json.dumps(body),
@@ -71,7 +69,7 @@ def rerank_documents(query: str, documents: list[str], provider: str | None = No
                         "Content-Type": "application/json",
                     },
                     json={
-                        "model": _DEV_MODEL_ID,
+                        "model": model_id,
                         "query": query,
                         "documents": documents,
                         "top_n": len(documents),

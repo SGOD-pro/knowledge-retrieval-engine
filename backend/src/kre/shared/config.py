@@ -31,3 +31,33 @@ def get_boto3_client(service_name: str):
         return boto3.client(service_name, region_name=region, endpoint_url=endpoint_url)
     
     return boto3.client(service_name, region_name=region)
+
+# ==========================================
+# Model Configurations (Environment Overrides)
+# ==========================================
+
+def get_llm_model(provider: str) -> str:
+    if provider == "prod":
+        return os.environ.get("PROD_LLM_MODEL", "amazon.nova-lite-v1:0")
+    return os.environ.get("DEV_LLM_MODEL", "nvidia/nemotron-nano-9b-v2:free")
+
+def get_embedding_model(provider: str) -> str:
+    if provider == "prod":
+        return os.environ.get("PROD_EMBEDDING_MODEL", "amazon.titan-embed-text-v2:0")
+    return os.environ.get("DEV_EMBEDDING_MODEL", "nvidia/nemotron-3-embed-1b:free")
+
+def get_reranker_model(provider: str) -> str:
+    if provider == "prod":
+        return os.environ.get("PROD_RERANKER_MODEL", "cohere.rerank-v3-5:0")
+    return os.environ.get("DEV_RERANKER_MODEL", "nvidia/llama-nemotron-rerank-vl-1b-v2:free")
+
+def get_concept_model(provider: str) -> str:
+    if provider == "prod":
+        return os.environ.get("PROD_CONCEPT_MODEL", "amazon.nova-micro-v1:0")
+    return os.environ.get("DEV_CONCEPT_MODEL", "nvidia/nemotron-3-nano-30b-a3b:free")
+
+# ==========================================
+# Caching Configuration
+# ==========================================
+CACHE_TTL_SECONDS = 86400
+CACHE_MIN_CONFIDENCE = 0.50

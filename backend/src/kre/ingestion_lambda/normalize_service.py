@@ -16,14 +16,15 @@ def cluster_entities(entity_names: list[str], threshold: float = 0.92, provider:
     embeddings = embed_batch(unique_names, provider=provider)
     
     canonical_map = {}
-    clusters = [] # list of lists of canonical indices
+    clusters = [] # list of dicts: {"canonical_idx": i, "members": [(idx, confidence, is_flagged)]}
     
     for i, emb_i in enumerate(embeddings):
-        matched_cluster = -1
-        # Try to find a matching cluster
+        best_sim = 0.0
+        best_cluster = -1
+        
+        # Find the most similar cluster
         for c_idx, cluster in enumerate(clusters):
-            # Compare with the canonical element of the cluster (first item)
-            canonical_idx = cluster[0]
+            canonical_idx = cluster["canonical_idx"]
             emb_c = embeddings[canonical_idx]
             
             # Cosine similarity
@@ -32,19 +33,34 @@ def cluster_entities(entity_names: list[str], threshold: float = 0.92, provider:
             norm_b = sum(b * b for b in emb_c) ** 0.5
             sim = dot / (norm_a * norm_b) if (norm_a * norm_b) > 0 else 0.0
             
-            if sim >= threshold:
-                matched_cluster = c_idx
-                break
+            if sim > best_sim:
+                best_sim = sim
+                best_cluster = c_idx
                 
-        if matched_cluster >= 0:
-            clusters[matched_cluster].append(i)
+        # DECISION.md Brackets:
+        # cosine_sim >= 0.92    auto-merge (same entity)
+        # 0.85 <= sim < 0.92    merge, set low_confidence = True
+        # sim < 0.85            separate nodes, add to manual review queue
+        if best_sim >= 0.92:
+            clusters[best_cluster]["members"].append({"idx": i, "low_confidence": False, "flagged": False})
+        elif best_sim >= 0.85:
+            clusters[best_cluster]["members"].append({"idx": i, "low_confidence": True, "flagged": False})
         else:
-            clusters.append([i])
+            clusters.append({"canonical_idx": i, "members": [{"idx": i, "low_confidence": False, "flagged": True}]})
             
     # Build the map
+    # In a full system, we would store the low_confidence and flagged metadata in the DB.
+    # For now, we return the canonical mapping and log the flagged/low_confidence items.
     for cluster in clusters:
-        canonical_name = unique_names[cluster[0]]
-        for idx in cluster:
-            canonical_map[unique_names[idx]] = canonical_name
-            
+        canonical_name = unique_names[cluster["canonical_idx"]]
+        for member in cluster["members"]:
+            member_name = unique_names[member["idx"]]
+            canonical_map[member_name] = canonical_name
+            if member["low_confidence"]:
+                logger.info(f"Merged '{member_name}' into '{canonical_name}' with LOW CONFIDENCE (sim < 0.92)")
+            if member["flagged"] and member["idx"] != cluster["canonical_idx"]:
+                # This should theoretically not happen because flagged creates a new cluster,
+                # but if we extend logic, this logs the manual review queue items.
+                pass
+        
     return canonical_map

@@ -20,12 +20,9 @@ import numpy as np
 import onnxruntime as ort
 
 from kre.shared.providers.provider_client import get_active_provider
+from kre.shared.config import get_embedding_model
 
 logger = logging.getLogger(__name__)
-
-# Model IDs per ARCHITECTURE.md Model Provider Matrix
-_PROD_MODEL_ID = "amazon.titan-embed-text-v2:0"
-_DEV_MODEL_ID = "nvidia/nemotron-3-embed-1b"
 
 FULL_EMBEDDING_DIM = 1024
 FAST_EMBEDDING_DIM = 384
@@ -151,6 +148,7 @@ def embed_text(text: str, provider: str | None = None) -> list[float]:
     Fallback: Deterministic pseudo-embedding when API keys are absent.
     """
     active = provider or get_active_provider()
+    model_id = get_embedding_model(active)
     dim = FULL_EMBEDDING_DIM
 
     if active == "prod":
@@ -162,7 +160,7 @@ def embed_text(text: str, provider: str | None = None) -> list[float]:
             truncated_text = text[:30000]
 
             response = client.invoke_model(
-                modelId=_PROD_MODEL_ID,
+                modelId=model_id,
                 contentType="application/json",
                 accept="application/json",
                 body=json.dumps({
@@ -189,7 +187,7 @@ def embed_text(text: str, provider: str | None = None) -> list[float]:
                         "Content-Type": "application/json",
                     },
                     json={
-                        "model": _DEV_MODEL_ID,
+                        "model": model_id,
                         "input": text[:30000],
                     },
                     timeout=30.0,

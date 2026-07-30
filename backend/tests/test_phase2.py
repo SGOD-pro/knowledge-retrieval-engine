@@ -7,7 +7,7 @@ from unittest.mock import patch, MagicMock
 from kre.query_lambda.api.main import app, repository
 from kre.shared.models import Chunk, Document
 from kre.shared.providers.embedding_provider import embed_text as api_embed_text
-from kre.query_lambda.embed_service import embed_fast_local
+from kre.shared.providers.embedding_provider import embed_fast_local
 from kre.shared.providers.provider_client import get_active_provider
 from kre.query_lambda.retrieval.bm25_retriever import BM25Retriever
 from kre.query_lambda.retrieval.page_index_retriever import PageIndexRetriever

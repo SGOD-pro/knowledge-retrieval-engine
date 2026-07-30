@@ -258,3 +258,51 @@ class PostgresRepository:
 
             results.sort(key=lambda x: x[1], reverse=True)
             return results[:limit]
+
+    def check_semantic_cache(
+        self,
+        query_embedding: list[float],
+        doc_scope_hash: str,
+        provider: str
+    ) -> str | None:
+        """Layer 1 Cache: pgvector semantic similarity check.
+        Uses <=> (cosine distance) operator. A distance <= 0.05 is equivalent to similarity >= 0.95.
+        Returns the redis_key if a match is found, otherwise None.
+        """
+        try:
+            embedding_str = f"[{','.join(str(x) for x in query_embedding)}]"
+            query_sql = """
+                SELECT redis_key
+                FROM cache_entries
+                WHERE doc_scope_hash = %s AND provider = %s
+                  AND query_embedding <=> %s::vector <= 0.05
+                ORDER BY query_embedding <=> %s::vector ASC
+                LIMIT 1
+            """
+            with self._connect() as connection:
+                row = connection.execute(query_sql, (doc_scope_hash, provider, embedding_str, embedding_str)).fetchone()
+                if row:
+                    return row[0]
+        except Exception:
+            pass
+        return None
+
+    def save_semantic_cache(
+        self,
+        redis_key: str,
+        query_embedding: list[float],
+        doc_scope_hash: str,
+        provider: str
+    ) -> None:
+        """Save a new entry to the semantic cache index."""
+        try:
+            embedding_str = f"[{','.join(str(x) for x in query_embedding)}]"
+            query_sql = """
+                INSERT INTO cache_entries (redis_key, query_embedding, doc_scope_hash, provider)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (redis_key) DO NOTHING
+            """
+            with self._connect() as connection:
+                connection.execute(query_sql, (redis_key, embedding_str, doc_scope_hash, provider))
+        except Exception:
+            pass
