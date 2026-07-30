@@ -31,12 +31,19 @@ NEW: Three-Lambda distributed architecture.
 
 ## Vector Store — RDS PostgreSQL + pgvector
 
-- Chunks table gets an `embedding vector(1024)` column for API embeddings, and a separate one (or unified schema) for BGE-small (384-dim) for fast path.
-- HNSW index on embedding column.
+- Two permanent, separate columns, never merged:
+  - `embedding_fast vector(384)` for local BGE-small ONNX embeddings.
+  - `embedding_full vector(1024)` for Titan V2 (prod) / Nemotron (dev) API embeddings.
+- Both columns are populated at ingestion time for every chunk.
+- Two separate HNSW indexes, one per column: `chunks_embedding_fast_hnsw_idx`, `chunks_embedding_full_hnsw_idx`.
+- Query-time routing rule (Rule 19): fast-path queries embed via local BGE-small and search ONLY `embedding_fast`. Full-path queries embed via the active API provider and search ONLY `embedding_full`. No query ever compares against both columns, and no code path merges results across them.
 - Dev environment uses `floci` to emulate RDS PostgreSQL and ElastiCache. Prod uses real RDS PostgreSQL. No local Postgres-only fallback.
 
-## Module Map (rev 5)
+## PDF Extraction Invocation Contract (Dev vs. Prod)
+- **Dev Environment:** The Ingestion Lambda bypasses `boto3` and S3. It dynamically imports the `odl/main.py` handler from the repository root and passes `{"local_file_path": "..."}` in the event payload. This allows local PDF parsing without uploading to S3.
+- **Prod Environment:** The Ingestion Lambda uses `boto3.client('lambda').invoke(FunctionName='odl-parser-lambda', ...)` and passes `{"s3_bucket": "...", "s3_key": "..."}`. The deployed Lambda code is exactly the same as `odl/main.py`.
 
+## Module Map (rev 5)
 kre/
 ├── pdf_extraction_lambda/    # Deployed separately. Container image (JRE + opendataloader-pdf).
 ├── ingestion_lambda/         # Zip deployment (pending size check).

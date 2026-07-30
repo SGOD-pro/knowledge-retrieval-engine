@@ -6,6 +6,7 @@ Dev environment is NOT fully local or fully cloud. It is a strict three-way spli
 1. **FLOCI-EMULATED (dev only):** RDS PostgreSQL and ElastiCache Redis are emulated locally via `floci`.
 2. **REAL CLOUD (Bedrock/OpenRouter):** All LLM and API-based embedding/reranker calls hit real cloud endpoints using real API keys/credentials in every environment.
 3. **REAL CLOUD (Lambda):** Cross-Lambda invocations (specifically `odl-parser-lambda`) use real AWS Lambda via boto3 with dev AWS credentials holding `lambda:InvokeFunction`.
+4. **PDF Parsing (Dev):** Uses direct Python import of `odl/main.py` (bypasses AWS Lambda and S3). The `odl/main.py` handler is modified to accept a `local_file_path` fallback.
 
 ## Provider Routing
 

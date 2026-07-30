@@ -35,12 +35,18 @@ class PostgresRepository:
                     (document.id, document.filename, document.source_format),
                 )
                 for chunk in document.chunks:
-                    embedding_str = f"[{','.join(str(x) for x in chunk.embedding)}]" if chunk.embedding else None
+                    emb_fast_str = f"[{','.join(str(x) for x in chunk.embedding_fast)}]" if chunk.embedding_fast else None
+                    emb_full_str = f"[{','.join(str(x) for x in chunk.embedding_full)}]" if chunk.embedding_full else None
                     connection.execute(
                         """INSERT INTO chunks (
                             id, document_id, source_format, text, element_type, page_number,
-                            section_path, bounding_box, location_reference, metadata, structural_weight, provider, embedding
-                        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (id) DO UPDATE SET text=EXCLUDED.text""",
+                            section_path, bounding_box, location_reference, metadata,
+                            structural_weight, provider, embedding_fast, embedding_full
+                        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        ON CONFLICT (id) DO UPDATE SET
+                            text=EXCLUDED.text,
+                            embedding_fast=EXCLUDED.embedding_fast,
+                            embedding_full=EXCLUDED.embedding_full""",
                         (
                             chunk.id,
                             chunk.document_id,
@@ -54,7 +60,8 @@ class PostgresRepository:
                             json.dumps(chunk.metadata) if chunk.metadata else None,
                             chunk.structural_weight,
                             chunk.provider,
-                            embedding_str,
+                            emb_fast_str,
+                            emb_full_str,
                         ),
                     )
                 return
@@ -109,19 +116,22 @@ class PostgresRepository:
                     uuids = [UUID(d) for d in document_ids]
                     rows = connection.execute(
                         """SELECT id, document_id, source_format, text, element_type, page_number,
-                                  section_path, bounding_box, location_reference, metadata, structural_weight, provider, embedding
+                                  section_path, bounding_box, location_reference, metadata,
+                                  structural_weight, provider, embedding_fast, embedding_full
                            FROM chunks WHERE document_id = ANY(%s) ORDER BY id""",
                         (uuids,),
                     ).fetchall()
                 else:
                     rows = connection.execute(
                         """SELECT id, document_id, source_format, text, element_type, page_number,
-                                  section_path, bounding_box, location_reference, metadata, structural_weight, provider, embedding
+                                  section_path, bounding_box, location_reference, metadata,
+                                  structural_weight, provider, embedding_fast, embedding_full
                            FROM chunks ORDER BY id"""
                     ).fetchall()
             chunks = []
             for row in rows:
-                emb = json.loads(row[12]) if isinstance(row[12], str) else row[12]
+                emb_fast = json.loads(row[12]) if isinstance(row[12], str) else row[12]
+                emb_full = json.loads(row[13]) if isinstance(row[13], str) else row[13]
                 chunks.append(
                     Chunk(
                         row[0],
@@ -136,7 +146,8 @@ class PostgresRepository:
                         row[9],
                         row[10],
                         row[11],
-                        emb,
+                        emb_fast,
+                        emb_full,
                     )
                 )
             return chunks
@@ -150,7 +161,7 @@ class PostgresRepository:
     def search_vector(
         self,
         query_embedding: list[float],
-        provider: str = "dev",
+        embedding_column: str = "embedding_full",
         document_ids: list[str] | None = None,
         candidate_page_ids: list[int] | None = None,
         candidate_chunk_ids: list[str] | None = None,
@@ -158,19 +169,23 @@ class PostgresRepository:
     ) -> list[tuple[Chunk, float]]:
         """Vector search using pgvector cosine distance operator (<=>).
 
-        Rule 30: provider matching enforced.
+        Rule 19: fast-path queries target embedding_fast, full-path queries target embedding_full.
+        Rule 30: No query ever compares across both columns.
         Rule 5: PageIndex candidate scoping enforced.
         """
+        if embedding_column not in ("embedding_fast", "embedding_full"):
+            raise ValueError(f"Invalid embedding_column: {embedding_column}. Must be 'embedding_fast' or 'embedding_full'.")
+
         try:
             embedding_str = f"[{','.join(str(x) for x in query_embedding)}]"
-            query_sql = """
+            query_sql = f"""
                 SELECT id, document_id, source_format, text, element_type, page_number,
                        section_path, bounding_box, location_reference, metadata, structural_weight, provider,
-                       embedding <=> %s::vector AS distance
+                       {embedding_column} <=> %s::vector AS distance
                 FROM chunks
-                WHERE provider = %s
+                WHERE {embedding_column} IS NOT NULL
             """
-            params = [embedding_str, provider]
+            params: list = [embedding_str]
 
             if document_ids:
                 query_sql += " AND document_id = ANY(%s)"
@@ -213,20 +228,19 @@ class PostgresRepository:
         except Exception:
             # Fallback cosine distance calculation over in-memory chunks
             chunks = self.get_all_chunks(document_ids)
-            filtered = [c for c in chunks if c.provider == provider]
 
             if candidate_page_ids:
                 page_set = set(candidate_page_ids)
-                filtered = [c for c in filtered if c.page_number in page_set]
+                chunks = [c for c in chunks if c.page_number in page_set]
 
             if candidate_chunk_ids:
                 chunk_set = set(candidate_chunk_ids)
-                filtered = [c for c in filtered if c.id in chunk_set]
+                chunks = [c for c in chunks if c.id in chunk_set]
 
             results = []
-            for chunk in filtered:
-                if chunk.embedding:
-                    vec = chunk.embedding
+            for chunk in chunks:
+                vec = chunk.embedding_fast if embedding_column == "embedding_fast" else chunk.embedding_full
+                if vec:
                     # Compute cosine similarity
                     dot = sum(a * b for a, b in zip(query_embedding, vec))
                     norm_a = sum(a * a for a in query_embedding) ** 0.5
@@ -238,4 +252,3 @@ class PostgresRepository:
 
             results.sort(key=lambda x: x[1], reverse=True)
             return results[:limit]
-

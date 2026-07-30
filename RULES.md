@@ -130,6 +130,23 @@ def test_r27_no_forbidden_dependencies():
 ### RULE 30 — No cross-provider embedding comparison
 [Same as rev 4]
 
+```python
+def test_r30_schema_level_routing_isolation():
+    # Assert that a fast-path query's SQL ONLY references embedding_fast
+    fast_query = "What is the refund policy?"
+    fast_plan = planner.route(fast_query)
+    fast_sql = vector_retriever.build_query_sql(fast_query, fast_plan)
+    ASSERT "embedding_fast" in fast_sql
+    ASSERT "embedding_full" not in fast_sql
+
+    # Assert that a full-path query's SQL ONLY references embedding_full
+    full_query = "Why did sales drop?"
+    full_plan = planner.route(full_query)
+    full_sql = vector_retriever.build_query_sql(full_query, full_plan)
+    ASSERT "embedding_full" in full_sql
+    ASSERT "embedding_fast" not in full_sql
+```
+
 ### Cold start latency tracking
 [Same as rev 4]
 

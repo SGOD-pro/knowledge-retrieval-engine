@@ -1,0 +1,12 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "odl-parser"
+resolve_s3 = true
+s3_prefix = "odl-parser"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM"
+image_repositories = ["ODLParserFunction=445567096027.dkr.ecr.ap-south-1.amazonaws.com/odlparser8a5b79e7/odlparserfunction433d9ba9repo"]
+
+[default.global.parameters]
+region = "ap-south-1"
