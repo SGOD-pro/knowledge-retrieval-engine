@@ -37,3 +37,17 @@ CREATE TABLE IF NOT EXISTS cache_entries (
     provider TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE TABLE IF NOT EXISTS concepts (
+    id UUID PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE IF NOT EXISTS properties (
+    id UUID PRIMARY KEY,
+    concept_id UUID NOT NULL REFERENCES concepts(id) ON DELETE CASCADE,
+    property_name TEXT NOT NULL,
+    property_value TEXT NOT NULL,
+    source_chunk_id TEXT NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+    confidence DOUBLE PRECISION NOT NULL DEFAULT 1.0
+);

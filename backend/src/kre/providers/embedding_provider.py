@@ -22,8 +22,8 @@ from kre.providers.provider_client import get_active_provider
 logger = logging.getLogger(__name__)
 
 # Model IDs per ARCHITECTURE.md Model Provider Matrix
-_PROD_MODEL_ID = "amazon.titan-embed-text-v2:0"
-_DEV_MODEL_ID = "nvidia/nemotron-3-embed-1b"
+_PROD_MODEL_ID = os.environ.get("PROD_EMBEDDING_MODEL", "amazon.titan-embed-text-v2:0")
+_DEV_MODEL_ID = os.environ.get("DEV_EMBEDDING_MODEL", "nvidia/llama-nemotron-embed-vl-1b-v2:free")
 
 FULL_EMBEDDING_DIM = 1024
 
@@ -93,8 +93,8 @@ def embed_text(text: str, provider: str | None = None) -> list[float]:
             except Exception as e:
                 logger.error("Dev embedding request failed: %s", str(e))
 
-    # Deterministic fallback vector generation based on SHA-256 seed
-    return _deterministic_vector(text, dim)
+    # Raise error instead of falling back to deterministic vector
+    raise RuntimeError("API embedding failed. Check rate limits or API key.")
 
 
 def _deterministic_vector(text: str, dim: int) -> list[float]:
@@ -108,5 +108,7 @@ def _deterministic_vector(text: str, dim: int) -> list[float]:
 
 
 def embed_batch(texts: Sequence[str], provider: str | None = None) -> list[list[float]]:
-    """Generate embeddings for multiple texts."""
-    return [embed_text(text, provider=provider) for text in texts]
+    """Generate embeddings for multiple texts concurrently."""
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        return list(executor.map(lambda t: embed_text(t, provider=provider), texts))

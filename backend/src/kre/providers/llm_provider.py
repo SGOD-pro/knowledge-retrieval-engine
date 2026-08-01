@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 # Model IDs per ARCHITECTURE.md Model Provider Matrix
 _PROD_MODEL_ID = "amazon.nova-lite-v1:0"
-_DEV_MODEL_ID = "nvidia/nemotron-nano-9b-v2:free"
+_DEV_MODEL_ID = os.environ.get("DEV_LLM_MODEL", "nvidia/nemotron-nano-9b-v2:free")
 
 # Hard constraint: max tokens to LLM (Rule 4)
 _MAX_TOKENS = 1200

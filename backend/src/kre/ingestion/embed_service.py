@@ -113,8 +113,8 @@ def embed_fast_local(text: str) -> list[float]:
 
         return pooled.tolist()
 
-    # Deterministic fallback for environments without model files
-    return _deterministic_vector(text, dim=384)
+    # Raise error if model files are missing instead of falling back silently
+    raise RuntimeError(f"BGE-small ONNX model or tokenizer missing at expected path: {_BGE_MODEL_DIR}")
 
 
 def embed_fast_batch(texts: list[str]) -> list[list[float]]:
@@ -145,8 +145,10 @@ def embed_chunks_dual(chunks: list[Chunk], provider: str = "dev") -> list[Chunk]
     # Fast embeddings — always local ONNX, zero network calls
     fast_embeddings = embed_fast_batch(texts)
 
+    from kre.providers.embedding_provider import embed_batch as api_embed_batch
+
     # Full embeddings — always API provider
-    full_embeddings = [api_embed_text(t, provider=provider) for t in texts]
+    full_embeddings = api_embed_batch(texts, provider=provider)
 
     result = []
     for chunk, emb_fast, emb_full in zip(chunks, fast_embeddings, full_embeddings):

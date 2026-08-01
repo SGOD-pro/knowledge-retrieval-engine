@@ -63,8 +63,12 @@ def run_vector(state: PipelineState):
     page_ids = state.get("candidate_page_ids", [])
     chunk_ids = state.get("candidate_chunk_ids", [])
     
+    plan = state.get("plan")
+    is_fast_path = plan.fast_path if plan else False
+    
     chunks = retriever.search(
         query=state["query"],
+        fast_path=is_fast_path,
         document_ids=state.get("document_ids"),
         candidate_page_ids=page_ids if page_ids else None,
         candidate_chunk_ids=chunk_ids if chunk_ids else None,

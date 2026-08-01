@@ -50,7 +50,11 @@ class VectorRetriever:
             from kre.providers.provider_client import get_active_provider
 
             active_provider = get_active_provider()
-            query_embedding = embed_text(query, provider=active_provider)
+            try:
+                query_embedding = embed_text(query, provider=active_provider)
+            except RuntimeError as e:
+                logger.error(f"Full path embedding failed: {e}")
+                return []
             embedding_column = "embedding_full"
 
         results = self.repository.search_vector(

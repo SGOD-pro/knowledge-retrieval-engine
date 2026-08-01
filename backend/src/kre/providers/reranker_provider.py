@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 # Model IDs per ARCHITECTURE.md Model Provider Matrix
 _PROD_MODEL_ID = "cohere.rerank-v3-5:0"
-_DEV_MODEL_ID = "nvidia/llama-nemotron-rerank-vl-1b-v2"
+_DEV_MODEL_ID = os.environ.get("DEV_RERANKER_MODEL", "nvidia/llama-nemotron-rerank-vl-1b-v2")
 
 
 def rerank_documents(query: str, documents: list[str], provider: str | None = None) -> list[float]:

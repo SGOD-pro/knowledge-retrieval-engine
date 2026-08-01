@@ -1,0 +1,12 @@
+{
+  "avg_latency_ms": 932.1719741662188,
+  "p95_latency_ms": 1110.1629000040703,
+  "mrr_5": 0.0,
+  "ndcg_5": 0.0,
+  "recall_3": 0.0,
+  "recall_5": 0.0,
+  "precision_3": 0.0,
+  "faithfulness": 0.0,
+  "context_precision": 0.0,
+  "llm_activation_rate": 0.8833333333333333
+}

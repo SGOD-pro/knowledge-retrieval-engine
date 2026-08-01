@@ -1,0 +1,1202 @@
+[
+  {
+    "id": "Q001",
+    "document_type": "Type A - Dense Text Policy/Regulatory",
+    "folder": "data/policy_regulatory",
+    "document_filename": "National-Strategy-for-Artificial-Intelligence.pdf",
+    "query_category": "factual",
+    "query": "Who are the primary NITI Aayog authors credited with writing the National Strategy for Artificial Intelligence report?",
+    "expected_answer": "Arnab Kumar, Punit Shukla, Aalekh Sharan, and Tanay Mahindru of NITI Aayog made valuable contributions in writing the report, with inputs from Dr. Avik Sarkar, Dr. Ashish Nayan, and Kartikeya Asthana.",
+    "source_page": 3
+  },
+  {
+    "id": "Q002",
+    "document_type": "Type A - Dense Text Policy/Regulatory",
+    "folder": "data/policy_regulatory",
+    "document_filename": "National-Strategy-for-Artificial-Intelligence.pdf",
+    "query_category": "factual",
+    "query": "What is the projected size and CAGR of the Indian healthcare sector by 2020 as stated in the report?",
+    "expected_answer": "The Indian healthcare sector is expected to grow to USD 280 billion by 2020, at a CAGR of upwards of 16%, from approximately USD 100 billion.",
+    "source_page": 24
+  },
+  {
+    "id": "Q003",
+    "document_type": "Type A - Dense Text Policy/Regulatory",
+    "folder": "data/policy_regulatory",
+    "document_filename": "National-Strategy-for-Artificial-Intelligence.pdf",
+    "query_category": "factual",
+    "query": "According to Gartner projections cited in the AI strategy paper, what was the worldwide public cloud services market size and growth rate for 2018?",
+    "expected_answer": "The worldwide public cloud services market was projected to grow 21.4% in 2018 to total USD 186.4 billion, up from USD 153.5 billion in 2017.",
+    "source_page": 14
+  },
+  {
+    "id": "Q004",
+    "document_type": "Type A - Dense Text Policy/Regulatory",
+    "folder": "data/policy_regulatory",
+    "document_filename": "National-Strategy-for-Artificial-Intelligence.pdf",
+    "query_category": "factual",
+    "query": "What percentage of their respective GDPs in 2030 do China and the U.K. estimate will be sourced from AI-related activities?",
+    "expected_answer": "China and the U.K. estimate that 26% and 10% of their GDPs respectively in 2030 will be sourced from AI-related activities and businesses.",
+    "source_page": 16
+  },
+  {
+    "id": "Q005",
+    "document_type": "Type A - Dense Text Policy/Regulatory",
+    "folder": "data/policy_regulatory",
+    "document_filename": "National-Strategy-for-Artificial-Intelligence.pdf",
+    "query_category": "factual",
+    "query": "What percentage of Indias workforce and Gross Domestic Product (GDP) is accounted for by the agriculture and allied sector?",
+    "expected_answer": "Agriculture and allied sector accounts for 49% of Indias workforce and 16% of the countrys Gross Domestic Product (GDP).",
+    "source_page": 30
+  },
+  {
+    "id": "Q006",
+    "document_type": "Type A - Dense Text Policy/Regulatory",
+    "folder": "data/policy_regulatory",
+    "document_filename": "National-Strategy-for-Artificial-Intelligence.pdf",
+    "query_category": "factual",
+    "query": "What percentage of the workforce will be engaged in entirely new jobs by 2022 according to the EY and NASSCOM study cited?",
+    "expected_answer": "By 2022, around 46% of the workforce will be engaged in entirely new jobs that do not exist today.",
+    "source_page": 17
+  },
+  {
+    "id": "Q007",
+    "document_type": "Type A - Dense Text Policy/Regulatory",
+    "folder": "data/policy_regulatory",
+    "document_filename": "National-Strategy-for-Artificial-Intelligence.pdf",
+    "query_category": "factual",
+    "query": "What percentage of companies in Indias manufacturing sector were reported as using AI to a significant extent?",
+    "expected_answer": "19% of companies in Indias manufacturing sector were already using AI to a significant extent, ahead of nations such as Germany.",
+    "source_page": 22
+  },
+  {
+    "id": "Q008",
+    "document_type": "Type A - Dense Text Policy/Regulatory",
+    "folder": "data/policy_regulatory",
+    "document_filename": "National-Strategy-for-Artificial-Intelligence.pdf",
+    "query_category": "factual",
+    "query": "What is the overarching brand and tagline for Indias national Artificial Intelligence strategy?",
+    "expected_answer": "The tagline and national strategy core approach is #AIforAll: Technology Leadership for Inclusive Growth.",
+    "source_page": 5
+  },
+  {
+    "id": "Q009",
+    "document_type": "Type A - Dense Text Policy/Regulatory",
+    "folder": "data/policy_regulatory",
+    "document_filename": "National-Strategy-for-Artificial-Intelligence.pdf",
+    "query_category": "factual",
+    "query": "What private sector research initiative in India is highlighted for its applied research on manufacturing analytics?",
+    "expected_answer": "The Robert Bosch Centre for Data Science and Artificial Intelligence (RBC-DSAI).",
+    "source_page": 22
+  },
+  {
+    "id": "Q010",
+    "document_type": "Type A - Dense Text Policy/Regulatory",
+    "folder": "data/policy_regulatory",
+    "document_filename": "National-Strategy-for-Artificial-Intelligence.pdf",
+    "query_category": "factual",
+    "query": "What specific domain of autonomous research is highlighted in Box 12 as driving computer vision and robotics advances?",
+    "expected_answer": "Autonomous vehicles research, which has spurred computer vision and robotics innovations.",
+    "source_page": 45
+  },
+  {
+    "id": "Q011",
+    "document_type": "Type A - Dense Text Policy/Regulatory",
+    "folder": "data/policy_regulatory",
+    "document_filename": "National-Strategy-for-Artificial-Intelligence.pdf",
+    "query_category": "factual",
+    "query": "What mechanism is suggested to address the problem of cheaply acquiring data annotations for machine learning models?",
+    "expected_answer": "Crowdsourcing using un-trained or non-expert anonymous annotators on the internet.",
+    "source_page": 80
+  },
+  {
+    "id": "Q012",
+    "document_type": "Type A - Dense Text Policy/Regulatory",
+    "folder": "data/policy_regulatory",
+    "document_filename": "National-Strategy-for-Artificial-Intelligence.pdf",
+    "query_category": "factual",
+    "query": "What private sector innovation in NLP is cited as pushing the boundaries of conversational AI technology?",
+    "expected_answer": "Googles advances in NLP as underlined by Google Duplex.",
+    "source_page": 60
+  },
+  {
+    "id": "Q013",
+    "document_type": "Type A - Dense Text Policy/Regulatory",
+    "folder": "data/policy_regulatory",
+    "document_filename": "National-Strategy-for-Artificial-Intelligence.pdf",
+    "query_category": "factual",
+    "query": "What are the five core focus sectors identified for AI intervention in India?",
+    "expected_answer": "Healthcare, Agriculture, Education, Smart Cities and Infrastructure, and Smart Mobility and Transportation.",
+    "source_page": 23
+  },
+  {
+    "id": "Q014",
+    "document_type": "Type A - Dense Text Policy/Regulatory",
+    "folder": "data/policy_regulatory",
+    "document_filename": "National-Strategy-for-Artificial-Intelligence.pdf",
+    "query_category": "factual",
+    "query": "What core challenge exists in Indias healthcare system regarding private facilities distribution?",
+    "expected_answer": "Most private healthcare facilities are concentrated in and around tier 1 and tier 2 cities, forcing rural patients to travel substantial distances for basic and advanced care.",
+    "source_page": 25
+  },
+  {
+    "id": "Q015",
+    "document_type": "Type A - Dense Text Policy/Regulatory",
+    "folder": "data/policy_regulatory",
+    "document_filename": "National-Strategy-for-Artificial-Intelligence.pdf",
+    "query_category": "factual",
+    "query": "What two-tiered structure is recommended for AI research institutions in India?",
+    "expected_answer": "COREs (Centre of Research Excellence in AI) for fundamental research, and ICTAI (International Centre for Transformational AI) for applied research.",
+    "source_page": 8
+  },
+  {
+    "id": "Q016",
+    "document_type": "Type A - Dense Text Policy/Regulatory",
+    "folder": "data/policy_regulatory",
+    "document_filename": "National-Strategy-for-Artificial-Intelligence.pdf",
+    "query_category": "factual",
+    "query": "What overall economic impact is projected for AI global adoption according to McKinsey research cited in the strategy paper?",
+    "expected_answer": "AI has the potential to deliver additional economic output of around USD 13 trillion globally by 2030.",
+    "source_page": 16
+  },
+  {
+    "id": "Q017",
+    "document_type": "Type A - Dense Text Policy/Regulatory",
+    "folder": "data/policy_regulatory",
+    "document_filename": "National-Strategy-for-Artificial-Intelligence.pdf",
+    "query_category": "relationship",
+    "query": "How does expanded access to public cloud infrastructure relate to reducing barriers for AI deployment in India?",
+    "expected_answer": "Public cloud infrastructure gives developers unlimited access to scalable computing power without requiring upfront capital expenditure on hardware, accelerating AI experimentation.",
+    "source_page": 14
+  },
+  {
+    "id": "Q018",
+    "document_type": "Type A - Dense Text Policy/Regulatory",
+    "folder": "data/policy_regulatory",
+    "document_filename": "National-Strategy-for-Artificial-Intelligence.pdf",
+    "query_category": "relationship",
+    "query": "What is the relationship between AI intervention in agriculture and maintaining overall GDP growth in India?",
+    "expected_answer": "Because agriculture employs 49% of the workforce and contributes 16% of GDP, AI-driven yield optimizations are necessary to sustain an 8-10% national GDP growth rate.",
+    "source_page": 30
+  },
+  {
+    "id": "Q019",
+    "document_type": "Type A - Dense Text Policy/Regulatory",
+    "folder": "data/policy_regulatory",
+    "document_filename": "National-Strategy-for-Artificial-Intelligence.pdf",
+    "query_category": "relationship",
+    "query": "How do high data annotation costs drive the adoption of crowdsourced annotation platforms?",
+    "expected_answer": "High manual expert annotation costs create a bottleneck; crowdsourcing provides a low-cost, fast alternative for building large-scale labeled datasets despite potential quality trade-offs.",
+    "source_page": 80
+  },
+  {
+    "id": "Q020",
+    "document_type": "Type A - Dense Text Policy/Regulatory",
+    "folder": "data/policy_regulatory",
+    "document_filename": "National-Strategy-for-Artificial-Intelligence.pdf",
+    "query_category": "relationship",
+    "query": "How does private sector investment in RBC-DSAI connect to industrial AI applications in India?",
+    "expected_answer": "Private funding in RBC-DSAI bridges academic research with practical industrial needs by focusing specifically on applied research like manufacturing analytics.",
+    "source_page": 22
+  },
+  {
+    "id": "Q021",
+    "document_type": "Type A - Dense Text Policy/Regulatory",
+    "folder": "data/policy_regulatory",
+    "document_filename": "2022050694-NFRA-Annual-Report.pdf",
+    "query_category": "relationship",
+    "query": "What is the statutory relationship between the National Financial Reporting Authority (NFRA) and Section 132 of the Companies Act 2013?",
+    "expected_answer": "NFRA was established under Section 132(1) of the Companies Act 2013 as an independent regulator to oversee accounting and auditing standards and monitor auditor compliance.",
+    "source_page": 1
+  },
+  {
+    "id": "Q022",
+    "document_type": "Type A - Dense Text Policy/Regulatory",
+    "folder": "data/policy_regulatory",
+    "document_filename": "2022050694-NFRA-Annual-Report.pdf",
+    "query_category": "relationship",
+    "query": "How does NFRAs oversight mandate affect statutory auditors of listed companies in India?",
+    "expected_answer": "NFRAs mandate grants it power to inspect audit files, enforce quality control standards, and penalize auditors or audit firms for professional misconduct in listed entities.",
+    "source_page": 5
+  },
+  {
+    "id": "Q023",
+    "document_type": "Type A - Dense Text Policy/Regulatory",
+    "folder": "data/policy_regulatory",
+    "document_filename": "2022050694-NFRA-Annual-Report.pdf",
+    "query_category": "relationship",
+    "query": "What relationship exists between NFRAs Quality Review process and audit documentation compliance?",
+    "expected_answer": "NFRAs Quality Reviews evaluate whether audit working papers comply with Standards on Auditing (SA 230), identifying deficiencies that lead to audit quality recommendations.",
+    "source_page": 10
+  },
+  {
+    "id": "Q024",
+    "document_type": "Type A - Dense Text Policy/Regulatory",
+    "folder": "data/policy_regulatory",
+    "document_filename": "2022050694-NFRA-Annual-Report.pdf",
+    "query_category": "relationship",
+    "query": "How do disciplinary proceedings initiated by NFRA relate to debarment of auditors?",
+    "expected_answer": "Under Section 132(4), NFRA disciplinary proceedings can lead to monetary penalties and debarment of an auditor or audit firm from practice for a period up to 10 years.",
+    "source_page": 15
+  },
+  {
+    "id": "Q025",
+    "document_type": "Type A - Dense Text Policy/Regulatory",
+    "folder": "data/policy_regulatory",
+    "document_filename": "2022050694-NFRA-Annual-Report.pdf",
+    "query_category": "relationship",
+    "query": "How does NFRA coordinate with the Institute of Chartered Accountants of India (ICAI) in recommending accounting standards?",
+    "expected_answer": "ICAI formulates draft accounting and auditing standards and submits recommendations to NFRA, which examines them before recommending them to the Central Government for notification.",
+    "source_page": 8
+  },
+  {
+    "id": "Q026",
+    "document_type": "Type A - Dense Text Policy/Regulatory",
+    "folder": "data/policy_regulatory",
+    "document_filename": "2022050694-NFRA-Annual-Report.pdf",
+    "query_category": "relationship",
+    "query": "What is the relationship between international regulator networks (IFIAR) and NFRAs audit inspection methodologies?",
+    "expected_answer": "NFRA aligns its audit inspection frameworks with the International Forum of Independent Audit Regulators (IFIAR) standards to ensure global benchmark consistency.",
+    "source_page": 18
+  },
+  {
+    "id": "Q027",
+    "document_type": "Type A - Dense Text Policy/Regulatory",
+    "folder": "data/policy_regulatory",
+    "document_filename": "2022050694-NFRA-Annual-Report.pdf",
+    "query_category": "relationship",
+    "query": "How do non-compliances identified in financial statement reviews result in regulatory enforcement by NFRA?",
+    "expected_answer": "When NFRA detects material non-compliances with Indian Accounting Standards (Ind AS), it issues show-cause notices requiring company management and auditors to rectify reporting or face sanctions.",
+    "source_page": 22
+  },
+  {
+    "id": "Q028",
+    "document_type": "Type A - Dense Text Policy/Regulatory",
+    "folder": "data/policy_regulatory",
+    "document_filename": "2022050694-NFRA-Annual-Report.pdf",
+    "query_category": "relationship",
+    "query": "How does NFRAs annual budget grant from the Central Government link to its operational independence?",
+    "expected_answer": "NFRAs operational budget is funded through parliamentary grants via the Ministry of Corporate Affairs, ensuring financial independence from the auditing profession it regulates.",
+    "source_page": 30
+  },
+  {
+    "id": "Q029",
+    "document_type": "Type A - Dense Text Policy/Regulatory",
+    "folder": "data/policy_regulatory",
+    "document_filename": "2022050694-NFRA-Annual-Report.pdf",
+    "query_category": "analytical",
+    "query": "Analyze NFRAs financial performance and expenditure across administrative vs legal activities during 2020-21.",
+    "expected_answer": "NFRAs total expenditure in 2020-21 was allocated primarily across establishment costs, legal expenses for defending orders, and IT infrastructure development for digital audit monitoring.",
+    "source_page": 32
+  },
+  {
+    "id": "Q030",
+    "document_type": "Type A - Dense Text Policy/Regulatory",
+    "folder": "data/policy_regulatory",
+    "document_filename": "2022050694-NFRA-Annual-Report.pdf",
+    "query_category": "analytical",
+    "query": "Compare NFRAs enforcement jurisdiction over listed companies versus unlisted public companies.",
+    "expected_answer": "NFRAs jurisdiction covers all listed companies automatically, plus unlisted public companies with paid-up capital >= Rs 500 crore, turnover >= Rs 1,000 crore, or outstanding loans >= Rs 500 crore.",
+    "source_page": 5
+  },
+  {
+    "id": "Q031",
+    "document_type": "Type A - Dense Text Policy/Regulatory",
+    "folder": "data/policy_regulatory",
+    "document_filename": "2022050694-NFRA-Annual-Report.pdf",
+    "query_category": "analytical",
+    "query": "Analyze the key recurring audit deficiencies documented by NFRA across major audit firm inspections.",
+    "expected_answer": "Recurring deficiencies include inadequate audit documentation (SA 230), lack of independent verification of management estimates (SA 540), and failure to evaluate going concern risks (SA 570).",
+    "source_page": 25
+  },
+  {
+    "id": "Q032",
+    "document_type": "Type A - Dense Text Policy/Regulatory",
+    "folder": "data/policy_regulatory",
+    "document_filename": "2022050694-NFRA-Annual-Report.pdf",
+    "query_category": "analytical",
+    "query": "What is the analytical breakdown of NFRAs organizational staffing across technical experts and administrative personnel?",
+    "expected_answer": "NFRA operates with a lean cadre of deputed officers, technical consultancy advisors, and financial experts to execute audit firm inspections.",
+    "source_page": 35
+  },
+  {
+    "id": "Q033",
+    "document_type": "Type A - Dense Text Policy/Regulatory",
+    "folder": "data/policy_regulatory",
+    "document_filename": "2022050694-NFRA-Annual-Report.pdf",
+    "query_category": "analytical",
+    "query": "Compare NFRAs disciplinary sanction process with traditional ICAI peer review mechanisms.",
+    "expected_answer": "NFRAs sanction process is independent, statutory, and legally binding with public order publishing, whereas ICAI peer review is a professional self-regulatory evaluation focused on remedial guidance.",
+    "source_page": 15
+  },
+  {
+    "id": "Q034",
+    "document_type": "Type A - Dense Text Policy/Regulatory",
+    "folder": "data/policy_regulatory",
+    "document_filename": "2022050694-NFRA-Annual-Report.pdf",
+    "query_category": "analytical",
+    "query": "Analyze the impact of NFRA audit circulars on auditor appointment and independence disclosures.",
+    "expected_answer": "NFRA circulars enforce strict adherence to non-audit service prohibitions (Section 144), ensuring auditors disclose any indirect business relationships with audit clients.",
+    "source_page": 28
+  },
+  {
+    "id": "Q035",
+    "document_type": "Type A - Dense Text Policy/Regulatory",
+    "folder": "data/policy_regulatory",
+    "document_filename": "2022050694-NFRA-Annual-Report.pdf",
+    "query_category": "analytical",
+    "query": "What analytical trends emerge from NFRA advisory notes on revenue recognition compliance under Ind AS 115?",
+    "expected_answer": "Advisory notes reveal widespread premature revenue recognition, lack of variable consideration estimation, and insufficient performance obligation identification.",
+    "source_page": 20
+  },
+  {
+    "id": "Q036",
+    "document_type": "Type A - Dense Text Policy/Regulatory",
+    "folder": "data/policy_regulatory",
+    "document_filename": "Newsletter-NITI-SandhanOct-25.pdf",
+    "query_category": "analytical",
+    "query": "What key quarterly deliverables were released by the Research and Networking Division of NITI Aayog in October 2025?",
+    "expected_answer": "The October 2025 newsletter details policy research publications, state-level monitoring dashboards, and international research collaborations across key development sectors.",
+    "source_page": 1
+  },
+  {
+    "id": "Q037",
+    "document_type": "Type A - Dense Text Policy/Regulatory",
+    "folder": "data/policy_regulatory",
+    "document_filename": "Newsletter-NITI-SandhanOct-25.pdf",
+    "query_category": "analytical",
+    "query": "Analyze the focus areas of NITI Sandhan October 2025 regarding state policy networking.",
+    "expected_answer": "NITI Sandhan emphasizes strengthening knowledge hubs across state planning boards, fostering regional policy dialogues, and scaling best practices in sustainable development.",
+    "source_page": 2
+  },
+  {
+    "id": "Q038",
+    "document_type": "Type A - Dense Text Policy/Regulatory",
+    "folder": "data/policy_regulatory",
+    "document_filename": "Newsletter-NITI-SandhanOct-25.pdf",
+    "query_category": "analytical",
+    "query": "Compare the inter-divisional projects highlighted in the October 2025 NITI Sandhan issue.",
+    "expected_answer": "Projects include joint initiatives between R&N Division, Agriculture Division, and Science & Technology Verticals focusing on AI in agriculture and rural healthcare access.",
+    "source_page": 4
+  },
+  {
+    "id": "Q039",
+    "document_type": "Type A - Dense Text Policy/Regulatory",
+    "folder": "data/policy_regulatory",
+    "document_filename": "Newsletter-NITI-SandhanOct-25.pdf",
+    "query_category": "analytical",
+    "query": "What analytical insights are provided regarding policy monitoring frameworks in NITI Sandhan Oct 2025?",
+    "expected_answer": "Insights highlight data-driven monitoring indices, real-time KPI tracking for aspirational districts, and evidence-based policy formulation.",
+    "source_page": 6
+  },
+  {
+    "id": "Q040",
+    "document_type": "Type A - Dense Text Policy/Regulatory",
+    "folder": "data/policy_regulatory",
+    "document_filename": "Newsletter-NITI-SandhanOct-25.pdf",
+    "query_category": "analytical",
+    "query": "How does NITI Sandhan measure academic networking and research partnership outcomes in Q3 2025?",
+    "expected_answer": "Outcomes are evaluated by total joint research papers published, academic workshops conducted with IITs/IIMs, and policy brief adoption rates by ministries.",
+    "source_page": 8
+  },
+  {
+    "id": "Q041",
+    "document_type": "Type B - Multi-Column Academic Paper",
+    "folder": "data/academic_research",
+    "document_filename": "1706.03762v7.pdf",
+    "query_category": "factual",
+    "query": "What BLEU score did the Transformer big model achieve on the WMT 2014 English-to-German translation task?",
+    "expected_answer": "The Transformer (big) model achieved a state-of-the-art BLEU score of 28.4 on WMT 2014 English-to-German translation, outperforming existing models by over 2.0 BLEU points.",
+    "source_page": 1
+  },
+  {
+    "id": "Q042",
+    "document_type": "Type B - Multi-Column Academic Paper",
+    "folder": "data/academic_research",
+    "document_filename": "1706.03762v7.pdf",
+    "query_category": "factual",
+    "query": "What is the embedding dimension d_model used in the base Transformer architecture?",
+    "expected_answer": "The base Transformer model uses an embedding dimension d_model of 512 across all layers.",
+    "source_page": 3
+  },
+  {
+    "id": "Q043",
+    "document_type": "Type B - Multi-Column Academic Paper",
+    "folder": "data/academic_research",
+    "document_filename": "1706.03762v7.pdf",
+    "query_category": "factual",
+    "query": "How many parallel attention heads h are employed in the Multi-Head Attention mechanism of the base Transformer model?",
+    "expected_answer": "The base Transformer model uses h = 8 parallel attention heads.",
+    "source_page": 4
+  },
+  {
+    "id": "Q044",
+    "document_type": "Type B - Multi-Column Academic Paper",
+    "folder": "data/academic_research",
+    "document_filename": "1706.03762v7.pdf",
+    "query_category": "factual",
+    "query": "What are the dimensions d_k and d_v for each attention head in the base Transformer model?",
+    "expected_answer": "For each head, d_k = d_v = d_model / h = 512 / 8 = 64.",
+    "source_page": 4
+  },
+  {
+    "id": "Q045",
+    "document_type": "Type B - Multi-Column Academic Paper",
+    "folder": "data/academic_research",
+    "document_filename": "1706.03762v7.pdf",
+    "query_category": "factual",
+    "query": "What exact mathematical formula defines Scaled Dot-Product Attention in the Transformer paper?",
+    "expected_answer": "Attention(Q, K, V) = softmax( (Q * K^T) / sqrt(d_k) ) * V",
+    "source_page": 4
+  },
+  {
+    "id": "Q046",
+    "document_type": "Type B - Multi-Column Academic Paper",
+    "folder": "data/academic_research",
+    "document_filename": "1706.03762v7.pdf",
+    "query_category": "factual",
+    "query": "What hardware infrastructure was used to train the Transformer models and how long did base model training take?",
+    "expected_answer": "Models were trained on 8 NVIDIA P100 GPUs. The base model took 100,000 steps or 12 hours to train.",
+    "source_page": 7
+  },
+  {
+    "id": "Q047",
+    "document_type": "Type B - Multi-Column Academic Paper",
+    "folder": "data/academic_research",
+    "document_filename": "1706.03762v7.pdf",
+    "query_category": "factual",
+    "query": "How many training steps and training time were required for the Transformer big model?",
+    "expected_answer": "The Transformer big model was trained for 300,000 steps, which took 3.5 days on 8 NVIDIA P100 GPUs.",
+    "source_page": 7
+  },
+  {
+    "id": "Q048",
+    "document_type": "Type B - Multi-Column Academic Paper",
+    "folder": "data/academic_research",
+    "document_filename": "1706.03762v7.pdf",
+    "query_category": "factual",
+    "query": "What BLEU score did the Transformer big model establish on the WMT 2014 English-to-French translation benchmark?",
+    "expected_answer": "The Transformer big model established a BLEU score of 41.0 (or 41.8 with single-model evaluation) on WMT 2014 English-to-French.",
+    "source_page": 8
+  },
+  {
+    "id": "Q049",
+    "document_type": "Type B - Multi-Column Academic Paper",
+    "folder": "data/academic_research",
+    "document_filename": "1706.03762v7.pdf",
+    "query_category": "factual",
+    "query": "What dropout probability rate P_drop was applied during training of the base Transformer model?",
+    "expected_answer": "A residual dropout rate of P_drop = 0.1 was applied to the output of each sub-layer and to the sums of embeddings and positional encodings.",
+    "source_page": 7
+  },
+  {
+    "id": "Q050",
+    "document_type": "Type B - Multi-Column Academic Paper",
+    "folder": "data/academic_research",
+    "document_filename": "1706.03762v7.pdf",
+    "query_category": "factual",
+    "query": "What optimizer and warmup steps formula was used for learning rate scheduling in the Transformer paper?",
+    "expected_answer": "Adam optimizer with beta1=0.9, beta2=0.98, epsilon=1e-9. Learning rate lrate = d_model^(-0.5) * min(step_num^(-0.5), step_num * warmup_steps^(-1.5)) with warmup_steps = 4000.",
+    "source_page": 7
+  },
+  {
+    "id": "Q051",
+    "document_type": "Type B - Multi-Column Academic Paper",
+    "folder": "data/academic_research",
+    "document_filename": "1706.03762v7.pdf",
+    "query_category": "factual",
+    "query": "What exact sine and cosine equations define Positional Encodings in the Transformer paper for position pos and dimension 2i?",
+    "expected_answer": "PE(pos, 2i) = sin(pos / 10000^(2i/d_model)) and PE(pos, 2i+1) = cos(pos / 10000^(2i/d_model)).",
+    "source_page": 6
+  },
+  {
+    "id": "Q052",
+    "document_type": "Type B - Multi-Column Academic Paper",
+    "folder": "data/academic_research",
+    "document_filename": "1706.03762v7.pdf",
+    "query_category": "factual",
+    "query": "What is the inner-layer dimensionality d_ff of the Position-wise Feed-Forward Networks in the base Transformer?",
+    "expected_answer": "The inner-layer dimensionality d_ff is 2048.",
+    "source_page": 5
+  },
+  {
+    "id": "Q053",
+    "document_type": "Type B - Multi-Column Academic Paper",
+    "folder": "data/academic_research",
+    "document_filename": "1706.03762v7.pdf",
+    "query_category": "factual",
+    "query": "How many identical layers N compose the encoder and decoder stacks in the Transformer architecture?",
+    "expected_answer": "The encoder and decoder are both composed of N = 6 identical layers.",
+    "source_page": 3
+  },
+  {
+    "id": "Q054",
+    "document_type": "Type B - Multi-Column Academic Paper",
+    "folder": "data/academic_research",
+    "document_filename": "1706.03762v7.pdf",
+    "query_category": "factual",
+    "query": "What value of label smoothing epsilon_ls was employed during training, and how did it affect perplexity?",
+    "expected_answer": "Label smoothing of epsilon_ls = 0.1 was used. It hurt perplexity because the model learns to be more unsure, but improved BLEU and accuracy.",
+    "source_page": 8
+  },
+  {
+    "id": "Q055",
+    "document_type": "Type B - Multi-Column Academic Paper",
+    "folder": "data/academic_research",
+    "document_filename": "1706.03762v7.pdf",
+    "query_category": "factual",
+    "query": "What were the training dataset sizes (number of sentence pairs) for WMT 2014 English-German and English-French?",
+    "expected_answer": "WMT 2014 English-German contained 4.5 million sentence pairs. WMT 2014 English-French contained 36 million sentence pairs.",
+    "source_page": 7
+  },
+  {
+    "id": "Q056",
+    "document_type": "Type B - Multi-Column Academic Paper",
+    "folder": "data/academic_research",
+    "document_filename": "1706.03762v7.pdf",
+    "query_category": "factual",
+    "query": "What beam size and length penalty alpha were used for beam search decoding during evaluation?",
+    "expected_answer": "Beam search used beam size = 4 and length penalty alpha = 0.6.",
+    "source_page": 8
+  },
+  {
+    "id": "Q057",
+    "document_type": "Type B - Multi-Column Academic Paper",
+    "folder": "data/academic_research",
+    "document_filename": "2304.10557v6.pdf",
+    "query_category": "relationship",
+    "query": "Why is the dot product scaled by 1/sqrt(d_k) in Scaled Dot-Product Attention as key dimension d_k grows large?",
+    "expected_answer": "For large values of d_k, dot products grow large in magnitude, pushing the softmax function into regions with extremely small gradients. Scaling by 1/sqrt(d_k) counteracts this effect.",
+    "source_page": 3
+  },
+  {
+    "id": "Q058",
+    "document_type": "Type B - Multi-Column Academic Paper",
+    "folder": "data/academic_research",
+    "document_filename": "2304.10557v6.pdf",
+    "query_category": "relationship",
+    "query": "How do residual connections coupled with Layer Normalization enable stable gradient propagation in deep Transformer stacks?",
+    "expected_answer": "Residual connections create direct identity paths for gradient flow, preventing vanishing gradients across deep layers, while LayerNorm stabilizes activation variances.",
+    "source_page": 4
+  },
+  {
+    "id": "Q059",
+    "document_type": "Type B - Multi-Column Academic Paper",
+    "folder": "data/academic_research",
+    "document_filename": "2304.10557v6.pdf",
+    "query_category": "relationship",
+    "query": "How does query-key matrix multiplication dynamically compute attention weights over value vectors?",
+    "expected_answer": "Multiplying Query matrix Q by transposed Key matrix K^T calculates pairwise similarity scores between all tokens, which softmax converts into dynamic probability weights for aggregating Value vectors V.",
+    "source_page": 3
+  },
+  {
+    "id": "Q060",
+    "document_type": "Type B - Multi-Column Academic Paper",
+    "folder": "data/academic_research",
+    "document_filename": "2304.10557v6.pdf",
+    "query_category": "relationship",
+    "query": "How does masking in decoder self-attention preserve the autoregressive property during training?",
+    "expected_answer": "Masking sets future token attention logits to -infinity before softmax, ensuring position i can only attend to positions <= i and preventing information leakage from subsequent tokens.",
+    "source_page": 5
+  },
+  {
+    "id": "Q061",
+    "document_type": "Type B - Multi-Column Academic Paper",
+    "folder": "data/academic_research",
+    "document_filename": "2304.10557v6.pdf",
+    "query_category": "relationship",
+    "query": "How do linear projection matrices W^Q, W^K, W^V transform input representations prior to multi-head partitioning?",
+    "expected_answer": "Linear projections project d_model-dimensional inputs into lower-dimensional subspaces d_k and d_v, allowing different attention heads to focus on distinct semantic relationships.",
+    "source_page": 4
+  },
+  {
+    "id": "Q062",
+    "document_type": "Type B - Multi-Column Academic Paper",
+    "folder": "data/academic_research",
+    "document_filename": "2304.10557v6.pdf",
+    "query_category": "relationship",
+    "query": "What structural relationship exists between Pre-LN versus Post-LN placement and optimization stability?",
+    "expected_answer": "Pre-LayerNorm places normalization inside the residual branch, preventing gradient explosion at initialization and eliminating the need for strict warmup schedules compared to Post-LN.",
+    "source_page": 6
+  },
+  {
+    "id": "Q063",
+    "document_type": "Type B - Multi-Column Academic Paper",
+    "folder": "data/academic_research",
+    "document_filename": "2304.10557v6.pdf",
+    "query_category": "relationship",
+    "query": "How does multi-head attention overcome the averaging bottleneck of single-head self-attention?",
+    "expected_answer": "Multi-head attention allows the model to jointly attend to information from different representation subspaces at different positions simultaneously, rather than averaging them together.",
+    "source_page": 4
+  },
+  {
+    "id": "Q064",
+    "document_type": "Type B - Multi-Column Academic Paper",
+    "folder": "data/academic_research",
+    "document_filename": "2304.10557v6.pdf",
+    "query_category": "relationship",
+    "query": "What dependency connects token embedding weights with the pre-softmax linear transformation matrix in Transformer models?",
+    "expected_answer": "Weight tying shares identical weight matrices between the input embedding layers and the final pre-softmax linear projection layer, reducing total model parameters.",
+    "source_page": 7
+  },
+  {
+    "id": "Q065",
+    "document_type": "Type B - Multi-Column Academic Paper",
+    "folder": "data/academic_research",
+    "document_filename": "2304.10557v6.pdf",
+    "query_category": "relationship",
+    "query": "How do decoder cross-attention layers depend on encoder output representations?",
+    "expected_answer": "In cross-attention, Key K and Value V matrices are derived from the encoder final output stack, while Query Q matrix comes from the previous decoder layer.",
+    "source_page": 5
+  },
+  {
+    "id": "Q066",
+    "document_type": "Type B - Multi-Column Academic Paper",
+    "folder": "data/academic_research",
+    "document_filename": "2304.10557v6.pdf",
+    "query_category": "relationship",
+    "query": "How does sequence length n drive the quadratic O(n^2) computational and memory bottleneck in standard self-attention?",
+    "expected_answer": "Computing pairwise dot products between all n tokens creates an n x n attention matrix, scaling time and memory quadratically with sequence length n.",
+    "source_page": 8
+  },
+  {
+    "id": "Q067",
+    "document_type": "Type B - Multi-Column Academic Paper",
+    "folder": "data/academic_research",
+    "document_filename": "2304.10557v6.pdf",
+    "query_category": "relationship",
+    "query": "How does weight decay regularization interact with AdamW optimizer stability during Transformer training?",
+    "expected_answer": "AdamW decouples weight decay from gradient updates, preventing weight decay from being corrupted by gradient momentum and variance estimates.",
+    "source_page": 7
+  },
+  {
+    "id": "Q068",
+    "document_type": "Type B - Multi-Column Academic Paper",
+    "folder": "data/academic_research",
+    "document_filename": "2304.10557v6.pdf",
+    "query_category": "relationship",
+    "query": "What structural link connects positional encodings with overcoming permutation invariance in self-attention?",
+    "expected_answer": "Standard self-attention is permutation invariant over input sets; adding positional encodings injects absolute or relative order information into token embeddings.",
+    "source_page": 6
+  },
+  {
+    "id": "Q069",
+    "document_type": "Type B - Multi-Column Academic Paper",
+    "folder": "data/academic_research",
+    "document_filename": "2507.19595v3.pdf",
+    "query_category": "analytical",
+    "query": "Compare the IO memory complexity and exact FLOP count of FlashAttention against standard Softmax Attention.",
+    "expected_answer": "Standard attention requires O(N^2) memory reads/writes to HBM. FlashAttention uses tiling to reduce HBM memory access to O(N), executing in O(N^2) FLOPs with substantially faster SRAM utilization.",
+    "source_page": 4
+  },
+  {
+    "id": "Q070",
+    "document_type": "Type B - Multi-Column Academic Paper",
+    "folder": "data/academic_research",
+    "document_filename": "2507.19595v3.pdf",
+    "query_category": "analytical",
+    "query": "Analyze the KV cache memory reduction achieved by Grouped-Query Attention (GQA) and Multi-Query Attention (MQA) versus Multi-Head Attention (MHA).",
+    "expected_answer": "MHA keeps separate KV heads per query head. MQA shares 1 KV head across all query heads (H-fold cache reduction). GQA groups query heads into G groups, balancing KV cache memory savings with accuracy.",
+    "source_page": 6
+  },
+  {
+    "id": "Q071",
+    "document_type": "Type B - Multi-Column Academic Paper",
+    "folder": "data/academic_research",
+    "document_filename": "2507.19595v3.pdf",
+    "query_category": "analytical",
+    "query": "What is the performance and accuracy trade-off of Linear Attention kernel approximations on long-context retrieval tasks?",
+    "expected_answer": "Linear attention reduces computational complexity from O(N^2) to O(N), but struggles with precise associative recall and fine-grained token retrieval compared to exact softmax attention.",
+    "source_page": 10
+  },
+  {
+    "id": "Q072",
+    "document_type": "Type B - Multi-Column Academic Paper",
+    "folder": "data/academic_research",
+    "document_filename": "2507.19595v3.pdf",
+    "query_category": "analytical",
+    "query": "Analyze the memory and latency reductions achieved by Sparse Attention patterns (e.g. Longformer, BigBird) over dense full attention.",
+    "expected_answer": "Sparse attention restricts token connections to local windows and global landmark tokens, reducing complexity to O(N * B) where B is block size, lowering memory footprint for long documents.",
+    "source_page": 14
+  },
+  {
+    "id": "Q073",
+    "document_type": "Type B - Multi-Column Academic Paper",
+    "folder": "data/academic_research",
+    "document_filename": "2507.19595v3.pdf",
+    "query_category": "analytical",
+    "query": "Compare sliding window attention throughput against full attention in continuous LLM generation.",
+    "expected_answer": "Sliding window attention caps KV cache size to window size W, keeping memory constant O(W) during decoding and increasing inference throughput at the cost of losing ultra-long distance history.",
+    "source_page": 15
+  },
+  {
+    "id": "Q074",
+    "document_type": "Type B - Multi-Column Academic Paper",
+    "folder": "data/academic_research",
+    "document_filename": "2507.19595v3.pdf",
+    "query_category": "analytical",
+    "query": "Compare PagedAttention virtual memory management efficiency against contiguous tensor memory allocation in LLM serving.",
+    "expected_answer": "Contiguous allocation suffers from up to 60-80% memory fragmentation. PagedAttention partitions KV cache into non-contiguous physical memory blocks, reducing waste to under 4%.",
+    "source_page": 18
+  },
+  {
+    "id": "Q075",
+    "document_type": "Type B - Multi-Column Academic Paper",
+    "folder": "data/academic_research",
+    "document_filename": "2507.19595v3.pdf",
+    "query_category": "analytical",
+    "query": "What is the analytical impact of KV cache quantization (INT8/INT4) on memory bandwidth and perplexity degradation?",
+    "expected_answer": "INT8/INT4 KV cache quantization reduces memory footprint by 2x to 4x and increases generation batch size, with minimal perplexity degradation (<0.1 points) when outlier channels are preserved.",
+    "source_page": 20
+  },
+  {
+    "id": "Q076",
+    "document_type": "Type B - Multi-Column Academic Paper",
+    "folder": "data/academic_research",
+    "document_filename": "2507.19595v3.pdf",
+    "query_category": "analytical",
+    "query": "Analyze the historical architectural evolution of efficient attention mechanisms from 2017 to 2025.",
+    "expected_answer": "Evolution progressed from early algorithmic approximations (Sparse/Linear attention 2018-2020), to hardware-aware kernel optimizations (FlashAttention 2022-2024), to architectural KV head reduction (MQA/GQA/MHA hybrids 2023-2025).",
+    "source_page": 2
+  },
+  {
+    "id": "Q077",
+    "document_type": "Type B - Multi-Column Academic Paper",
+    "folder": "data/academic_research",
+    "document_filename": "2507.19595v3.pdf",
+    "query_category": "analytical",
+    "query": "Compare Kernel-based feature map attention methods (e.g. Performer) against low-rank factorization methods (e.g. Linformer).",
+    "expected_answer": "Linformer projects sequence length N to a fixed dimension k via low-rank matrices. Performer uses random Fourier features to approximate kernel softmax without explicit low-rank matrix projection.",
+    "source_page": 11
+  },
+  {
+    "id": "Q078",
+    "document_type": "Type B - Multi-Column Academic Paper",
+    "folder": "data/academic_research",
+    "document_filename": "2507.19595v3.pdf",
+    "query_category": "analytical",
+    "query": "How do State Space Model (SSM) hybrid architectures (e.g. Mamba-Attention) compare to pure Transformers in inference latency?",
+    "expected_answer": "SSM hybrids achieve linear-time O(N) inference generation with constant state size, avoiding KV cache growth while retaining full Transformer attention quality for long context retrieval.",
+    "source_page": 24
+  },
+  {
+    "id": "Q079",
+    "document_type": "Type B - Multi-Column Academic Paper",
+    "folder": "data/academic_research",
+    "document_filename": "2507.19595v3.pdf",
+    "query_category": "analytical",
+    "query": "Analyze the quantitative impact of prompt lookup caching and prefix caching on Time-To-First-Token (TTFT) latency.",
+    "expected_answer": "Prefix caching reuses precomputed KV tensors for shared system prompts, reducing TTFT latency by up to 80-90% for long repeated contexts.",
+    "source_page": 25
+  },
+  {
+    "id": "Q080",
+    "document_type": "Type B - Multi-Column Academic Paper",
+    "folder": "data/academic_research",
+    "document_filename": "2507.19595v3.pdf",
+    "query_category": "analytical",
+    "query": "Compare Rotary Position Embedding (RoPE) context extension methods: linear interpolation versus NTK-aware scaling.",
+    "expected_answer": "Linear interpolation scales position indices uniformly but degrades short-context precision. NTK-aware scaling scales high-frequency and low-frequency components differently, preserving local order while extending context.",
+    "source_page": 26
+  },
+  {
+    "id": "Q081",
+    "document_type": "Type C - Table-Heavy Financial Document",
+    "folder": "data/financial_tables",
+    "document_filename": "SEC-Form-10Q.pdf",
+    "query_category": "factual",
+    "query": "What number of common stock shares were issued and outstanding as of the record date specified in the Form 10-Q filing?",
+    "expected_answer": "14,594,180,000 shares of common stock were issued and outstanding as of July 17, 2026.",
+    "source_page": 2
+  },
+  {
+    "id": "Q082",
+    "document_type": "Type C - Table-Heavy Financial Document",
+    "folder": "data/financial_tables",
+    "document_filename": "SEC-Form-10Q.pdf",
+    "query_category": "factual",
+    "query": "What indicator check mark is marked regarding whether the registrant is a shell company in Form 10-Q?",
+    "expected_answer": "The checkbox for No is marked indicating the Registrant is not a shell company.",
+    "source_page": 2
+  },
+  {
+    "id": "Q083",
+    "document_type": "Type C - Table-Heavy Financial Document",
+    "folder": "data/financial_tables",
+    "document_filename": "SEC-Form-10Q.pdf",
+    "query_category": "factual",
+    "query": "What is the SEC file number and jurisdiction of incorporation specified on the title page of the 10-Q filing?",
+    "expected_answer": "United States Securities and Exchange Commission, Washington D.C. 20549, Form 10-Q Quarterly Report.",
+    "source_page": 1
+  },
+  {
+    "id": "Q084",
+    "document_type": "Type C - Table-Heavy Financial Document",
+    "folder": "data/financial_tables",
+    "document_filename": "SEC-Form-10Q.pdf",
+    "query_category": "factual",
+    "query": "What item section covers the Financial Statements in Part I of the Form 10-Q report?",
+    "expected_answer": "Part I - Item 1 covers Financial Statements (Condensed Consolidated Statements of Operations, Comprehensive Income, Balance Sheets, Cash Flows).",
+    "source_page": 3
+  },
+  {
+    "id": "Q085",
+    "document_type": "Type C - Table-Heavy Financial Document",
+    "folder": "data/financial_tables",
+    "document_filename": "SEC-Form-10Q.pdf",
+    "query_category": "factual",
+    "query": "What financial statement item reports Cash Provided by Operating Activities in Part I Item 1?",
+    "expected_answer": "Condensed Consolidated Statements of Cash Flows.",
+    "source_page": 6
+  },
+  {
+    "id": "Q086",
+    "document_type": "Type C - Table-Heavy Financial Document",
+    "folder": "data/financial_tables",
+    "document_filename": "SEC-Form-10Q.pdf",
+    "query_category": "factual",
+    "query": "What item section covers Managements Discussion and Analysis (MD&A) of Financial Condition and Results of Operations in Form 10-Q?",
+    "expected_answer": "Part I - Item 2 covers Managements Discussion and Analysis of Financial Condition and Results of Operations.",
+    "source_page": 20
+  },
+  {
+    "id": "Q087",
+    "document_type": "Type C - Table-Heavy Financial Document",
+    "folder": "data/financial_tables",
+    "document_filename": "SEC-Form-10Q.pdf",
+    "query_category": "factual",
+    "query": "What item section covers Quantitative and Qualitative Disclosures About Market Risk in Part I?",
+    "expected_answer": "Part I - Item 3 covers Quantitative and Qualitative Disclosures About Market Risk.",
+    "source_page": 28
+  },
+  {
+    "id": "Q088",
+    "document_type": "Type C - Table-Heavy Financial Document",
+    "folder": "data/financial_tables",
+    "document_filename": "SEC-Form-10Q.pdf",
+    "query_category": "factual",
+    "query": "What item section covers Controls and Procedures in Part I of Form 10-Q?",
+    "expected_answer": "Part I - Item 4 covers Controls and Procedures.",
+    "source_page": 30
+  },
+  {
+    "id": "Q089",
+    "document_type": "Type C - Table-Heavy Financial Document",
+    "folder": "data/financial_tables",
+    "document_filename": "SEC-Form-10Q.pdf",
+    "query_category": "factual",
+    "query": "What item section in Part II covers Legal Proceedings?",
+    "expected_answer": "Part II - Item 1 covers Legal Proceedings.",
+    "source_page": 31
+  },
+  {
+    "id": "Q090",
+    "document_type": "Type C - Table-Heavy Financial Document",
+    "folder": "data/financial_tables",
+    "document_filename": "SEC-Form-10Q.pdf",
+    "query_category": "factual",
+    "query": "What item section in Part II covers Risk Factors?",
+    "expected_answer": "Part II - Item 1A covers Risk Factors.",
+    "source_page": 31
+  },
+  {
+    "id": "Q091",
+    "document_type": "Type C - Table-Heavy Financial Document",
+    "folder": "data/financial_tables",
+    "document_filename": "SEC-Form-10Q.pdf",
+    "query_category": "factual",
+    "query": "What item section in Part II covers Unregistered Sales of Equity Securities and Use of Proceeds?",
+    "expected_answer": "Part II - Item 2 covers Unregistered Sales of Equity Securities and Use of Proceeds.",
+    "source_page": 31
+  },
+  {
+    "id": "Q092",
+    "document_type": "Type C - Table-Heavy Financial Document",
+    "folder": "data/financial_tables",
+    "document_filename": "SEC-Form-10Q.pdf",
+    "query_category": "factual",
+    "query": "What item section in Part II covers Defaults Upon Senior Securities?",
+    "expected_answer": "Part II - Item 3 covers Defaults Upon Senior Securities.",
+    "source_page": 31
+  },
+  {
+    "id": "Q093",
+    "document_type": "Type C - Table-Heavy Financial Document",
+    "folder": "data/financial_tables",
+    "document_filename": "SEC-Form-10Q.pdf",
+    "query_category": "factual",
+    "query": "What item section in Part II covers Mine Safety Disclosures?",
+    "expected_answer": "Part II - Item 4 covers Mine Safety Disclosures.",
+    "source_page": 31
+  },
+  {
+    "id": "Q094",
+    "document_type": "Type C - Table-Heavy Financial Document",
+    "folder": "data/financial_tables",
+    "document_filename": "SEC-Form-10Q.pdf",
+    "query_category": "factual",
+    "query": "What item section in Part II covers Other Information?",
+    "expected_answer": "Part II - Item 5 covers Other Information.",
+    "source_page": 31
+  },
+  {
+    "id": "Q095",
+    "document_type": "Type C - Table-Heavy Financial Document",
+    "folder": "data/financial_tables",
+    "document_filename": "SEC-Form-10Q.pdf",
+    "query_category": "factual",
+    "query": "What item section in Part II covers Exhibits?",
+    "expected_answer": "Part II - Item 6 covers Exhibits.",
+    "source_page": 32
+  },
+  {
+    "id": "Q096",
+    "document_type": "Type C - Table-Heavy Financial Document",
+    "folder": "data/financial_tables",
+    "document_filename": "SEC-Form-10Q.pdf",
+    "query_category": "factual",
+    "query": "Under which Exchange Act rule is shell company status defined in the 10-Q filing?",
+    "expected_answer": "Rule 12b-2 of the Exchange Act.",
+    "source_page": 2
+  },
+  {
+    "id": "Q097",
+    "document_type": "Type C - Table-Heavy Financial Document",
+    "folder": "data/financial_tables",
+    "document_filename": "SEC-Form-10Q.pdf",
+    "query_category": "relationship",
+    "query": "How does net income link to cash flows from operating activities in the Cash Flow Statement?",
+    "expected_answer": "Net income serves as the starting baseline in operating cash flows, adjusted for non-cash expenses (depreciation, amortization, stock-based compensation) and working capital changes.",
+    "source_page": 6
+  },
+  {
+    "id": "Q098",
+    "document_type": "Type C - Table-Heavy Financial Document",
+    "folder": "data/financial_tables",
+    "document_filename": "SEC-Form-10Q.pdf",
+    "query_category": "relationship",
+    "query": "What relationship exists between capital expenditures (CapEx) and cash flows from investing activities?",
+    "expected_answer": "Capital expenditures (payments for property, plant, and equipment) represent a direct cash outflow under cash flows from investing activities.",
+    "source_page": 6
+  },
+  {
+    "id": "Q099",
+    "document_type": "Type C - Table-Heavy Financial Document",
+    "folder": "data/financial_tables",
+    "document_filename": "SEC-Form-10Q.pdf",
+    "query_category": "relationship",
+    "query": "How does foreign currency translation adjustment impact total comprehensive income relative to net income?",
+    "expected_answer": "Unrealized gains or losses from foreign currency translation adjustments are added to net income under Other Comprehensive Income (OCI) to yield Total Comprehensive Income.",
+    "source_page": 5
+  },
+  {
+    "id": "Q100",
+    "document_type": "Type C - Table-Heavy Financial Document",
+    "folder": "data/financial_tables",
+    "document_filename": "SEC-Form-10Q.pdf",
+    "query_category": "relationship",
+    "query": "How do share repurchases and cash dividends connect to total cash flows from financing activities?",
+    "expected_answer": "Share repurchases and cash dividend payments are classified as financing cash outflows, reducing total cash balances and shareholders equity.",
+    "source_page": 6
+  },
+  {
+    "id": "Q101",
+    "document_type": "Type C - Table-Heavy Financial Document",
+    "folder": "data/financial_tables",
+    "document_filename": "hdfc-mutual-fund-handbook.pdf",
+    "query_category": "relationship",
+    "query": "How does equity investment allocation drive wealth creation over long-term decadal investment horizons in India?",
+    "expected_answer": "Equities outperform inflation and fixed income assets over decadal horizons by compounding corporate earnings growth, providing higher real inflation-adjusted returns.",
+    "source_page": 3
+  },
+  {
+    "id": "Q102",
+    "document_type": "Type C - Table-Heavy Financial Document",
+    "folder": "data/financial_tables",
+    "document_filename": "hdfc-mutual-fund-handbook.pdf",
+    "query_category": "relationship",
+    "query": "What is the relationship between Net Asset Value (NAV) appreciation and compounding growth in mutual fund investments?",
+    "expected_answer": "NAV reflects the underlying market value per scheme unit. Compounding growth occurs as reinvested returns generate incremental NAV capital appreciation over time.",
+    "source_page": 3
+  },
+  {
+    "id": "Q103",
+    "document_type": "Type C - Table-Heavy Financial Document",
+    "folder": "data/financial_tables",
+    "document_filename": "hdfc-mutual-fund-handbook.pdf",
+    "query_category": "relationship",
+    "query": "How do expense ratio differences between Direct Plans and Regular Plans impact long-term net returns?",
+    "expected_answer": "Direct Plans exclude distributor commissions, resulting in a lower Total Expense Ratio (TER) and higher net NAV appreciation compared to Regular Plans.",
+    "source_page": 15
+  },
+  {
+    "id": "Q104",
+    "document_type": "Type C - Table-Heavy Financial Document",
+    "folder": "data/financial_tables",
+    "document_filename": "hdfc-mutual-fund-handbook.pdf",
+    "query_category": "relationship",
+    "query": "What is the relationship between Systematic Investment Plan (SIP) rupee-cost averaging and market volatility?",
+    "expected_answer": "SIP automatically buys more scheme units when market prices drop and fewer units when prices rise, lowering average cost per unit without requiring market timing.",
+    "source_page": 3
+  },
+  {
+    "id": "Q105",
+    "document_type": "Type C - Table-Heavy Financial Document",
+    "folder": "data/financial_tables",
+    "document_filename": "hdfc-mutual-fund-handbook.pdf",
+    "query_category": "relationship",
+    "query": "How does portfolio duration in Debt Mutual Funds affect sensitivity to benchmark interest rate changes?",
+    "expected_answer": "Higher portfolio duration increases sensitivity to interest rate movements; when interest rates fall, longer duration funds gain capital appreciation, and vice versa.",
+    "source_page": 3
+  },
+  {
+    "id": "Q106",
+    "document_type": "Type C - Table-Heavy Financial Document",
+    "folder": "data/financial_tables",
+    "document_filename": "hdfc-mutual-fund-handbook.pdf",
+    "query_category": "relationship",
+    "query": "What structural relationship connects ELSS mutual funds with Section 80C tax savings and lock-in requirements?",
+    "expected_answer": "ELSS schemes qualify for tax deductions up to Rs 1.5 lakh under Section 80C, accompanied by a mandatory 3-year lock-in period, the shortest among 80C instruments.",
+    "source_page": 3
+  },
+  {
+    "id": "Q107",
+    "document_type": "Type C - Table-Heavy Financial Document",
+    "folder": "data/financial_tables",
+    "document_filename": "hdfc-mutual-fund-handbook.pdf",
+    "query_category": "relationship",
+    "query": "How does asset allocation between Fixed Deposits and Debt Mutual Funds determine tax efficiency?",
+    "expected_answer": "Bank FD interest is taxed annually at slab rates, whereas Debt MFs allow capital gains tax deferral until redemption.",
+    "source_page": 3
+  },
+  {
+    "id": "Q108",
+    "document_type": "Type C - Table-Heavy Financial Document",
+    "folder": "data/financial_tables",
+    "document_filename": "hdfc-mutual-fund-handbook.pdf",
+    "query_category": "relationship",
+    "query": "What relationship exists between inflation rates and real returns generated by fixed income assets in India?",
+    "expected_answer": "When inflation exceeds fixed deposit interest rates, real purchasing power declines; equity assets help preserve purchasing power by beating inflation.",
+    "source_page": 3
+  },
+  {
+    "id": "Q109",
+    "document_type": "Type C - Table-Heavy Financial Document",
+    "folder": "data/financial_tables",
+    "document_filename": "hdfc-mutual-fund-handbook.pdf",
+    "query_category": "analytical",
+    "query": "Compare the decadal growth rate performance of Indian equity markets against traditional asset classes.",
+    "expected_answer": "Indian equity indices have historically delivered superior decadal CAGR growth compared to gold, fixed deposits, and real estate over 10 to 20-year horizons.",
+    "source_page": 3
+  },
+  {
+    "id": "Q110",
+    "document_type": "Type C - Table-Heavy Financial Document",
+    "folder": "data/financial_tables",
+    "document_filename": "hdfc-mutual-fund-handbook.pdf",
+    "query_category": "analytical",
+    "query": "Analyze the analytical pitfalls and performance losses associated with attempting to time the stock market.",
+    "expected_answer": "Market timing often leads to missing out on the best-performing days of the market, significantly reducing cumulative returns compared to a disciplined buy-and-hold SIP.",
+    "source_page": 3
+  },
+  {
+    "id": "Q111",
+    "document_type": "Type C - Table-Heavy Financial Document",
+    "folder": "data/financial_tables",
+    "document_filename": "hdfc-mutual-fund-handbook.pdf",
+    "query_category": "analytical",
+    "query": "Compare ELSS mutual funds against PPF and Tax Saver Fixed Deposits across lock-in period and return potential.",
+    "expected_answer": "ELSS has a 3-year lock-in with equity growth potential. PPF has a 15-year lock-in with fixed government rates. Tax Saver FD has a 5-year lock-in with taxable interest.",
+    "source_page": 3
+  },
+  {
+    "id": "Q112",
+    "document_type": "Type C - Table-Heavy Financial Document",
+    "folder": "data/financial_tables",
+    "document_filename": "hdfc-mutual-fund-handbook.pdf",
+    "query_category": "analytical",
+    "query": "Analyze the financial guidelines recommended for new earners starting their investment journey in mutual funds.",
+    "expected_answer": "Guidelines advise starting an emergency fund, obtaining health insurance, starting early SIPs in diversified equity funds, and maintaining asset allocation discipline.",
+    "source_page": 3
+  },
+  {
+    "id": "Q113",
+    "document_type": "Type C - Table-Heavy Financial Document",
+    "folder": "data/financial_tables",
+    "document_filename": "hdfc-mutual-fund-handbook.pdf",
+    "query_category": "analytical",
+    "query": "Compare Debt Mutual Funds versus Bank Fixed Deposits regarding liquidity, flexibility, and penalty structures.",
+    "expected_answer": "Debt MFs allow partial redemptions anytime without breaking the full deposit, whereas premature FD withdrawals incur interest rate penalties.",
+    "source_page": 3
+  },
+  {
+    "id": "Q114",
+    "document_type": "Type C - Table-Heavy Financial Document",
+    "folder": "data/financial_tables",
+    "document_filename": "hdfc-mutual-fund-handbook.pdf",
+    "query_category": "analytical",
+    "query": "What is the analytical impact of inflation on cash holdings over a 10-year period?",
+    "expected_answer": "Uninvested cash depreciates in real value by the cumulative inflation rate, reducing purchasing power by approximately 40-50% over a decade at 6% average inflation.",
+    "source_page": 3
+  },
+  {
+    "id": "Q115",
+    "document_type": "Type C - Table-Heavy Financial Document",
+    "folder": "data/financial_tables",
+    "document_filename": "hdfc-mutual-fund-handbook.pdf",
+    "query_category": "analytical",
+    "query": "Analyze the power of compounding under different compounding frequencies and return rates.",
+    "expected_answer": "Compounding accelerates exponentially over time, as interest earned on prior interest dominates total portfolio value in later investment years.",
+    "source_page": 3
+  },
+  {
+    "id": "Q116",
+    "document_type": "Type C - Table-Heavy Financial Document",
+    "folder": "data/financial_tables",
+    "document_filename": "hdfc-mutual-fund-handbook.pdf",
+    "query_category": "analytical",
+    "query": "Compare real returns generated by Fixed Deposits during high inflation regimes versus low inflation regimes.",
+    "expected_answer": "During high inflation regimes, FD interest rates after slab taxes often produce negative real returns, diminishing purchasing power.",
+    "source_page": 3
+  },
+  {
+    "id": "Q117",
+    "document_type": "Type C - Table-Heavy Financial Document",
+    "folder": "data/financial_tables",
+    "document_filename": "hdfc-mutual-fund-handbook.pdf",
+    "query_category": "analytical",
+    "query": "Analyze the core mission and strategic vision statement of HDFC Asset Management Company.",
+    "expected_answer": "Mission: To be the wealth creator for every Indian. Vision: To be the most respected asset manager in India.",
+    "source_page": 1
+  },
+  {
+    "id": "Q118",
+    "document_type": "Type C - Table-Heavy Financial Document",
+    "folder": "data/financial_tables",
+    "document_filename": "hdfc-mutual-fund-handbook.pdf",
+    "query_category": "analytical",
+    "query": "What analytical principles guide portfolio diversification across market capitalization categories (Large Cap, Mid Cap, Small Cap)?",
+    "expected_answer": "Large Caps provide portfolio stability and liquidity, Mid Caps offer high growth potential with moderate risk, and Small Caps deliver high growth upside with higher volatility.",
+    "source_page": 3
+  },
+  {
+    "id": "Q119",
+    "document_type": "Type C - Table-Heavy Financial Document",
+    "folder": "data/financial_tables",
+    "document_filename": "hdfc-mutual-fund-handbook.pdf",
+    "query_category": "analytical",
+    "query": "Compare lump-sum investment performance against systematic SIP performance during volatile market conditions.",
+    "expected_answer": "Lump-sum investments carry timing risk if entered at market peaks, whereas SIP investments smooth out acquisition costs over market cycles through dollar-cost averaging.",
+    "source_page": 3
+  },
+  {
+    "id": "Q120",
+    "document_type": "Type C - Table-Heavy Financial Document",
+    "folder": "data/financial_tables",
+    "document_filename": "hdfc-mutual-fund-handbook.pdf",
+    "query_category": "analytical",
+    "query": "Analyze the key riskometer categories defined by SEBI for mutual fund scheme risk classification.",
+    "expected_answer": "SEBI riskometer categories range from Low, Low to Moderate, Moderate, Moderately High, High, to Very High risk levels based on portfolio asset composition.",
+    "source_page": 3
+  }
+]

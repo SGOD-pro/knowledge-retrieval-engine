@@ -65,8 +65,10 @@ class PostgresRepository:
                         ),
                     )
                 return
-        except Exception:
-            pass
+        except Exception as e:
+            print("DB SAVE ERROR:", str(e))
+            import traceback
+            traceback.print_exc()
 
         # In-memory fallback
         _IN_MEMORY_DOCS[str(document.id)] = document
