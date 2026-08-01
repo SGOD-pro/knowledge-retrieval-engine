@@ -47,7 +47,7 @@
 - Ingestion is batch/async. Not synchronous per-upload.
 
 ## Out of Scope v1
-- Image/chart description.
+- Image/chart description (Extraction logic exists in odl-parser-lambda but remains inert and out of scope for Phase 4 UI/client responses).
 - Formula rendering.
 - User authentication / multi-tenancy.
 - Feedback-driven live reranking.

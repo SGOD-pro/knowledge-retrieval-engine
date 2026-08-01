@@ -40,6 +40,9 @@ Query Lambda defaults to Zip (bundling the ~130MB BGE-small weights + ONNX runti
 - Payload IN: S3 object reference to the PDF.
 - Payload OUT: *Pending verification against live function.* (Inline JSON vs S3-reference).
 
+**Partial Failure Handling (odl-parser-lambda):**
+`opendataloader_pdf.convert` raises an exception if any single file in a batch is corrupt (e.g. invalid PDF header). However, it successfully processes and outputs `.md` and `.json` files for the valid documents before throwing. The lambda handler catches this exception, ignores it, and relies purely on the presence/absence of output files matching `f"{document_id}.md"` and `.json` (which matches the underlying library's output convention) to determine success vs failure. Only the missing/corrupt documents are marked as failed; valid ones are correctly returned.
+
 ## Query Complexity Score
 
 Computed deterministically in `preprocess.py`. No LLM call. No ML model.  

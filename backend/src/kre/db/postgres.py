@@ -35,8 +35,15 @@ class PostgresRepository:
                     (document.id, document.filename, document.source_format),
                 )
                 for chunk in document.chunks:
-                    emb_fast_str = f"[{','.join(str(x) for x in chunk.embedding_fast)}]" if chunk.embedding_fast else None
-                    emb_full_str = f"[{','.join(str(x) for x in chunk.embedding_full)}]" if chunk.embedding_full else None
+                    emb_fast = chunk.embedding_fast
+                    emb_full = chunk.embedding_full
+                    
+                    if emb_full and len(emb_full) > 1024:
+                        emb_full = emb_full[:1024]
+                        
+                    emb_fast_str = f"[{','.join(str(x) for x in emb_fast)}]" if emb_fast else None
+                    emb_full_str = f"[{','.join(str(x) for x in emb_full)}]" if emb_full else None
+                    
                     connection.execute(
                         """INSERT INTO chunks (
                             id, document_id, source_format, text, element_type, page_number,

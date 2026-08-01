@@ -1,12 +1,12 @@
 {
-  "avg_latency_ms": 932.1719741662188,
-  "p95_latency_ms": 1110.1629000040703,
-  "mrr_5": 0.0,
-  "ndcg_5": 0.0,
-  "recall_3": 0.0,
-  "recall_5": 0.0,
-  "precision_3": 0.0,
+  "avg_latency_ms": 8930.942390274746,
+  "p95_latency_ms": 14616.638207000506,
+  "mrr_5": 0.03333333333333333,
+  "ndcg_5": 0.07103099178571526,
+  "recall_3": 0.03333333333333333,
+  "recall_5": 0.03333333333333333,
+  "precision_3": 0.03333333333333333,
   "faithfulness": 0.0,
-  "context_precision": 0.0,
+  "context_precision": 0.03333333333333333,
   "llm_activation_rate": 0.8833333333333333
 }

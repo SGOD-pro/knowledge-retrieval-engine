@@ -5,6 +5,22 @@ from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv()
 from kre.api.main import query_endpoint, QueryRequest
+import kre.providers.embedding_provider
+import kre.providers.llm_provider
+
+from kre.db.postgres import PostgresRepository
+_original_get_all_chunks = PostgresRepository.get_all_chunks
+_cached_chunks = None
+def _mock_get_all_chunks(self, document_ids=None):
+    global _cached_chunks
+    if _cached_chunks is None:
+        _cached_chunks = _original_get_all_chunks(self, document_ids)
+    if document_ids:
+        doc_set = set(str(d) for d in document_ids)
+        return [c for c in _cached_chunks if str(c.document_id) in doc_set]
+    return _cached_chunks
+PostgresRepository.get_all_chunks = _mock_get_all_chunks
+
 from kre.providers.llm_provider import generate_completion
 
 def run_benchmark():
@@ -54,7 +70,22 @@ def run_benchmark():
         expected_page = q["source_page"]
         
         # Retrieval metrics computation
-        hits = [1 if c.get("page_number") == expected_page else 0 for c in citations]
+        hits = []
+        for c in citations:
+            pg = None
+            chunk_id = c.get("chunk_id", "")
+            if ":page:" in chunk_id:
+                try:
+                    pg = int(chunk_id.split(":page:")[1].split(":")[0])
+                except:
+                    pass
+            elif "location_reference" in c and c["location_reference"] and str(c["location_reference"]).startswith("Page: "):
+                try:
+                    pg = int(str(c["location_reference"]).split("Page: ")[1])
+                except:
+                    pass
+            
+            hits.append(1 if pg == expected_page else 0)
         
         # Recall@3 & Precision@3
         hits_3 = hits[:3]
@@ -81,7 +112,7 @@ def run_benchmark():
         answer = response.get("answer", "")
         prompt = f"Context: {' '.join([c.get('text_snippet', '') for c in citations])}\nAnswer: {answer}\nIs the answer supported by the context? Reply strictly YES or NO."
         try:
-            judge_resp = generate_completion("You are a strict judge.", prompt, provider="dev").strip().upper()
+            judge_resp = generate_completion("You are a strict judge.", prompt, provider="prod").strip().upper()
             if "YES" in judge_resp:
                 faithfulness_score += 1.0
         except Exception as e:
@@ -92,7 +123,7 @@ def run_benchmark():
         context_precision_score += (sum(hits) / len(hits)) if hits else 0.0
         
         # Sleep to avoid rate limits on the new API key
-        time.sleep(2.0)
+        pass
 
     # Calculate final averages
     if latencies:

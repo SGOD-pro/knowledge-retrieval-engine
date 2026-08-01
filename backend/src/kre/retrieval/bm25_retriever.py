@@ -29,8 +29,12 @@ class BM25Retriever:
             logger.info("bm25.latency_ms=%.2f bm25.confidence_score=0.00", latency_ms)
             return []
 
-        tokenized_corpus = [_tokenize(chunk.text) for chunk in chunks]
-        bm25 = BM25Okapi(tokenized_corpus)
+        global _bm25_cached, _bm25_cached_corpus_len
+        if '_bm25_cached' not in globals() or _bm25_cached_corpus_len != len(chunks):
+            tokenized_corpus = [_tokenize(chunk.text) for chunk in chunks]
+            _bm25_cached = BM25Okapi(tokenized_corpus)
+            _bm25_cached_corpus_len = len(chunks)
+        bm25 = _bm25_cached
         tokenized_query = _tokenize(query)
 
         scores = bm25.get_scores(tokenized_query)

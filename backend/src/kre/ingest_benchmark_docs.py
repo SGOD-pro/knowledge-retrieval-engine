@@ -35,6 +35,8 @@ def ingest_all():
             print(f"Successfully ingested {doc_path.name} with {len(document.chunks)} chunks.")
         except Exception as e:
             print(f"Failed to ingest {doc_path.name}: {e}")
+            import traceback
+            traceback.print_exc()
 
 if __name__ == "__main__":
     ingest_all()

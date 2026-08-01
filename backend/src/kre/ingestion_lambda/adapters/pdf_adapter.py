@@ -3,13 +3,14 @@
 ARCHITECTURE.md rev 5: PDF Extraction Lambda is a separate container image
 deployed to ECR, invoked synchronously via boto3 from the Ingestion Lambda.
 
-DECISION.md: Payload IN is an S3 object reference. Payload OUT is pending
-verification against the live function.
+DECISION.md: Payload IN is a documents[] array with {document_id, s3_bucket, s3_key}.
+Payload OUT is {results: [...], failed: [...]}.
 """
 
 import json
 import logging
 import os
+import sys
 
 import boto3
 
@@ -31,22 +32,28 @@ def parse(path, document_id: str) -> list[Chunk]:
     Returns:
         List of Chunk objects parsed from the PDF.
     """
-    import os
-    import sys
-    import json
-    
     environment = os.environ.get("ENVIRONMENT", "dev")
-    
+
     if environment == "dev":
-        # DEV BYPASS: Direct import to avoid S3 dependency
+        # DEV BYPASS: Direct import to avoid S3 dependency.
+        # odl/main.py lambda_handler expects a documents[] batch event.
         odl_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "..", "odl"))
         if odl_path not in sys.path:
             sys.path.append(odl_path)
         import main as odl_main
-        
-        event = {"local_file_path": os.path.abspath(path)}
-        response = odl_main.lambda_handler(event, None)
-        response_payload = response
+
+        event = {
+            "documents": [{
+                "document_id": document_id,
+                "s3_bucket": os.environ.get("S3_BUCKET_NAME", "kre-documents-dev"),
+                "s3_key": str(path),
+            }]
+        }
+        batch_response = odl_main.lambda_handler(event, None)
+        # Unwrap the single-doc batch result so the rest of this function
+        # sees the same element list it would get from the prod Lambda path.
+        doc_results = batch_response.get("results", [])
+        response_payload = doc_results[0] if doc_results else {}
     else:
         # PROD PATH: Invoke deployed Lambda via boto3
         from kre.shared.config import get_boto3_client

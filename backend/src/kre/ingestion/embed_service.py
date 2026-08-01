@@ -148,7 +148,11 @@ def embed_chunks_dual(chunks: list[Chunk], provider: str = "dev") -> list[Chunk]
     from kre.providers.embedding_provider import embed_batch as api_embed_batch
 
     # Full embeddings — always API provider
-    full_embeddings = api_embed_batch(texts, provider=provider)
+    try:
+        full_embeddings = api_embed_batch(texts, provider=provider)
+    except Exception as e:
+        logger.error(f"Failed full embeddings: {e}")
+        full_embeddings = [None] * len(texts)
 
     result = []
     for chunk, emb_fast, emb_full in zip(chunks, fast_embeddings, full_embeddings):

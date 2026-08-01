@@ -5,14 +5,36 @@ Description: ODL PDF Parser Lambda
 
 Globals:
   Function:
-    Timeout: 300
-    MemorySize: 2048
+    Timeout: 600
+    MemorySize: 4096
+    EphemeralStorage:
+      Size: 4096
 
 Resources:
   ODLBucket:
     Type: AWS::S3::Bucket
     Properties:
       BucketName: docker-containers-070905
+
+  # ── ODL Batch Queue (Phase 4 SQS-native batch trigger stub) ─────────────────
+  # Documents that fail the quality gate are enqueued here.
+  # BatchSize=10, MaximumBatchingWindowInSeconds=60 will be wired in Phase 4
+  # when the full prod event-source mapping is added.
+  OdlBatchQueueDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: OdlBatchQueue-DLQ
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  OdlBatchQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: OdlBatchQueue
+      VisibilityTimeout: 660          # must be > Lambda Timeout (600s)
+      MessageRetentionPeriod: 3600    # 1 hour — stale batches should not linger
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OdlBatchQueueDLQ.Arn
+        maxReceiveCount: 3            # 2 retries before DLQ (3 total attempts)
 
   ODLParserFunction:
     Type: AWS::Serverless::Function
@@ -32,8 +54,22 @@ Resources:
             - Effect: Allow
               Action:
                 - s3:GetObject
+                - s3:PutObject
               Resource:
                 - arn:aws:s3:::*/*
+
+        # Allow the function to receive / delete messages from OdlBatchQueue
+        # (Phase 4 will add the event source mapping that auto-polls the queue)
+        - Statement:
+            - Effect: Allow
+              Action:
+                - sqs:ReceiveMessage
+                - sqs:DeleteMessage
+                - sqs:GetQueueAttributes
+                - sqs:SendMessage
+              Resource:
+                - !GetAtt OdlBatchQueue.Arn
+                - !GetAtt OdlBatchQueueDLQ.Arn
 
     Metadata:
       DockerContext: .
@@ -44,3 +80,11 @@ Outputs:
 
   ODLFunctionArn:
     Value: !GetAtt ODLParserFunction.Arn
+
+  OdlBatchQueueUrl:
+    Description: "URL of the ODL batch queue (used by Lambda A to enqueue quality-failed docs)"
+    Value: !Ref OdlBatchQueue
+
+  OdlBatchQueueArn:
+    Description: "ARN of the ODL batch queue"
+    Value: !GetAtt OdlBatchQueue.Arn
