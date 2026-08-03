@@ -1,7 +1,22 @@
-from dataclasses import asdict, dataclass
+"""Response builder for the Query Lambda retrieval pipeline.
+
+Constructs Citation and FastPathResponse objects from scored Chunk results.
+
+Rule 20: Every citation must carry a non-null location reference.
+Image URLs: Generated at query time via presigned S3 URLs — NEVER at ingest
+time — because presigned URLs expire.  No public ACLs are used.
+"""
+
+import os
+from dataclasses import asdict, dataclass, field
 from typing import Any, Sequence
 
 from kre.shared.models import Chunk
+from kre.shared.providers.image_url_provider import get_signed_image_url
+
+# Bucket used when the document record does not carry an explicit per-doc bucket.
+# Provide S3_BUCKET_NAME in environment to override.
+_DEFAULT_IMAGE_BUCKET = os.environ.get("S3_BUCKET_NAME", "kre-documents-dev")
 
 
 @dataclass(frozen=True)
@@ -12,9 +27,15 @@ class Citation:
     bounding_box: dict[str, float] | None
     location_reference: str | None
     text_snippet: str
+    # Presigned S3 URLs for images co-extracted with this chunk.
+    # Generated fresh per query so they are never stale.
+    image_urls: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        # Serialise tuple as plain list for JSON consumers.
+        d["image_urls"] = list(self.image_urls)
+        return d
 
 
 @dataclass(frozen=True)
@@ -33,8 +54,22 @@ class FastPathResponse:
         return d
 
 
-def build_citation(chunk: Chunk) -> Citation:
-    """Build a citation enforcing Rule 20 (zero null location responses)."""
+def build_citation(
+    chunk: Chunk,
+    image_bucket: str | None = None,
+) -> Citation:
+    """Build a citation enforcing Rule 20 (zero null location responses).
+
+    Args:
+        chunk:        The source Chunk from the retrieval pipeline.
+        image_bucket: S3 bucket that holds the chunk's images.  Falls back to
+                      the ``S3_BUCKET_NAME`` env var then a dev default.
+                      Pass explicitly when the document carries its own bucket
+                      metadata.
+
+    Returns:
+        A fully populated Citation with fresh presigned image URLs (if any).
+    """
     bbox = chunk.bounding_box
     loc_ref = chunk.location_reference
 
@@ -51,6 +86,20 @@ def build_citation(chunk: Chunk) -> Citation:
             else:
                 loc_ref = f"Section: {chunk.element_type}"
 
+    # Generate presigned URLs at query time — URLs expire, must be fresh per response.
+    # Security: no public ACLs, no bucket policy changes.  Presigned only.
+    image_urls: tuple[str, ...] = ()
+    if chunk.image_s3_keys:
+        bucket = image_bucket or _DEFAULT_IMAGE_BUCKET
+        urls = []
+        for key in chunk.image_s3_keys:
+            try:
+                urls.append(get_signed_image_url(key, bucket))
+            except Exception:
+                # Never let a presign failure break query responses — skip the key.
+                pass
+        image_urls = tuple(urls)
+
     return Citation(
         chunk_id=chunk.id,
         document_id=str(chunk.document_id),
@@ -58,6 +107,7 @@ def build_citation(chunk: Chunk) -> Citation:
         bounding_box=bbox,
         location_reference=loc_ref,
         text_snippet=chunk.text[:200],
+        image_urls=image_urls,
     )
 
 

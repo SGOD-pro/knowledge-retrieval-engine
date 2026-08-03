@@ -17,7 +17,7 @@ Read:  checked before any retrieval stage runs
 
 ### Invalidation:
 - On re-ingestion of document `D`: `DELETE` all cache keys where `doc_scope_hash` includes `D`.
-
+7890-=
 ## Semantic Cache â€” pgvector-backed
 
 Table: cache_entries
@@ -166,12 +166,13 @@ Phase 3 completion status is INVALIDATED as of this revision. The 19 previously-
 
 ---
 
-## Session State — Phase 3 Re-Verification Attempt (2026-07-30)
+## Session State ï¿½ Phase 3 Re-Verification Attempt (2026-07-30)
 
 - **Step 3 (Provider Definitions) Completion**:
   - embedding_provider.py updated to use mazon.titan-embed-text-v2:0 (Prod) and 
 vidia/nemotron-3-embed-1b (Dev). Consolidating the local BGE-small ONNX embedding path into embedding_provider.py ensures EXACTLY ONE place owns "which embedding model for which path".
-  - eranker_provider.py updated to use cohere.rerank-v3-5:0 (Prod) and 
+  - 
+eranker_provider.py updated to use cohere.rerank-v3-5:0 (Prod) and 
 vidia/llama-nemotron-rerank-vl-1b-v2 (Dev).
   - llm_provider.py updated to use mazon.nova-lite-v1:0 (Prod) and 
 vidia/nemotron-nano-9b-v2:free (Dev).
@@ -188,7 +189,8 @@ umpy) for isolated execution.
 
 - **Benchmark Run Complete**:
   - To bypass OpenRouter free-tier rate limits (429s), all remote LLM API calls and full-path embedding/reranking API calls were mocked. 
-  - un_benchmark.py successfully processed all 120 queries against the finalized 3-type document corpus using the local fallback retrieval pipeline.
+  - 
+un_benchmark.py successfully processed all 120 queries against the finalized 3-type document corpus using the local fallback retrieval pipeline.
   
 - **Official Retrieval Metrics (Mocked Endpoints)**:
   - Total Queries: 120

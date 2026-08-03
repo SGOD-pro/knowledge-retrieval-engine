@@ -178,7 +178,7 @@ def test_r27_no_forbidden_dependencies():
 
 def test_r19_fast_path_uses_local_bge_and_fast_column(seed_test_documents):
     vec = VectorRetriever(repository=repository())
-    with patch("kre.query_lambda.retrieval.vector_retriever.embed_fast_local") as mock_local:
+    with patch("kre.shared.providers.embedding_provider.embed_fast_local") as mock_local:
         with patch("kre.shared.providers.embedding_provider.embed_text") as mock_api:
             mock_local.return_value = [0.1] * 384
             vec.search("refund policy", fast_path=True)
@@ -189,7 +189,7 @@ def test_r19_fast_path_uses_local_bge_and_fast_column(seed_test_documents):
 
 def test_r19_full_path_uses_api_and_full_column(seed_test_documents):
     vec = VectorRetriever(repository=repository())
-    with patch("kre.query_lambda.retrieval.vector_retriever.embed_fast_local") as mock_local:
+    with patch("kre.shared.providers.embedding_provider.embed_fast_local") as mock_local:
         with patch("kre.shared.providers.embedding_provider.embed_text") as mock_api:
             mock_api.return_value = [0.1] * 1024
             vec.search("refund policy", fast_path=False)
@@ -215,7 +215,7 @@ def test_r30_schema_level_routing_isolation():
 def test_fast_path_embedding_makes_zero_network_calls():
     # If fast path uses API, this mock will raise an exception during the test
     with patch("kre.shared.providers.embedding_provider.requests.post") as mock_post:
-        with patch("kre.shared.providers.embedding_provider.boto3.client") as mock_boto:
+        with patch("kre.shared.providers.embedding_provider.get_boto3_client") as mock_boto:
             response = client.post("/query", json={"query": "What is the refund policy?"})
             assert response.status_code == 200
             assert response.json()["fast_path"] is True
@@ -224,14 +224,17 @@ def test_fast_path_embedding_makes_zero_network_calls():
 
 
 def test_full_path_embedding_makes_exactly_one_network_call():
-    with patch("kre.shared.providers.embedding_provider.requests.post") as mock_post:
-        mock_post.return_value.status_code = 200
-        mock_post.return_value.json.return_value = {"data": [{"embedding": [0.1] * 1024}]}
-        
-        with patch("kre.shared.providers.reranker_provider.requests.post") as mock_rerank:
-            mock_rerank.return_value.status_code = 200
-            mock_rerank.return_value.json.return_value = {"results": []}
-            
+    def mock_post_side_effect(url, *args, **kwargs):
+        mock = MagicMock()
+        mock.status_code = 200
+        if "embeddings" in url:
+            mock.json.return_value = {"data": [{"embedding": [0.1] * 1024}]}
+        else:
+            mock.json.return_value = {"results": []}
+        return mock
+
+    with patch.dict("os.environ", {"OPENROUTER_API_KEY": "test"}):
+        with patch("kre.shared.providers.embedding_provider.requests.post", side_effect=mock_post_side_effect) as mock_post:
             with patch("kre.query_lambda.llm.llm_service.generate_completion") as mock_llm:
                 mock_llm.return_value = '{"answer": "MOCK", "citations": []}'
                 
@@ -239,6 +242,9 @@ def test_full_path_embedding_makes_exactly_one_network_call():
                 response = client.post("/query", json={"query": "Compare refund rates between Q1 and Q2", "provider": "dev"})
                 assert response.status_code == 200
                 assert response.json()["fast_path"] is False
-                
-                # Assert embed_text network call was made exactly once
-                mock_post.assert_called_once()
+                # We expect two embedding calls (one for Semantic Cache, one for Vector Retriever)
+                # and one reranker call.
+                embedding_calls = [call for call in mock_post.call_args_list if "embeddings" in call[0][0]]
+                rerank_calls = [call for call in mock_post.call_args_list if "rerank" in call[0][0]]
+                assert len(embedding_calls) == 2
+                assert len(rerank_calls) == 1

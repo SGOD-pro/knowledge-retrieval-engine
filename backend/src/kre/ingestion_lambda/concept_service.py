@@ -3,7 +3,7 @@ import json
 import logging
 import re
 from kre.shared.models import Chunk
-from kre.shared.providers.provider_client import get_active_provider
+from kre.shared.providers.provider_client import get_active_provider, enforce_rate_limit
 from kre.shared.config import get_concept_model
 
 logger = logging.getLogger(__name__)
@@ -16,6 +16,7 @@ def extract_properties_nova_micro(chunks: list[Chunk], provider: str | None = No
     """
     active = provider or get_active_provider()
     model_id = get_concept_model(active)
+    enforce_rate_limit(model_id)
     results = []
     
     # Process 20 chunks at a time

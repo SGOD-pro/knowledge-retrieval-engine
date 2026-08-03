@@ -13,9 +13,10 @@ BOUNDARIES.md: Temperature = 0 on all LLM calls.
 import json
 import logging
 import os
+import requests
 
-from kre.shared.providers.provider_client import get_active_provider
-from kre.shared.config import get_llm_model
+from kre.shared.providers.provider_client import get_active_provider, enforce_rate_limit
+from kre.shared.config import get_llm_model, get_boto3_client
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,7 @@ def generate_completion(
     """
     active = provider or get_active_provider()
     model_id = get_llm_model(active)
+    enforce_rate_limit(model_id)
 
     if active == "prod":
         try:
@@ -63,8 +65,6 @@ def generate_completion(
         openrouter_key = os.environ.get("OPENROUTER_API_KEY")
         if openrouter_key:
             try:
-                import requests
-
                 response = requests.post(
                     "https://openrouter.ai/api/v1/chat/completions",
                     headers={

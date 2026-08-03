@@ -4,15 +4,15 @@ from docx import Document as DocxDocument
 from openpyxl import Workbook
 from pptx import Presentation
 
-from kre.ingestion.format_router import route
-from kre.ingestion.adapters.docx_adapter import parse as parse_docx
-from kre.ingestion.adapters.pdf_adapter import parse as parse_pdf
-from kre.ingestion.adapters.pptx_adapter import parse as parse_pptx
-from kre.ingestion.adapters.xlsx_adapter import parse as parse_xlsx
-from kre.ingestion.adapters.csv_adapter import parse as parse_csv
-from kre.ingestion.parse_service import parse_file
-from kre.ingestion.page_index_service import rank, score
-from kre.models import Chunk
+from kre.ingestion_lambda.format_router import route
+from kre.ingestion_lambda.adapters.docx_adapter import parse as parse_docx
+from kre.ingestion_lambda.adapters.pdf_adapter import parse as parse_pdf
+from kre.ingestion_lambda.adapters.pptx_adapter import parse as parse_pptx
+from kre.ingestion_lambda.adapters.xlsx_adapter import parse as parse_xlsx
+from kre.ingestion_lambda.adapters.csv_adapter import parse as parse_csv
+from kre.ingestion_lambda.parse_service import parse_file
+from kre.ingestion_lambda.page_index_service import rank, score
+from kre.shared.models import Chunk
 
 DATA_DIR = Path(__file__).parent / "data"
 
@@ -69,7 +69,12 @@ def test_real_pdf_ingestion_data():
     pdf_path = DATA_DIR / "hdfc.pdf"
     if not pdf_path.exists():
         pytest.skip("hdfc.pdf not found in tests/data")
-    document = parse_file(pdf_path, "pdf-doc-1")
+    try:
+        document = parse_file(pdf_path, "pdf-doc-1")
+    except RuntimeError as e:
+        if "opendataloader_pdf is not installed" in str(e):
+            pytest.skip("opendataloader-pdf not installed, skipping test")
+        raise
     assert document.source_format == "pdf"
     assert len(document.chunks) > 50
     # Bounding box non-null check for PDF chunks per Phase 1 exit criteria

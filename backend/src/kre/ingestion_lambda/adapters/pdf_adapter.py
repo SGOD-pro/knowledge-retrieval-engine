@@ -5,6 +5,21 @@ deployed to ECR, invoked synchronously via boto3 from the Ingestion Lambda.
 
 DECISION.md: Payload IN is a documents[] array with {document_id, s3_bucket, s3_key}.
 Payload OUT is {results: [...], failed: [...]}.
+
+Response shape expected from odl-parser (post Prompt 1 normalizer fix):
+    {
+        "results": [
+            {
+                "document_id": "<uuid>",
+                "elements": [...],          # list of element dicts
+                "image_s3_keys": [...]      # S3 keys of extracted images (may be absent)
+            }
+        ],
+        "failed": ["<uuid>", ...]           # document_ids that errored
+    }
+
+The prod invoke payload wraps the request in {"documents": [...]} to match
+the odl-parser normalizer contract (same shape as the dev direct-import path).
 """
 
 import json
@@ -31,6 +46,10 @@ def parse(path, document_id: str) -> list[Chunk]:
 
     Returns:
         List of Chunk objects parsed from the PDF.
+
+    Raises:
+        RuntimeError: If odl-parser returns a Lambda-level error, or if
+            document_id appears in the response's "failed" list.
     """
     environment = os.environ.get("ENVIRONMENT", "dev")
 
@@ -50,24 +69,28 @@ def parse(path, document_id: str) -> list[Chunk]:
             }]
         }
         batch_response = odl_main.lambda_handler(event, None)
-        # Unwrap the single-doc batch result so the rest of this function
-        # sees the same element list it would get from the prod Lambda path.
-        doc_results = batch_response.get("results", [])
-        response_payload = doc_results[0] if doc_results else {}
+        # Dev path: odl_main already returns {results: [...], failed: [...]}.
+        # We re-use the same result-parsing block below — no special-casing needed.
+        response_payload = batch_response
+
     else:
-        # PROD PATH: Invoke deployed Lambda via boto3
+        # PROD PATH: Invoke deployed Lambda via boto3.
+        #
+        # Payload wraps the request in {"documents": [...]} so it matches the
+        # odl-parser normalizer contract (Prompt 1 fix). Flat {s3_bucket,
+        # s3_key, document_id} was wrong — the Lambda expects a batch envelope.
         from kre.shared.config import get_boto3_client
         client = get_boto3_client("lambda")
-        
-        # In a real S3 trigger, these would come from the event. 
-        # For now, we mock them based on the path.
+
         s3_bucket = os.environ.get("S3_BUCKET_NAME", "kre-documents-prod")
         s3_key = path.name
-        
+
         payload = {
-            "s3_bucket": s3_bucket,
-            "s3_key": s3_key,
-            "document_id": document_id,
+            "documents": [{
+                "document_id": document_id,
+                "s3_bucket": s3_bucket,
+                "s3_key": s3_key,
+            }]
         }
 
         logger.info("Invoking %s for s3://%s/%s", _ODL_PARSER_FUNCTION_NAME, s3_bucket, s3_key)
@@ -85,11 +108,43 @@ def parse(path, document_id: str) -> list[Chunk]:
             logger.error("odl-parser-lambda returned error: %s", error_msg)
             raise RuntimeError(f"PDF extraction failed: {error_msg}")
 
-    # Parse the response items into Chunk objects
-    items = response_payload if isinstance(response_payload, list) else (
-        response_payload.get("chunks") or response_payload.get("kids") or
-        response_payload.get("pages") or response_payload.get("elements") or []
-    )
+    # ---------------------------------------------------------------------------
+    # Parse the normalised response_payload: {results: [...], failed: [...]}
+    # ---------------------------------------------------------------------------
+
+    # Check the failed list first — raise early rather than silently returning [].
+    failed_ids: list[str] = response_payload.get("failed", [])
+    if document_id in failed_ids:
+        raise RuntimeError(
+            f"odl-parser reported extraction failure for document_id={document_id!r}. "
+            f"Full failed list: {failed_ids}"
+        )
+
+    results: list[dict] = response_payload.get("results", [])
+    if not results:
+        logger.warning("odl-parser returned empty results for document_id=%s", document_id)
+        return []
+
+    # Find our document's result entry (there should be exactly one in a
+    # single-document invocation, but be defensive and match by id).
+    doc_result: dict | None = None
+    for entry in results:
+        if str(entry.get("document_id", "")) == document_id:
+            doc_result = entry
+            break
+    if doc_result is None:
+        # Fall back to first entry if document_id matching fails
+        logger.warning(
+            "odl-parser result missing document_id=%s; falling back to results[0]",
+            document_id,
+        )
+        doc_result = results[0]
+
+    # Real element data is at results[0]["elements"] — NOT at the top-level dict.
+    items: list[dict] = doc_result.get("elements", [])
+
+    # Image S3 keys for this document (may be absent for text-only PDFs).
+    doc_image_s3_keys: tuple[str, ...] = tuple(doc_result.get("image_s3_keys", []))
 
     chunks: list[Chunk] = []
 
@@ -119,6 +174,11 @@ def parse(path, document_id: str) -> list[Chunk]:
             page_number=page_number,
             bounding_box=bounding_box,
             location_reference=f"Page: {page_number}",
+            # Attach the document-level image keys to every chunk so that
+            # any chunk in a figure-heavy document can surface the images.
+            # Chunk-level image filtering (by page/element) can be added
+            # later once odl-parser exposes per-element image associations.
+            image_s3_keys=doc_image_s3_keys,
         ))
 
     return chunks

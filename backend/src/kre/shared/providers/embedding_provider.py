@@ -15,12 +15,13 @@ import logging
 import os
 from pathlib import Path
 from typing import Sequence
+import requests
 
 import numpy as np
 import onnxruntime as ort
 
-from kre.shared.providers.provider_client import get_active_provider
-from kre.shared.config import get_embedding_model
+from kre.shared.providers.provider_client import get_active_provider, enforce_rate_limit
+from kre.shared.config import get_embedding_model, get_boto3_client
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +150,7 @@ def embed_text(text: str, provider: str | None = None) -> list[float]:
     """
     active = provider or get_active_provider()
     model_id = get_embedding_model(active)
+    enforce_rate_limit(model_id)
     dim = FULL_EMBEDDING_DIM
 
     if active == "prod":
@@ -178,8 +180,6 @@ def embed_text(text: str, provider: str | None = None) -> list[float]:
         openrouter_key = os.environ.get("OPENROUTER_API_KEY")
         if openrouter_key:
             try:
-                import requests
-
                 response = requests.post(
                     "https://openrouter.ai/api/v1/embeddings",
                     headers={

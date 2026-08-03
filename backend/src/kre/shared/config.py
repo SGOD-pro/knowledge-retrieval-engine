@@ -9,6 +9,7 @@ Local services (S3, SQS, …) route through AWS_ENDPOINT_URL when set (floci).
 import os
 
 import boto3
+from botocore.config import Config
 
 _ENV = os.environ.get("ENVIRONMENT", "dev")
 _REGION = os.environ.get("AWS_REGION", "us-east-1")
@@ -22,7 +23,7 @@ def _default_session() -> boto3.Session:
     """Profile-based session in dev; ambient-creds session in prod."""
     if _ENV != "prod":
         return boto3.Session(
-            profile_name=os.environ.get("AWS_PROFILE", "default"),
+            profile_name="local",
             region_name=_REGION,
         )
     return boto3.Session(region_name=_REGION)
@@ -38,16 +39,18 @@ def get_boto3_client(service_name: str):
     ambient creds in prod).  All other local-emulated services get the
     floci endpoint when AWS_ENDPOINT_URL is set.
     """
+    config = Config(retries={'max_attempts': 2})
+
     if service_name == "bedrock-runtime":
         if _ENV != "prod":
             return boto3.Session(
                 profile_name="aws",
                 region_name="ap-south-1",
-            ).client("bedrock-runtime")
+            ).client("bedrock-runtime", config=config)
         # Prod: let the instance role / env creds supply everything
-        return boto3.Session(region_name=_REGION).client("bedrock-runtime")
+        return boto3.Session(region_name=_REGION).client("bedrock-runtime", config=config)
 
-    kwargs = {}
+    kwargs = {"config": config}
     if _ENDPOINT_URL and service_name in _LOCAL_SERVICES:
         kwargs["endpoint_url"] = _ENDPOINT_URL
 

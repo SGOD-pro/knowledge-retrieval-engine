@@ -18,10 +18,14 @@ class Chunk:
     provider: str = "dev"
     embedding_fast: list[float] | None = None
     embedding_full: list[float] | None = None
+    # S3 keys for images extracted alongside this chunk (e.g. figures in a PDF).
+    # Tuple (not list) to stay consistent with section_path and keep Chunk hashable.
+    image_s3_keys: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
         value["section_path"] = list(self.section_path)
+        value["image_s3_keys"] = list(self.image_s3_keys)
         return value
 
 

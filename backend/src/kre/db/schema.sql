@@ -21,7 +21,10 @@ CREATE TABLE IF NOT EXISTS chunks (
     structural_weight DOUBLE PRECISION NOT NULL DEFAULT 0,
     provider TEXT NOT NULL DEFAULT 'dev',
     embedding_fast vector(384),
-    embedding_full vector(1024)
+    embedding_full vector(1024),
+    -- S3 keys of images co-extracted with this chunk; never exposed as public URLs.
+    -- Presigned URLs are generated at query time by image_url_provider.
+    image_s3_keys JSONB NOT NULL DEFAULT '[]'
 );
 
 CREATE INDEX IF NOT EXISTS chunks_document_id_idx ON chunks(document_id);

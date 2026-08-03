@@ -11,9 +11,10 @@ Rule 28: All reranker calls route through this module.
 import json
 import logging
 import os
+import requests
 
-from kre.shared.providers.provider_client import get_active_provider
-from kre.shared.config import get_reranker_model
+from kre.shared.providers.provider_client import get_active_provider, enforce_rate_limit
+from kre.shared.config import get_reranker_model, get_boto3_client
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,7 @@ def rerank_documents(query: str, documents: list[str], provider: str | None = No
     """
     active = provider or get_active_provider()
     model_id = get_reranker_model(active)
+    enforce_rate_limit(model_id)
 
     if active == "prod":
         try:
@@ -60,8 +62,6 @@ def rerank_documents(query: str, documents: list[str], provider: str | None = No
         openrouter_key = os.environ.get("OPENROUTER_API_KEY")
         if openrouter_key:
             try:
-                import requests
-
                 response = requests.post(
                     "https://openrouter.ai/api/v1/rerank",
                     headers={

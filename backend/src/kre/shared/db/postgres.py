@@ -47,12 +47,14 @@ class PostgresRepository:
                         """INSERT INTO chunks (
                             id, document_id, source_format, text, element_type, page_number,
                             section_path, bounding_box, location_reference, metadata,
-                            structural_weight, provider, embedding_fast, embedding_full
-                        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                            structural_weight, provider, embedding_fast, embedding_full,
+                            image_s3_keys
+                        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                         ON CONFLICT (id) DO UPDATE SET
                             text=EXCLUDED.text,
                             embedding_fast=EXCLUDED.embedding_fast,
-                            embedding_full=EXCLUDED.embedding_full""",
+                            embedding_full=EXCLUDED.embedding_full,
+                            image_s3_keys=EXCLUDED.image_s3_keys""",
                         (
                             chunk.id,
                             chunk.document_id,
@@ -60,7 +62,7 @@ class PostgresRepository:
                             chunk.text,
                             chunk.element_type,
                             chunk.page_number,
-                            json.dumps(chunk.section_path),
+                            json.dumps(list(chunk.section_path)),
                             json.dumps(chunk.bounding_box) if chunk.bounding_box else None,
                             chunk.location_reference,
                             json.dumps(chunk.metadata) if chunk.metadata else None,
@@ -68,6 +70,7 @@ class PostgresRepository:
                             chunk.provider,
                             emb_fast_str,
                             emb_full_str,
+                            json.dumps(list(chunk.image_s3_keys)),
                         ),
                     )
                 return
@@ -123,7 +126,8 @@ class PostgresRepository:
                     rows = connection.execute(
                         """SELECT id, document_id, source_format, text, element_type, page_number,
                                   section_path, bounding_box, location_reference, metadata,
-                                  structural_weight, provider, embedding_fast, embedding_full
+                                  structural_weight, provider, embedding_fast, embedding_full,
+                                  image_s3_keys
                            FROM chunks WHERE document_id = ANY(%s) ORDER BY id""",
                         (uuids,),
                     ).fetchall()
@@ -131,13 +135,21 @@ class PostgresRepository:
                     rows = connection.execute(
                         """SELECT id, document_id, source_format, text, element_type, page_number,
                                   section_path, bounding_box, location_reference, metadata,
-                                  structural_weight, provider, embedding_fast, embedding_full
+                                  structural_weight, provider, embedding_fast, embedding_full,
+                                  image_s3_keys
                            FROM chunks ORDER BY id"""
                     ).fetchall()
             chunks = []
             for row in rows:
                 emb_fast = json.loads(row[12]) if isinstance(row[12], str) else row[12]
                 emb_full = json.loads(row[13]) if isinstance(row[13], str) else row[13]
+                raw_img_keys = row[14]
+                if isinstance(raw_img_keys, str):
+                    img_keys: tuple[str, ...] = tuple(json.loads(raw_img_keys))
+                elif raw_img_keys:
+                    img_keys = tuple(raw_img_keys)
+                else:
+                    img_keys = ()
                 chunks.append(
                     Chunk(
                         row[0],
@@ -154,6 +166,7 @@ class PostgresRepository:
                         row[11],
                         emb_fast,
                         emb_full,
+                        img_keys,
                     )
                 )
             return chunks

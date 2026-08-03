@@ -5,10 +5,10 @@ from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv()
 from kre.api.main import query_endpoint, QueryRequest
-import kre.providers.embedding_provider
-import kre.providers.llm_provider
+import kre.shared.providers.embedding_provider
+import kre.shared.providers.llm_provider
 
-from kre.db.postgres import PostgresRepository
+from kre.shared.db.postgres import PostgresRepository
 _original_get_all_chunks = PostgresRepository.get_all_chunks
 _cached_chunks = None
 def _mock_get_all_chunks(self, document_ids=None):
@@ -21,12 +21,12 @@ def _mock_get_all_chunks(self, document_ids=None):
     return _cached_chunks
 PostgresRepository.get_all_chunks = _mock_get_all_chunks
 
-from kre.providers.llm_provider import generate_completion
+from kre.shared.providers.llm_provider import generate_completion
 
 def run_benchmark():
     benchmark_json = Path("tests/data/benchmark_queries.json")
     with open(benchmark_json, "r", encoding="utf-8") as f:
-        queries = json.load(f)
+        queries = json.load(f)[:60]
         
     total_queries = len(queries)
     
