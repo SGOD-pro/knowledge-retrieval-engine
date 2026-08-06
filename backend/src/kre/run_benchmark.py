@@ -64,12 +64,19 @@ def _tracked_rerank(query, documents, **kwargs):
 kre.providers.reranker_provider.rerank_documents = _tracked_rerank
 
 
-def run_benchmark():
+def run_benchmark(limit: int | None = None):
     benchmark_json = Path("tests/data/benchmark_queries.json")
     with open(benchmark_json, "r", encoding="utf-8") as f:
-        queries = json.load(f)[:60]
-        
+        all_queries = json.load(f)
+
+    full_count = len(all_queries)
+    queries = all_queries[:limit] if limit is not None else all_queries
     total_queries = len(queries)
+
+    if total_queries < full_count:
+        print(f"WARNING: Running benchmark on {total_queries} of {full_count} total queries (partial run — limit={limit}).")
+    else:
+        print(f"Running benchmark on {total_queries} of {full_count} total queries (full dataset).")
     
     # Metrics
     latencies = []
@@ -86,7 +93,7 @@ def run_benchmark():
     # System Metrics
     fast_path_count = 0
     
-    print(f"Running benchmark on {total_queries} queries...")
+    # (count already printed above)
     
     for i, q in enumerate(queries):
         if i % 10 == 0:
@@ -259,4 +266,8 @@ def run_benchmark():
         json.dump(results, f, indent=2)
 
 if __name__ == "__main__":
-    run_benchmark()
+    import argparse
+    parser = argparse.ArgumentParser(description="Run the KRE benchmark.")
+    parser.add_argument("--limit", type=int, default=None, help="Limit to N queries (default: all).")
+    args = parser.parse_args()
+    run_benchmark(limit=args.limit)

@@ -24,7 +24,7 @@ NEW: Three-Lambda distributed architecture.
 |-------------------|----------------------------------------|----------------------------------|
 | Fast Path Embed   | Local BGE-small-en-v1.5 (ONNX)         | Local BGE-small-en-v1.5 (ONNX) |
 | Full Path Embed   | nvidia/nemotron-3-embed-1b (OpenRouter)| amazon.titan-embed-text-v2 (Bedrock) |
-| Reranker          | nvidia/llama-nemotron-rerank-vl-1b-v2 (OpenRouter) | cohere.rerank-v3-5 (Bedrock) |
+| Reranker          | nvidia/llama-nemotron-rerank-1b-v2 (NVIDIA NIM) | nvidia/llama-nemotron-rerank-1b-v2 (NVIDIA NIM) |
 | OKF extraction    | nvidia/nemotron-3-nano-30b-a3b (OpenRouter) | amazon.nova-micro-v1 (Bedrock) |
 | Query LLM         | openai/gpt-oss-20b or nemotron-nano-9b | amazon.nova-lite-v1 or claude-haiku |
 | CI judge          | —                                      | amazon.nova-lite-v1 (Bedrock) |

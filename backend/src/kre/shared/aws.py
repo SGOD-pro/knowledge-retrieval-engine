@@ -12,7 +12,13 @@ LOCAL_SERVICES = [
     "elasticache",
 ]
 
+_clients = {}
+
 def get_client(service: str):
+    global _clients
+    if service in _clients:
+        return _clients[service]
+        
     config = Config(retries={'max_attempts': 3, 'mode': 'adaptive'})
 
     if settings.ENVIRONMENT == "dev":
@@ -21,17 +27,20 @@ def get_client(service: str):
                 profile_name="aws",
                 region_name="ap-south-1",
             )
-            return aws_session.client(service, config=config)
+            client = aws_session.client(service, config=config)
         else:
             local_session = boto3.Session(
                 profile_name="local",
                 region_name="us-east-1",
             )
-            return local_session.client(
+            client = local_session.client(
                 service, 
                 endpoint_url="http://localhost:4566", 
                 config=config
             )
     else:
         session = boto3.Session()
-        return session.client(service, config=config)
+        client = session.client(service, config=config)
+        
+    _clients[service] = client
+    return client

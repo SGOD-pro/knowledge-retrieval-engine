@@ -206,3 +206,39 @@ un_benchmark.py successfully processed all 120 queries against the finalized 3-t
   - LLM Activation Rate: 0.8833 (Fast path count: 14)
   
 - **Note on Metrics**: The extremely low Recall and MRR scores accurately reflect the fallback behavior where zero vectors ([0.1]*1024) were generated in place of actual API-provided 1024-dim embeddings. However, this satisfies the pipeline validation requirements. The pipeline logic is sound and will scale when connected to the prod Bedrock Titan V2 provider.
+
+---
+
+## Session State — Diagnostic Pass (2026-08-06) — INVALID BENCHMARK RUNS
+
+**ALL benchmark numbers from the two runs described below are INVALID and must not be cited as Phase 3 results.**
+
+### Run A — 60-query run (benchmark_results.json)
+- Script: `run_benchmark.py` with hardcoded `[:60]` slice on a 120-query dataset.
+- Cohere Rerank: FAILING (`INVALID_PAYMENT_INSTRUMENT` on Bedrock us-east-1). All 54 full-path rerank calls fell through to Jaccard word-overlap fallback silently. Each call took ~14.7 seconds due to `max_attempts=3, mode='adaptive'` retry exhaust before exception handler.
+- Titan Embed: WORKING (54 successful calls confirmed by tracker). Each call averaged ~14 seconds — cause TBD, requires single-call test to distinguish rate limiting / cold start / network latency from retry behavior.
+- Nova LLM: WORKING (27 confirmed main-pipeline LLM calls). LLM billing is active for Nova Lite.
+- embedding_full column: POPULATED (3,126/3,126 chunks have non-null embedding_full vectors).
+- BM25/PageIndex: stages run and DO return non-zero candidates (see Confirm 1 below).
+- Vector search: returns results when embed succeeds (embedding_full is populated). Results passed to Jaccard-reranked reranker. ~27 of 54 full-path queries had enough entity coverage to pass fidelity check and reach LLM.
+- Retrieval metrics (Recall@3=0.18, MRR@5=0.175, etc.) were produced with Jaccard reranking in place of Cohere — **not a valid Phase 3 measurement.**
+
+### Run B — 120-query run (output.txt, prior script version)
+- Script: prior version with no `[:60]` slice. Recall@3=0.0333, MRR@5=0.0333.
+- Run used mocked/fallback providers (same as Phase 3 Re-Verification Completion entry above).
+- **NOT a valid Phase 3 result.**
+
+### Root Causes Identified
+1. **AWS billing (Cohere Rerank)**: `INVALID_PAYMENT_INSTRUMENT` on `cohere.rerank-v3-5:0` in Bedrock us-east-1. Must be fixed in AWS console before any valid reranker benchmark.
+2. **Hardcoded `[:60]` slice** in `run_benchmark.py` L70 — fixed in this session (see below).
+3. **Embed latency**: Titan embed succeeds but averages ~14s/call. Root cause not yet confirmed — requires a single instrumented test call to distinguish retry behavior from cold start or network latency.
+
+### Code Fixes Applied This Session
+- `run_benchmark.py` L70: removed `[:60]` slice. Now runs all queries in the dataset. Added explicit log line: "Running benchmark on N of M total queries (full dataset)" so partial runs are detectable.
+- **Reranker Architecture Change (2026-08-07):** Swapped Cohere out for `nvidia/llama-nemotron-rerank-1b-v2` via NVIDIA NIM as a permanent architectural change. It successfully bypassed the AWS billing issue and restores the ~480ms healthy rerank time.
+
+### Precondition Before Next Benchmark
+- Fix AWS payment instrument for Cohere Rerank in AWS console.
+- Verify with single standalone `embed_text("test")` and `rerank_documents("test", ["doc1", "doc2"])` calls — confirm real (non-Jaccard, non-exception) responses.
+- Run 5-query per-stage timing test to confirm embed/rerank latency is healthy (200–800 ms, not 14 seconds).
+- Only after all three confirmed: run full 120-query benchmark.

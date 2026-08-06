@@ -92,7 +92,18 @@ Frontend:  Next.js 3-pane workspace
 Verifiable RAG for regulated industries. Citation-to-bounding-box in under 3 seconds (fast path).
 
 ## Competitive Landscape
-[Same as rev 4]
+
+| Competitor | Approach | Core Failure |
+| :--- | :--- | :--- |
+| **ChatGPT + PDF** | Flat vector RAG | Unverifiable, no source pinning |
+| **Perplexity** | Web search + LLM | Not document-private |
+| **Notion AI** | Flat keyword in notes | No hierarchy, no semantic layer |
+| **LlamaIndex** | Framework only | User assembles, no quality guarantee |
+| **Azure AI Search** | BM25 + vector hybrid | Black box, no audit trail |
+| **Vertex AI Search** | Google-managed RAG | Cloud-locked, no structural index |
+| **Elasticsearch** | BM25 + dense vector | No document hierarchy, no OKF |
+
+---
 
 ## What Makes KRE Hard to Copy
 1. PageIndex structural scoring.
