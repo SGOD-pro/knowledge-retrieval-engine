@@ -12,7 +12,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Sequence
 
 from kre.shared.models import Chunk
-from kre.shared.providers.image_url_provider import get_signed_image_url
+from kre.providers.image_url_provider import get_signed_image_url
 
 # Bucket used when the document record does not carry an explicit per-doc bucket.
 # Provide S3_BUCKET_NAME in environment to override.

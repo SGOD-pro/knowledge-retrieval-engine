@@ -74,8 +74,8 @@ def query_endpoint(req: QueryRequest):
         return cached_response
 
     # 2. Check Semantic Cache (Layer 1)
-    from kre.shared.providers.embedding_provider import embed_text
-    from kre.shared.providers.provider_client import get_active_provider
+    from kre.providers.embedding_provider import embed_text
+    from kre.providers.provider_client import get_active_provider
     provider = req.provider or get_active_provider()
     
     query_embedding = embed_text(req.query, provider=provider)

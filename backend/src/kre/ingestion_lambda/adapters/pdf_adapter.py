@@ -79,8 +79,8 @@ def parse(path, document_id: str) -> list[Chunk]:
         # Payload wraps the request in {"documents": [...]} so it matches the
         # odl-parser normalizer contract (Prompt 1 fix). Flat {s3_bucket,
         # s3_key, document_id} was wrong — the Lambda expects a batch envelope.
-        from kre.shared.config import get_boto3_client
-        client = get_boto3_client("lambda")
+        from kre.shared.aws import get_client
+        client = get_client("lambda")
 
         s3_bucket = os.environ.get("S3_BUCKET_NAME", "kre-documents-prod")
         s3_key = path.name

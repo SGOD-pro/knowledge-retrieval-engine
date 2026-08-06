@@ -5,8 +5,9 @@ from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv()
 from kre.api.main import query_endpoint, QueryRequest
-import kre.shared.providers.embedding_provider
-import kre.shared.providers.llm_provider
+import kre.providers.embedding_provider
+import kre.providers.llm_provider
+import kre.providers.reranker_provider
 
 from kre.shared.db.postgres import PostgresRepository
 _original_get_all_chunks = PostgresRepository.get_all_chunks
@@ -21,7 +22,47 @@ def _mock_get_all_chunks(self, document_ids=None):
     return _cached_chunks
 PostgresRepository.get_all_chunks = _mock_get_all_chunks
 
-from kre.shared.providers.llm_provider import generate_completion
+# Setup Stats Tracking
+stats = {
+    "llm": {"calls": 0, "time_ms": 0.0, "prompt_chars": 0, "response_chars": 0},
+    "embed": {"calls": 0, "time_ms": 0.0, "chars": 0},
+    "rerank": {"calls": 0, "time_ms": 0.0, "docs": 0}
+}
+
+_orig_generate = kre.providers.llm_provider.generate_completion
+def _tracked_generate(system_prompt, user_prompt, **kwargs):
+    t0 = time.perf_counter()
+    res = _orig_generate(system_prompt, user_prompt, **kwargs)
+    t1 = time.perf_counter()
+    stats["llm"]["calls"] += 1
+    stats["llm"]["time_ms"] += (t1 - t0) * 1000
+    stats["llm"]["prompt_chars"] += len(system_prompt) + len(user_prompt)
+    stats["llm"]["response_chars"] += len(res)
+    return res
+kre.providers.llm_provider.generate_completion = _tracked_generate
+
+_orig_embed = kre.providers.embedding_provider.embed_text
+def _tracked_embed(text, **kwargs):
+    t0 = time.perf_counter()
+    res = _orig_embed(text, **kwargs)
+    t1 = time.perf_counter()
+    stats["embed"]["calls"] += 1
+    stats["embed"]["time_ms"] += (t1 - t0) * 1000
+    stats["embed"]["chars"] += len(text)
+    return res
+kre.providers.embedding_provider.embed_text = _tracked_embed
+
+_orig_rerank = kre.providers.reranker_provider.rerank_documents
+def _tracked_rerank(query, documents, **kwargs):
+    t0 = time.perf_counter()
+    res = _orig_rerank(query, documents, **kwargs)
+    t1 = time.perf_counter()
+    stats["rerank"]["calls"] += 1
+    stats["rerank"]["time_ms"] += (t1 - t0) * 1000
+    stats["rerank"]["docs"] += len(documents)
+    return res
+kre.providers.reranker_provider.rerank_documents = _tracked_rerank
+
 
 def run_benchmark():
     benchmark_json = Path("tests/data/benchmark_queries.json")
@@ -62,6 +103,7 @@ def run_benchmark():
             
         latency_ms = (time.perf_counter() - start_time) * 1000
         latencies.append(latency_ms)
+        print(f"Query {i} latency: {latency_ms:.2f} ms")
         
         if response.get("fast_path"):
             fast_path_count += 1
@@ -71,17 +113,39 @@ def run_benchmark():
         
         # Retrieval metrics computation
         hits = []
+        resolved_context_texts = []
         for c in citations:
             pg = None
-            chunk_id = c.get("chunk_id", "")
+            if isinstance(c, str):
+                chunk_id = c
+                loc_ref = ""
+                # Resolve chunk text for faithfulness judge
+                chunk_text = chunk_id
+                global _cached_chunks
+                if _cached_chunks is not None:
+                    chunk_text = next((chk.text for chk in _cached_chunks if chk.id == chunk_id), chunk_id)
+                else:
+                    # If cache wasn't initialized, try to use PostgresRepository directly
+                    try:
+                        repo = PostgresRepository()
+                        _cached_chunks = repo.get_all_chunks()
+                        chunk_text = next((chk.text for chk in _cached_chunks if chk.id == chunk_id), chunk_id)
+                    except Exception:
+                        pass
+                resolved_context_texts.append(chunk_text)
+            else:
+                chunk_id = c.get("chunk_id", "")
+                loc_ref = str(c.get("location_reference", ""))
+                resolved_context_texts.append(c.get("text_snippet", ""))
+                
             if ":page:" in chunk_id:
                 try:
                     pg = int(chunk_id.split(":page:")[1].split(":")[0])
                 except:
                     pass
-            elif "location_reference" in c and c["location_reference"] and str(c["location_reference"]).startswith("Page: "):
+            elif loc_ref.startswith("Page: "):
                 try:
-                    pg = int(str(c["location_reference"]).split("Page: ")[1])
+                    pg = int(loc_ref.split("Page: ")[1])
                 except:
                     pass
             
@@ -110,20 +174,22 @@ def run_benchmark():
         
         # Faithfulness (LLM judge)
         answer = response.get("answer", "")
-        prompt = f"Context: {' '.join([c.get('text_snippet', '') for c in citations])}\nAnswer: {answer}\nIs the answer supported by the context? Reply strictly YES or NO."
+        # Basic verification via LLM using resolved texts
+        context_text = " ".join(resolved_context_texts)
+        prompt = f"Context: {context_text}\nAnswer: {answer}\nIs the answer supported by the context? Reply strictly YES or NO."
         try:
-            judge_resp = generate_completion("You are a strict judge.", prompt, provider="prod").strip().upper()
+            # Bypass tracking for judge so it doesn't pollute model stats
+            judge_resp = _orig_generate("You are a strict judge.", prompt, provider="prod").strip().upper()
             if "YES" in judge_resp:
                 faithfulness_score += 1.0
         except Exception as e:
-            # Failed to judge
             pass
             
         # Context Precision
         context_precision_score += (sum(hits) / len(hits)) if hits else 0.0
         
-        # Sleep to avoid rate limits on the new API key
-        pass
+        # Sleep to avoid rate limits
+        time.sleep(4.1)
 
     # Calculate final averages
     if latencies:
@@ -161,6 +227,20 @@ def run_benchmark():
     print(f"P95 Latency: {p95_latency:.2f} ms")
     print(f"LLM Activation Rate: {llm_activation_rate:.4f} (Fast path count: {fast_path_count})")
     
+    print("\n=======================================================")
+    print("MODEL USAGE STATS")
+    print("=======================================================")
+    for model, s in stats.items():
+        print(f"--- {model.upper()} ---")
+        print(f"  Calls: {s['calls']}")
+        print(f"  Total Time: {s['time_ms']:.2f} ms")
+        if model == "llm":
+            print(f"  Prompt Chars: {s['prompt_chars']}, Response Chars: {s['response_chars']}")
+        elif model == "embed":
+            print(f"  Chars Embed: {s['chars']}")
+        elif model == "rerank":
+            print(f"  Docs Reranked: {s['docs']}")
+
     # Save results
     results = {
         "avg_latency_ms": avg_latency,
@@ -172,7 +252,8 @@ def run_benchmark():
         "precision_3": precision_3,
         "faithfulness": faithfulness_score,
         "context_precision": context_precision_score,
-        "llm_activation_rate": llm_activation_rate
+        "llm_activation_rate": llm_activation_rate,
+        "stats": stats
     }
     with open("benchmark_results.json", "w") as f:
         json.dump(results, f, indent=2)

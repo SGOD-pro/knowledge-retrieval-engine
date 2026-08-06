@@ -152,6 +152,8 @@ def embed_chunks_dual(chunks: list[Chunk], provider: str = "dev") -> list[Chunk]
         full_embeddings = api_embed_batch(texts, provider=provider)
     except Exception as e:
         logger.error(f"Failed full embeddings: {e}")
+        import traceback
+        traceback.print_exc()
         full_embeddings = [None] * len(texts)
 
     result = []

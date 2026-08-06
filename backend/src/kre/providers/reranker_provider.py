@@ -2,7 +2,7 @@
 
 Model Provider Matrix (ARCHITECTURE.md rev 5):
   - Prod: cohere.rerank-v3-5 (Bedrock)
-  - Dev:  nvidia/llama-nemotron-rerank-vl-1b-v2 (OpenRouter)
+  - Dev:  Same as Prod
 
 Rule 6: Reranker runs before compression. Always.
 Rule 28: All reranker calls route through this module.
@@ -13,83 +13,45 @@ import logging
 import os
 
 from kre.providers.provider_client import get_active_provider
+from kre.shared.reranker_config import get_reranker_client
+from kre.shared.bedrock_models import get_reranker_model
 
 logger = logging.getLogger(__name__)
 
-# Model IDs per ARCHITECTURE.md Model Provider Matrix
-_PROD_MODEL_ID = "cohere.rerank-v3-5:0"
-_DEV_MODEL_ID = os.environ.get("DEV_RERANKER_MODEL", "nvidia/llama-nemotron-rerank-vl-1b-v2")
-
 
 def rerank_documents(query: str, documents: list[str], provider: str | None = None) -> list[float]:
-    """Score a list of document strings against a query using the active reranker provider.
+    """Score a list of document strings against a query using Bedrock reranker.
 
     Returns a list of relevance scores (floats) aligned with the input documents list.
     """
-    active = provider or get_active_provider()
+    try:
+        client = get_reranker_client()
 
-    if active == "prod":
-        try:
-            import boto3
+        body = {
+            "query": query,
+            "documents": documents,
+            "top_n": len(documents),
+            "api_version": 2,
+        }
 
-            client = boto3.client("bedrock-runtime", region_name=os.environ.get("AWS_REGION", "us-east-1"))
+        response = client.invoke_model(
+            modelId=get_reranker_model(),
+            contentType="application/json",
+            accept="application/json",
+            body=json.dumps(body),
+        )
 
-            body = {
-                "query": query,
-                "documents": documents,
-                "top_n": len(documents),
-            }
+        response_body = json.loads(response.get("body").read())
+        results = response_body.get("results", [])
 
-            response = client.invoke_model(
-                modelId=_PROD_MODEL_ID,
-                contentType="application/json",
-                accept="application/json",
-                body=json.dumps(body),
-            )
+        scores = [0.0] * len(documents)
+        for r in results:
+            scores[r["index"]] = float(r["relevance_score"])
 
-            response_body = json.loads(response.get("body").read())
-            results = response_body.get("results", [])
+        return scores
 
-            scores = [0.0] * len(documents)
-            for r in results:
-                scores[r["index"]] = float(r["relevance_score"])
-
-            return scores
-
-        except Exception as e:
-            logger.error("Prod reranker failed: %s", str(e))
-
-    elif active == "dev":
-        openrouter_key = os.environ.get("OPENROUTER_API_KEY")
-        if openrouter_key:
-            try:
-                import requests
-
-                response = requests.post(
-                    "https://openrouter.ai/api/v1/rerank",
-                    headers={
-                        "Authorization": f"Bearer {openrouter_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": _DEV_MODEL_ID,
-                        "query": query,
-                        "documents": documents,
-                        "top_n": len(documents),
-                    },
-                    timeout=30.0,
-                )
-                if response.status_code == 200:
-                    data = response.json()
-                    results = data.get("results", [])
-                    scores = [0.0] * len(documents)
-                    for r in results:
-                        scores[r["index"]] = float(r["relevance_score"])
-                    return scores
-                else:
-                    logger.error("Dev reranker returned %d: %s", response.status_code, response.text)
-            except Exception as e:
-                logger.error("Dev reranker request failed: %s", str(e))
+    except Exception as e:
+        logger.error("Reranker failed: %s", str(e))
 
     # Deterministic fallback — Jaccard word overlap scoring
     scores = []

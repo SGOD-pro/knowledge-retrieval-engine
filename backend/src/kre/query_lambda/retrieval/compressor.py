@@ -29,9 +29,20 @@ def compress_chunks(query: str, chunks: list[Chunk]) -> str:
             
     final_text = "\n\n".join(compressed_text)
     
+    from kre.query_lambda.retrieval.fidelity_check import extract_query_entities
+    
+    entities = extract_query_entities(query)
+    final_text_lower = final_text.lower()
+    missing_entities = False
+    if final_text:
+        for e in entities:
+            if e.lower() not in final_text_lower:
+                missing_entities = True
+                break
+
     # If compression dropped everything (e.g. no query word matched exactly), 
-    # fallback to just sending the raw text of the top chunks.
-    if not final_text and chunks:
+    # OR if it dropped critical query entities, fallback to just sending the raw text.
+    if missing_entities or (not final_text and chunks):
         final_text = "\n\n".join(f"[{c.id}] {c.text}" for c in chunks)
         
     latency_ms = (time.perf_counter() - start_time) * 1000.0

@@ -12,7 +12,7 @@ import logging
 from dataclasses import replace
 
 from kre.shared.models import Chunk
-from kre.shared.providers.embedding_provider import embed_fast_batch, embed_text as api_embed_text
+from kre.providers.embedding_provider import embed_fast_batch, embed_text as api_embed_text
 
 logger = logging.getLogger(__name__)
 

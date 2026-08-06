@@ -1,84 +1,26 @@
-"""Centralized AWS and environment configuration.
+from pydantic_settings import BaseSettings
 
-Dev:  uses AWS_PROFILE for the default session; Bedrock always uses
-      profile 'aws' + ap-south-1 (Mumbai) regardless of the default profile.
-Prod: ambient IAM creds (instance role / env vars) — no profile needed.
-Local services (S3, SQS, …) route through AWS_ENDPOINT_URL when set (floci).
-"""
+class Settings(BaseSettings):
+    ENVIRONMENT: str = "dev"
+    
+    # AWS Resources
+    DATABASE_URL: str = "postgresql://postgres:postgres@localhost:5432/kre"
+    REDIS_URL: str = "redis://localhost:6379/0"
+    S3_BUCKET_NAME: str = "kre-documents-prod"
+    ODL_PARSER_LAMBDA_NAME: str = "odl-parser-lambda"
+    DYNAMODB_TABLE_NAME: str = "kre-table"
 
-import os
+    # PROD Models (Bedrock)
+    PROD_LLM_MODEL: str = "apac.amazon.nova-lite-v1:0"
+    PROD_EMBEDDING_MODEL: str = "amazon.titan-embed-text-v2:0"
+    PROD_RERANKER_MODEL: str = "cohere.rerank-v3-5:0"
+    PROD_CONCEPT_MODEL: str = "apac.amazon.nova-micro-v1:0"
 
-import boto3
-from botocore.config import Config
+    class Config:
+        env_file = ".env"
+        extra = "ignore"
 
-_ENV = os.environ.get("ENVIRONMENT", "dev")
-_REGION = os.environ.get("AWS_REGION", "us-east-1")
-_ENDPOINT_URL = os.environ.get("AWS_ENDPOINT_URL") or None  # None disables override
-
-# Services that may be emulated locally via floci/LocalStack
-_LOCAL_SERVICES = {"dynamodb", "s3", "sqs", "sns", "lambda"}
-
-
-def _default_session() -> boto3.Session:
-    """Profile-based session in dev; ambient-creds session in prod."""
-    if _ENV != "prod":
-        return boto3.Session(
-            profile_name="local",
-            region_name=_REGION,
-        )
-    return boto3.Session(region_name=_REGION)
-
-
-_session = _default_session()
-
-
-def get_boto3_client(service_name: str):
-    """Return a boto3 client for service_name.
-
-    Bedrock always hits real AWS (profile 'aws', ap-south-1 in dev;
-    ambient creds in prod).  All other local-emulated services get the
-    floci endpoint when AWS_ENDPOINT_URL is set.
-    """
-    config = Config(retries={'max_attempts': 2})
-
-    if service_name == "bedrock-runtime":
-        if _ENV != "prod":
-            return boto3.Session(
-                profile_name="aws",
-                region_name="ap-south-1",
-            ).client("bedrock-runtime", config=config)
-        # Prod: let the instance role / env creds supply everything
-        return boto3.Session(region_name=_REGION).client("bedrock-runtime", config=config)
-
-    kwargs = {"config": config}
-    if _ENDPOINT_URL and service_name in _LOCAL_SERVICES:
-        kwargs["endpoint_url"] = _ENDPOINT_URL
-
-    return _session.client(service_name, **kwargs)
-
-# ==========================================
-# Model Configurations (Environment Overrides)
-# ==========================================
-
-def get_llm_model(provider: str) -> str:
-    if provider == "prod":
-        return os.environ.get("PROD_LLM_MODEL", "amazon.nova-lite-v1:0")
-    return os.environ.get("DEV_LLM_MODEL", "nvidia/nemotron-nano-9b-v2:free")
-
-def get_embedding_model(provider: str) -> str:
-    if provider == "prod":
-        return os.environ.get("PROD_EMBEDDING_MODEL", "amazon.titan-embed-text-v2:0")
-    return os.environ.get("DEV_EMBEDDING_MODEL", "nvidia/nemotron-3-embed-1b:free")
-
-def get_reranker_model(provider: str) -> str:
-    if provider == "prod":
-        return os.environ.get("PROD_RERANKER_MODEL", "cohere.rerank-v3-5:0")
-    return os.environ.get("DEV_RERANKER_MODEL", "nvidia/llama-nemotron-rerank-vl-1b-v2:free")
-
-def get_concept_model(provider: str) -> str:
-    if provider == "prod":
-        return os.environ.get("PROD_CONCEPT_MODEL", "amazon.nova-micro-v1:0")
-    return os.environ.get("DEV_CONCEPT_MODEL", "nvidia/nemotron-3-nano-30b-a3b:free")
+settings = Settings()
 
 # ==========================================
 # Caching Configuration

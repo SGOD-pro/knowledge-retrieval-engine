@@ -40,14 +40,14 @@ class VectorRetriever:
 
         if fast_path:
             # Local ONNX embedding — zero network calls (Rule 19)
-            from kre.shared.providers.embedding_provider import embed_fast_local
+            from kre.providers.embedding_provider import embed_fast_local
 
             query_embedding = embed_fast_local(query)
             embedding_column = "embedding_fast"
         else:
             # API embedding — through provider layer (Rule 28)
-            from kre.shared.providers.embedding_provider import embed_text
-            from kre.shared.providers.provider_client import get_active_provider
+            from kre.providers.embedding_provider import embed_text
+            from kre.providers.provider_client import get_active_provider
 
             active_provider = get_active_provider()
             query_embedding = embed_text(query, provider=active_provider)

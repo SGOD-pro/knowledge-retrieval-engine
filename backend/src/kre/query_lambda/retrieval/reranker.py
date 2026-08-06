@@ -1,7 +1,7 @@
 import logging
 import time
 from kre.shared.models import Chunk
-from kre.shared.providers.reranker_provider import rerank_documents
+from kre.providers.reranker_provider import rerank_documents
 
 logger = logging.getLogger(__name__)
 

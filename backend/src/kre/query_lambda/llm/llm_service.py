@@ -4,7 +4,7 @@ import re
 import time
 from typing import Any
 
-from kre.shared.providers.llm_provider import generate_completion
+from kre.providers.llm_provider import generate_completion
 
 logger = logging.getLogger(__name__)
 

@@ -19,7 +19,22 @@ class PostgresRepository:
         elif env == "prod":
             self.dsn = os.environ["DATABASE_URL"]  # Must be set in prod
         else:
-            self.dsn = os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/kre")
+            try:
+                from kre.shared.aws import get_client
+                rds_client = get_client("rds")
+                response = rds_client.describe_db_instances()
+                if response["DBInstances"]:
+                    db_instance = response["DBInstances"][0]
+                    host = db_instance["Endpoint"]["Address"]
+                    port = db_instance["Endpoint"]["Port"]
+                    username = db_instance["MasterUsername"]
+                    self.dsn = f"postgresql://{username}:postgres@{host}:{port}/kre"
+                else:
+                    self.dsn = os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/kre")
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning("Failed to fetch RDS instance, falling back to DATABASE_URL: %s", e)
+                self.dsn = os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/kre")
 
     def _connect(self):
         return psycopg.connect(self.dsn)

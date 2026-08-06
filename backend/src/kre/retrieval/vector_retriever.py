@@ -46,8 +46,8 @@ class VectorRetriever:
             embedding_column = "embedding_fast"
         else:
             # API embedding — through provider layer (Rule 28)
-            from kre.shared.providers.embedding_provider import embed_text
-            from kre.shared.providers.provider_client import get_active_provider
+            from kre.providers.embedding_provider import embed_text
+            from kre.providers.provider_client import get_active_provider
 
             active_provider = get_active_provider()
             try:
