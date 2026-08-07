@@ -11,7 +11,7 @@ Adapter = Callable[[Path, str], list[Chunk]]
 def route(path: Path) -> tuple[str, Adapter]:
     suffix = path.suffix.lower()
     adapters: dict[str, tuple[str, Adapter]] = {
-        ".pdf": ("pdf", pdf_adapter.parse),
+        ".pdf": ("pdf", lambda path, doc_id: __import__('kre.ingestion_lambda.adapters.pdf_adapter', fromlist=['']).parse(path, doc_id)),
         ".docx": ("docx", docx_adapter.parse),
         ".xlsx": ("xlsx", xlsx_adapter.parse),
         ".pptx": ("pptx", pptx_adapter.parse),

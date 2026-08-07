@@ -2,3 +2,4 @@
 /odl/*.json
 
 /bge-onix/model.onnx
+__pycache__

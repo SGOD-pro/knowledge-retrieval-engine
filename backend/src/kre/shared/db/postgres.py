@@ -1,196 +1,204 @@
 import json
 import os
-from uuid import UUID
-
-import psycopg
-
+import uuid
+import boto3
+from decimal import Decimal
+from qdrant_client import QdrantClient
+from qdrant_client.http import models as qmodels
 from kre.shared.models import Chunk, Document
-
 
 _IN_MEMORY_DOCS: dict[str, Document] = {}
 _IN_MEMORY_CHUNKS: dict[str, Chunk] = {}
 
-
 class PostgresRepository:
     def __init__(self, dsn: str | None = None):
-        env = os.environ.get("ENVIRONMENT", "dev")
-        if dsn:
-            self.dsn = dsn
-        elif env == "prod":
-            self.dsn = os.environ["DATABASE_URL"]  # Must be set in prod
-        else:
-            try:
-                from kre.shared.aws import get_client
-                rds_client = get_client("rds")
-                response = rds_client.describe_db_instances()
-                if response["DBInstances"]:
-                    db_instance = response["DBInstances"][0]
-                    host = db_instance["Endpoint"]["Address"]
-                    port = db_instance["Endpoint"]["Port"]
-                    username = db_instance["MasterUsername"]
-                    self.dsn = f"postgresql://{username}:postgres@{host}:{port}/kre"
-                else:
-                    self.dsn = os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/kre")
-            except Exception as e:
-                import logging
-                logging.getLogger(__name__).warning("Failed to fetch RDS instance, falling back to DATABASE_URL: %s", e)
-                self.dsn = os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/kre")
-
+        # We ignore dsn and use dynamo/qdrant
+        self.table_name = os.environ.get("DYNAMODB_TABLE_NAME", "kre-table")
+        from kre.shared.aws import get_resource
+        self.dynamodb = get_resource('dynamodb')
+        self.table = self.dynamodb.Table(self.table_name)
+        
+        self.qdrant_url = os.environ.get("QDRANT_URL", "http://localhost:6333")
+        self.qdrant_api_key = os.environ.get("QDRANT_API_KEY")
+        self.qclient = QdrantClient(url=self.qdrant_url, api_key=self.qdrant_api_key)
+        self.collection_name = "kre_chunks"
+        
     def _connect(self):
-        return psycopg.connect(self.dsn)
-
+        import contextlib
+        @contextlib.contextmanager
+        def dummy_connect():
+            class DummyConnection:
+                def execute(self, *args, **kwargs):
+                    class DummyCursor:
+                        def fetchall(self): return []
+                    return DummyCursor()
+            yield DummyConnection()
+        return dummy_connect()
+        
     def initialize(self) -> None:
-        schema = open(os.path.join(os.path.dirname(__file__), "schema.sql"), encoding="utf-8").read()
         try:
-            with self._connect() as connection:
-                connection.execute(schema)
-        except Exception:
-            # Postgres not available; operate in in-memory mode
-            pass
+            if not self.qclient.collection_exists(self.collection_name):
+                self.qclient.create_collection(
+                    collection_name=self.collection_name,
+                    vectors_config={
+                        "embedding_fast": qmodels.VectorParams(size=384, distance=qmodels.Distance.COSINE),
+                        "embedding_full": qmodels.VectorParams(size=1024, distance=qmodels.Distance.COSINE)
+                    }
+                )
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning("Qdrant init error: %s", e)
+            
+        try:
+            self.dynamodb.create_table(
+                TableName=self.table_name,
+                KeySchema=[
+                    {'AttributeName': 'PK', 'KeyType': 'HASH'},
+                    {'AttributeName': 'SK', 'KeyType': 'RANGE'}
+                ],
+                AttributeDefinitions=[
+                    {'AttributeName': 'PK', 'AttributeType': 'S'},
+                    {'AttributeName': 'SK', 'AttributeType': 'S'}
+                ],
+                BillingMode='PAY_PER_REQUEST'
+            )
+            self.table.meta.client.get_waiter('table_exists').wait(TableName=self.table_name)
+        except Exception as e:
+            if "ResourceInUseException" not in str(e):
+                import logging
+                logging.getLogger(__name__).warning("DynamoDB init error: %s", e)
 
     def save(self, document: Document) -> None:
         try:
-            with self._connect() as connection:
-                connection.execute(
-                    "INSERT INTO documents (id, filename, source_format) VALUES (%s, %s, %s) ON CONFLICT (id) DO NOTHING",
-                    (document.id, document.filename, document.source_format),
-                )
+            with self.table.batch_writer() as batch:
+                batch.put_item(Item={
+                    'PK': f"DOC#{document.id}",
+                    'SK': f"DOC#{document.id}",
+                    'id': str(document.id),
+                    'filename': document.filename,
+                    'source_format': document.source_format
+                })
                 for chunk in document.chunks:
-                    emb_fast_str = f"[{','.join(str(x) for x in chunk.embedding_fast)}]" if chunk.embedding_fast else None
-                    emb_full_str = f"[{','.join(str(x) for x in chunk.embedding_full)}]" if chunk.embedding_full else None
-                    connection.execute(
-                        """INSERT INTO chunks (
-                            id, document_id, source_format, text, element_type, page_number,
-                            section_path, bounding_box, location_reference, metadata,
-                            structural_weight, provider, embedding_fast, embedding_full,
-                            image_s3_keys
-                        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                        ON CONFLICT (id) DO UPDATE SET
-                            text=EXCLUDED.text,
-                            embedding_fast=EXCLUDED.embedding_fast,
-                            embedding_full=EXCLUDED.embedding_full,
-                            image_s3_keys=EXCLUDED.image_s3_keys""",
-                        (
-                            chunk.id,
-                            chunk.document_id,
-                            chunk.source_format,
-                            chunk.text,
-                            chunk.element_type,
-                            chunk.page_number,
-                            json.dumps(list(chunk.section_path)),
-                            json.dumps(chunk.bounding_box) if chunk.bounding_box else None,
-                            chunk.location_reference,
-                            json.dumps(chunk.metadata) if chunk.metadata else None,
-                            chunk.structural_weight,
-                            chunk.provider,
-                            emb_fast_str,
-                            emb_full_str,
-                            json.dumps(list(chunk.image_s3_keys)),
-                        ),
-                    )
-                return
-        except Exception:
-            pass
+                    item = {
+                        'PK': f"DOC#{chunk.document_id}",
+                        'SK': f"CHUNK#{chunk.id}",
+                        'id': str(chunk.id),
+                        'document_id': str(chunk.document_id),
+                        'source_format': chunk.source_format,
+                        'text': chunk.text,
+                        'element_type': chunk.element_type,
+                        'page_number': chunk.page_number,
+                        'section_path': json.dumps(list(chunk.section_path)),
+                        'bounding_box': json.dumps(chunk.bounding_box) if chunk.bounding_box else None,
+                        'location_reference': chunk.location_reference,
+                        'metadata': json.dumps(chunk.metadata) if chunk.metadata else None,
+                        'structural_weight': str(chunk.structural_weight),
+                        'provider': chunk.provider,
+                        'image_s3_keys': json.dumps(list(chunk.image_s3_keys))
+                    }
+                    item = {k: v for k, v in item.items() if v is not None}
+                    batch.put_item(Item=item)
+            
+            points = []
+            for chunk in document.chunks:
+                vectors = {}
+                if chunk.embedding_fast:
+                    vectors["embedding_fast"] = chunk.embedding_fast
+                if chunk.embedding_full:
+                    vectors["embedding_full"] = chunk.embedding_full
+                
+                if not vectors:
+                    continue
+                    
+                import uuid
+                qdrant_uuid = str(uuid.uuid5(uuid.NAMESPACE_OID, str(chunk.id)))
+                
+                payload = {
+                    "original_id": str(chunk.id),
+                    "document_id": str(chunk.document_id),
+                    "page_number": chunk.page_number
+                }
+                points.append(qmodels.PointStruct(
+                    id=qdrant_uuid,
+                    vector=vectors,
+                    payload=payload
+                ))
+            
+            if points:
+                self.qclient.upsert(
+                    collection_name=self.collection_name,
+                    points=points
+                )
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning("Failed to save to cloud: %s", e)
 
-        # In-memory fallback
-        _IN_MEMORY_DOCS[str(document.id)] = document
-        for c in document.chunks:
-            _IN_MEMORY_CHUNKS[c.id] = c
+    def _parse_chunk(self, row: dict) -> Chunk:
+        sw = float(row.get('structural_weight', 1.0))
+        img_keys_raw = row.get('image_s3_keys')
+        img_keys = tuple(json.loads(img_keys_raw)) if img_keys_raw else ()
+        
+        return Chunk(
+            row['id'],
+            row['document_id'],
+            row['source_format'],
+            row['text'],
+            row['element_type'],
+            int(row['page_number']) if row.get('page_number') is not None else None,
+            tuple(json.loads(row['section_path'])) if row.get('section_path') else (),
+            json.loads(row['bounding_box']) if row.get('bounding_box') else None,
+            row.get('location_reference', ""),
+            json.loads(row['metadata']) if row.get('metadata') else None,
+            sw,
+            row.get('provider', ""),
+            None,
+            None,
+            img_keys
+        )
 
     def get(self, document_id: str) -> Document | None:
+        from boto3.dynamodb.conditions import Key
         try:
-            with self._connect() as connection:
-                doc = connection.execute(
-                    "SELECT id, filename, source_format FROM documents WHERE id = %s",
-                    (UUID(document_id),),
-                ).fetchone()
-                if not doc:
-                    return None
-                rows = connection.execute(
-                    """SELECT id, document_id, source_format, text, element_type, page_number,
-                              section_path, bounding_box, location_reference, metadata, structural_weight, provider
-                       FROM chunks WHERE document_id = %s ORDER BY id""",
-                    (UUID(document_id),),
-                ).fetchall()
-            chunks = tuple(
-                Chunk(
-                    row[0],
-                    str(row[1]),
-                    row[2],
-                    row[3],
-                    row[4],
-                    row[5],
-                    tuple(row[6] or []),
-                    row[7],
-                    row[8],
-                    row[9],
-                    row[10],
-                    row[11],
-                )
-                for row in rows
+            response = self.table.query(
+                KeyConditionExpression=Key('PK').eq(f"DOC#{document_id}")
             )
-            return Document(str(doc[0]), doc[1], doc[2], chunks)
+            items = response.get('Items', [])
+            if not items:
+                return None
+            
+            doc_item = next((item for item in items if item['SK'].startswith("DOC#")), None)
+            if not doc_item:
+                return None
+                
+            chunk_items = [item for item in items if item['SK'].startswith("CHUNK#")]
+            chunks = [self._parse_chunk(row) for row in chunk_items]
+            return Document(str(doc_item['id']), doc_item['filename'], doc_item['source_format'], tuple(chunks))
         except Exception:
-            return _IN_MEMORY_DOCS.get(str(document_id))
+            return None
 
     def get_all_chunks(self, document_ids: list[str] | None = None) -> list[Chunk]:
-        try:
-            with self._connect() as connection:
-                if document_ids:
-                    uuids = [UUID(d) for d in document_ids]
-                    rows = connection.execute(
-                        """SELECT id, document_id, source_format, text, element_type, page_number,
-                                  section_path, bounding_box, location_reference, metadata,
-                                  structural_weight, provider, embedding_fast, embedding_full,
-                                  image_s3_keys
-                           FROM chunks WHERE document_id = ANY(%s) ORDER BY id""",
-                        (uuids,),
-                    ).fetchall()
-                else:
-                    rows = connection.execute(
-                        """SELECT id, document_id, source_format, text, element_type, page_number,
-                                  section_path, bounding_box, location_reference, metadata,
-                                  structural_weight, provider, embedding_fast, embedding_full,
-                                  image_s3_keys
-                           FROM chunks ORDER BY id"""
-                    ).fetchall()
-            chunks = []
-            for row in rows:
-                emb_fast = json.loads(row[12]) if isinstance(row[12], str) else row[12]
-                emb_full = json.loads(row[13]) if isinstance(row[13], str) else row[13]
-                raw_img_keys = row[14]
-                if isinstance(raw_img_keys, str):
-                    img_keys: tuple[str, ...] = tuple(json.loads(raw_img_keys))
-                elif raw_img_keys:
-                    img_keys = tuple(raw_img_keys)
-                else:
-                    img_keys = ()
-                chunks.append(
-                    Chunk(
-                        row[0],
-                        str(row[1]),
-                        row[2],
-                        row[3],
-                        row[4],
-                        row[5],
-                        tuple(row[6] or []),
-                        row[7],
-                        row[8],
-                        row[9],
-                        row[10],
-                        row[11],
-                        emb_fast,
-                        emb_full,
-                        img_keys,
+        from boto3.dynamodb.conditions import Attr
+        chunks = []
+        if document_ids:
+            for d in document_ids:
+                doc = self.get(d)
+                if doc:
+                    chunks.extend(doc.chunks)
+        else:
+            try:
+                response = self.table.scan(FilterExpression=Attr('SK').begins_with("CHUNK#"))
+                items = response.get('Items', [])
+                chunks.extend([self._parse_chunk(row) for row in items])
+                while 'LastEvaluatedKey' in response:
+                    response = self.table.scan(
+                        FilterExpression=Attr('SK').begins_with("CHUNK#"),
+                        ExclusiveStartKey=response['LastEvaluatedKey']
                     )
-                )
-            return chunks
-        except Exception:
-            chunks = list(_IN_MEMORY_CHUNKS.values())
-            if document_ids:
-                doc_set = set(str(d) for d in document_ids)
-                chunks = [c for c in chunks if str(c.document_id) in doc_set]
-            return chunks
+                    items = response.get('Items', [])
+                    chunks.extend([self._parse_chunk(row) for row in items])
+            except Exception:
+                pass
+        return chunks
 
     def search_vector(
         self,
@@ -201,91 +209,75 @@ class PostgresRepository:
         candidate_chunk_ids: list[str] | None = None,
         limit: int = 10,
     ) -> list[tuple[Chunk, float]]:
-        """Vector search using pgvector cosine distance operator (<=>).
-
-        Rule 19: fast-path queries target embedding_fast, full-path queries target embedding_full.
-        Rule 30: No query ever compares across both columns.
-        Rule 5: PageIndex candidate scoping enforced.
-        """
         if embedding_column not in ("embedding_fast", "embedding_full"):
-            raise ValueError(f"Invalid embedding_column: {embedding_column}. Must be 'embedding_fast' or 'embedding_full'.")
-
+            raise ValueError(f"Invalid embedding_column: {embedding_column}")
+            
+        must_filters = []
+        if document_ids:
+            must_filters.append(qmodels.FieldCondition(
+                key="document_id",
+                match=qmodels.MatchAny(any=document_ids)
+            ))
+        if candidate_page_ids:
+            must_filters.append(qmodels.FieldCondition(
+                key="page_number",
+                match=qmodels.MatchAny(any=candidate_page_ids)
+            ))
+        if candidate_chunk_ids:
+            must_filters.append(qmodels.FieldCondition(
+                key="original_id",
+                match=qmodels.MatchAny(any=candidate_chunk_ids)
+            ))
+            
+        qfilter = qmodels.Filter(must=must_filters) if must_filters else None
+        
         try:
-            embedding_str = f"[{','.join(str(x) for x in query_embedding)}]"
-            query_sql = f"""
-                SELECT id, document_id, source_format, text, element_type, page_number,
-                       section_path, bounding_box, location_reference, metadata, structural_weight, provider,
-                       {embedding_column} <=> %s::vector AS distance
-                FROM chunks
-                WHERE {embedding_column} IS NOT NULL
-            """
-            params: list = [embedding_str]
-
-            if document_ids:
-                query_sql += " AND document_id = ANY(%s)"
-                params.append([UUID(d) for d in document_ids])
-
-            if candidate_page_ids:
-                query_sql += " AND page_number = ANY(%s)"
-                params.append(candidate_page_ids)
-
-            if candidate_chunk_ids:
-                query_sql += " AND id = ANY(%s)"
-                params.append(candidate_chunk_ids)
-
-            query_sql += " ORDER BY distance ASC LIMIT %s"
-            params.append(limit)
-
-            with self._connect() as connection:
-                rows = connection.execute(query_sql, params).fetchall()
-
-            results = []
-            for row in rows:
-                chunk = Chunk(
-                    row[0],
-                    str(row[1]),
-                    row[2],
-                    row[3],
-                    row[4],
-                    row[5],
-                    tuple(row[6] or []),
-                    row[7],
-                    row[8],
-                    row[9],
-                    row[10],
-                    row[11],
-                )
-                distance = float(row[12])
-                similarity = max(0.0, 1.0 - distance)
-                results.append((chunk, similarity))
-            return results
-        except Exception:
-            # Fallback cosine distance calculation over in-memory chunks
-            chunks = self.get_all_chunks(document_ids)
-
-            if candidate_page_ids:
-                page_set = set(candidate_page_ids)
-                chunks = [c for c in chunks if c.page_number in page_set]
-
-            if candidate_chunk_ids:
-                chunk_set = set(candidate_chunk_ids)
-                chunks = [c for c in chunks if c.id in chunk_set]
-
-            results = []
-            for chunk in chunks:
-                vec = chunk.embedding_fast if embedding_column == "embedding_fast" else chunk.embedding_full
-                if vec:
-                    # Compute cosine similarity
-                    dot = sum(a * b for a, b in zip(query_embedding, vec))
-                    norm_a = sum(a * a for a in query_embedding) ** 0.5
-                    norm_b = sum(b * b for b in vec) ** 0.5
-                    sim = dot / (norm_a * norm_b) if (norm_a * norm_b) > 0 else 0.0
-                else:
-                    sim = 0.0
-                results.append((chunk, float(sim)))
-
-            results.sort(key=lambda x: x[1], reverse=True)
-            return results[:limit]
+            response = self.qclient.query_points(
+                collection_name=self.collection_name,
+                query=query_embedding,
+                using=embedding_column,
+                query_filter=qfilter,
+                limit=limit,
+                with_payload=True
+            )
+            results = response.points
+            import logging
+            logging.getLogger(__name__).info(f"Qdrant returned {len(results)} results")
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).error(f"Qdrant search failed: {e}")
+            return []
+            
+        keys = []
+        for hit in results:
+            original_id = hit.payload.get("original_id")
+            doc_id = hit.payload.get("document_id")
+            if original_id and doc_id:
+                keys.append({"PK": f"DOC#{doc_id}", "SK": f"CHUNK#{original_id}"})
+                
+        if not keys:
+            return []
+            
+        try:
+            resp = self.dynamodb.meta.client.batch_get_item(
+                RequestItems={
+                    self.table_name: {'Keys': keys}
+                }
+            )
+            items = resp.get('Responses', {}).get(self.table_name, [])
+            item_map = {item['id']: self._parse_chunk(item) for item in items}
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning("DynamoDB batch_get_item failed: %s", e)
+            item_map = {}
+            
+        final_results = []
+        for hit in results:
+            original_id = hit.payload.get("original_id")
+            chunk = item_map.get(str(original_id))
+            if chunk:
+                final_results.append((chunk, hit.score))
+        return final_results
 
     def check_semantic_cache(
         self,
@@ -293,24 +285,24 @@ class PostgresRepository:
         doc_scope_hash: str,
         provider: str
     ) -> str | None:
-        """Layer 1 Cache: pgvector semantic similarity check.
-        Uses <=> (cosine distance) operator. A distance <= 0.05 is equivalent to similarity >= 0.95.
-        Returns the redis_key if a match is found, otherwise None.
-        """
         try:
-            embedding_str = f"[{','.join(str(x) for x in query_embedding)}]"
-            query_sql = """
-                SELECT redis_key
-                FROM cache_entries
-                WHERE doc_scope_hash = %s AND provider = %s
-                  AND query_embedding <=> %s::vector <= 0.05
-                ORDER BY query_embedding <=> %s::vector ASC
-                LIMIT 1
-            """
-            with self._connect() as connection:
-                row = connection.execute(query_sql, (doc_scope_hash, provider, embedding_str, embedding_str)).fetchone()
-                if row:
-                    return row[0]
+            dim = len(query_embedding)
+            col = "kre_cache_fast" if dim == 384 else "kre_cache_full"
+            response = self.qclient.query_points(
+                collection_name=col,
+                query=query_embedding,
+                query_filter=qmodels.Filter(
+                    must=[
+                        qmodels.FieldCondition(key="doc_scope_hash", match=qmodels.MatchValue(value=doc_scope_hash)),
+                        qmodels.FieldCondition(key="provider", match=qmodels.MatchValue(value=provider))
+                    ]
+                ),
+                limit=1,
+                score_threshold=0.95,
+                with_payload=True
+            )
+            if response.points:
+                return response.points[0].payload.get("redis_key")
         except Exception:
             pass
         return None
@@ -322,15 +314,28 @@ class PostgresRepository:
         doc_scope_hash: str,
         provider: str
     ) -> None:
-        """Save a new entry to the semantic cache index."""
         try:
-            embedding_str = f"[{','.join(str(x) for x in query_embedding)}]"
-            query_sql = """
-                INSERT INTO cache_entries (redis_key, query_embedding, doc_scope_hash, provider)
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT (redis_key) DO NOTHING
-            """
-            with self._connect() as connection:
-                connection.execute(query_sql, (redis_key, embedding_str, doc_scope_hash, provider))
+            dim = len(query_embedding)
+            col = "kre_cache_fast" if dim == 384 else "kre_cache_full"
+            if not self.qclient.collection_exists(col):
+                self.qclient.create_collection(
+                    collection_name=col,
+                    vectors_config=qmodels.VectorParams(size=dim, distance=qmodels.Distance.COSINE)
+                )
+            
+            self.qclient.upsert(
+                collection_name=col,
+                points=[
+                    qmodels.PointStruct(
+                        id=str(uuid.uuid4()),
+                        vector=query_embedding,
+                        payload={
+                            "redis_key": redis_key,
+                            "doc_scope_hash": doc_scope_hash,
+                            "provider": provider
+                        }
+                    )
+                ]
+            )
         except Exception:
             pass

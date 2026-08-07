@@ -1,0 +1,62 @@
+[
+  {
+    "id": "hdfc_01",
+    "query": "What does best days mean in the context of market timing?",
+    "expected_keywords": ["highest returns"],
+    "expected_doc": "hdfc-mutual-fund-handbook.pdf"
+  },
+  {
+    "id": "hdfc_02",
+    "query": "How does inflation affect your money's purchasing power?",
+    "expected_keywords": ["reduces", "same things tomorrow"],
+    "expected_doc": "hdfc-mutual-fund-handbook.pdf"
+  },
+  {
+    "id": "hdfc_03",
+    "query": "What has CPI inflation averaged at over the last 4 decades?",
+    "expected_keywords": ["decades", "averaged"],
+    "expected_doc": "hdfc-mutual-fund-handbook.pdf"
+  },
+  {
+    "id": "hdfc_04",
+    "query": "Can equity mutual funds beat inflation?",
+    "expected_keywords": ["potential to beat inflation", "higher returns"],
+    "expected_doc": "hdfc-mutual-fund-handbook.pdf"
+  },
+  {
+    "id": "hdfc_05",
+    "query": "What was the retail inflation as of 31st July 2024?",
+    "expected_keywords": ["3.54%"],
+    "expected_doc": "hdfc-mutual-fund-handbook.pdf"
+  },
+  {
+    "id": "hdfc_06",
+    "query": "How is interest income taxed in Debt MFs compared to FDs?",
+    "expected_keywords": ["accrual basis", "dividend is received", "units are redeemed"],
+    "expected_doc": "hdfc-mutual-fund-handbook.pdf"
+  },
+  {
+    "id": "hdfc_07",
+    "query": "What should be the sum assured for a Term Insurance policy?",
+    "expected_keywords": ["10x", "initial annual salary"],
+    "expected_doc": "hdfc-mutual-fund-handbook.pdf"
+  },
+  {
+    "id": "hdfc_08",
+    "query": "What is the benefit of skipping one cigarette per day?",
+    "expected_keywords": ["5,475"],
+    "expected_doc": "hdfc-mutual-fund-handbook.pdf"
+  },
+  {
+    "id": "hdfc_09",
+    "query": "What is the corpus at the end of 20 years if you top up a 10,000 SIP by 10% each year?",
+    "expected_keywords": ["2.39 Crore"],
+    "expected_doc": "hdfc-mutual-fund-handbook.pdf"
+  },
+  {
+    "id": "hdfc_10",
+    "query": "Who dominates the AUM of Debt MF?",
+    "expected_keywords": ["institutional investors"],
+    "expected_doc": "hdfc-mutual-fund-handbook.pdf"
+  }
+]

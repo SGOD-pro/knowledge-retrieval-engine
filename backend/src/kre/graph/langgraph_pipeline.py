@@ -21,6 +21,7 @@ class PipelineState(TypedDict):
     document_ids: list[str] | None
     plan: Plan | None
     candidate_chunks: list[Chunk]
+    bm25_candidates: list[Chunk]   # BM25 top-k, preserved for reranker union
     candidate_page_ids: list[int]
     candidate_chunk_ids: list[str]
     okf_properties: list[dict[str, Any]]
@@ -42,13 +43,21 @@ def run_bm25(state: PipelineState):
     all_chunks = repo.get_all_chunks(state.get("document_ids"))
     
     retriever = BM25Retriever()
-    chunks = retriever.search(state["query"], all_chunks, top_k=20)
-    return {"candidate_chunks": [c for c, _ in chunks]}
+    chunks = retriever.search(state["query"], all_chunks, top_k=5)
+    bm25_chunks = [c for c, _ in chunks]
+    # Preserve BM25 results in bm25_candidates so the reranker can
+    # union them with vector results for recall recovery.
+    return {"candidate_chunks": bm25_chunks, "bm25_candidates": bm25_chunks}
 
 def run_page_index(state: PipelineState):
     retriever = PageIndexRetriever()
+    # top_k=20: pass all BM25 candidates through so structural scoring
+    # doesn't cull semantically-relevant chunks before vector search.
+    # PageIndex re-orders by structural weight; vector search does the
+    # final top-k selection by semantic similarity.
+    bm25_chunks = state.get("candidate_chunks", [])
     scored_page_chunks, candidate_pages = retriever.filter_and_rank(
-        state["query"], state.get("candidate_chunks", []), top_k=10
+        state["query"], bm25_chunks, top_k=len(bm25_chunks) or 20
     )
     return {
         "candidate_page_ids": candidate_pages,
@@ -70,18 +79,17 @@ def run_vector(state: PipelineState):
         query=state["query"],
         fast_path=is_fast_path,
         document_ids=state.get("document_ids"),
-        candidate_page_ids=page_ids if page_ids else None,
-        candidate_chunk_ids=chunk_ids if chunk_ids else None,
+        # To maximize recall, we must allow Vector Search to pull from the entire document,
+        # not just the tiny subset of chunks BM25 found.
+        candidate_page_ids=None,
+        candidate_chunk_ids=None,
         top_k=5
     )
-    # If fast path, return these as top_chunks directly
-    plan = state["plan"]
-    if plan and plan.fast_path:
-        # Take top 3 for fast path
-        top_chunks = [c for c, _ in chunks[:3]]
-        return {"candidate_chunks": [c for c, _ in chunks], "top_chunks": top_chunks}
-    
-    return {"candidate_chunks": [c for c, _ in chunks]}
+    # For full path: store vector results in candidate_chunks.
+    # The original BM25 candidates are already in state["candidate_chunks"] from run_bm25.
+    # We keep vector results separate so run_reranker (or end_fast_path) can union them.
+    vector_chunks = [c for c, _ in chunks]
+    return {"candidate_chunks": vector_chunks}
 
 def run_okf(state: PipelineState):
     # Very naive extraction of entities for OKF lookup to satisfy tests
@@ -102,12 +110,33 @@ def run_graph(state: PipelineState):
     return {"graph_results": results}
 
 def run_reranker(state: PipelineState):
-    chunks = state.get("candidate_chunks", [])
-    if not chunks:
-        return {"top_chunks": []}
+    vector_chunks = state.get("candidate_chunks", [])
+    bm25_chunks = state.get("bm25_candidates", [])
     
-    # Reranker trims to top 6
-    top_chunks = rerank(state["query"], chunks, top_k=6)
+    vector_ranks = {c.id: i for i, c in enumerate(vector_chunks)}
+    bm25_ranks = {c.id: i for i, c in enumerate(bm25_chunks)}
+    
+    def rrf_score(c):
+        score = 0.0
+        if c.id in vector_ranks:
+            score += 1.0 / (60 + vector_ranks[c.id])
+        if c.id in bm25_ranks:
+            score += 1.0 / (60 + bm25_ranks[c.id])
+        return score
+
+    seen_ids = set()
+    merged = []
+    for c in vector_chunks + bm25_chunks:
+        if c.id not in seen_ids:
+            seen_ids.add(c.id)
+            merged.append(c)
+            
+    merged.sort(key=rrf_score, reverse=True)
+    merged = merged[:4]
+    
+    if not merged:
+        return {"top_chunks": []}
+    top_chunks = rerank(state["query"], merged, top_k=6)
     return {"top_chunks": top_chunks}
 
 def run_compressor(state: PipelineState):
@@ -143,9 +172,22 @@ def run_llm(state: PipelineState):
     
     confidence = (avg_reranker * 0.6) + (coverage * 0.4)
     
+    # Map integer citations from LLM back to actual chunk objects
+    from kre.retrieval.response_builder import build_citation
+    raw_citations = response.get("citations", [])
+    resolved_citations = []
+    for rank_str in raw_citations:
+        try:
+            # Rank could be an integer or a string like "1"
+            idx = int(str(rank_str).strip("[]")) - 1
+            if 0 <= idx < len(top_chunks):
+                resolved_citations.append(build_citation(top_chunks[idx]).to_dict())
+        except (ValueError, TypeError):
+            pass
+            
     return {
         "final_answer": response.get("answer", "NOT_FOUND"),
-        "citations": response.get("citations", []),
+        "citations": resolved_citations,
         "confidence_score": confidence
     }
 
@@ -167,8 +209,31 @@ def route_after_fidelity(state: PipelineState):
     return "run_llm"
 
 def end_fast_path(state: PipelineState):
+    vector_chunks = state.get("candidate_chunks", [])
+    bm25_chunks = state.get("bm25_candidates", [])
+    
+    vector_ranks = {c.id: i for i, c in enumerate(vector_chunks)}
+    bm25_ranks = {c.id: i for i, c in enumerate(bm25_chunks)}
+    
+    def rrf_score(c):
+        score = 0.0
+        if c.id in vector_ranks:
+            score += 1.0 / (60 + vector_ranks[c.id])
+        if c.id in bm25_ranks:
+            score += 1.0 / (60 + bm25_ranks[c.id])
+        return score
+
+    seen_ids = set()
+    merged = []
+    for c in vector_chunks + bm25_chunks:
+        if c.id not in seen_ids:
+            seen_ids.add(c.id)
+            merged.append(c)
+            
+    merged.sort(key=rrf_score, reverse=True)
+    top_chunks = merged[:5]
+
     from kre.retrieval.response_builder import build_citation
-    top_chunks = state.get("top_chunks", [])
     citations = [build_citation(c).to_dict() for c in top_chunks]
     
     combined_answers = " ".join([c.text for c in top_chunks])
@@ -177,6 +242,7 @@ def end_fast_path(state: PipelineState):
     return {
         "final_answer": answer,
         "citations": citations,
+        "top_chunks": top_chunks,
         "confidence_score": 0.85
     }
 
@@ -244,6 +310,7 @@ class Pipeline:
             "document_ids": document_ids,
             "plan": None,
             "candidate_chunks": [],
+            "bm25_candidates": [],
             "candidate_page_ids": [],
             "candidate_chunk_ids": [],
             "okf_properties": [],
@@ -264,6 +331,7 @@ class Pipeline:
                 self.answer = state.get("final_answer", "")
                 self.citations = state.get("citations", [])
                 self.confidence_score = state.get("confidence_score", 0.0)
+                self.top_chunks = [c.id for c in state.get("top_chunks", [])]
                 plan = state.get("plan")
                 self.fast_path = plan.fast_path if plan else False
                 

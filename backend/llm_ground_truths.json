@@ -1,0 +1,779 @@
+[
+  {
+    "query": "Who are the primary NITI Aayog authors credited with writing the National Strategy for Artificial Intelligence report?",
+    "retrieved_context": "The purpose of this paper is to lay the ground work for evolving the National Strategy for Artificial Intelligence. While this paper includes several recommendations, some of which may be deemed disruptive, specifics (e.g. execution and financial implications) have been consciously avoided, since wider consultations and consensus building is needed to refine these recommendations. This document is intended to serve as an “essential pre-read” in building a truly transformative approach in pursuit of #AIforAll. Amitabh Kant CEO, NITI Aayog Executive Summary India’s Approach to Leadership in AI AI refers to the ability of machines to perform cognitive tasks like thinking, perceiving, learning, problem solving and decision making. Initially conceived as a technology that could mimic human intelligence, AI has evolved in ways that far exceed its original conception. With incredible advances made in data collection, processing and computation power, intelligent systems can now be deployed to take over a variety of tasks, enable connectivity and enhance productivity. As AI’s capabilities have dramatically expanded, so have its utility in a growing number of fields. This page has been intentionally left blank Acknowledgments In writing this Report, Arnab Kumar, Punit Shukla, Aalekh Sharan and Tanay Mahindru of NITI Aayog have made valuable contributions. Inputs were also provided by Dr. Avik Sarkar, Dr. Ashish Nayan and Kartikeya Asthana of NITI Aayog. The valuable contributions of Mr. P. Anandan and his team from Wadhwani Institute for AI, Dr. Manish Gupta of Videoken, Prof. Ramesh Raskar of MIT Media Labs, nVIDIA, Intel, IBM, NASSCOM, McKinsey and Accenture are also thankfully acknowledged. Special contribution of Accenture in the production of this report is also acknowledged. Anna Roy Advisor (Industry) NITI Aayog",
+    "llm_answer": "Arnab Kumar, Punit Shukla, Aalekh Sharan, and Tanay Mahindru are the primary NITI Aayog authors credited with writing the National Strategy for Artificial Intelligence report.",
+    "citations": [
+      {
+        "chunk_id": "44912ed2-fa9b-4401-91c5-904110f6d81a:page:6:element:33",
+        "document_id": "44912ed2-fa9b-4401-91c5-904110f6d81a",
+        "source_format": "pdf",
+        "bounding_box": {
+          "x1": 93.624,
+          "y1": 542.778,
+          "x2": 552.087,
+          "y2": 624.031
+        },
+        "location_reference": "Page: 6",
+        "text_snippet": "The purpose of this paper is to lay the ground work for evolving the National Strategy for Artificial Intelligence. While this paper includes several recommendations, some of which may be deemed disru"
+      },
+      {
+        "chunk_id": "44912ed2-fa9b-4401-91c5-904110f6d81a:page:2:element:1",
+        "document_id": "44912ed2-fa9b-4401-91c5-904110f6d81a",
+        "source_format": "pdf",
+        "bounding_box": {
+          "x1": 204.53,
+          "y1": 396.498,
+          "x2": 390.688,
+          "y2": 405.821
+        },
+        "location_reference": "Page: 2",
+        "text_snippet": "This page has been intentionally left blank Acknowledgments In writing this Report, Arnab Kumar, Punit Shukla, Aalekh Sharan and Tanay Mahindru of NITI Aayog have made valuable contributions. Inputs w"
+      }
+    ]
+  },
+  {
+    "query": "What is the projected size and CAGR of the Indian healthcare sector by 2020 as stated in the report?",
+    "retrieved_context": "Focus areas for AI intervention Sectoral deep dives Healthcare Healthcare is one of the most dynamic, yet challenging, sectors in India, and is expected to grow to USD280 billion by 2020, at a CAGR of upwards of 16%, from the current ~USD100 billion8. Yet, it faces major challenges of quality, accessibility and affordability for a large section of the population: Figure 7: Accessibility of Healthcare across India Source: PwC Analysis, World Bank data (2017) With most of the private facilities concentrated in and around tier 1 and tier 2 cities, patients have to travel substantial distances for basic and advanced healthcare services. (Box 2: What TMH’s Cancer heat map tells us about the availability of healthcare in India?)",
+    "llm_answer": "The projected size of the Indian healthcare sector by 2020 is USD280 billion, with a Compound Annual Growth Rate (CAGR) of upwards of 16%.",
+    "citations": [
+      {
+        "chunk_id": "44912ed2-fa9b-4401-91c5-904110f6d81a:page:24:element:133",
+        "document_id": "44912ed2-fa9b-4401-91c5-904110f6d81a",
+        "source_format": "pdf",
+        "bounding_box": {
+          "x1": 93.624,
+          "y1": 698.688,
+          "x2": 398.684,
+          "y2": 724.071
+        },
+        "location_reference": "Page: 24",
+        "text_snippet": "Focus areas for AI intervention Sectoral deep dives Healthcare Healthcare is one of the most dynamic, yet challenging, sectors in India, and is expected to grow to USD280 billion by 2020, at a CAGR of"
+      }
+    ]
+  },
+  {
+    "query": "According to Gartner projections cited in the AI strategy paper, what was the worldwide public cloud services market size and growth rate for 2018?",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "What percentage of Indias workforce and Gross Domestic Product (GDP) is accounted for by the agriculture and allied sector?",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "What percentage of the workforce will be engaged in entirely new jobs by 2022 according to the EY and NASSCOM study cited?",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "What is the relationship between AI intervention in agriculture and maintaining overall GDP growth in India?",
+    "retrieved_context": "AI based healthcare solutions can also help in making healthcare services more proactive – moving from “sick” care to true “health” care, with emphasis on preventive techniques. Agriculture While India has come a long way from being categorised as purely an agrarian economy, agriculture and allied sector still accounts for 49% of India’s workforce, 16% of the country’s gross domestic product (GDP)12, and ensures food security to roughly 1.3 billion people. Agriculture and allied sector is critical to India’s growth story. To achieve and maintain an annual growth rate of 8 –10% for the Indian economy, agriculture sector must grow 4% or higher rate. The Government of India has recently prioritised Doubling Farmers’ Income as a National Agenda; putting considerable focus on supply chain perspectives in agriculture and market development in addition to productivity augmentation. Accenture, in its recent AI research reports5, provides a framework for evaluating the economic impact of AI for select G20 countries and estimates AI to boost India’s annual growth rate by 1.3 percentage points by 2035. Figure 5: Unlocking innovation through AI Source: Accenture AI for Greater Good: social development and inclusive growth Beyond just the headline numbers of economic impact, a disruptive technology such as AI needs to be seen from the perspective of the transformative impact it could have on the greater good – improving the quality of life and access of choice to a large section of the country. In that sense, the recent advancements in AI seem to be custom-made for the unique opportunities and challenges that India faces. Increased access to quality health facilities (including addressing the locational access barriers), inclusive financial growth for large sections of population that have hitherto been excluded from formal financial products, providing real-time advisory to farmers and help address unforeseen factors towards increasing productivity, building smart and efficient cities and infrastructure to meet the demands of rapidly urbanising population are some of the examples that can be most effectively solved through the non-incremental advantages that a technology such as AI can provide.",
+    "llm_answer": "AI intervention in agriculture is critical to maintaining overall GDP growth in India as it can help achieve and sustain an annual growth rate of 8–10% for the Indian economy by ensuring the agriculture sector grows at a rate of 4% or higher. This is because agriculture and allied sectors account for 49% of India’s workforce and 16% of the country’s GDP, and ensuring food security for 1.3 billion people. The government has prioritized doubling farmers' income, focusing on supply chain perspectives in agriculture and market development in addition to productivity augmentation.",
+    "citations": [
+      {
+        "chunk_id": "44912ed2-fa9b-4401-91c5-904110f6d81a:page:29:element:194",
+        "document_id": "44912ed2-fa9b-4401-91c5-904110f6d81a",
+        "source_format": "pdf",
+        "bounding_box": {
+          "x1": 93.624,
+          "y1": 257.109,
+          "x2": 552.06,
+          "y2": 282.637
+        },
+        "location_reference": "Page: 29",
+        "text_snippet": "AI based healthcare solutions can also help in making healthcare services more proactive – moving from “sick” care to true “health” care, with emphasis on preventive techniques. Agriculture While Indi"
+      },
+      {
+        "chunk_id": "44912ed2-fa9b-4401-91c5-904110f6d81a:page:18:element:104",
+        "document_id": "44912ed2-fa9b-4401-91c5-904110f6d81a",
+        "source_format": "pdf",
+        "bounding_box": {
+          "x1": 93.624,
+          "y1": 202.888,
+          "x2": 551.956,
+          "y2": 241.148
+        },
+        "location_reference": "Page: 18",
+        "text_snippet": "Accenture, in its recent AI research reports5, provides a framework for evaluating the economic impact of AI for select G20 countries and estimates AI to boost India’s annual growth rate by 1.3 percen"
+      }
+    ]
+  },
+  {
+    "query": "What is the statutory relationship between the National Financial Reporting Authority (NFRA) and Section 132 of the Companies Act 2013?",
+    "retrieved_context": "The Authority expects the Technical Advisory Committee (The Committee) to assist in fulfilling its mandate to protect the public interest and the interests of the users of financial statements and related information. The committee’s assistance comes in a number of ways including the following: . Chapter 7 Details of other salient activities undertaken by NFRA during the year 2020-2021 Serial Number Forum Case Number Main Parties Gist of the matter WP No. 12096 of 2019 Federation of Chartered Accountants Challenged constitutional validity AssociationV/s Union of India and NFRA of Section 132 of the Companies Act (CA) (AT) 152 of 2020",
+    "llm_answer": "The context does not provide the exact statutory relationship between the National Financial Reporting Authority (NFRA) and Section 132 of the Companies Act 2013.",
+    "citations": [
+      {
+        "chunk_id": "6253e7c5-a68c-4741-a824-bd08e9698d36:page:42:element:140",
+        "document_id": "6253e7c5-a68c-4741-a824-bd08e9698d36",
+        "source_format": "pdf",
+        "bounding_box": {
+          "x1": 93.743,
+          "y1": 109.204,
+          "x2": 518.54,
+          "y2": 156.369
+        },
+        "location_reference": "Page: 42",
+        "text_snippet": "The Authority expects the Technical Advisory Committee (The Committee) to assist in fulfilling its mandate to protect the public interest and the interests of the users of financial statements and rel"
+      }
+    ]
+  },
+  {
+    "query": "What relationship exists between NFRAs Quality Review process and audit documentation compliance?",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "How does NFRA coordinate with the Institute of Chartered Accountants of India (ICAI) in recommending accounting standards?",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "What is the relationship between international regulator networks (IFIAR) and NFRAs audit inspection methodologies?",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "Analyze NFRAs financial performance and expenditure across administrative vs legal activities during 2020-21.",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "Compare NFRAs enforcement jurisdiction over listed companies versus unlisted public companies.",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "Compare NFRAs disciplinary sanction process with traditional ICAI peer review mechanisms.",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "Analyze the impact of NFRA audit circulars on auditor appointment and independence disclosures.",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "What analytical trends emerge from NFRA advisory notes on revenue recognition compliance under Ind AS 115?",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "What key quarterly deliverables were released by the Research and Networking Division of NITI Aayog in October 2025?",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "Analyze the focus areas of NITI Sandhan October 2025 regarding state policy networking.",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "Compare the inter-divisional projects highlighted in the October 2025 NITI Sandhan issue.",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "What analytical insights are provided regarding policy monitoring frameworks in NITI Sandhan Oct 2025?",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "How does NITI Sandhan measure academic networking and research partnership outcomes in Q3 2025?",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "What BLEU score did the Transformer big model achieve on the WMT 2014 English-to-German translation task?",
+    "retrieved_context": "Residual Dropout We apply dropout [33] to the output of each sub-layer, before it is added to the sub-layer input and normalized. In addition, we apply dropout to the sums of the embeddings and the positional encodings in both the encoder and decoder stacks. For the base model, we use a rate of Pdrop = 0.1. Label Smoothing During training, we employed label smoothing of value ϵls = 0.1 [36]. This hurts perplexity, as the model learns to be more unsure, but improves accuracy and BLEU score. 6 Results 6.1 Machine Translation On the WMT 2014 English-to-German translation task, the big transformer model (Transformer (big) in Table 2) outperforms the best previously reported models (including ensembles) by more than 2.0 BLEU, establishing a new state-of-the-art BLEU score of 28.4. The configuration of this model is listed in the bottom line of Table 3. Training took 3.5 days on 8 P100 GPUs. Even our base model surpasses all previously published models and ensembles, at a fraction of the training cost of any of the competitive models.",
+    "llm_answer": "The Transformer big model achieved a BLEU score of 28.4 on the WMT 2014 English-to-German translation task.",
+    "citations": [
+      {
+        "chunk_id": "06193aad-df42-4043-91fa-9890377d702a:page:8:element:117",
+        "document_id": "06193aad-df42-4043-91fa-9890377d702a",
+        "source_format": "pdf",
+        "bounding_box": {
+          "x1": 108.0,
+          "y1": 475.179,
+          "x2": 504.001,
+          "y2": 520.707
+        },
+        "location_reference": "Page: 8",
+        "text_snippet": "Residual Dropout We apply dropout [33] to the output of each sub-layer, before it is added to the sub-layer input and normalized. In addition, we apply dropout to the sums of the embeddings and the po"
+      }
+    ]
+  },
+  {
+    "query": "How many parallel attention heads h are employed in the Multi-Head Attention mechanism of the base Transformer model?",
+    "retrieved_context": "MultiHead(Q,K,V ) = Concat(head1,...,headh)WO where headi = Attention(QWiQ,KWiK,V WiV ) Where the projections are parameter matrices WiQ ∈ Rd model×dk, WiK ∈ Rd model×dk, WiV ∈ Rd model×dv and WO ∈ Rhd v×dmodel. In this work we employ h = 8 parallel attention layers, or heads. For each of these we use dk = dv = dmodel/h = 64. Due to the reduced dimension of each head, the total computational cost is similar to that of single-head attention with full dimensionality. 3.3 Position-wise Feed-Forward Networks In addition to attention sub-layers, each of the layers in our encoder and decoder contains a fully connected feed-forward network, which is applied to each position separately and identically. This consists of two linear transformations with a ReLU activation in between. In order to increase capacity of the first self-attention stage, the transformer block applies H sets of self-attention in parallel12 (termed H heads) and then linearly projects the results down to the D × N array required for further processing. This slight generalisation is called multi-head self-attention. H Vh(m)X(m−1)A(hm), where (4) Y (m) = MHSAθ(X(m−1)) = h=1 ⊤ exp kh,n(m) qh,n(m)′ [A(hm)]n,n′ = (5) ⊤ N n′′=1 exp kh,n(m)′′ qh,n(m)′ qh,n(m) = Uq(m,h)x(nm−1) and kh,n(m) = Uk(m,h)x(nm−1). (6) Here the H matrices Vh(m) which are D ×D project the H self-attention stages down to the required output dimensionality D.13 The addition of the matrices Vh(m), and the fact that retaining just the diagonal elements of the attention matrix A(m) will interact the signal instantaneously",
+    "llm_answer": "The base Transformer model employs h = 8 parallel attention heads in the Multi-Head Attention mechanism.",
+    "citations": [
+      {
+        "chunk_id": "06193aad-df42-4043-91fa-9890377d702a:page:5:element:66",
+        "document_id": "06193aad-df42-4043-91fa-9890377d702a",
+        "source_format": "pdf",
+        "bounding_box": {
+          "x1": 186.94,
+          "y1": 633.38,
+          "x2": 410.922,
+          "y2": 645.961
+        },
+        "location_reference": "Page: 5",
+        "text_snippet": "MultiHead(Q,K,V ) = Concat(head1,...,headh)WO where headi = Attention(QWiQ,KWiK,V WiV ) Where the projections are parameter matrices WiQ ∈ Rd model×dk, WiK ∈ Rd model×dk, WiV ∈ Rd model×dv and WO ∈ Rh"
+      },
+      {
+        "chunk_id": "e2a94033-9ef4-402d-8625-15a97932e7cc:page:4:element:51",
+        "document_id": "e2a94033-9ef4-402d-8625-15a97932e7cc",
+        "source_format": "pdf",
+        "bounding_box": {
+          "x1": 56.693,
+          "y1": 303.316,
+          "x2": 385.233,
+          "y2": 353.756
+        },
+        "location_reference": "Page: 4",
+        "text_snippet": "In order to increase capacity of the first self-attention stage, the transformer block applies H sets of self-attention in parallel12 (termed H heads) and then linearly projects the results down to th"
+      }
+    ]
+  },
+  {
+    "query": "What exact mathematical formula defines Scaled Dot-Product Attention in the Transformer paper?",
+    "retrieved_context": "In practice, we compute the attention function on a set of queries simultaneously, packed together into a matrix Q. The keys and values are also packed together into matrices K and V . We compute the matrix of outputs as: QKT √dk Attention(Q,K,V ) = softmax( )V (1) The two most commonly used attention functions are additive attention [2], and dot-product (multiplicative) attention. Dot-product attention is identical to our algorithm, except for the scaling factor of √1d . Additive attention computes the compatibility function using a feed-forward network with a single hidden layer. While the two are similar in theoretical complexity, dot-product attention is much faster and more space-efficient in practice, since it can be implemented using highly optimized matrix multiplication code.",
+    "llm_answer": "The exact mathematical formula that defines Scaled Dot-Product Attention in the Transformer paper is: Attention(Q,K,V) = softmax(QKTV/√dk)V [2].",
+    "citations": [
+      {
+        "chunk_id": "06193aad-df42-4043-91fa-9890377d702a:page:4:element:49",
+        "document_id": "06193aad-df42-4043-91fa-9890377d702a",
+        "source_format": "pdf",
+        "bounding_box": {
+          "x1": 108.0,
+          "y1": 340.934,
+          "x2": 504.17,
+          "y2": 374.756
+        },
+        "location_reference": "Page: 4",
+        "text_snippet": "In practice, we compute the attention function on a set of queries simultaneously, packed together into a matrix Q. The keys and values are also packed together into matrices K and V . We compute the "
+      }
+    ]
+  },
+  {
+    "query": "What BLEU score did the Transformer big model establish on the WMT 2014 English-to-French translation benchmark?",
+    "retrieved_context": "arXiv:1706.03762v7 [cs.CL] 2 Aug 2023 Provided proper attribution is provided, Google hereby grants permission to reproduce the tables and figures in this paper solely for use in journalistic or scholarly works. Attention Is All You Need Ashish Vaswani∗ Google Brain avaswani@google.com Noam Shazeer∗ Google Brain noam@google.com Niki Parmar∗ Google Research nikip@google.com Jakob Uszkoreit∗ Google Research usz@google.com Llion Jones∗ Google Research llion@google.com Aidan N. Gomez∗ † University of Toronto aidan@cs.toronto.edu Łukasz Kaiser∗ Google Brain lukaszkaiser@google.com Illia Polosukhin∗ ‡ illia.polosukhin@gmail.com Abstract The dominant sequence transduction models are based on complex recurrent or convolutional neural networks that include an encoder and a decoder. The best performing models also connect the encoder and decoder through an attention mechanism. We propose a new simple network architecture, the Transformer, based solely on attention mechanisms, dispensing with recurrence and convolutions entirely. Experiments on two machine translation tasks show these models to be superior in quality while being more parallelizable and requiring significantly less time to train. Our model achieves 28.4 BLEU on the WMT 2014 Englishto-German translation task, improving over the existing best results, including ensembles, by over 2 BLEU. On the WMT 2014 English-to-French translation task, our model establishes a new single-model state-of-the-art BLEU score of 41.8 after training for 3.5 days on eight GPUs, a small fraction of the training costs of the best models from the literature. We show that the Transformer generalizes well to other tasks by applying it successfully to English constituency parsing both with large and limited training data.",
+    "llm_answer": "The Transformer big model established a new single-model state-of-the-art BLEU score of 41.8 on the WMT 2014 English-to-French translation benchmark.",
+    "citations": [
+      {
+        "chunk_id": "06193aad-df42-4043-91fa-9890377d702a:page:1:element:0",
+        "document_id": "06193aad-df42-4043-91fa-9890377d702a",
+        "source_format": "pdf",
+        "bounding_box": {
+          "x1": 14.04,
+          "y1": 237.0,
+          "x2": 36.36,
+          "y2": 578.08
+        },
+        "location_reference": "Page: 1",
+        "text_snippet": "arXiv:1706.03762v7 [cs.CL] 2 Aug 2023 Provided proper attribution is provided, Google hereby grants permission to reproduce the tables and figures in this paper solely for use in journalistic or schol"
+      }
+    ]
+  },
+  {
+    "query": "What dropout probability rate P_drop was applied during training of the base Transformer model?",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "What is the inner-layer dimensionality d_ff of the Position-wise Feed-Forward Networks in the base Transformer?",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "What value of label smoothing epsilon_ls was employed during training, and how did it affect perplexity?",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "What were the training dataset sizes (number of sentence pairs) for WMT 2014 English-German and English-French?",
+    "retrieved_context": "As side benefit, self-attention could yield more interpretable models. We inspect attention distributions from our models and present and discuss examples in the appendix. Not only do individual attention heads clearly learn to perform different tasks, many appear to exhibit behavior related to the syntactic and semantic structure of the sentences. 5.1 Training Data and Batching We trained on the standard WMT 2014 English-German dataset consisting of about 4.5 million sentence pairs. Sentences were encoded using byte-pair encoding [3], which has a shared sourcetarget vocabulary of about 37000 tokens. For English-French, we used the significantly larger WMT 2014 English-French dataset consisting of 36M sentences and split tokens into a 32000 word-piece vocabulary [38]. Sentence pairs were batched together by approximate sequence length. Each training batch contained a set of sentence pairs containing approximately 25000 source tokens and 25000 target tokens. As side benefit, self-attention could yield more interpretable models. We inspect attention distributions from our models and present and discuss examples in the appendix. Not only do individual attention heads clearly learn to perform different tasks, many appear to exhibit behavior related to the syntactic and semantic structure of the sentences. 5.1 Training Data and Batching We trained on the standard WMT 2014 English-German dataset consisting of about 4.5 million sentence pairs. Sentences were encoded using byte-pair encoding [3], which has a shared sourcetarget vocabulary of about 37000 tokens. For English-French, we used the significantly larger WMT 2014 English-French dataset consisting of 36M sentences and split tokens into a 32000 word-piece vocabulary [38]. Sentence pairs were batched together by approximate sequence length. Each training batch contained a set of sentence pairs containing approximately 25000 source tokens and 25000 target tokens.",
+    "llm_answer": "The WMT 2014 English-German dataset consisted of about 4.5 million sentence pairs, and the WMT 2014 English-French dataset consisted of 36 million sentence pairs.",
+    "citations": [
+      {
+        "chunk_id": "06193aad-df42-4043-91fa-9890377d702a:page:7:element:102",
+        "document_id": "06193aad-df42-4043-91fa-9890377d702a",
+        "source_format": "pdf",
+        "bounding_box": {
+          "x1": 107.641,
+          "y1": 510.825,
+          "x2": 504.004,
+          "y2": 555.556
+        },
+        "location_reference": "Page: 7",
+        "text_snippet": "As side benefit, self-attention could yield more interpretable models. We inspect attention distributions from our models and present and discuss examples in the appendix. Not only do individual atten"
+      },
+      {
+        "chunk_id": "06193aad-df42-4043-91fa-9890377d702a:page:7:element:102",
+        "document_id": "06193aad-df42-4043-91fa-9890377d702a",
+        "source_format": "pdf",
+        "bounding_box": {
+          "x1": 107.641,
+          "y1": 510.825,
+          "x2": 504.004,
+          "y2": 555.556
+        },
+        "location_reference": "Page: 7",
+        "text_snippet": "As side benefit, self-attention could yield more interpretable models. We inspect attention distributions from our models and present and discuss examples in the appendix. Not only do individual atten"
+      }
+    ]
+  },
+  {
+    "query": "What beam size and length penalty alpha were used for beam search decoding during evaluation?",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "Why is the dot product scaled by 1/sqrt(d_k) in Scaled Dot-Product Attention as key dimension d_k grows large?",
+    "retrieved_context": "k While for small values of dk the two mechanisms perform similarly, additive attention outperforms dot product attention without scaling for larger values of dk [3]. We suspect that for large values of dk, the dot products grow large in magnitude, pushing the softmax function into regions where it has extremely small gradients 4. To counteract this effect, we scale the dot products by √1d . k 3.2.2 Multi-Head Attention Instead of performing a single attention function with dmodel-dimensional keys, values and queries, we found it beneficial to linearly project the queries, keys and values h times with different, learned 3.2 Attention An attention function can be described as mapping a query and a set of key-value pairs to an output, where the query, keys, values, and output are all vectors. The output is computed as a weighted sum Scaled Dot-Product Attention Multi-Head Attention of the values, where the weight assigned to each value is computed by a compatibility function of the query with the corresponding key. 3.2.1 Scaled Dot-Product Attention We call our particular attention \"Scaled Dot-Product Attention\" (Figure 2). The input consists of queries and keys of dimension dk, and values of dimension dv. We compute the dot products of the query with all keys, divide each by √dk, and apply a softmax function to obtain the weights on the values.",
+    "llm_answer": "To counteract the effect of the dot products growing large in magnitude, which pushes the softmax function into regions where it has extremely small gradients.",
+    "citations": [
+      {
+        "chunk_id": "06193aad-df42-4043-91fa-9890377d702a:page:4:element:56",
+        "document_id": "06193aad-df42-4043-91fa-9890377d702a",
+        "source_format": "pdf",
+        "bounding_box": {
+          "x1": 130.749,
+          "y1": 256.599,
+          "x2": 134.525,
+          "y2": 261.58
+        },
+        "location_reference": "Page: 4",
+        "text_snippet": "k While for small values of dk the two mechanisms perform similarly, additive attention outperforms dot product attention without scaling for larger values of dk [3]. We suspect that for large values "
+      },
+      {
+        "chunk_id": "06193aad-df42-4043-91fa-9890377d702a:page:3:element:40",
+        "document_id": "06193aad-df42-4043-91fa-9890377d702a",
+        "source_format": "pdf",
+        "bounding_box": {
+          "x1": 108.0,
+          "y1": 99.49,
+          "x2": 170.814,
+          "y2": 112.451
+        },
+        "location_reference": "Page: 3",
+        "text_snippet": "3.2 Attention An attention function can be described as mapping a query and a set of key-value pairs to an output, where the query, keys, values, and output are all vectors. The output is computed as "
+      }
+    ]
+  },
+  {
+    "query": "How does masking in decoder self-attention preserve the autoregressive property during training?",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "What structural relationship exists between Pre-LN versus Post-LN placement and optimization stability?",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "How does weight decay regularization interact with AdamW optimizer stability during Transformer training?",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "Compare the IO memory complexity and exact FLOP count of FlashAttention against standard Softmax Attention.",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "Analyze the KV cache memory reduction achieved by Grouped-Query Attention (GQA) and Multi-Query Attention (MQA) versus Multi-Head Attention (MHA).",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "Analyze the memory and latency reductions achieved by Sparse Attention patterns (e.g. Longformer, BigBird) over dense full attention.",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "Compare sliding window attention throughput against full attention in continuous LLM generation.",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "Compare PagedAttention virtual memory management efficiency against contiguous tensor memory allocation in LLM serving.",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "What is the analytical impact of KV cache quantization (INT8/INT4) on memory bandwidth and perplexity degradation?",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "Analyze the historical architectural evolution of efficient attention mechanisms from 2017 to 2025.",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "Compare Kernel-based feature map attention methods (e.g. Performer) against low-rank factorization methods (e.g. Linformer).",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "How do State Space Model (SSM) hybrid architectures (e.g. Mamba-Attention) compare to pure Transformers in inference latency?",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "Analyze the quantitative impact of prompt lookup caching and prefix caching on Time-To-First-Token (TTFT) latency.",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "Compare Rotary Position Embedding (RoPE) context extension methods: linear interpolation versus NTK-aware scaling.",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "What item section covers the Financial Statements in Part I of the Form 10-Q report?",
+    "retrieved_context": "Item 6. Exhibits Incorporated by Reference Filing Date/ Period End Date Exhibit Number Exhibit Description Form Exhibit 101* Inline XBRL Document Set for the condensed consolidated financial statements and accompanying notes in Part I, Item 1, “Financial Statements” of this Quarterly Report on Form 10-Q. 104* Inline XBRL for the cover page of this Quarterly Report on Form 10-Q, included in the Exhibit 101 Inline XBRL Document Set. Apple Inc. | Q3 2026 Form 10-Q | 25 SIGNATURE Pursuant to the requirements of the Securities Exchange Act of 1934, the Registrant has duly caused this report to be signed on its behalf by the undersigned thereunto duly authorized.",
+    "llm_answer": "Item 1. Financial Statements covers the Financial Statements in Part I of the Form 10-Q report.",
+    "citations": [
+      {
+        "chunk_id": "d10a4a1d-503d-4f0b-bb78-4384b0492c8c:page:28:element:422",
+        "document_id": "d10a4a1d-503d-4f0b-bb78-4384b0492c8c",
+        "source_format": "pdf",
+        "bounding_box": {
+          "x1": 18.225,
+          "y1": 533.3,
+          "x2": 567.108,
+          "y2": 557.008
+        },
+        "location_reference": "Page: 28",
+        "text_snippet": "Item 6. Exhibits Incorporated by Reference Filing Date/ Period End Date Exhibit Number Exhibit Description Form Exhibit 101* Inline XBRL Document Set for the condensed consolidated financial statement"
+      }
+    ]
+  },
+  {
+    "query": "What financial statement item reports Cash Provided by Operating Activities in Part I Item 1?",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "What item section covers Managements Discussion and Analysis (MD&A) of Financial Condition and Results of Operations in Form 10-Q?",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "What item section covers Quantitative and Qualitative Disclosures About Market Risk in Part I?",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "What item section covers Controls and Procedures in Part I of Form 10-Q?",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "What item section in Part II covers Unregistered Sales of Equity Securities and Use of Proceeds?",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "What item section in Part II covers Defaults Upon Senior Securities?",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "What item section in Part II covers Mine Safety Disclosures?",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "What relationship exists between capital expenditures (CapEx) and cash flows from investing activities?",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "What is the relationship between Net Asset Value (NAV) appreciation and compounding growth in mutual fund investments?",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "How do expense ratio differences between Direct Plans and Regular Plans impact long-term net returns?",
+    "retrieved_context": "PERFORMANCE OF TOP 3 SCHEMES MANAGED BY SHOBHIT MEHROTRA PERFORMANCE OF BOTTOM 3 SCHEMES MANAGED BY SHOBHIT MEHROTRA & The Scheme is co-managed by Mr. Srinivasan Ramamurthy (Equity Assets) (since December 14, 2021) and Shobhit Mehrotra (Debt Assets) (since September 1, 2007). ~ The Scheme is co-managed by Mr. Shobhit Mehrotra (since October 23, 2007) and Mr. Vikash Agarwal (since July 1, 2020). Common Notes for all the above tables: Past performance may or may not be sustained in future and is not a guarantee of any future returns. Top 3 and bottom 3 schemes managed by the Fund Manager have been derived on the basis of since inception returns vis-à-vis the benchmark. In case the benchmark is not available on the Scheme’s inception date, the returns for the concerned scheme is considered from the date the benchmark is available. Returns greater than 1 year period are compounded annualized (CAGR). Load is not taken into consideration for computation of performance. Different plans viz. Regular Plan and Direct Plan have a different expense structure. The expenses of the Direct Plan under the Scheme will be lower to the extent of the distribution expenses / commission charged in the Regular Plan. N.A.: Not Available. Data as on July 31, 2024. PERFORMANCE OF TOP 3 SCHEMES MANAGED BY SHOBHIT MEHROTRA PERFORMANCE OF BOTTOM 3 SCHEMES MANAGED BY SHOBHIT MEHROTRA & The Scheme is co-managed by Mr. Srinivasan Ramamurthy (Equity Assets) (since December 14, 2021) and Shobhit Mehrotra (Debt Assets) (since February 25, 2016). ~ The Scheme is co-managed by Mr. Srinivasan Ramamurthy (Equity Assets) (since December 14, 2021) and Shobhit Mehrotra (Debt Assets) (since February 26, 2016). Common Notes for all the above tables: Past performance may or may not be sustained in future and is not a guarantee of any future returns. Top 3 and bottom 3 schemes managed by the Fund Manager have been derived on the basis of since inception returns vis-à-vis the benchmark. In case the benchmark is not available on the Scheme’s inception date, the returns for the concerned scheme is considered from the date the benchmark is available. Returns greater than 1 year period are compounded annualized (CAGR). Load is not taken into consideration for computation of performance. Different plans viz. Regular Plan and Direct Plan have a different expense structure. The expenses of the Direct Plan under the Scheme will be lower to the extent of the distribution expenses / commission charged in the Regular Plan. N.A.: Not Available. Data as on July 31, 2024.",
+    "llm_answer": "Expense ratio differences between Direct Plans and Regular Plans impact long-term net returns by reducing the overall expenses borne by the investor in Direct Plans, which can lead to higher net returns over time. This is because the Direct Plan under the Scheme will have lower expenses to the extent of the distribution expenses/commission charged in the Regular Plan. [1][2]",
+    "citations": [
+      {
+        "chunk_id": "b06554a0-27ab-4e7b-9554-843a0e13e934:page:45:element:825",
+        "document_id": "b06554a0-27ab-4e7b-9554-843a0e13e934",
+        "source_format": "pdf",
+        "bounding_box": {
+          "x1": 20.986,
+          "y1": 272.227,
+          "x2": 372.902,
+          "y2": 286.416
+        },
+        "location_reference": "Page: 45",
+        "text_snippet": "PERFORMANCE OF TOP 3 SCHEMES MANAGED BY SHOBHIT MEHROTRA PERFORMANCE OF BOTTOM 3 SCHEMES MANAGED BY SHOBHIT MEHROTRA & The Scheme is co-managed by Mr. Srinivasan Ramamurthy (Equity Assets) (since Dece"
+      },
+      {
+        "chunk_id": "b06554a0-27ab-4e7b-9554-843a0e13e934:page:48:element:873",
+        "document_id": "b06554a0-27ab-4e7b-9554-843a0e13e934",
+        "source_format": "pdf",
+        "bounding_box": {
+          "x1": 20.986,
+          "y1": 272.227,
+          "x2": 372.902,
+          "y2": 286.416
+        },
+        "location_reference": "Page: 48",
+        "text_snippet": "PERFORMANCE OF TOP 3 SCHEMES MANAGED BY SHOBHIT MEHROTRA PERFORMANCE OF BOTTOM 3 SCHEMES MANAGED BY SHOBHIT MEHROTRA & The Scheme is co-managed by Mr. Srinivasan Ramamurthy (Equity Assets) (since Dece"
+      }
+    ]
+  },
+  {
+    "query": "What is the relationship between Systematic Investment Plan (SIP) rupee-cost averaging and market volatility?",
+    "retrieved_context": "Ensure Disciplined Spending and maintain Asset Allocation by diversifying your investments. SIP – Systematic Investment Plan Asset Allocation “Don’t put all your eggs in one basket”. It’s an age old saying and applies to investments as well. Asset Allocation is one of the important steps in one's investment strategy. It means to diversify investment portfolio among different asset categories such as: Equity – Equity represents shares of ownership in a company. They have a potential for capital growth with high volatility. Cash - Cash is suitable for very short term needs such as parking money for emergency needs or for surplus fund where the investment is undecided.",
+    "llm_answer": "The relationship between Systematic Investment Plan (SIP) rupee-cost averaging and market volatility is that SIP rupee-cost averaging helps mitigate the impact of market volatility by spreading out the investment over time, which can reduce the risk of investing a large amount at a market peak. [1]",
+    "citations": [
+      {
+        "chunk_id": "b06554a0-27ab-4e7b-9554-843a0e13e934:page:24:element:439",
+        "document_id": "b06554a0-27ab-4e7b-9554-843a0e13e934",
+        "source_format": "pdf",
+        "bounding_box": {
+          "x1": 218.002,
+          "y1": 103.756,
+          "x2": 417.658,
+          "y2": 149.776
+        },
+        "location_reference": "Page: 24",
+        "text_snippet": "Ensure Disciplined Spending and maintain Asset Allocation by diversifying your investments. SIP – Systematic Investment Plan Asset Allocation “Don’t put all your eggs in one basket”. It’s an age old s"
+      }
+    ]
+  },
+  {
+    "query": "How does asset allocation between Fixed Deposits and Debt Mutual Funds determine tax efficiency?",
+    "retrieved_context": "Debt MFs provide wide array of investment opportunities. Interest income is taxed on accrual basis in FDs while in Debt MFs income is taxed only when dividend is received or units are redeemed SIP for Wealth Creation Start an SIP when you are young, the earlier you start, the power of compounding can aid in creating wealth. Tax Savings Investors can save tax with an aim to create wealth by investing in Equity Linked Savings Scheme (ELSS) and Notiﬁed Retirement Funds. Contingency fund Invest a reasonable amount in Liquid fund for any near-term contingencies (should ideally be 3-4x of Monthly Income). Debt MFs vs Fixed Deposits AUM of Debt MF shows the dominance of institutional investors in the category. Retail investors AUM as a percentage of Total Debt AUM is minuscule. The primary reason behind the under penetration of Debt MFs among retail investors has been lack of understanding and awareness. Over the years, retail investors have favored Bank FDs due to their inherent nature of providing ﬁxed return on investments. However, Debt MFs tend to score over Banks FDs on other parameters which are mentioned below: Fixed Debt Diversiﬁcation - The portfolio of Debt MF is generally spread across various issuers and securities, thus reducing the single issuer risk",
+    "llm_answer": "Asset allocation between Fixed Deposits and Debt Mutual Funds determines tax efficiency because interest income from Fixed Deposits is taxed on an accrual basis, while income from Debt Mutual Funds is taxed only when a dividend is received or units are redeemed. This means that with Debt Mutual Funds, investors may benefit from tax efficiency by potentially deferring taxes until they actually receive income in the form of dividends or redeem their units. [1][3]",
+    "citations": [
+      {
+        "chunk_id": "b06554a0-27ab-4e7b-9554-843a0e13e934:page:14:element:304",
+        "document_id": "b06554a0-27ab-4e7b-9554-843a0e13e934",
+        "source_format": "pdf",
+        "bounding_box": {
+          "x1": 48.2,
+          "y1": 259.278,
+          "x2": 300.947,
+          "y2": 269.952
+        },
+        "location_reference": "Page: 14",
+        "text_snippet": "Debt MFs provide wide array of investment opportunities. Interest income is taxed on accrual basis in FDs while in Debt MFs income is taxed only when dividend is received or units are redeemed SIP for"
+      },
+      {
+        "chunk_id": "b06554a0-27ab-4e7b-9554-843a0e13e934:page:14:element:299",
+        "document_id": "b06554a0-27ab-4e7b-9554-843a0e13e934",
+        "source_format": "pdf",
+        "bounding_box": {
+          "x1": 32.0,
+          "y1": 537.043,
+          "x2": 463.46,
+          "y2": 582.133
+        },
+        "location_reference": "Page: 14",
+        "text_snippet": "Debt MFs vs Fixed Deposits AUM of Debt MF shows the dominance of institutional investors in the category. Retail investors AUM as a percentage of Total Debt AUM is minuscule. The primary reason behind"
+      }
+    ]
+  },
+  {
+    "query": "What relationship exists between inflation rates and real returns generated by fixed income assets in India?",
+    "retrieved_context": "*Source: RBI #Investments must be tailored to investor’s individual situation and objectives and therefore, investors should consult their ﬁnancial advisors to ascertain whether the products are suitable for them. Real Returns in Fixed Deposits (FDs) The graph hypothetically illustrates how much real returns you can get by investing your money in FDs. 8.00 7.00 6.00 5.00 4.00 3.00 2.00 1.00 0.00 6.8% 3.5% 2.3% 1.0% Interest Inﬂation Tax on Interest Real Return Assuming a tax bracket of 33.38% and a FD Rate of 6.8%. Even though FDs offer guaranteed returns, after deduction of inﬂation and tax, the real returns amount to hardly 1.0% of your principal. Inﬂation reduces your purchasing power. Hence, today’s money will not buy you the same things tomorrow. E.g. 1 Litre of petrol which used to cost 9.84 in 1990, costs 94.72 (2024) Over the last 4 decades CPI Inﬂation in India has averaged at ~ A few speciﬁc examples above show how small increases over time end up increasing costs dramatically. 7% per year.* Investing in equities can help you beat inﬂation better than other asset classes and provides positive real returns over the long term#. Questions on every investor’s mind - How does inﬂation affect your day-to-day life? CPI - Consumer Price Index",
+    "llm_answer": "Inflation reduces the real returns generated by fixed income assets in India. For example, after accounting for inflation and tax, the real returns from fixed deposits (FDs) are significantly lower than the nominal interest rate. Specifically, with a tax bracket of 33.38% and a FD rate of 6.8%, the real returns amount to only 1.0% of the principal.",
+    "citations": [
+      {
+        "chunk_id": "b06554a0-27ab-4e7b-9554-843a0e13e934:page:12:element:274",
+        "document_id": "b06554a0-27ab-4e7b-9554-843a0e13e934",
+        "source_format": "pdf",
+        "bounding_box": {
+          "x1": 30.588,
+          "y1": 28.89,
+          "x2": 374.883,
+          "y2": 60.285
+        },
+        "location_reference": "Page: 12",
+        "text_snippet": "*Source: RBI #Investments must be tailored to investor’s individual situation and objectives and therefore, investors should consult their ﬁnancial advisors to ascertain whether the products are suita"
+      },
+      {
+        "chunk_id": "b06554a0-27ab-4e7b-9554-843a0e13e934:page:12:element:267",
+        "document_id": "b06554a0-27ab-4e7b-9554-843a0e13e934",
+        "source_format": "pdf",
+        "bounding_box": {
+          "x1": 162.0,
+          "y1": 214.402,
+          "x2": 369.97,
+          "y2": 226.592
+        },
+        "location_reference": "Page: 12",
+        "text_snippet": "Inﬂation reduces your purchasing power. Hence, today’s money will not buy you the same things tomorrow. E.g. 1 Litre of petrol which used to cost 9.84 in 1990, costs 94.72 (2024) Over the last 4 decad"
+      }
+    ]
+  },
+  {
+    "query": "Compare the decadal growth rate performance of Indian equity markets against traditional asset classes.",
+    "retrieved_context": "Decadal GROWTH RATES of India 16.0 14.9 15.0 14.0 12.4 11.7 12.0 9.2 9.2 10.0 5.6 6.1 8.0 6.0 4.0 6.1 6.3 5.8 5.7 2.0 - CY: 1980-1989 CY: 1990-1999 CY: 2000-2009 CY: 2010-2024 Decadal Real GDP Growth Inﬂation 1980-89 1990-99 2000-09 2010-24 • 9/11, Dotcom Bubble The graph depicts the growth of the Indian economy over the past decades. The nominal growth of the economy (real growth plus inﬂation) is a good proxy for the average growth in businesses of a country. Equities over time grow in line with the growth of underlying businesses/economy. This is evident in the fact that the Indian economy has grown at a nominal growth of ~ 14% p.a., while SENSEX has grown at a CAGR of 15.79%. (From Mar 1979 to Mar 2024) which is a little more than the nominal GDP growth. Data source: World Bank Questions on every investor’s mind - Why are equities volatile? Have equities given positive real returns over the long run? How have equities performed compared to other asset classes? Source: Bloomberg, RBI Handbook of statistics on Indian Economy, World Gold Council, SBI #Average Inﬂation is shown for comparison with returns from various asset classes. *Data is of CAGR returns of various asset classes (Equity, Gold, Bank FD) for the period March 31, 1980 till March 31, 2024, Average Inﬂation - Data as on March 31, 2024. Equities are a volatile asset class. However, volatility in returns reduces as holding period increases. Above asset classes are not strictly comparable. Above chart is for illustration purposes only. Past performance may or may not be sustained in future and is not a guarantee of any future returns. No single asset classes has consistently delivered highest return year after year and different asset classes perform differently under different market cycles. Winner of one year may become loser in the following year and vice-a-versa. The table below shows importance of diversifying within the asset classes while creating the portfolio. Schemes should be selected in a way that all schemes should not go up or fall together thereby reducing overall risk of portfolio. The table below shows how various indices have performed year-on-year basis: FY2008 FY2009 FY2010 FY2011 FY2012 FY2013 FY2014 FY2015 FY2016 FY2017 FY2018 FY2019 FY2020 FY2021 FY2022 FY2023 FY2024",
+    "llm_answer": "The Indian equity markets, specifically the BSE SENSEX, have shown a Compound Annual Growth Rate (CAGR) of 15.79% from March 1980 to March 2024, which is slightly higher than the nominal GDP growth of the Indian economy. Traditional asset classes like gold and bank fixed deposits have different performance metrics and are not directly comparable to equity markets. For instance, the average inflation rate during this period was lower than the returns from the equity markets. However, it is important to note that no single asset class consistently delivers the highest return year after year, and diversification within asset classes is crucial for reducing overall portfolio risk.",
+    "citations": [
+      {
+        "chunk_id": "b06554a0-27ab-4e7b-9554-843a0e13e934:page:8:element:147",
+        "document_id": "b06554a0-27ab-4e7b-9554-843a0e13e934",
+        "source_format": "pdf",
+        "bounding_box": {
+          "x1": 32.0,
+          "y1": 520.709,
+          "x2": 305.78,
+          "y2": 597.509
+        },
+        "location_reference": "Page: 8",
+        "text_snippet": "Decadal GROWTH RATES of India 16.0 14.9 15.0 14.0 12.4 11.7 12.0 9.2 9.2 10.0 5.6 6.1 8.0 6.0 4.0 6.1 6.3 5.8 5.7 2.0 - CY: 1980-1989 CY: 1990-1999 CY: 2000-2009 CY: 2010-2024 Decadal Real GDP Growth "
+      },
+      {
+        "chunk_id": "b06554a0-27ab-4e7b-9554-843a0e13e934:page:6:element:137",
+        "document_id": "b06554a0-27ab-4e7b-9554-843a0e13e934",
+        "source_format": "pdf",
+        "bounding_box": {
+          "x1": 24.0,
+          "y1": 123.536,
+          "x2": 99.078,
+          "y2": 132.899
+        },
+        "location_reference": "Page: 6",
+        "text_snippet": "Data source: World Bank Questions on every investor’s mind - Why are equities volatile? Have equities given positive real returns over the long run? How have equities performed compared to other asset"
+      },
+      {
+        "chunk_id": "b06554a0-27ab-4e7b-9554-843a0e13e934:page:26:element:457",
+        "document_id": "b06554a0-27ab-4e7b-9554-843a0e13e934",
+        "source_format": "pdf",
+        "bounding_box": {
+          "x1": 32.652,
+          "y1": 479.273,
+          "x2": 320.154,
+          "y2": 540.323
+        },
+        "location_reference": "Page: 26",
+        "text_snippet": "No single asset classes has consistently delivered highest return year after year and different asset classes perform differently under different market cycles. Winner of one year may become loser in "
+      }
+    ]
+  },
+  {
+    "query": "Compare ELSS mutual funds against PPF and Tax Saver Fixed Deposits across lock-in period and return potential.",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND.",
+    "citations": []
+  },
+  {
+    "query": "Compare Debt Mutual Funds versus Bank Fixed Deposits regarding liquidity, flexibility, and penalty structures.",
+    "retrieved_context": "Debt MFs vs Fixed Deposits AUM of Debt MF shows the dominance of institutional investors in the category. Retail investors AUM as a percentage of Total Debt AUM is minuscule. The primary reason behind the under penetration of Debt MFs among retail investors has been lack of understanding and awareness. Over the years, retail investors have favored Bank FDs due to their inherent nature of providing ﬁxed return on investments. However, Debt MFs tend to score over Banks FDs on other parameters which are mentioned below: Fixed Debt Diversiﬁcation - The portfolio of Debt MF is generally spread across various issuers and securities, thus reducing the single issuer risk Routes of investment Asset Classes Gold and Silver Debt Equity Physical Gold/Silver and Gold Bonds Fixed Deposits/ Corporate Bonds Direct Equity Drawbacks Physical Gold / Silver – Safety concerns and storage capacity Gold Bonds – Low liquidity Medium to Low liquidity Penalty for premature withdrawal Requires time and expertise Relatively riskier Here’s how mutual fund route can help overcome the above drawbacks Gold Exchange Traded Fund (ETF) & Gold Fund, Silver Exchange Traded Fund (ETF) & Silver Fund Buying limits – Min.1 unit through stock exchange and no upper limit High liquidity No lock-in Debt Mutual Fund Equity Mutual Fund",
+    "llm_answer": "Debt Mutual Funds (MFs) generally offer higher liquidity compared to Bank Fixed Deposits (FDs). Bank FDs often have a lock-in period and may incur penalties for premature withdrawal, whereas Debt MFs allow for more flexible withdrawals without such penalties. However, the liquidity of Debt MFs can depend on the specific fund and its redemption policies. Bank FDs provide guaranteed returns with no market risk, while Debt MFs offer potential for higher returns but are subject to market risks.",
+    "citations": [
+      {
+        "chunk_id": "b06554a0-27ab-4e7b-9554-843a0e13e934:page:14:element:299",
+        "document_id": "b06554a0-27ab-4e7b-9554-843a0e13e934",
+        "source_format": "pdf",
+        "bounding_box": {
+          "x1": 32.0,
+          "y1": 537.043,
+          "x2": 463.46,
+          "y2": 582.133
+        },
+        "location_reference": "Page: 14",
+        "text_snippet": "Debt MFs vs Fixed Deposits AUM of Debt MF shows the dominance of institutional investors in the category. Retail investors AUM as a percentage of Total Debt AUM is minuscule. The primary reason behind"
+      },
+      {
+        "chunk_id": "b06554a0-27ab-4e7b-9554-843a0e13e934:page:4:element:32",
+        "document_id": "b06554a0-27ab-4e7b-9554-843a0e13e934",
+        "source_format": "pdf",
+        "bounding_box": {
+          "x1": 37.5,
+          "y1": 388.31,
+          "x2": 96.87,
+          "y2": 413.34
+        },
+        "location_reference": "Page: 4",
+        "text_snippet": "Routes of investment Asset Classes Gold and Silver Debt Equity Physical Gold/Silver and Gold Bonds Fixed Deposits/ Corporate Bonds Direct Equity Drawbacks Physical Gold / Silver – Safety concerns and "
+      }
+    ]
+  },
+  {
+    "query": "What is the analytical impact of inflation on cash holdings over a 10-year period?",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "Compare real returns generated by Fixed Deposits during high inflation regimes versus low inflation regimes.",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "Analyze the core mission and strategic vision statement of HDFC Asset Management Company.",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "What analytical principles guide portfolio diversification across market capitalization categories (Large Cap, Mid Cap, Small Cap)?",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  },
+  {
+    "query": "Compare lump-sum investment performance against systematic SIP performance during volatile market conditions.",
+    "retrieved_context": "",
+    "llm_answer": "NOT_FOUND",
+    "citations": []
+  }
+]

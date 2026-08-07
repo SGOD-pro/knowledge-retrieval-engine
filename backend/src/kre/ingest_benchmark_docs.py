@@ -8,6 +8,7 @@ from kre.shared.db.postgres import PostgresRepository
 
 def ingest_all():
     repo = PostgresRepository()
+    repo.initialize()
     benchmark_json = Path("tests/data/benchmark_queries.json")
     
     with open(benchmark_json, "r", encoding="utf-8") as f:

@@ -58,5 +58,6 @@ def parse(path: Path, document_id: str, executable: str = "opendataloader-pdf") 
             location_reference=f"Page: {page_number}",
         ))
 
-    return chunks
+    from .chunk_util import merge_and_split_chunks
+    return merge_and_split_chunks(chunks)
 

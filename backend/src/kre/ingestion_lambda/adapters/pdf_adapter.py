@@ -141,7 +141,16 @@ def parse(path, document_id: str) -> list[Chunk]:
         doc_result = results[0]
 
     # Real element data is at results[0]["elements"] — NOT at the top-level dict.
-    items: list[dict] = doc_result.get("elements", [])
+    raw_elements = doc_result.get("elements", [])
+    if isinstance(raw_elements, dict):
+        # opendataloader_pdf sometimes returns {"kids": [...]} or {"text": [...]} instead of a flat list
+        items: list[dict] = raw_elements.get("kids", [])
+        if not items:
+            items = raw_elements.get("text", [])
+        if not items:
+            items = raw_elements.get("elements", [])
+    else:
+        items: list[dict] = raw_elements
 
     # Image S3 keys for this document (may be absent for text-only PDFs).
     doc_image_s3_keys: tuple[str, ...] = tuple(doc_result.get("image_s3_keys", []))
@@ -181,4 +190,5 @@ def parse(path, document_id: str) -> list[Chunk]:
             image_s3_keys=doc_image_s3_keys,
         ))
 
-    return chunks
+    from kre.ingestion.adapters.chunk_util import merge_and_split_chunks
+    return merge_and_split_chunks(chunks)

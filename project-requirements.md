@@ -41,7 +41,7 @@ FastAPI wrapped by Mangum. Uvicorn for local dev only.
 
 ## 6. Frontend
 
-Next.js 14.x, Tailwind CSS, `react-pdf`.
+Next.js 14.x (Deprecated) -> Vite React (Latest), Tailwind CSS, `react-pdf`.
 
 ## 7. Explicitly Forbidden Dependencies
 

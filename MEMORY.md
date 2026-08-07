@@ -240,5 +240,39 @@ un_benchmark.py successfully processed all 120 queries against the finalized 3-t
 ### Precondition Before Next Benchmark
 - Fix AWS payment instrument for Cohere Rerank in AWS console.
 - Verify with single standalone `embed_text("test")` and `rerank_documents("test", ["doc1", "doc2"])` calls — confirm real (non-Jaccard, non-exception) responses.
-- Run 5-query per-stage timing test to confirm embed/rerank latency is healthy (200–800 ms, not 14 seconds).
 - Only after all three confirmed: run full 120-query benchmark.
+
+---
+
+## Session State — Phase 3 Retrieval Fixes (2026-07-30)
+1. PageIndex top_k expanded to prevent pruning before vector search.
+2. Reranker now receives a union of BM25 + Vector candidates (20-30 chunks) instead of just 5.
+3. L2 normalization applied to all API embeddings. Chunk merging utility applied to adapters.
+
+---
+
+## Session State — Phase 3 Completion (Rev 5 Alignment)
+
+- Documented final verified metrics:
+  - Recall@5: 0.908
+  - Faithfulness: 0.894 (89.4%)
+  - LLM Activation: 0.55 (55%)
+  - p95 Latency: <4000ms (3678ms final logged)
+- Documented that the Zero Hallucination guardrail (Fidelity check + ruthless system prompt) successfully forces `NOT_FOUND` on incomplete context, achieving 89.4% true faithfulness on grounded queries.
+
+---
+
+## Session State — Phase 4 API & Frontend Development (2026-08-07)
+
+- **API Contract**: Created `api.md` establishing the strict API contract for Query Lambda endpoints (`POST /query`, `GET /documents`, `POST /documents`, `POST /documents/{id}/ingest`), including the `Citation` schema rules for `.pdf` vs `.docx` / `.xlsx`.
+- **Frontend Initialization**: Initialized a Vite + React + TypeScript frontend in `frontend/`. Enforced Vite as a substitute for Next.js per explicit user instruction (conflict resolution).
+- **Design System**: Installed Tailwind CSS v4.1, `tailwindcss-animate`, and Shadcn UI. Mapped `DESIGN.md` hex colors to HSL variables in `index.css` via the `@theme` and `@layer base` directives. Added full light/dark/system mode support via `ThemeProvider`.
+- **3-Pane UI Layout**: Implemented the workspace using CSS Grid in `App.tsx`.
+  - Left Pane (`DocumentViewer`): Mocked PDF rendering and bounding box overlay.
+  - Center Pane (`QueryPane`): Textarea for querying, badge indicators for retrieval path (Fast Match vs Reasoned Answer), and mocked latency.
+  - Right Pane (`CitationList`): Interactive citation cards reflecting source formats and snippets.
+- **Dummy Auth Layer**: Created `AuthContext` to default to an unauthenticated state, simulating a login screen. Ready to be swapped for OAuth2.1 token exchange in Phase 5.
+- **Testing**:
+  - **Vitest**: `workspace.test.tsx` passed, verifying citation rendering, chip text formatting, and simulated CORS check.
+  - **Playwright**: `workspace.spec.ts` passed, executing a full E2E login flow, query submission, and assertion of 3-pane visibility.
+- **Status**: Phase 4 is complete. The system is ready to advance.

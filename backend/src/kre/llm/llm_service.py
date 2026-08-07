@@ -9,9 +9,9 @@ from kre.providers.llm_provider import generate_completion
 logger = logging.getLogger(__name__)
 
 # Simple regex-based token counter estimate (1 token ~ 4 chars for rough limits)
-# For strict 1200 token limits, we enforce a character limit of 1200 * 4 = 4800 characters
+# For strict 1000 token limits, we enforce a character limit of 1000 * 4 = 4000 characters
 # The compressor should already be limiting this, but we enforce it here.
-MAX_CONTEXT_CHARS = 4800
+MAX_CONTEXT_CHARS = 4000
 
 def _strip_markdown_json(text: str) -> str:
     """Strip markdown code blocks around JSON."""
@@ -32,21 +32,22 @@ def call(query: str, compressed_context: str, provider: str | None = None) -> di
     """
     start_time = time.perf_counter()
     
-    # Enforce 1200 token (~4800 char) context limit programmatically
+    # Enforce 1000 token (~4000 char) context limit programmatically
     if len(compressed_context) > MAX_CONTEXT_CHARS:
-        logger.warning("Context exceeded 4800 chars. Truncating to enforce Rule 4.")
+        logger.warning("Context exceeded 4000 chars. Truncating to enforce Rule 4.")
         compressed_context = compressed_context[:MAX_CONTEXT_CHARS]
         
     system_prompt = (
-        "You are a factual knowledge retrieval assistant. Your goal is to answer "
-        "the user's query using strictly the provided context.\n"
+        "You are a strict document analysis engine. Answer the question using ONLY the provided context. "
+        "You must cite every claim using [1], [2] notation. If the context does not contain the exact information "
+        "to answer the question, you must respond with exactly: NOT_FOUND. Do not infer, guess, or use external knowledge. "
+        "Do not be helpful. Be accurate.\n"
         "Return a JSON object with the following schema:\n"
         "{\n"
         '  "answer": "Your detailed answer to the query",\n'
         '  "citations": ["chunk_id_1", "chunk_id_2"]\n'
         "}\n"
-        "Do NOT include a 'confidence', 'certainty', or 'score' field (Rule 15).\n"
-        "If the answer cannot be found in the context, return NOT_FOUND for the answer."
+        "Do NOT include a 'confidence', 'certainty', or 'score' field (Rule 15)."
     )
     
     user_prompt = f"Context:\n{compressed_context}\n\nQuery: {query}"

@@ -1,0 +1,168 @@
+Running benchmark on 120 of 120 total queries (full dataset).
+Processed 0/120 queries...
+Query 0 latency: 38684.13 ms
+Query 1 latency: 565.15 ms
+Query 2 latency: 571.13 ms
+Query 3 latency: 440.62 ms
+Query 4 latency: 424.95 ms
+Query 5 latency: 468.46 ms
+Query 6 latency: 429.88 ms
+Query 7 latency: 1104.02 ms
+Query 8 latency: 591.26 ms
+Query 9 latency: 433.05 ms
+Processed 10/120 queries...
+Query 10 latency: 1075.61 ms
+Query 11 latency: 1159.03 ms
+Query 12 latency: 583.17 ms
+Query 13 latency: 537.79 ms
+Query 14 latency: 576.75 ms
+Query 15 latency: 471.50 ms
+Query 16 latency: 575.72 ms
+Query 17 latency: 592.31 ms
+Query 18 latency: 525.22 ms
+Query 19 latency: 431.86 ms
+Processed 20/120 queries...
+Query 20 latency: 473.83 ms
+Query 21 latency: 774.71 ms
+Query 22 latency: 476.92 ms
+Query 23 latency: 2258.63 ms
+Query 24 latency: 426.03 ms
+Query 25 latency: 529.53 ms
+Query 26 latency: 482.12 ms
+Query 27 latency: 495.71 ms
+Query 28 latency: 1026.41 ms
+Query 29 latency: 1070.11 ms
+Processed 30/120 queries...
+Query 30 latency: 515.13 ms
+Query 31 latency: 382.47 ms
+Query 32 latency: 1102.38 ms
+Query 33 latency: 1129.80 ms
+Query 34 latency: 699.15 ms
+Query 35 latency: 442.21 ms
+Query 36 latency: 430.96 ms
+Query 37 latency: 1115.68 ms
+Query 38 latency: 437.02 ms
+Query 39 latency: 560.62 ms
+Processed 40/120 queries...
+Query 40 latency: 596.49 ms
+Query 41 latency: 561.34 ms
+Query 42 latency: 412.30 ms
+Query 43 latency: 431.00 ms
+Query 44 latency: 1086.62 ms
+Query 45 latency: 639.27 ms
+Query 46 latency: 1228.60 ms
+Query 47 latency: 1083.62 ms
+Query 48 latency: 586.96 ms
+Query 49 latency: 1046.54 ms
+Processed 50/120 queries...
+Query 50 latency: 439.11 ms
+Query 51 latency: 562.78 ms
+Query 52 latency: 459.65 ms
+Query 53 latency: 1093.52 ms
+Query 54 latency: 557.10 ms
+Query 55 latency: 436.25 ms
+Query 56 latency: 576.88 ms
+Query 57 latency: 717.94 ms
+Query 58 latency: 430.39 ms
+Query 59 latency: 545.91 ms
+Processed 60/120 queries...
+Query 60 latency: 493.10 ms
+Query 61 latency: 539.76 ms
+Query 62 latency: 367.63 ms
+Query 63 latency: 1099.12 ms
+Query 64 latency: 1151.06 ms
+Query 65 latency: 467.20 ms
+Query 66 latency: 528.65 ms
+Query 67 latency: 496.16 ms
+Query 68 latency: 423.70 ms
+Query 69 latency: 517.40 ms
+Processed 70/120 queries...
+Query 70 latency: 623.73 ms
+Query 71 latency: 568.74 ms
+Query 72 latency: 1078.92 ms
+Query 73 latency: 1094.58 ms
+Query 74 latency: 1159.96 ms
+Query 75 latency: 3620.72 ms
+Query 76 latency: 597.45 ms
+Query 77 latency: 426.97 ms
+Query 78 latency: 634.38 ms
+Query 79 latency: 468.77 ms
+Processed 80/120 queries...
+Query 80 latency: 615.11 ms
+Query 81 latency: 557.88 ms
+Query 82 latency: 694.31 ms
+Query 83 latency: 554.86 ms
+Query 84 latency: 1102.55 ms
+Query 85 latency: 670.45 ms
+Query 86 latency: 543.98 ms
+Query 87 latency: 464.44 ms
+Query 88 latency: 580.57 ms
+Query 89 latency: 448.83 ms
+Processed 90/120 queries...
+Query 90 latency: 589.91 ms
+Query 91 latency: 3612.91 ms
+Query 92 latency: 669.14 ms
+Query 93 latency: 471.79 ms
+Query 94 latency: 1091.34 ms
+Query 95 latency: 550.39 ms
+Query 96 latency: 415.18 ms
+Query 97 latency: 588.77 ms
+Query 98 latency: 622.49 ms
+Query 99 latency: 548.14 ms
+Processed 100/120 queries...
+Query 100 latency: 553.48 ms
+Query 101 latency: 492.43 ms
+Query 102 latency: 669.27 ms
+Query 103 latency: 665.43 ms
+Query 104 latency: 479.48 ms
+Query 105 latency: 597.89 ms
+Query 106 latency: 454.29 ms
+Query 107 latency: 593.52 ms
+Query 108 latency: 483.68 ms
+Query 109 latency: 489.91 ms
+Processed 110/120 queries...
+Query 110 latency: 1072.87 ms
+Query 111 latency: 541.05 ms
+Query 112 latency: 567.14 ms
+Query 113 latency: 628.58 ms
+Query 114 latency: 543.52 ms
+Query 115 latency: 450.18 ms
+Query 116 latency: 1240.05 ms
+Query 117 latency: 569.55 ms
+Query 118 latency: 618.83 ms
+Query 119 latency: 384.13 ms
+
+=======================================================
+RETRIEVAL METRICS (real embeddings, mocked LLM/reranker) — final
+=======================================================
+Total Queries: 120
+Recall@3: 0.0000
+Recall@5: 0.0000
+MRR@5: 0.0000
+nDCG@5: 0.0000
+Precision@3: 0.0000
+
+=======================================================
+LLM-DEPENDENT METRICS
+=======================================================
+Faithfulness: 0.0167
+Context Precision: 0.0000
+Average Latency: 1020.08 ms
+P95 Latency: 1228.60 ms
+LLM Activation Rate: 0.8833 (Fast path count: 14)
+
+=======================================================
+MODEL USAGE STATS
+=======================================================
+--- LLM ---
+  Calls: 0
+  Total Time: 0.00 ms
+  Prompt Chars: 0, Response Chars: 0
+--- EMBED ---
+  Calls: 105
+  Total Time: 23608.92 ms
+  Chars Embed: 10803
+--- RERANK ---
+  Calls: 0
+  Total Time: 0.00 ms
+  Docs Reranked: 0

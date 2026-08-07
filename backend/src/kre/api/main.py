@@ -76,6 +76,7 @@ def query_endpoint(req: QueryRequest):
     return {
         "answer": response.answer,
         "citations": response.citations,
+        "retrieved_chunks": getattr(response, "top_chunks", []),
         "confidence_score": response.confidence_score,
         "latency_breakdown": latency_breakdown,
         "fast_path": fast_path,

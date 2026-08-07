@@ -106,8 +106,13 @@ def lambda_handler(event, context):
                 continue
 
             input_pdf = inputs_dir / f"{doc_id}.pdf"
-            logger.info("Downloading s3://%s/%s → %s", bucket, key, input_pdf)
-            s3_client.download_file(bucket, key, str(input_pdf))
+            if Path(key).exists():
+                logger.info("Local file found for %s, copying → %s", key, input_pdf)
+                import shutil
+                shutil.copy(key, str(input_pdf))
+            else:
+                logger.info("Downloading s3://%s/%s → %s", bucket, key, input_pdf)
+                s3_client.download_file(bucket, key, str(input_pdf))
 
             input_paths.append(str(input_pdf))
             doc_map[doc_id] = doc

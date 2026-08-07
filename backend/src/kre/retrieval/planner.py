@@ -16,7 +16,14 @@ class Plan:
 def extract_entities(query: str) -> list[str]:
     # Simple capitalization / noun phrase entity extraction without external NER (per Section 3)
     words = re.findall(r"\b[A-Z][a-z0-9]+\b|\b[0-9]+\b", query)
-    return list(dict.fromkeys(words))
+    stop_words = {
+        "What", "Who", "How", "Why", "When", "Where", "Is", "Are", "Can", "Do", "Does", "Which", "Did", "Will", "Would", "Should", "Could",
+        "The", "A", "An", "In", "On", "At", "To", "For", "With", "By", "About", "From", "As", "If", "It", "They", "We", "He", "She",
+        "This", "That", "These", "Those", "There", "Here", "And", "Or", "But", "Of", "According", "Based", "Has", "Have", "Had", "Been",
+        "Was", "Were", "Not", "No", "Any", "All", "Some", "Many", "Much", "More", "Most", "Less", "Least", "Few", "Fewer", "Between",
+        "Among", "Through", "During", "Before", "After", "Above", "Below", "Under", "Over", "Since", "Until", "Explain", "Describe", "Tell", "List"
+    }
+    return list(dict.fromkeys(w for w in words if w not in stop_words))
 
 
 def compute_complexity(query: str) -> tuple[float, dict[str, bool | int]]:
@@ -24,17 +31,21 @@ def compute_complexity(query: str) -> tuple[float, dict[str, bool | int]]:
     entities = extract_entities(query)
     entity_count = len(entities)
 
-    multi_entity_flag = entity_count > 1
-    temporal_flag = any(k in q_lower for k in ["q1", "q2", "q3", "q4", "202", "201", "between", "during", "since", "year", "month"])
-    comparison_flag = any(k in q_lower for k in ["vs", "compare", "difference", "higher", "lower", "better", "than"])
+    multi_entity_flag = entity_count > 3
+    # Only fire on explicit quarter/year tokens, NOT generic words like 'year'/'month'
+    # that appear in simple definitional queries ("What is a fiscal year?").
+    temporal_flag = any(k in q_lower for k in ["q1 ", "q2 ", "q3 ", "q4 ", "fy20", "202", "201", "between ", "during ", "since "])
+    comparison_flag = any(k in q_lower for k in ["vs", "compare", "difference between", "higher than", "lower than", "better than"])
     negation_flag = any(k in q_lower for k in ["not", "except", "without", "other than"])
+    # Only fire relationship_flag on explicit multi-word causal phrases, not single words
+    # like 'impact' which appear in simple factual queries ("What is the impact of risk?").
     relationship_flag = any(
         k in q_lower
-        for k in ["cause", "affect", "depend", "lead to", "because", "impact", "relation between", "why did", "result of", "due to"]
+        for k in ["lead to", "because of", "impact of", "relation between", "why did", "result of", "due to", "caused by", "depends on"]
     )
 
     score = (
-        min(entity_count, 3) * 0.25
+        min(entity_count, 3) * 0.04
         + (0.20 if multi_entity_flag else 0.0)
         + (0.15 if temporal_flag else 0.0)
         + (0.15 if comparison_flag else 0.0)
@@ -63,13 +74,17 @@ class Planner:
     Rule 4: Full Path default.
     """
 
+    # Rule 1 threshold — lowered from 0.30 → 0.15 so simple single-entity
+    # factual queries reliably take the fast path and avoid LLM invocation.
+    FAST_PATH_THRESHOLD = 0.15
+
     def route(self, query: str) -> Plan:
         score, flags = compute_complexity(query)
 
         # Rule 1 — FAST PATH
         if (
-            score < 0.30
-            and flags["entity_count"] <= 1
+            score < self.FAST_PATH_THRESHOLD
+            and flags["entity_count"] <= 3
             and not flags["relationship_flag"]
             and not flags["temporal_flag"]
             and not flags["comparison_flag"]

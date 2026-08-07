@@ -48,8 +48,10 @@ def check_fidelity(query: str, compressed_text: str) -> float:
     coverage = float(found) / len(entities)
     latency_ms = (time.perf_counter() - start_time) * 1000.0
     logger.info("fidelity_check.latency_ms=%.2f fidelity_check.confidence_score=%.2f", latency_ms, coverage)
-    
-    if coverage < 1.0:
-        raise CoverageError(f"Coverage ratio {coverage} is below 1.0 threshold.")
+
+    FIDELITY_THRESHOLD = 1.0  # Require 100% coverage
+    if coverage < FIDELITY_THRESHOLD:
+        raise CoverageError(f"Coverage ratio {coverage} is below {FIDELITY_THRESHOLD} threshold.")
         
     return coverage
+

@@ -51,7 +51,15 @@ def embed_text(text: str, provider: str | None = None) -> list[float]:
             }),
         )
         response_body = json.loads(response.get("body").read())
-        return response_body.get("embedding")
+        vec = response_body.get("embedding")
+        if vec:
+            import numpy as np
+            arr = np.array(vec, dtype=np.float32)
+            norm = np.linalg.norm(arr)
+            if norm > 0:
+                arr = arr / norm
+            return arr.tolist()
+        return vec
     except Exception as e:
         logger.error("Embedding request failed: %s", str(e))
 
@@ -65,7 +73,9 @@ def _deterministic_vector(text: str, dim: int) -> list[float]:
     return vector
 
 def embed_batch(texts: Sequence[str], provider: str | None = None) -> list[list[float]]:
-    """Generate embeddings for multiple texts concurrently."""
-    from concurrent.futures import ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=20) as executor:
-        return list(executor.map(lambda t: embed_text(t, provider=provider), texts))
+    import time
+    res = []
+    for t in texts:
+        res.append(embed_text(t, provider=provider))
+        time.sleep(0.5)
+    return res

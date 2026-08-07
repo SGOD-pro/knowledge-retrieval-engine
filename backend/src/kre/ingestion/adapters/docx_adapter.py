@@ -25,4 +25,5 @@ def parse(path: Path, document_id: str) -> list[Chunk]:
             section_path=tuple(section),
             location_reference=f"Paragraph: {index + 1}",
         ))
-    return chunks
+    from .chunk_util import merge_and_split_chunks
+    return merge_and_split_chunks(chunks)
