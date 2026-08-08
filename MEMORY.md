@@ -276,3 +276,12 @@ un_benchmark.py successfully processed all 120 queries against the finalized 3-t
   - **Vitest**: `workspace.test.tsx` passed, verifying citation rendering, chip text formatting, and simulated CORS check.
   - **Playwright**: `workspace.spec.ts` passed, executing a full E2E login flow, query submission, and assertion of 3-pane visibility.
 - **Status**: Phase 4 is complete. The system is ready to advance.
+
+---
+
+## Session State — Phase 4 E2E Integration (2026-08-07)
+
+- Starting full application E2E testing with Playwright.
+- Transitioning frontend from mocked `useQueryEngine` to Backend API (`/query`, `/ingest`) defined in `api.md`.
+- E2E flow works end-to-end with real data ingestion, fetching against PROD models (Bedrock) via Vite proxy.
+- PDF ingestion currently bypasses Lambda invocation locally unless the Lambda is fully deployed in the target AWS account (falls back to local `odl_main.py` which requires Java dependencies). CSVs/DOCX successfully index to Qdrant/DynamoDB.

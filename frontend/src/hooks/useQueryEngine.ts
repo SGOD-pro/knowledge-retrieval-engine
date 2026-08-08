@@ -23,37 +23,41 @@ export function useQueryEngine() {
 
   const executeQuery = async (query: string) => {
     setLoading(true);
-    // Mock network latency
-    await new Promise(resolve => setTimeout(resolve, 1500));
-
-    // Dummy response for layout testing
-    const mockResponse: QueryResponse = {
-      answer: "The Indian healthcare sector is expected to grow to USD 280 billion by 2020. This growth is driven by increasing incomes, greater health awareness, lifestyle diseases and increasing access to insurance.",
-      retrieval_path: ["BM25", "Vector", "LLM"],
-      confidence: 0.89,
-      latency_ms: 1540,
-      citations: [
-        {
-          id: "cit_1",
-          document_id: "doc_123",
-          source_format: ".pdf",
-          snippet: "Healthcare in India is expected to reach USD 280 billion...",
-          location_reference: "Page 14",
-          bounding_box: [100, 150, 400, 200]
-        },
-        {
-          id: "cit_2",
-          document_id: "doc_456",
-          source_format: ".xlsx",
-          snippet: "Row 14: Q3 Healthcare Projections",
-          location_reference: "Sheet: Revenue, Row: 14",
-          bounding_box: null
-        }
-      ]
-    };
-
-    setResponse(mockResponse);
-    setLoading(false);
+    try {
+      const res = await fetch('/api/query', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query })
+      });
+      
+      if (!res.ok) {
+        throw new Error('Query failed with status: ' + res.status);
+      }
+      
+      const data = await res.json();
+      
+      const mappedResponse: QueryResponse = {
+        answer: data.answer || "No answer returned.",
+        citations: data.citations || [],
+        retrieval_path: data.fast_path ? ["BM25", "Vector"] : ["BM25", "Vector", "LLM"],
+        confidence: data.confidence_score || 0,
+        latency_ms: data.latency_breakdown?.total_ms || 0
+      };
+      
+      setResponse(mappedResponse);
+    } catch (err) {
+      console.error("Failed to execute query:", err);
+      // Ensure we don't leave the UI in a broken state if the request fails
+      setResponse({
+        answer: "Failed to connect to the backend API.",
+        citations: [],
+        retrieval_path: ["Error"],
+        confidence: 0,
+        latency_ms: 0
+      });
+    } finally {
+      setLoading(false);
+    }
   };
 
   return { loading, response, executeQuery };

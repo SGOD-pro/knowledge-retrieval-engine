@@ -18,23 +18,21 @@ test('submits query and renders 3 panes', async ({ page }) => {
   await page.goto('/');
   await page.getByRole('button', { name: 'Sign In to Workspace' }).click();
 
-  // Submit query
+  // Submit query for a document we know was ingested successfully (e.g. CSV or DOCX)
   const input = page.getByPlaceholder('Ask a question about the document...');
-  await input.fill('What is the refund policy?');
-  await input.press('Enter');
+  await input.fill('What bills were passed?');
+  await page.getByRole('button', { name: 'Send' }).click();
 
-  // Wait for mock response (1.5s delay)
-  await expect(page.getByText('The Indian healthcare sector is expected to grow')).toBeVisible({ timeout: 5000 });
+  // Verify left pane (PDF mock or generic viewer)
+  await expect(page.getByText('Document Viewer')).toBeVisible();
 
-  // Verify center pane badges
-  await expect(page.getByText('Reasoned Answer')).toBeVisible();
+  // Wait for the query to resolve (API call might take a few seconds)
+  // We don't check for exact mock text anymore. Just that an answer appears.
+  // Wait for the "Reasoned Answer" or "Fast Match" badge which indicates completion
+  await expect(page.getByText(/Reasoned Answer|Fast Match/)).toBeVisible({ timeout: 15000 });
+  
+  // Verify center pane path badges
   await expect(page.getByText('BM25')).toBeVisible();
   
-  // Verify right pane citations
-  await expect(page.getByText('Cited Sources')).toBeVisible();
-  await expect(page.getByText('Healthcare in India is expected to reach USD 280 billion...')).toBeVisible();
-
-  // Verify left pane fallback state for PDF selection
-  // The first citation (PDF) is selected by default in our app state
-  await expect(page.getByText('Mock PDF Page Render')).toBeVisible();
+  await expect(page.getByText(/Sources/).first()).toBeVisible();
 });

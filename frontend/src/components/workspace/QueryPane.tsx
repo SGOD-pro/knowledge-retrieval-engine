@@ -96,6 +96,7 @@ export function QueryPane({ onSearch, loading, response }: QueryPaneProps) {
               type="submit" 
               disabled={!input.trim() || loading}
               className="absolute right-2 bottom-2 rounded-xl transition-transform active:scale-95"
+              aria-label="Send"
             >
               <Send className="w-4 h-4" />
             </Button>

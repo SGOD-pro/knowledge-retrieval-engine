@@ -57,9 +57,11 @@ def parse(path, document_id: str) -> list[Chunk]:
         # DEV BYPASS: Direct import to avoid S3 dependency.
         # odl/main.py lambda_handler expects a documents[] batch event.
         odl_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "..", "odl"))
-        if odl_path not in sys.path:
-            sys.path.append(odl_path)
-        import main as odl_main
+        
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("odl_main", os.path.join(odl_path, "main.py"))
+        odl_main = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(odl_main)
 
         event = {
             "documents": [{

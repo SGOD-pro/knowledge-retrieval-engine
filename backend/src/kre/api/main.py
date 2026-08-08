@@ -3,6 +3,9 @@ import time
 from pathlib import Path
 from pydantic import BaseModel
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from kre.db.postgres import PostgresRepository
 from kre.ingestion.format_router import SUPPORTED_FORMATS
