@@ -262,6 +262,7 @@ class Pipeline:
                 self.confidence_score = state.get("confidence_score", 0.0)
                 plan = state.get("plan")
                 self.fast_path = plan.fast_path if plan else False
+                self.stages = plan.stages if plan else []
                 
                 # Expose mock internal state for tests
                 class LLMInput:

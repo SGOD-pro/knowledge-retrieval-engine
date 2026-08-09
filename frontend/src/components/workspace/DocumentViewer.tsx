@@ -1,4 +1,3 @@
-import React, { useState } from 'react';
 import type { Citation } from '@/hooks/useQueryEngine';
 
 export function DocumentViewer({ selectedCitation }: { selectedCitation: Citation | null }) {

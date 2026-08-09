@@ -1,4 +1,5 @@
-import React, { createContext, useContext, useEffect, useState } from "react"
+import React, { createContext, useContext, useLayoutEffect, useState } from "react"
+import { flushSync } from "react-dom"
 
 type Theme = "dark" | "light" | "system"
 
@@ -30,7 +31,7 @@ export function ThemeProvider({
     () => (localStorage.getItem(storageKey) as Theme) || defaultTheme
   )
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const root = window.document.documentElement
 
     root.classList.remove("light", "dark")
@@ -50,9 +51,20 @@ export function ThemeProvider({
 
   const value = {
     theme,
-    setTheme: (theme: Theme) => {
-      localStorage.setItem(storageKey, theme)
-      setTheme(theme)
+    setTheme: (newTheme: Theme) => {
+      localStorage.setItem(storageKey, newTheme)
+      
+      const switchTheme = () => {
+        flushSync(() => {
+          setTheme(newTheme)
+        })
+      }
+
+      if (!document.startViewTransition) {
+        switchTheme()
+      } else {
+        document.startViewTransition(switchTheme)
+      }
     },
   }
 

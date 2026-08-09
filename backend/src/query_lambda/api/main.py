@@ -111,6 +111,7 @@ def query_endpoint(req: QueryRequest):
         "fast_path": fast_path,
         "cached": False,
         "document_ids": req.document_ids or [],
+        "retrieval_path": getattr(response, "stages", []),
     }
     
     # 3. Write Cache (ONLY if conditions are met)

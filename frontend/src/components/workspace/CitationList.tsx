@@ -1,4 +1,3 @@
-import React from 'react';
 import type { Citation } from '@/hooks/useQueryEngine';
 import { Badge } from '@/components/ui/badge';
 import { Card, CardContent } from '@/components/ui/card';
