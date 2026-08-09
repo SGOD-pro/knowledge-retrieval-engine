@@ -4,15 +4,15 @@ from docx import Document as DocxDocument
 from openpyxl import Workbook
 from pptx import Presentation
 
-from kre.ingestion_lambda.format_router import route
-from kre.ingestion_lambda.adapters.docx_adapter import parse as parse_docx
-from kre.ingestion_lambda.adapters.pdf_adapter import parse as parse_pdf
-from kre.ingestion_lambda.adapters.pptx_adapter import parse as parse_pptx
-from kre.ingestion_lambda.adapters.xlsx_adapter import parse as parse_xlsx
-from kre.ingestion_lambda.adapters.csv_adapter import parse as parse_csv
-from kre.ingestion_lambda.parse_service import parse_file
-from kre.ingestion_lambda.page_index_service import rank, score
-from kre.shared.models import Chunk
+from ingestion_lambda.format_router import route
+from ingestion_lambda.adapters.docx_adapter import parse as parse_docx
+from ingestion_lambda.adapters.pdf_adapter import parse as parse_pdf
+from ingestion_lambda.adapters.pptx_adapter import parse as parse_pptx
+from ingestion_lambda.adapters.xlsx_adapter import parse as parse_xlsx
+from ingestion_lambda.adapters.csv_adapter import parse as parse_csv
+from ingestion_lambda.parse_service import parse_file
+from ingestion_lambda.page_index_service import rank, score
+from shared.models import Chunk
 
 DATA_DIR = Path(__file__).parent / "data"
 

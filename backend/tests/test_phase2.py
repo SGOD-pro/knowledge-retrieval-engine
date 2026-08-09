@@ -4,16 +4,15 @@ import pytest
 from fastapi.testclient import TestClient
 from unittest.mock import patch, MagicMock
 
-from kre.query_lambda.api.main import app, repository
-from kre.shared.models import Chunk, Document
-from kre.shared.providers.embedding_provider import embed_text as api_embed_text
-from kre.shared.providers.embedding_provider import embed_fast_local
-from kre.shared.providers.provider_client import get_active_provider
-from kre.query_lambda.retrieval.bm25_retriever import BM25Retriever
-from kre.query_lambda.retrieval.page_index_retriever import PageIndexRetriever
-from kre.query_lambda.retrieval.planner import planner
-from kre.query_lambda.retrieval.response_builder import build_citation
-from kre.query_lambda.retrieval.vector_retriever import VectorRetriever
+from api.main import app, repository
+from models import Chunk, Document
+from providers.embedding_provider import embed_text as api_embed_text
+from providers.provider_client import get_active_provider
+from retrieval.bm25_retriever import BM25Retriever
+from retrieval.page_index_retriever import PageIndexRetriever
+from retrieval.planner import planner
+from retrieval.response_builder import build_citation
+from retrieval.vector_retriever import VectorRetriever
 
 client = TestClient(app)
 
@@ -178,8 +177,8 @@ def test_r27_no_forbidden_dependencies():
 
 def test_r19_fast_path_uses_local_bge_and_fast_column(seed_test_documents):
     vec = VectorRetriever(repository=repository())
-    with patch("kre.shared.providers.embedding_provider.embed_fast_local") as mock_local:
-        with patch("kre.shared.providers.embedding_provider.embed_text") as mock_api:
+    with patch("shared.providers.embedding_provider.embed_fast_local") as mock_local:
+        with patch("shared.providers.embedding_provider.embed_text") as mock_api:
             mock_local.return_value = [0.1] * 384
             vec.search("refund policy", fast_path=True)
             
@@ -189,8 +188,8 @@ def test_r19_fast_path_uses_local_bge_and_fast_column(seed_test_documents):
 
 def test_r19_full_path_uses_api_and_full_column(seed_test_documents):
     vec = VectorRetriever(repository=repository())
-    with patch("kre.shared.providers.embedding_provider.embed_fast_local") as mock_local:
-        with patch("kre.shared.providers.embedding_provider.embed_text") as mock_api:
+    with patch("shared.providers.embedding_provider.embed_fast_local") as mock_local:
+        with patch("shared.providers.embedding_provider.embed_text") as mock_api:
             mock_api.return_value = [0.1] * 1024
             vec.search("refund policy", fast_path=False)
             
@@ -214,8 +213,8 @@ def test_r30_schema_level_routing_isolation():
 
 def test_fast_path_embedding_makes_zero_network_calls():
     # If fast path uses API, this mock will raise an exception during the test
-    with patch("kre.shared.providers.embedding_provider.requests.post") as mock_post:
-        with patch("kre.shared.providers.embedding_provider.get_boto3_client") as mock_boto:
+    with patch("shared.providers.embedding_provider.requests.post") as mock_post:
+        with patch("shared.providers.embedding_provider.get_boto3_client") as mock_boto:
             response = client.post("/query", json={"query": "What is the refund policy?"})
             assert response.status_code == 200
             assert response.json()["fast_path"] is True
@@ -234,8 +233,8 @@ def test_full_path_embedding_makes_exactly_one_network_call():
         return mock
 
     with patch.dict("os.environ", {"OPENROUTER_API_KEY": "test"}):
-        with patch("kre.shared.providers.embedding_provider.requests.post", side_effect=mock_post_side_effect) as mock_post:
-            with patch("kre.query_lambda.llm.llm_service.generate_completion") as mock_llm:
+        with patch("shared.providers.embedding_provider.requests.post", side_effect=mock_post_side_effect) as mock_post:
+            with patch("query_lambda.llm.llm_service.generate_completion") as mock_llm:
                 mock_llm.return_value = '{"answer": "MOCK", "citations": []}'
                 
                 # Rule 3 query triggers full path
