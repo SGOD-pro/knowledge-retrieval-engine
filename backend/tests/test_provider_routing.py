@@ -3,7 +3,7 @@ import pytest
 from unittest.mock import patch
 
 from providers.provider_client import get_active_provider, ConfigurationError
-from shared.bedrock_models import get_embedding_model, get_reranker_model, get_llm_model
+from providers.bedrock_models import get_embedding_model, get_reranker_model, get_llm_model
 
 def test_r28_provider_routing_enforced():
     """Rule 28: All models must map to the defined model matrix."""

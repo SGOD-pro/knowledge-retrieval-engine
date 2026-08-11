@@ -1,7 +1,7 @@
 """Ingestion Lambda handler entry point.
 
 Receives S3 event notifications for new documents, orchestrates parsing,
-OKF extraction, and dual-column embedding before persisting to Postgres.
+OKF extraction, and dual-column embedding before persisting to DynamoDB and Qdrant.
 """
 
 import json
@@ -19,6 +19,6 @@ def handler(event, context):
     # 2. Route to appropriate adapter (PDF → invoke odl-parser-lambda, others → in-process)
     # 3. Run page_index_service, concept_service, normalize_service, okf_builder
     # 4. Run embed_service.embed_chunks_dual() to populate both embedding columns
-    # 5. Persist to Postgres via shared/db/postgres.py
+    # 5. Persist to DynamoDB/Qdrant via shared/db/database.py
 
     return {"statusCode": 200, "body": json.dumps({"message": "Ingestion complete"})}

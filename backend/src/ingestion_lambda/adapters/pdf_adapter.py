@@ -29,12 +29,13 @@ import sys
 
 import boto3
 
-from shared.models import Chunk
+from schemas.models import Chunk
+from config import settings
 
 logger = logging.getLogger(__name__)
 
-# Lambda function name — configurable via env var for dev/prod routing
-_ODL_PARSER_FUNCTION_NAME = os.environ.get("ODL_PARSER_LAMBDA_NAME", "odl-parser-lambda")
+# Lambda function name from config
+_ODL_PARSER_FUNCTION_NAME = settings.ODL_PARSER_LAMBDA_NAME
 
 
 def parse(path, document_id: str) -> list[Chunk]:
@@ -51,12 +52,12 @@ def parse(path, document_id: str) -> list[Chunk]:
         RuntimeError: If odl-parser returns a Lambda-level error, or if
             document_id appears in the response's "failed" list.
     """
-    environment = os.environ.get("ENVIRONMENT", "dev")
+    environment = settings.ENVIRONMENT
 
-    if environment == "dev":
+    if environment in ("dev", "test"):
         # DEV BYPASS: Direct import to avoid S3 dependency.
         # odl/main.py lambda_handler expects a documents[] batch event.
-        odl_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "..", "odl"))
+        odl_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "odl"))
         
         import importlib.util
         spec = importlib.util.spec_from_file_location("odl_main", os.path.join(odl_path, "main.py"))
@@ -66,7 +67,7 @@ def parse(path, document_id: str) -> list[Chunk]:
         event = {
             "documents": [{
                 "document_id": document_id,
-                "s3_bucket": os.environ.get("S3_BUCKET_NAME", "kre-documents-dev"),
+                "s3_bucket": settings.S3_BUCKET_NAME,
                 "s3_key": str(path),
             }]
         }
@@ -81,10 +82,10 @@ def parse(path, document_id: str) -> list[Chunk]:
         # Payload wraps the request in {"documents": [...]} so it matches the
         # odl-parser normalizer contract (Prompt 1 fix). Flat {s3_bucket,
         # s3_key, document_id} was wrong — the Lambda expects a batch envelope.
-        from shared.aws import get_client
+        from aws.infra import get_client
         client = get_client("lambda")
 
-        s3_bucket = os.environ.get("S3_BUCKET_NAME", "kre-documents-prod")
+        s3_bucket = settings.S3_BUCKET_NAME
         s3_key = path.name
 
         payload = {

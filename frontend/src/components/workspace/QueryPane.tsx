@@ -36,8 +36,8 @@ export function QueryPane({ onSearch, loading, response }: QueryPaneProps) {
       <div className="flex-1 flex flex-col items-center justify-center p-8 max-w-3xl mx-auto w-full">
         {!response && !loading && (
           <div className="text-center mb-12 opacity-80">
-            <h2 className="font-serif text-4xl mb-4 tracking-tight">KRE Intelligence</h2>
-            <p className="text-muted-foreground">Ask any question about your organization's documents.</p>
+            <h2 className="text-display-lg mb-4">KRE Intelligence</h2>
+            <p className="text-body-lg text-muted-foreground">Ask any question about your organization's documents.</p>
           </div>
         )}
 
@@ -74,7 +74,7 @@ export function QueryPane({ onSearch, loading, response }: QueryPaneProps) {
                 </div>
               </div>
 
-              <div className="prose prose-slate dark:prose-invert max-w-none text-lg leading-relaxed text-foreground/90">
+              <div className="prose prose-slate dark:prose-invert max-w-none text-body-lg text-foreground/90">
                 {response.answer}
               </div>
             </div>

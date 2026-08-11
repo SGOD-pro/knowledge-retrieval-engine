@@ -1,4 +1,5 @@
 import os
+from config import settings
 
 
 class ConfigurationError(Exception):
@@ -18,8 +19,8 @@ def get_active_provider() -> str:
 
     Enforces Rule 29: MODEL_PROVIDER=dev is prohibited in production environment.
     """
-    environment = os.environ.get("ENVIRONMENT", "development").lower()
-    provider = os.environ.get("MODEL_PROVIDER", "dev").lower()
+    environment = settings.ENVIRONMENT.lower()
+    provider = settings.MODEL_PROVIDER.lower()
 
     if environment == "production" and provider == "dev":
         raise ConfigurationError("MODEL_PROVIDER=dev is strictly prohibited in production environment (Rule 29).")

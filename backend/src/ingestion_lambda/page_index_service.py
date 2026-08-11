@@ -1,6 +1,6 @@
 import re
 
-from shared.models import Chunk
+from schemas.models import Chunk
 
 _WEIGHTS = {"title": 3.0, "heading": 2.5, "section": 2.0, "paragraph": 1.0, "cell": 1.0, "caption": 0.8, "footnote": 0.75}
 

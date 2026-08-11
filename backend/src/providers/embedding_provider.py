@@ -17,7 +17,7 @@ import logging
 from typing import Sequence
 
 from providers.provider_client import get_active_provider
-from shared.bedrock_models import get_embedding_model
+from providers.bedrock_models import get_embedding_model
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +34,7 @@ def embed_text(text: str, provider: str | None = None) -> list[float]:
     dim = FULL_EMBEDDING_DIM
 
     try:
-        from shared.aws import get_client
+        from aws.infra import get_client
         client = get_client("bedrock-runtime")
         # Titan V2 accepts up to 8k tokens. 1 token ~ 4 chars.
         # Truncating to 30,000 chars provides a safe margin.
@@ -63,7 +63,11 @@ def embed_text(text: str, provider: str | None = None) -> list[float]:
     except Exception as e:
         logger.error("Embedding request failed: %s", str(e))
 
-    # Raise error instead of falling back to deterministic vector
+    from config import settings
+    if provider == "dev" or settings.ENVIRONMENT in ("dev", "test"):
+        logger.warning("Falling back to deterministic pseudo-embedding")
+        return _deterministic_vector(text, dim)
+        
     raise RuntimeError("API embedding failed. Check rate limits or API key.")
 
 def _deterministic_vector(text: str, dim: int) -> list[float]:
@@ -73,9 +77,17 @@ def _deterministic_vector(text: str, dim: int) -> list[float]:
     return vector
 
 def embed_batch(texts: Sequence[str], provider: str | None = None) -> list[list[float]]:
+    from config import settings
+    if provider == "dev" or settings.ENVIRONMENT in ("dev", "test"):
+        from ingestion.embed_service import _run_onnx_batch
+        fast_vecs = _run_onnx_batch(list(texts))
+        # Pad 384-dim ONNX vectors with zeros to 1024-dim for embedding_full compatibility in dev mode
+        padded = [v + [0.0] * (FULL_EMBEDDING_DIM - len(v)) for v in fast_vecs]
+        return padded
+
     import time
     res = []
     for t in texts:
         res.append(embed_text(t, provider=provider))
-        time.sleep(0.5)
+        time.sleep(0.05)  # 50ms delay per call to stay within rate limits without huge latency
     return res

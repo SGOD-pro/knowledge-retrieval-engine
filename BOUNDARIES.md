@@ -1,12 +1,12 @@
-# BOUNDARIES.md (rev 5)
+# BOUNDARIES.md (rev 6)
 
 ## Hard Boundaries
 
 - Answers from provided documents only. Never from LLM training data.
   Enforced by system prompt. Tested by test_r15_*.
 
-- Supported formats v1: PDF, DOCX, XLSX, PPTX.
-  HTML, XML, CSV: v2.
+- Supported formats v1: PDF, DOCX, XLSX, PPTX, CSV.
+  HTML, XML: v2.
 
 - No OCR in default mode. opendataloader-pdf --hybrid is opt-in.
   Non-PDF formats have no OCR layer — text extraction only.
@@ -17,9 +17,9 @@
 
 - No multi-turn conversation state. Each query is independent. (v2)
 
-- Local model inference is ONLY permitted for the Query Lambda fast path (`BGE-small-en-v1.5` ONNX). All other embedding, reranking, and LLM calls must be API calls through providers/*.py.
+- Local model inference runs in the BGE-small microservice (separate deployment). The Query Lambda does NOT bundle ONNX weights — it calls the microservice via HTTP. All other embedding, reranking, and LLM calls must be API calls through providers/*.py.
 
-- No GPU-dependent frameworks (torch, transformers) in the Lambda deployment package. `onnxruntime` is the explicit and sole exception for BGE-small.
+- No GPU-dependent frameworks (torch, transformers) in any Lambda deployment package. `onnxruntime` is allowed in the BGE-small microservice only.
 
 - Deployment package limits:
   - Query Lambda: Zip deployment <250MB unzipped, or Container image 10GB limit.
@@ -37,7 +37,7 @@
 
 ## Soft Boundaries
 
-- Max corpus: pgvector/RDS PostgreSQL doesn't have the 10k-page FAISS-recall-degradation ceiling from rev 1-3. Benchmark at 50k pages before setting a new number.
+- Max corpus: QdrantDB + DynamoDB don't have the 10k-page FAISS-recall-degradation ceiling from rev 1-3. Benchmark at 50k pages before setting a new number.
 
 - Lambda timeout: 15 minutes max. Full pipeline query must complete well under this (target 4s p95). Ingestion Lambda timeout must account for `odl-parser-lambda` JVM parse time + Ingestion Lambda's remaining work.
 
@@ -54,5 +54,4 @@
 - SQL / structured query path.
 - Fine-tuning on user data.
 - Real-time document sync.
-- CSV/HTML ingestion.
 - Fully air-gapped / zero-external-API deployment.

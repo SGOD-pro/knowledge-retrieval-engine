@@ -4,7 +4,7 @@ import logging
 import re
 from models import Chunk
 from providers.provider_client import get_active_provider, enforce_rate_limit
-from shared.bedrock_models import get_concept_model
+from providers.bedrock_models import get_concept_model
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +33,7 @@ def extract_properties_nova_micro(chunks: list[Chunk], provider: str | None = No
         user_prompt = f"Extract properties from these chunks:\n{batch_text}"
         
         try:
-            from shared.aws import get_client
+            from aws.infra import get_client
             client = get_client("bedrock-runtime")
             response = client.converse(
                 modelId=model_id,

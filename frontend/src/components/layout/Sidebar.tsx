@@ -32,7 +32,7 @@ export function Sidebar() {
             }
           >
             <item.icon className="h-4 w-4" />
-            <span className="font-medium text-sm">{item.name}</span>
+            <span className="text-label-md">{item.name}</span>
           </NavLink>
         ))}
       </nav>

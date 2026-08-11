@@ -1,7 +1,7 @@
 import csv
 from pathlib import Path
 
-from shared.models import Chunk
+from schemas.models import Chunk
 
 
 def parse(path: Path, document_id: str) -> list[Chunk]:

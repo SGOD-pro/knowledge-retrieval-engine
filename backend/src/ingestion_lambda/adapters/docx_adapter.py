@@ -2,7 +2,7 @@ from pathlib import Path
 
 from docx import Document as DocxDocument
 
-from shared.models import Chunk
+from schemas.models import Chunk
 
 
 def parse(path: Path, document_id: str) -> list[Chunk]:

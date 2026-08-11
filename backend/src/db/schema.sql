@@ -42,15 +42,30 @@ CREATE TABLE IF NOT EXISTS cache_entries (
 );
 
 CREATE TABLE IF NOT EXISTS concepts (
-    id UUID PRIMARY KEY,
-    name TEXT NOT NULL UNIQUE
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    type TEXT NOT NULL,
+    document_ids TEXT[] NOT NULL DEFAULT '{}'
 );
 
 CREATE TABLE IF NOT EXISTS properties (
-    id UUID PRIMARY KEY,
-    concept_id UUID NOT NULL REFERENCES concepts(id) ON DELETE CASCADE,
+    concept_id TEXT NOT NULL REFERENCES concepts(id) ON DELETE CASCADE,
     property_name TEXT NOT NULL,
     property_value TEXT NOT NULL,
+    value_type TEXT NOT NULL,
     source_chunk_id TEXT NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
-    confidence DOUBLE PRECISION NOT NULL DEFAULT 1.0
+    confidence DOUBLE PRECISION NOT NULL,
+    extraction_tier TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS properties_concept_idx ON properties(concept_id);
+
+CREATE TABLE IF NOT EXISTS relations (
+    from_concept_id TEXT NOT NULL REFERENCES concepts(id) ON DELETE CASCADE,
+    to_concept_id TEXT NOT NULL REFERENCES concepts(id) ON DELETE CASCADE,
+    relation_type TEXT NOT NULL,
+    relation_weight DOUBLE PRECISION NOT NULL,
+    source_chunk_id TEXT NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+    extraction_tier TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS relations_from_idx ON relations(from_concept_id);
+CREATE INDEX IF NOT EXISTS relations_to_idx ON relations(to_concept_id);

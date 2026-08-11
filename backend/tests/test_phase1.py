@@ -12,7 +12,7 @@ from ingestion_lambda.adapters.xlsx_adapter import parse as parse_xlsx
 from ingestion_lambda.adapters.csv_adapter import parse as parse_csv
 from ingestion_lambda.parse_service import parse_file
 from ingestion_lambda.page_index_service import rank, score
-from shared.models import Chunk
+from schemas.models import Chunk
 
 DATA_DIR = Path(__file__).parent / "data"
 

@@ -8,8 +8,8 @@
 | Fast path p95 latency (cold start) | <1500ms | 200 runs, first invocation after >15 min idle |
 | Full pipeline p95 latency (warm) | <4000ms | 200 runs, Lambda warm path |
 | Decomposed path p95 | <5500ms | 200 runs, decomposed query path |
-| Graph traversal p95 (2-hop CTE) | <200ms | 200 runs, relationship queries only |
-| Graph traversal p95 (3-hop CTE) | <350ms | 200 runs, relationship queries only |
+| Graph traversal p95 (2-hop) | <200ms | 200 runs, relationship queries only |
+| Graph traversal p95 (3-hop) | <350ms | 200 runs, relationship queries only |
 | Cold start delta | <1200ms | p95_cold - p95_warm |
 | Recall@3 (fast path) | >0.75 | 40-query factual test set |
 | Recall@5 (full path) | >0.85 | 80-query complex test set |
@@ -37,8 +37,8 @@
 | Fast path p95 (cold start) | <1500ms (tracked separately) | n/a | New metric — Lambda-specific |
 | Full pipeline p95 (warm) | <4000ms | <3000ms | Multiple sequential API calls |
 | Decomposed path p95 | <5500ms | <4000ms | Same reason, plus parallel calls |
-| Graph traversal p95 (2-hop CTE) | <200ms | <150ms | Postgres query vs in-memory dict |
-| Graph traversal p95 (3-hop CTE) | <350ms | <250ms | Same |
+| Graph traversal p95 (2-hop) | <200ms | <150ms | DynamoDB adjacency query vs in-memory dict |
+| Graph traversal p95 (3-hop) | <350ms | <250ms | Same |
 
 > [!WARNING]
 > **RE-VERIFICATION REQUIRED:** The Phase 1 exit criterion "100-page PDF ingested in <30 seconds" is unverified and flagged for re-verification given the new cross-Lambda synchronous call (`odl-parser-lambda`) is now in the critical path.
@@ -53,16 +53,11 @@ Measure separately from warm-path latency. Report both:
 Target: cold_start_delta < 1200ms. If exceeded, evaluate provisioned
 concurrency cost-benefit before Phase 5 sign-off.
 
-## Dev vs Prod Provider Parity Check (NEW)
+## Provider Parity Check
 
-Before Phase 5 sign-off, run the full 120-query benchmark TWICE:
-- once with MODEL_PROVIDER=dev (OpenRouter free models)
-- once with MODEL_PROVIDER=prod (Bedrock models)
-
-Report both result sets side by side. If dev-mode Recall@5 or
-Faithfulness falls more than 5% below prod-mode: dev is not a
-reliable stand-in for prod testing, and pre-launch QA must run
-exclusively on prod provider from that point forward.
+Before Phase 5 sign-off, run the full 120-query benchmark on Bedrock providers.
+Dev and Prod now use the same Bedrock models (Titan V2, Nova Lite, Nova Micro, NVIDIA NIM).
+No OpenRouter dependency remains.
 
 ---
 

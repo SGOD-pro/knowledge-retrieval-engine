@@ -1,7 +1,7 @@
 import os
 import time
 import pytest
-from api.main import app
+from main import app
 from fastapi.testclient import TestClient
 
 client = TestClient(app)
@@ -10,7 +10,7 @@ def test_full_pipeline_p95_under_4000ms_prod(monkeypatch):
     monkeypatch.setenv("MODEL_PROVIDER", "prod")
     # Simulate / Mock pipeline run to verify p95 latency under 4000ms
     latencies = []
-    from graph.langgraph_pipeline import pipeline
+    from services.langgraph_pipeline import pipeline
 
     class FastMockResponse:
         answer = "Test answer"
@@ -34,7 +34,7 @@ def test_full_pipeline_p95_under_4000ms_prod(monkeypatch):
 def test_full_pipeline_p95_under_4000ms_dev(monkeypatch):
     monkeypatch.setenv("MODEL_PROVIDER", "dev")
     latencies = []
-    from graph.langgraph_pipeline import pipeline
+    from services.langgraph_pipeline import pipeline
 
     class FastMockResponse:
         answer = "Test answer"
@@ -72,7 +72,7 @@ def test_lambda_package_size_under_250mb():
 
 def test_fast_path_cold_start_under_1500ms(monkeypatch):
     # Cold start simulation
-    from graph.langgraph_pipeline import pipeline
+    from services.langgraph_pipeline import pipeline
 
     class ColdStartMockResponse:
         answer = "Cold start answer"

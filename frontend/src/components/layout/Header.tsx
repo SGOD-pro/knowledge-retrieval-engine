@@ -9,7 +9,7 @@ export function Header() {
   return (
     <header className="h-14 border-b border-border bg-card flex items-center justify-between px-6 shrink-0">
       <div className="flex items-center gap-6">
-        <h1 className="font-serif text-lg font-semibold tracking-tight text-primary">
+        <h1 className="text-headline-sm text-primary">
           KRE Intelligence
         </h1>
         <div className="relative hidden md:block w-64">

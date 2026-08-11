@@ -2,10 +2,12 @@ import json
 import os
 import uuid
 import logging
+import time
 from decimal import Decimal
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
 from models import Chunk, Document
+from config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -17,27 +19,17 @@ class CloudRepository:
     and Qdrant Cloud for vector similarity search.
     """
     def __init__(self, dsn: str | None = None):
-        self.table_name = os.environ.get("DYNAMODB_TABLE_NAME", "kre-table")
-        from shared.aws import get_resource
+        self.table_name = settings.DYNAMODB_TABLE_NAME
+        from aws.infra import get_resource
         self.dynamodb = get_resource('dynamodb')
         self.table = self.dynamodb.Table(self.table_name)
         
-        self.qdrant_url = os.environ.get("QDRANT_URL", "http://localhost:6333")
-        self.qdrant_api_key = os.environ.get("QDRANT_API_KEY")
-        self.qclient = QdrantClient(url=self.qdrant_url, api_key=self.qdrant_api_key)
+        self.qclient = QdrantClient(url=settings.QDRANT_URL, api_key=settings.QDRANT_API_KEY)
         self.collection_name = "kre_chunks"
         
-    def _connect(self):
-        import contextlib
-        @contextlib.contextmanager
-        def dummy_connect():
-            class DummyConnection:
-                def execute(self, *args, **kwargs):
-                    class DummyCursor:
-                        def fetchall(self): return []
-                    return DummyCursor()
-            yield DummyConnection()
-        return dummy_connect()
+        self.okf_entities_table = self.dynamodb.Table("okf_entities")
+        self.okf_properties_table = self.dynamodb.Table("okf_properties")
+        self.okf_relations_table = self.dynamodb.Table("okf_relations")
         
     def initialize(self) -> None:
         try:
@@ -69,8 +61,51 @@ class CloudRepository:
         except Exception as e:
             if "ResourceInUseException" not in str(e):
                 logger.warning("DynamoDB init error: %s", e)
+                
+        try:
+            self.dynamodb.create_table(
+                TableName="okf_entities",
+                KeySchema=[
+                    {'AttributeName': 'PK', 'KeyType': 'HASH'},
+                    {'AttributeName': 'SK', 'KeyType': 'RANGE'}
+                ],
+                AttributeDefinitions=[
+                    {'AttributeName': 'PK', 'AttributeType': 'S'},
+                    {'AttributeName': 'SK', 'AttributeType': 'S'}
+                ],
+                BillingMode='PAY_PER_REQUEST'
+            )
+            self.okf_entities_table.meta.client.get_waiter('table_exists').wait(TableName="okf_entities")
+        except Exception as e:
+            if "ResourceInUseException" not in str(e):
+                logger.warning("DynamoDB okf_entities init error: %s", e)
+                
+        try:
+            self.dynamodb.create_table(
+                TableName="okf_properties",
+                KeySchema=[
+                    {'AttributeName': 'PK', 'KeyType': 'HASH'},
+                    {'AttributeName': 'SK', 'KeyType': 'RANGE'}
+                ],
+                AttributeDefinitions=[
+                    {'AttributeName': 'PK', 'AttributeType': 'S'},
+                    {'AttributeName': 'SK', 'AttributeType': 'S'}
+                ],
+                BillingMode='PAY_PER_REQUEST'
+            )
+            self.okf_properties_table.meta.client.get_waiter('table_exists').wait(TableName="okf_properties")
+        except Exception as e:
+            if "ResourceInUseException" not in str(e):
+                logger.warning("DynamoDB okf_properties init error: %s", e)
 
     def save(self, document: Document) -> None:
+        _IN_MEMORY_DOCS[str(document.id)] = document
+        for chunk in document.chunks:
+            _IN_MEMORY_CHUNKS[str(chunk.id)] = chunk
+
+        if settings.ENVIRONMENT == "test":
+            return
+            
         try:
             with self.table.batch_writer() as batch:
                 batch.put_item(Item={
@@ -126,10 +161,22 @@ class CloudRepository:
                 ))
             
             if points:
-                self.qclient.upsert(
-                    collection_name=self.collection_name,
-                    points=points
-                )
+                batch_size = 50  # Qdrant cloud rate limit mitigation
+                for i in range(0, len(points), batch_size):
+                    batch = points[i:i+batch_size]
+                    try:
+                        self.qclient.upsert(
+                            collection_name=self.collection_name,
+                            points=batch
+                        )
+                        time.sleep(0.5)
+                    except Exception as qe:
+                        if "429" in str(qe) or "Too Many Requests" in str(qe):
+                            logger.warning("Qdrant rate limit hit. Sleeping 5s and retrying...")
+                            time.sleep(5)
+                            self.qclient.upsert(collection_name=self.collection_name, points=batch)
+                        else:
+                            raise qe
         except Exception as e:
             logger.warning("Failed to save to cloud database: %s", e)
 
@@ -157,6 +204,9 @@ class CloudRepository:
         )
 
     def get(self, document_id: str) -> Document | None:
+        if settings.ENVIRONMENT == "test":
+            return _IN_MEMORY_DOCS.get(document_id)
+            
         from boto3.dynamodb.conditions import Key
         try:
             response = self.table.query(
@@ -177,6 +227,14 @@ class CloudRepository:
             return None
 
     def get_all_chunks(self, document_ids: list[str] | None = None) -> list[Chunk]:
+        if _IN_MEMORY_CHUNKS:
+            if document_ids:
+                return [c for c in _IN_MEMORY_CHUNKS.values() if str(c.document_id) in document_ids]
+            return list(_IN_MEMORY_CHUNKS.values())
+
+        if settings.ENVIRONMENT == "test":
+            return []
+
         from boto3.dynamodb.conditions import Attr
         chunks = []
         if document_ids:
@@ -188,14 +246,20 @@ class CloudRepository:
             try:
                 response = self.table.scan(FilterExpression=Attr('SK').begins_with("CHUNK#"))
                 items = response.get('Items', [])
-                chunks.extend([self._parse_chunk(row) for row in items])
+                for row in items:
+                    c = self._parse_chunk(row)
+                    chunks.append(c)
+                    _IN_MEMORY_CHUNKS[str(c.id)] = c
                 while 'LastEvaluatedKey' in response:
                     response = self.table.scan(
                         FilterExpression=Attr('SK').begins_with("CHUNK#"),
                         ExclusiveStartKey=response['LastEvaluatedKey']
                     )
                     items = response.get('Items', [])
-                    chunks.extend([self._parse_chunk(row) for row in items])
+                    for row in items:
+                        c = self._parse_chunk(row)
+                        chunks.append(c)
+                        _IN_MEMORY_CHUNKS[str(c.id)] = c
             except Exception:
                 pass
         return chunks
@@ -209,6 +273,21 @@ class CloudRepository:
         candidate_chunk_ids: list[str] | None = None,
         limit: int = 10,
     ) -> list[tuple[Chunk, float]]:
+        if settings.ENVIRONMENT == "test":
+            import numpy as np
+            results = []
+            q_vec = np.array(query_embedding)
+            for chunk in _IN_MEMORY_CHUNKS.values():
+                if document_ids and str(chunk.document_id) not in document_ids: continue
+                if candidate_page_ids and chunk.page_number not in candidate_page_ids: continue
+                if candidate_chunk_ids and str(chunk.id) not in candidate_chunk_ids: continue
+                c_vec = chunk.embedding_fast if embedding_column == "embedding_fast" else chunk.embedding_full
+                if c_vec:
+                    score = float(np.dot(q_vec, np.array(c_vec)))
+                    results.append((chunk, score))
+            results.sort(key=lambda x: x[1], reverse=True)
+            return results[:limit]
+            
         if embedding_column not in ("embedding_fast", "embedding_full"):
             raise ValueError(f"Invalid embedding_column: {embedding_column}")
             
@@ -218,16 +297,20 @@ class CloudRepository:
                 key="document_id",
                 match=qmodels.MatchAny(any=document_ids)
             ))
+        should_filters = []
         if candidate_page_ids:
-            must_filters.append(qmodels.FieldCondition(
+            should_filters.append(qmodels.FieldCondition(
                 key="page_number",
                 match=qmodels.MatchAny(any=candidate_page_ids)
             ))
         if candidate_chunk_ids:
-            must_filters.append(qmodels.FieldCondition(
+            should_filters.append(qmodels.FieldCondition(
                 key="original_id",
                 match=qmodels.MatchAny(any=candidate_chunk_ids)
             ))
+            
+        if should_filters:
+            must_filters.append(qmodels.Filter(should=should_filters))
             
         qfilter = qmodels.Filter(must=must_filters) if must_filters else None
         
@@ -337,5 +420,58 @@ class CloudRepository:
         except Exception:
             pass
 
-# Backward compatibility alias
-PostgresRepository = CloudRepository
+    def get_okf_properties(self, entities: list[str]) -> list[dict]:
+        from boto3.dynamodb.conditions import Key
+        results = []
+        for entity in entities:
+            try:
+                pk = f"ENTITY#{entity.strip().upper()}"
+                response = self.okf_properties_table.query(
+                    KeyConditionExpression=Key('PK').eq(pk)
+                )
+                for item in response.get('Items', []):
+                    results.append({
+                        "concept": entity,
+                        "property_name": item.get('property_name'),
+                        "property_value": item.get('property_value'),
+                        "source_chunk_id": item.get('source_chunk_id'),
+                        "confidence": float(item.get('confidence', 1.0))
+                    })
+            except Exception as e:
+                logger.warning("DynamoDB OKF property lookup failed for %s: %s", entity, e)
+        return results
+
+    def expand_graph(self, start_entities: list[str], max_hops: int = 2) -> list[dict]:
+        from boto3.dynamodb.conditions import Key
+        results = []
+        visited = set()
+        queue = [(e.strip().upper(), 1) for e in start_entities]
+        
+        while queue and len(results) < 40:
+            current_entity, hop = queue.pop(0)
+            if current_entity in visited or hop > max_hops:
+                continue
+            visited.add(current_entity)
+            
+            try:
+                pk = f"ENTITY#{current_entity}"
+                response = self.okf_entities_table.query(
+                    KeyConditionExpression=Key('PK').eq(pk) & Key('SK').begins_with("REL#")
+                )
+                for item in response.get('Items', []):
+                    weight = float(item.get('relation_weight', 0.0))
+                    if weight < 0.3:
+                        continue
+                    to_concept = item.get('to_concept_id')
+                    results.append({
+                        "concept_id": to_concept,
+                        "relation_type": item.get('relation_type'),
+                        "relation_weight": weight,
+                        "hop": hop
+                    })
+                    if hop < max_hops:
+                        queue.append((to_concept, hop + 1))
+            except Exception as e:
+                logger.warning("DynamoDB OKF graph traversal failed for %s: %s", current_entity, e)
+                
+        return results[:40]

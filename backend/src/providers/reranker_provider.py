@@ -18,8 +18,13 @@ import threading
 import requests
 
 from providers.provider_client import get_active_provider
+from config import settings
 
 logger = logging.getLogger(__name__)
+
+# Model name read from config (shared/config.py → NVIDIA_RERANKER_MODEL).
+# To override, set NVIDIA_RERANKER_MODEL in the environment.
+_NVIDIA_RERANKER_MODEL = settings.NVIDIA_RERANKER_MODEL
 
 # Basic token bucket / rate limiter state
 _rl_lock = threading.Lock()
@@ -47,15 +52,16 @@ def _sigmoid(x: float) -> float:
         return 1.0 if x > 0 else 0.0
 
 def nvidia_nim_reranker(query: str, documents: list[str]) -> list[float]:
-    invoke_url = "https://ai.api.nvidia.com/v1/retrieval/nvidia/llama-nemotron-rerank-1b-v2/reranking"
-    api_key = os.environ.get("NVIDIA_API_KEY", "")
+    invoke_url = f"https://ai.api.nvidia.com/v1/retrieval/nvidia/llama-nemotron-rerank-1b-v2/reranking"
+    api_key = settings.NVIDIA_API_KEY
+    logger.info("reranker.mode=nvidia_nim model=%s", _NVIDIA_RERANKER_MODEL)
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Accept": "application/json",
     }
-    
+
     payload = {
-        "model": "nvidia/llama-nemotron-rerank-1b-v2",
+        "model": _NVIDIA_RERANKER_MODEL,
         "query": {"text": query},
         "passages": [{"text": doc} for doc in documents]
     }
@@ -115,12 +121,14 @@ def rerank_documents(query: str, documents: list[str], provider: str | None = No
     except Exception as e:
         logger.error("Reranker failed: %s", str(e))
 
-    # Deterministic fallback — Jaccard word overlap scoring
-    scores = []
+    # Deterministic fallback — Jaccard word overlap scoring.
+    # This path runs when NVIDIA NIM is unavailable (e.g. missing/invalid NVIDIA_API_KEY).
+    logger.warning("reranker.mode=jaccard_fallback reason=nvidia_nim_failed — check NVIDIA_API_KEY")
     query_words = set(query.lower().split())
     if not query_words:
         return [0.0] * len(documents)
 
+    scores = []
     for doc in documents:
         doc_words = set(doc.lower().split())
         if not doc_words:

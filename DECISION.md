@@ -1,51 +1,56 @@
 # DECISION.md — Planner Rules and System Decisions
 
-## Three-Way Dev Environment Split
+## Dev Environment Split
 
-Dev environment is NOT fully local or fully cloud. It is a strict three-way split:
-1. **FLOCI-EMULATED (dev only):** RDS PostgreSQL and ElastiCache Redis are emulated locally via `floci`.
-2. **REAL CLOUD (Bedrock/OpenRouter):** All LLM and API-based embedding/reranker calls hit real cloud endpoints using real API keys/credentials in every environment.
-3. **REAL CLOUD (Lambda):** Cross-Lambda invocations (specifically `odl-parser-lambda`) use real AWS Lambda via boto3 with dev AWS credentials holding `lambda:InvokeFunction`.
-4. **PDF Parsing (Dev):** Uses direct Python import of `odl/main.py` (bypasses AWS Lambda and S3). The `odl/main.py` handler is modified to accept a `local_file_path` fallback.
+Dev environment is NOT fully local or fully cloud. It is a strict split:
+1. **LOCAL SERVICES (dev only):** Redis runs locally. QdrantDB runs locally (or Qdrant Cloud with dev API key). DynamoDB uses AWS dev credentials.
+2. **REAL CLOUD (Bedrock):** All LLM, embedding, and reranker calls hit real Bedrock/NVIDIA NIM endpoints using real API keys/credentials in every environment.
+3. **LOCAL LAMBDAS (dev):** `odl-parser-lambda` runs locally via direct Python import of `odl/main.py`. `bge_microservice` runs locally as a FastAPI app.
+4. **CORS:** Dev allows `http://localhost:5173`. Prod allows ONLY the configured frontend URL — no localhost, no wildcard `*`.
 
 ## Provider Routing
 
 `provider_client.py` reads `MODEL_PROVIDER` env var (dev|prod).
-- dev: OpenRouter free-tier models + `floci` for infrastructure + real AWS Lambda.
-- prod: Bedrock managed models + real RDS/ElastiCache + real AWS Lambda.
+- dev: Bedrock models + local Redis + QdrantDB + DynamoDB (dev credentials) + local BGE-small microservice.
+- prod: Bedrock models + ElastiCache + Qdrant Cloud + DynamoDB + BGE-small microservice (deployed).
 
-## Embedding Model — Dual Path Restored
+## Embedding Model — Dual Path
 
-Fast path: **Local BGE-small-en-v1.5 (ONNX)**
-- Runs purely local inside the Query Lambda. Zero network calls. Faster p95 latency.
+Fast path: **BGE-small-en-v1.5 (ONNX Microservice)**
+- Runs as a standalone FastAPI microservice. Zero Bedrock network calls. Fastest p95 latency.
+- Query Lambda calls the microservice HTTP endpoint — does NOT bundle the ONNX weights.
 
-Full path & Ingestion: **API-based**
-- Dev: nvidia/nemotron-3-embed-1b (OpenRouter).
-- Prod: amazon.titan-embed-text-v2 (Bedrock).
+Full path & Ingestion: **amazon.titan-embed-text-v2 (Bedrock)**
+- 1024-dim vectors via Bedrock API.
 
-`embed_service.py` contains TWO distinct code paths to handle this split. Local inference is ONLY allowed for the fast path query.
+`embedding_provider.py` contains TWO distinct code paths to handle this split. Microservice inference is ONLY allowed for the fast path query.
+
+## BGE-Small Microservice
+
+- Deployed as a separate service (can be Lambda, ECS, or local FastAPI).
+- Exposes `/embed` endpoint accepting `{"text": "..."}` and returning `{"embedding": [...]}`.
+- Model file: `model.onnx` (BGE-small-en-v1.5 exported to ONNX format).
+- User provides the model file. Do NOT download or generate it.
 
 ## Lambda Packaging Limits
 
 The functional deployment limits are:
 - Zip deployment: **<250MB unzipped**.
 - Container image: **10GB limit** via ECR.
-(50MB is merely the direct upload limit, not the execution limit).
 
-Query Lambda defaults to Zip (bundling the ~130MB BGE-small weights + ONNX runtime). Ingestion Lambda defaults to Zip (pending a build-time size check). PDF Extraction Lambda uses a Container Image (JRE required).
+Query Lambda uses Zip (NO BGE-small weights — calls microservice). Ingestion Lambda uses Zip. PDF Extraction Lambda uses Container Image (JRE required). BGE-small microservice is standalone.
 
 ## PDF Extraction Invocation Contract
 
 `odl-parser-lambda` is invoked synchronously via boto3 from `pdf_adapter.py`. 
 - Payload IN: S3 object reference to the PDF.
-- Payload OUT: *Pending verification against live function.* (Inline JSON vs S3-reference).
-
-**Partial Failure Handling (odl-parser-lambda):**
-`opendataloader_pdf.convert` raises an exception if any single file in a batch is corrupt (e.g. invalid PDF header). However, it successfully processes and outputs `.md` and `.json` files for the valid documents before throwing. The lambda handler catches this exception, ignores it, and relies purely on the presence/absence of output files matching `f"{document_id}.md"` and `.json` (which matches the underlying library's output convention) to determine success vs failure. Only the missing/corrupt documents are marked as failed; valid ones are correctly returned.
+- Payload OUT: Parsed chunks as JSON.
+- **Dev:** Direct Python import of `odl/main.py` with `{"local_file_path": "..."}`.
+- **Prod:** `boto3.client('lambda').invoke(FunctionName='odl-parser-lambda', ...)`.
 
 ## Query Complexity Score
 
-Computed deterministically in `preprocess.py`. No LLM call. No ML model.  
+Computed deterministically in `planner.py`. No LLM call. No ML model.  
 Pure keyword pattern matching + entity counting.
 
 ```python
@@ -72,7 +77,7 @@ AND relationship_flag == False
 AND temporal_flag == False
 AND comparison_flag == False
 → fast_path = True, use_graph = False
-  → Uses fast path (BM25 -> PageIndex -> Vector via Local BGE-small).
+  → Uses fast path (BM25 -> PageIndex -> Vector via BGE-small microservice).
   → No LLM call. Return top-3 vector results with citations.
 ```
 
@@ -80,7 +85,7 @@ AND comparison_flag == False
 ```text
 IF relationship_flag == True
 → fast_path = False, use_graph = True
-→ stages = [BM25, PageIndex, Vector (API), OKF, Graph, Rerank, FidelityCheck, Compress, LLM]
+→ stages = [BM25, PageIndex, Vector (Titan API), OKF, Graph, Rerank, FidelityCheck, Compress, LLM]
 ```
 
 ### Rule 3 — ANALYTICAL PATH
@@ -88,14 +93,14 @@ IF relationship_flag == True
 IF temporal_flag OR comparison_flag
 AND relationship_flag == False
 → fast_path = False, use_graph = False
-→ stages = [BM25, PageIndex, Vector (API), OKF, Rerank, FidelityCheck, Compress, LLM]
+→ stages = [BM25, PageIndex, Vector (Titan API), OKF, Rerank, FidelityCheck, Compress, LLM]
 ```
 
 ### Rule 4 — FULL PATH (default)
 ```text
 ELSE (complex_score >= 0.30, no specific flag match)
 → fast_path = False, use_graph = False
-→ stages = [BM25, PageIndex, Vector (API), OKF, Rerank, FidelityCheck, Compress, LLM]
+→ stages = [BM25, PageIndex, Vector (Titan API), OKF, Rerank, FidelityCheck, Compress, LLM]
 ```
 
 ## Graph Activation Decision
@@ -105,10 +110,12 @@ Graph is NOT a default pipeline stage. It activates ONLY under **Rule 2** (`rela
 ## OKF vs Graph — When to Use Which
 
 ### OKF Property Lookup (always runs in full path)
-Use for: typed factual properties on known entities.
+Use for: typed factual properties on known entities. Zero LLM calls — pure DynamoDB lookup.
+Examples: "What is the revenue for Q3?", "Which location had the most orders?" (CSV/Excel data).
 
 ### Graph Traversal (only Rule 2)
-Use for: multi-hop relationship reasoning.
+Use for: multi-hop relationship reasoning across the OKF knowledge graph.
+Graph traversal executes against DynamoDB adjacency entries.
 
 ## Graph Hard Limits (enforced as constants, not config values)
 
@@ -144,4 +151,7 @@ Answer using ONLY the provided context fragments. For each factual claim in your
 ```
 
 ## NetworkX Decision
-NetworkX: **rejected for production.** Implemented via dict-based adjacency list backed by Postgres `relations` table.
+NetworkX: **rejected for production.** Implemented via dict-based adjacency list backed by DynamoDB.
+
+## Storage Decision
+PostgreSQL/pgvector: **REMOVED.** All storage migrated to DynamoDB (metadata, OKF) + QdrantDB (vectors) + Redis (cache).

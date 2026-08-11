@@ -1,7 +1,7 @@
 from pathlib import Path
 from typing import Callable
 
-from shared.models import Chunk
+from schemas.models import Chunk
 from ingestion_lambda.adapters import csv_adapter, docx_adapter, pdf_adapter, pptx_adapter, xlsx_adapter
 
 SUPPORTED_FORMATS = {".pdf", ".docx", ".xlsx", ".pptx", ".csv"}

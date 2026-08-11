@@ -11,7 +11,7 @@ vectors to search against. Neither column is left null after ingestion.
 import logging
 from dataclasses import replace
 
-from shared.models import Chunk
+from schemas.models import Chunk
 from providers.embedding_provider import embed_fast_batch, embed_text as api_embed_text
 
 logger = logging.getLogger(__name__)

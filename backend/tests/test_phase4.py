@@ -1,7 +1,7 @@
 import os
 import pytest
 from fastapi.testclient import TestClient
-from api.main import app
+from main import app
 
 client = TestClient(app)
 
@@ -47,7 +47,7 @@ def test_api_query_handles_not_found():
 
 def test_api_query_success_renders_citations(monkeypatch):
     # Mock pipeline execution for predictable endpoint test
-    from graph.langgraph_pipeline import pipeline
+    from services.langgraph_pipeline import pipeline
     
     class MockPipelineResponse:
         answer = "This is a test answer from Phase 4."

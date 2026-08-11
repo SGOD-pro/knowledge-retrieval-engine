@@ -13,7 +13,7 @@ export function CitationList({ citations, onSelectCitation, selectedCitationId }
   if (!citations || citations.length === 0) {
     return (
       <div className="h-full flex flex-col bg-[#181715] text-[#efe9de] border-l border-border">
-        <div className="p-4 border-b border-white/10 font-medium text-sm text-[#efe9de]/70">
+        <div className="p-4 border-b border-white/10 text-label-md text-[#efe9de]/70">
           Sources
         </div>
         <div className="flex-1 flex items-center justify-center text-sm text-white/30">
@@ -25,9 +25,9 @@ export function CitationList({ citations, onSelectCitation, selectedCitationId }
 
   return (
     <div className="h-full flex flex-col bg-[#181715] text-[#efe9de] border-l border-border">
-      <div className="p-4 border-b border-white/10 font-medium text-sm flex justify-between items-center">
+      <div className="p-4 border-b border-white/10 text-label-md flex justify-between items-center">
         <span className="text-[#efe9de]/90">Cited Sources</span>
-        <Badge variant="secondary" className="bg-white/10 hover:bg-white/20 text-[#efe9de] font-mono text-xs">
+        <Badge variant="secondary" className="bg-white/10 hover:bg-white/20 text-[#efe9de] text-code-md">
           {citations.length}
         </Badge>
       </div>
@@ -47,16 +47,16 @@ export function CitationList({ citations, onSelectCitation, selectedCitationId }
                   <Badge className="bg-primary/20 text-primary hover:bg-primary/30 border-0 rounded-sm px-1.5 py-0">
                     {citation.source_format.replace('.', '').toUpperCase()}
                   </Badge>
-                  <span className="text-xs text-white/50 font-mono truncate">
+                  <span className="text-code-md text-white/50 truncate">
                     {citation.document_id}
                   </span>
                 </div>
                 
-                <p className="text-sm text-[#efe9de]/90 line-clamp-3 mb-3 leading-relaxed">
+                <p className="text-body-sm text-[#efe9de]/90 line-clamp-3 mb-3">
                   "{citation.snippet}"
                 </p>
 
-                <div className="flex items-center text-xs text-white/40 font-mono">
+                <div className="flex items-center text-code-md text-white/40">
                   <span className="mr-2 opacity-50">¶</span>
                   {citation.location_reference}
                 </div>

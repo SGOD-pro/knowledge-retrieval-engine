@@ -6,16 +6,16 @@ export function DocumentViewer({ selectedCitation }: { selectedCitation: Citatio
   
   return (
     <div className="h-full flex flex-col bg-background border-r">
-      <div className="p-4 border-b font-medium text-sm flex justify-between items-center bg-card">
+      <div className="p-4 border-b text-label-md flex justify-between items-center bg-card">
         <span>Document Viewer</span>
         {selectedCitation?.source_format && (
-          <span className="text-xs text-muted-foreground uppercase">{selectedCitation.source_format}</span>
+          <span className="text-code-md text-muted-foreground uppercase">{selectedCitation.source_format}</span>
         )}
       </div>
       
       <div className="flex-1 overflow-auto p-4 flex items-center justify-center relative bg-muted/30">
         {!selectedCitation ? (
-          <div className="text-muted-foreground text-sm">Select a citation to view document</div>
+          <div className="text-muted-foreground text-body-sm">Select a citation to view document</div>
         ) : selectedCitation.source_format === '.pdf' ? (
           <div className="relative bg-white w-[600px] h-[800px] shadow-sm border text-black/50 p-8">
             <div className="text-center mb-8 border-b pb-4">Mock PDF Page Render</div>
@@ -47,11 +47,11 @@ export function DocumentViewer({ selectedCitation }: { selectedCitation: Citatio
           </div>
         ) : (
           <div className="bg-card p-8 border rounded-xl shadow-sm text-center max-w-md">
-            <h3 className="font-semibold text-lg mb-2">Non-PDF Source</h3>
-            <p className="text-sm text-muted-foreground mb-4">
+            <h3 className="text-headline-sm mb-2">Non-PDF Source</h3>
+            <p className="text-body-sm text-muted-foreground mb-4">
               Visual rendering is not available for {selectedCitation.source_format} files.
             </p>
-            <div className="bg-muted p-4 rounded-md text-left text-sm font-mono text-primary">
+            <div className="bg-muted p-4 rounded-md text-left text-code-md text-primary">
               {selectedCitation.location_reference}
             </div>
           </div>

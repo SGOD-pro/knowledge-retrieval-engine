@@ -1,3 +1,4 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600&family=JetBrains+Mono:wght@400&family=Source+Serif+4:wght@400&display=swap');
 @import "tailwindcss";
 
 @plugin "tailwindcss-animate";
@@ -6,39 +7,81 @@
 
 @layer base {
   :root {
-    --card: #faf9f5;
-    --ring: #c96442;
-    --input: #b4b2a7;
-    --muted: #ede9de;
-    --accent: #e9e6dc;
-    --border: #dad9d4;
-    --radius: 0.5rem;
-    --chart-1: #b05730;
-    --chart-2: #9c87f5;
-    --chart-3: #ded8c4;
-    --chart-4: #dbd3f0;
-    --chart-5: #b4552d;
-    --popover: #ffffff;
-    --primary: #c96442;
-    --sidebar: #f5f4ee;
-    --secondary: #e9e6dc;
-    --background: #faf9f5;
-    --foreground: #3d3929;
-    --destructive: #141413;
-    --sidebar-ring: #b5b5b5;
-    --sidebar-accent: #e9e6dc;
-    --sidebar-border: #ebebeb;
-    --card-foreground: #141413;
-    --sidebar-primary: #c96442;
-    --muted-foreground: #83827d;
-    --accent-foreground: #28261b;
-    --popover-foreground: #28261b;
+    /* Shadcn UI Variables */
+    --card: #f6f3f1;
+    --ring: #8f482f;
+    --input: #87736d;
+    --muted: #e5e2e0;
+    --accent: #e6e2de;
+    --border: #dac1ba;
+    --chart-1: #8f482f;
+    --chart-2: #ad5f45;
+    --chart-3: #ffb59d;
+    --chart-4: #605e5b;
+    --chart-5: #e6e2de;
+    --popover: #f0edeb;
+    --primary: #8f482f;
+    --sidebar: #fcf9f6;
+    --secondary: #605e5b;
+    --background: #fcf9f6;
+    --foreground: #1c1c1a;
+    --destructive: #ba1a1a;
+    --sidebar-ring: #8f482f;
+    --sidebar-accent: #e6e2de;
+    --sidebar-border: #dac1ba;
+    --card-foreground: #1c1c1a;
+    --sidebar-primary: #8f482f;
+    --muted-foreground: #54433e;
+    --accent-foreground: #666461;
+    --popover-foreground: #1c1c1a;
     --primary-foreground: #ffffff;
-    --sidebar-foreground: #3d3d3a;
-    --secondary-foreground: #535146;
+    --sidebar-foreground: #1c1c1a;
+    --secondary-foreground: #ffffff;
     --destructive-foreground: #ffffff;
-    --sidebar-accent-foreground: #343434;
-    --sidebar-primary-foreground: #fbfbfb;
+    --sidebar-accent-foreground: #666461;
+    --sidebar-primary-foreground: #ffffff;
+    
+    /* Material Design 3 variables */
+    --surface: #fcf9f6;
+    --surface-dim: #dcd9d7;
+    --surface-bright: #fcf9f6;
+    --surface-container-lowest: #ffffff;
+    --surface-container-low: #f6f3f1;
+    --surface-container: #f0edeb;
+    --surface-container-high: #ebe8e5;
+    --surface-container-highest: #e5e2e0;
+    --on-surface: #1c1c1a;
+    --on-surface-variant: #54433e;
+    --inverse-surface: #31302f;
+    --inverse-on-surface: #f3f0ee;
+    --outline: #87736d;
+    --outline-variant: #dac1ba;
+    --surface-tint: #924a31;
+    --primary-container: #ad5f45;
+    --on-primary-container: #fffbff;
+    --inverse-primary: #ffb59d;
+    --secondary-container: #e6e2de;
+    --on-secondary-container: #666461;
+    --tertiary: #5f5c53;
+    --on-tertiary: #ffffff;
+    --tertiary-container: #78746b;
+    --on-tertiary-container: #fffbff;
+    --error: #ba1a1a;
+    --on-error: #ffffff;
+    --error-container: #ffdad6;
+    --on-error-container: #93000a;
+    --primary-fixed: #ffdbd0;
+    --primary-fixed-dim: #ffb59d;
+    --on-primary-fixed: #390c00;
+    --on-primary-fixed-variant: #75331c;
+    --secondary-fixed: #e6e2de;
+    --secondary-fixed-dim: #cac6c2;
+    --on-secondary-fixed: #1c1b19;
+    --on-secondary-fixed-variant: #484644;
+    --tertiary-fixed: #e8e2d7;
+    --tertiary-fixed-dim: #cbc6bb;
+    --on-tertiary-fixed: #1d1b15;
+    --on-tertiary-fixed-variant: #49473f;
   }
 
   .dark {
@@ -84,7 +127,6 @@
   --color-muted: var(--muted);
   --color-accent: var(--accent);
   --color-border: var(--border);
-  --color-radius: var(--radius);
   --color-chart-1: var(--chart-1);
   --color-chart-2: var(--chart-2);
   --color-chart-3: var(--chart-3);
@@ -111,6 +153,94 @@
   --color-destructive-foreground: var(--destructive-foreground);
   --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
   --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+
+  /* Fonts */
+  --font-sans: 'Inter', sans-serif;
+  --font-serif: 'Source Serif 4', serif;
+  --font-mono: 'JetBrains Mono', monospace;
+
+  /* Radius */
+  --radius-sm: 0.25rem;
+  --radius-md: 0.75rem;
+  --radius-lg: 1rem;
+  --radius-xl: 1.5rem;
+  --radius-full: 9999px;
+
+  /* Spacing */
+  --spacing-sidebar: 240px;
+  --spacing-container: 1200px;
+  --spacing-gutter: 24px;
+  --spacing-mobile: 16px;
+  --spacing-desktop: 48px;
+  --spacing-stack-sm: 8px;
+  --spacing-stack-md: 16px;
+  --spacing-stack-lg: 32px;
+}
+
+@utility text-display-lg {
+  font-family: var(--font-serif);
+  font-size: 48px;
+  font-weight: 400;
+  line-height: 56px;
+  letter-spacing: -0.02em;
+}
+
+@utility text-display-lg-mobile {
+  font-family: var(--font-serif);
+  font-size: 36px;
+  font-weight: 400;
+  line-height: 44px;
+  letter-spacing: -0.01em;
+}
+
+@utility text-headline-md {
+  font-family: var(--font-serif);
+  font-size: 32px;
+  font-weight: 400;
+  line-height: 40px;
+}
+
+@utility text-headline-sm {
+  font-family: var(--font-serif);
+  font-size: 24px;
+  font-weight: 400;
+  line-height: 32px;
+}
+
+@utility text-body-lg {
+  font-family: var(--font-sans);
+  font-size: 18px;
+  font-weight: 400;
+  line-height: 28px;
+}
+
+@utility text-body-md {
+  font-family: var(--font-sans);
+  font-size: 16px;
+  font-weight: 400;
+  line-height: 24px;
+}
+
+@utility text-body-sm {
+  font-family: var(--font-sans);
+  font-size: 14px;
+  font-weight: 400;
+  line-height: 20px;
+}
+
+@utility text-label-md {
+  font-family: var(--font-sans);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 16px;
+  letter-spacing: 0.04em;
+}
+
+@utility text-code-md {
+  font-family: var(--font-mono);
+  font-size: 14px;
+  font-weight: 400;
+  line-height: 20px;
 }
 
 @layer base {
