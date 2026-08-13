@@ -29,9 +29,9 @@ def compress_chunks(query: str, chunks: list[Chunk]) -> str:
             
     final_text = "\n\n".join(compressed_text)
     
-    from services.retrieval.fidelity_check import extract_query_entities
+    from services.retrieval.planner import extract_entities
     
-    entities = extract_query_entities(query)
+    entities = extract_entities(query)
     final_text_lower = final_text.lower()
     missing_entities = False
     if final_text:

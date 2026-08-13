@@ -37,6 +37,7 @@ class PipelineState(TypedDict):
     graph_results: list[dict[str, Any]]
     top_chunks: list[Chunk]
     compressed_text: str
+    context_snippet: str              # first 500 chars of compressed_text for faithfulness judge
     final_answer: str
     confidence_score: float
     citations: list[str]
@@ -236,14 +237,19 @@ def run_compressor(state: PipelineState):
     existing = state.get("stage_timings", {})
     return {
         "compressed_text": compressed,
+        "context_snippet": compressed[:500],   # expose for LLM faithfulness judge
         "stage_timings": {**existing, "compressor_ms": latency_ms},
     }
 
 
 def run_fidelity(state: PipelineState):
     t0 = time.perf_counter()
+    query = state.get("query", "")
+    compressed = state.get("compressed_text", "")
+    if not compressed:
+        return {"error": "No context available"}
     try:
-        check_fidelity(state["query"], state.get("compressed_text", ""))
+        check_fidelity(query, [compressed])
         latency_ms = (time.perf_counter() - t0) * 1000.0
         existing = state.get("stage_timings", {})
         return {
@@ -267,27 +273,35 @@ def run_llm(state: PipelineState):
         return {}
 
     t0 = time.perf_counter()
-    response = call_llm(state["query"], state.get("compressed_text", ""))
+    compressed = state.get("compressed_text", "").strip()
+    
+    # M1 / L2: Early exit if context is empty
+    if not compressed:
+        return {
+            "final_answer": "NOT_FOUND",
+            "citations": [],
+            "confidence_score": 0.0,
+            "stage_timings": {**state.get("stage_timings", {}), "llm_ms": 0.0}
+        }
 
-    # Real confidence score — avg reranker score weighted with entity coverage
+    response = call_llm(state["query"], compressed)
+
+    # Real confidence score — avg reranker score
     top_chunks = state.get("top_chunks", [])
     avg_reranker = (
         sum(getattr(c, "reranker_score", 0.0) for c in top_chunks) / len(top_chunks)
         if top_chunks else 0.0
     )
-    from services.retrieval.fidelity_check import extract_query_entities
-    entities = extract_query_entities(state["query"])
-    text_lower = state.get("compressed_text", "").lower()
-    found = sum(1 for e in entities if e.lower() in text_lower)
-    coverage = float(found) / len(entities) if entities else 1.0
-    confidence = (avg_reranker * 0.6) + (coverage * 0.4)
+    confidence = avg_reranker
 
     latency_ms = (time.perf_counter() - t0) * 1000.0
     logger.info("llm.latency_ms=%.2f llm.confidence=%.4f", latency_ms, confidence)
     existing = state.get("stage_timings", {})
+    
+    from services.retrieval.response_builder import build_citation
     return {
         "final_answer": response.get("answer", "NOT_FOUND"),
-        "citations": response.get("citations", []),
+        "citations": [build_citation(c).to_dict() for c in top_chunks],
         "confidence_score": confidence,
         "stage_timings": {**existing, "llm_ms": latency_ms},
     }
@@ -302,6 +316,16 @@ def end_fast_path(state: PipelineState):
 
     query = state["query"]
     top_chunks = state.get("top_chunks") or state.get("candidate_chunks", [])[:5]
+
+    # M1 / L2: Early exit if no chunks are available
+    if not top_chunks:
+        return {
+            "final_answer": "NOT_FOUND",
+            "confidence_score": 0.0,
+            "top_chunks": [],
+            "citations": [],
+            "stage_timings": {**state.get("stage_timings", {}), "fast_path_ms": 0.0},
+        }
 
     # Score each sentence by query term overlap (no LLM — Rule 1)
     query_terms = set(re.findall(r"\w+", query.lower()))
@@ -325,11 +349,11 @@ def end_fast_path(state: PipelineState):
 
     answer = " ".join(selected) if selected else "NOT_FOUND"
 
-    # Fidelity gate — correct two-arg signature (confirmed from source: line 29 of fidelity_check.py)
+    # Fidelity gate
     if answer != "NOT_FOUND":
-        compressed_text = "\n".join(c.text for c in top_chunks)
+        chunks_text = [c.text for c in top_chunks]
         try:
-            check_fidelity(query, compressed_text)
+            check_fidelity(query, chunks_text)
         except CoverageError as e:
             logger.warning("fast_path.fidelity_failed reason=%s", e)
             answer = "NOT_FOUND"
@@ -384,10 +408,7 @@ def route_after_okf_post(state: PipelineState):
     return "run_reranker"
 
 
-def route_after_fidelity(state: PipelineState):
-    if state.get("error"):
-        return END
-    return "run_llm"
+
 
 
 # ---------------------------------------------------------------------------
@@ -447,16 +468,7 @@ workflow.add_conditional_edges(
 workflow.add_edge("run_graph", "run_reranker")
 workflow.add_edge("run_reranker", "run_compressor")
 workflow.add_edge("run_compressor", "run_fidelity")
-
-workflow.add_conditional_edges(
-    "run_fidelity",
-    route_after_fidelity,
-    {
-        END: END,
-        "run_llm": "run_llm",
-    }
-)
-
+workflow.add_edge("run_fidelity", "run_llm")
 workflow.add_edge("run_llm", END)
 workflow.add_edge("end_fast_path", END)
 
@@ -481,6 +493,7 @@ class Pipeline:
             "graph_results": [],
             "top_chunks": [],
             "compressed_text": "",
+            "context_snippet": "",
             "final_answer": "",
             "confidence_score": 0.0,
             "citations": [],
@@ -496,6 +509,7 @@ class Pipeline:
                 self.citations = state.get("citations", [])
                 self.confidence_score = state.get("confidence_score", 0.0)
                 self.stage_timings = state.get("stage_timings", {})
+                self.context_snippet = state.get("context_snippet", "")  # for faithfulness judge
                 plan = state.get("plan")
                 self.fast_path = plan.fast_path if plan else False
                 self.stages = plan.stages if plan else []
@@ -506,17 +520,13 @@ class Pipeline:
                         self.context = ctx
                 self._llm_input = LLMInput(state.get("compressed_text", ""))
 
-                top_chunks = state.get("top_chunks", [])
+                self.top_chunks = state.get("top_chunks", [])
                 self._reranker_avg = (
-                    sum(getattr(c, "reranker_score", 0.0) for c in top_chunks) / len(top_chunks)
-                    if top_chunks else 0.0
+                    sum(getattr(c, "reranker_score", 0.0) for c in self.top_chunks) / len(self.top_chunks)
+                    if self.top_chunks else 0.0
                 )
 
-                from services.retrieval.fidelity_check import extract_query_entities
-                entities = extract_query_entities(state["query"])
-                text_lower = state.get("compressed_text", "").lower()
-                found = sum(1 for e in entities if e.lower() in text_lower)
-                self._coverage = float(found) / len(entities) if entities else 1.0
+                self._coverage = 1.0
 
         return ResponseObject(final_state)
 

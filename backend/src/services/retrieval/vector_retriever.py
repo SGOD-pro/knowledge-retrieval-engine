@@ -1,4 +1,4 @@
-"""Stage 3 vector retrieval using pgvector.
+"""Stage 3 vector retrieval using QdrantDB.
 
 Rule 5: Vector search scoped to PageIndex candidates.
 Rule 19: Fast-path queries use local BGE-small and search embedding_fast.
@@ -66,6 +66,12 @@ class VectorRetriever:
             candidate_chunk_ids=candidate_chunk_ids,
             limit=top_k,
         )
+        
+        from config import settings
+        pre_count = len(results)
+        results = [res for res in results if res[1] >= settings.VECTOR_THRESHOLD]
+        post_count = len(results)
+        print(f"[DEBUG Vector] Threshold: {settings.VECTOR_THRESHOLD}, Pre-filter: {pre_count}, Post-filter: {post_count}")
 
         avg_sim = sum(sim for _, sim in results) / max(1, len(results)) if results else 0.0
         confidence_score = min(1.0, max(0.0, avg_sim))

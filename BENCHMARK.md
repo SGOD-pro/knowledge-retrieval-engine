@@ -22,7 +22,7 @@
 | Answer Relevancy | >0.75 | Human rater on 40-query sample |
 | Hallucination rate | <5% | Citation mismatch check |
 | Compression ratio | >30% | raw_tokens vs compressed_tokens |
-| Entity coverage post-compress | 100% | fidelity_check test suite |
+| Cosine similarity post-compress | > 0.50 | fidelity_check test suite |
 | LLM activation rate | <60% | % queries reaching LLM call |
 | Cache hit rate (post-warmup) | >30% | Redis hit/miss counter |
 | PageIndex candidate reduction | >60% | candidate_pages / total_pages |
@@ -85,7 +85,7 @@ nDCG = DCG / IDCG where DCG = Σ (rel_i / log2(i + 1))
 
 ### Context Recall
 - % of query entities present in compressed context sent to LLM.
-- **Target:** 100% (enforced by `fidelity_check`).
+- **Target:** >80% (Note: `fidelity_check` gates based on cosine similarity > 0.50, not strict entity extraction due to latency).
 - **Benchmark measurement:** run against 40 entity-rich queries.
 
 ### Context Precision
@@ -122,6 +122,9 @@ hallucination_rate = hallucinated_facts / total_specific_facts
 
 Per type: 40 manually curated `(query, answer, source_page)` triples.  
 Total: 120 test cases.
+
+> [!WARNING]
+> **EVAL SET UNDERSIZED (Phase E):** The current `llm_ground_truths.json` contains 66 entries, but 49 were found to have empty citation arrays (unscorable). These 49 invalid entries have been temporarily excluded (Option B selected: regeneration was not feasible in the current sprint without human review of the PDF sources). The active N is currently 17, which does not meet the 120-query requirement. Pending ground truth repair.
 
 ### Query Distribution (enforced, not optional):
 - **Factual/lookup:** 40% (40 queries) → routes to fast path

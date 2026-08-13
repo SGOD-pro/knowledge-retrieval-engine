@@ -6,6 +6,7 @@ import time
 from typing import Sequence
 
 from rank_bm25 import BM25Okapi
+from config import settings
 
 from schemas.models import Chunk
 
@@ -62,7 +63,11 @@ class BM25Retriever:
         tokenized_query = _tokenize(query)
 
         scores = bm25.get_scores(tokenized_query)
-        scored_chunks = list(zip(ordered_chunks, [float(s) for s in scores]))
+        pre_count = len(ordered_chunks)
+        scored_chunks = [(chunk, float(s)) for chunk, s in zip(ordered_chunks, scores) if float(s) >= settings.BM25_THRESHOLD]
+        post_count = len(scored_chunks)
+        print(f"[DEBUG BM25] Threshold: {settings.BM25_THRESHOLD}, Pre-filter: {pre_count}, Post-filter: {post_count}")
+
         scored_chunks.sort(key=lambda item: item[1], reverse=True)
         results = scored_chunks[:top_k]
 

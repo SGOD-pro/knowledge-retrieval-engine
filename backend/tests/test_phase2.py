@@ -7,7 +7,7 @@ from unittest.mock import patch, MagicMock
 from main import app
 from api.routes import repository
 from ingestion.embed_service import embed_fast_local  # correct source (Component 7 fix)
-from models import Chunk, Document
+from schemas.models import Chunk, Document
 from providers.embedding_provider import embed_text as api_embed_text
 from providers.provider_client import get_active_provider
 from services.retrieval.bm25_retriever import BM25Retriever
@@ -252,3 +252,53 @@ def test_full_path_embedding_makes_exactly_one_network_call():
                 
                 # Check how many times Bedrock was invoked
                 assert mock_bedrock.invoke_model.call_count >= 1
+
+def test_fidelity_failure_blocks_llm():
+    """Test that if fidelity check raises CoverageError, run_llm is skipped entirely."""
+    from services.langgraph_pipeline import run_fidelity, run_llm
+    
+    state = {
+        "query": "supercalifragilisticexpialidocious query that isn't in context",
+        "compressed_text": "The sky is blue today and the weather is nice.",
+        "stage_timings": {}
+    }
+    
+    fidelity_res = run_fidelity(state)
+    assert "error" in fidelity_res
+    assert fidelity_res["error"] is not None
+    assert fidelity_res["final_answer"] == "NOT_FOUND"
+    
+    state.update(fidelity_res)
+    
+    llm_res = run_llm(state)
+    assert llm_res == {}
+
+def test_c2_rejection_thresholds(seed_test_documents):
+    """Test that retriever stages drop chunks below their threshold."""
+    repo = repository()
+    all_chunks = repo.get_all_chunks()
+    
+    # Test BM25
+    bm25 = BM25Retriever()
+    with patch("config.settings.BM25_THRESHOLD", 10.0):
+        res = bm25.search("refund policy", all_chunks)
+        assert len(res) == 0
+        
+    # Test PageIndex
+    page_index = PageIndexRetriever()
+    with patch("config.settings.PAGEINDEX_THRESHOLD", 10.0):
+        res_chunks, _, _ = page_index.filter_and_rank("refund policy", all_chunks)
+        assert len(res_chunks) == 0
+        
+    # Test Vector
+    vec = VectorRetriever(repository=repo)
+    with patch("config.settings.VECTOR_THRESHOLD", 10.0):
+        res = vec.search("refund policy", fast_path=True, candidate_page_ids=[1])
+        assert len(res) == 0
+
+    # Test Reranker
+    from services.retrieval.reranker import rerank
+    with patch("config.settings.RERANKER_THRESHOLD", 10.0):
+        with patch("services.retrieval.reranker.rerank_documents", return_value=[0.1] * len(all_chunks)):
+            res = rerank("refund policy", all_chunks)
+            assert len(res) == 0

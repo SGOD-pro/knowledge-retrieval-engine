@@ -8,11 +8,11 @@ Rule 2: Maximum ONE LLM call per query.
 Rule 4: Max tokens to LLM: 1200.
 Rule 28: All LLM calls route through this module.
 BOUNDARIES.md: Temperature = 0 on all LLM calls.
+
+Returns: (text: str, usage: dict) — usage contains input_tokens, output_tokens.
 """
 
-import json
 import logging
-import os
 
 from providers.provider_client import get_active_provider
 from providers.bedrock_models import get_llm_model
@@ -28,10 +28,11 @@ def generate_completion(
     user_prompt: str,
     provider: str | None = None,
     temperature: float = 0.0,
-) -> str:
+) -> tuple[str, dict]:
     """Generate LLM completion strictly enforcing max 1 LLM call per query.
 
-    Returns the raw string output.
+    Returns:
+        (text, usage) where usage = {"input_tokens": N, "output_tokens": M}
     """
     try:
         from aws.infra import get_client
@@ -49,10 +50,24 @@ def generate_completion(
             },
         )
 
-        return response["output"]["message"]["content"][0]["text"]
+        text = response["output"]["message"]["content"][0]["text"]
+
+        # Extract real token counts from Bedrock Converse response
+        raw_usage = response.get("usage", {})
+        usage = {
+            "input_tokens": raw_usage.get("inputTokens", 0),
+            "output_tokens": raw_usage.get("outputTokens", 0),
+        }
+
+        logger.info(
+            "llm_provider.tokens input=%d output=%d model=%s",
+            usage["input_tokens"],
+            usage["output_tokens"],
+            get_llm_model(),
+        )
+
+        return text, usage
 
     except Exception as e:
         logger.error("LLM request failed: %s", str(e))
         raise e
-
-    return "{}"  # Fallback empty JSON response if no provider config exists

@@ -22,9 +22,9 @@
 18. Nova Micro is NEVER called during query execution.
 19. Fast path uses LOCAL BGE-small-en-v1.5 embeddings. Full path uses API embeddings.
 20. bounding_box may be null for non-PDF sources. Every citation must have a non-null location reference.
-27. No local model weights, ML framework binaries, or GPU-dependent libraries in the deployment package EXCEPT for `onnxruntime` and ONNX-exported BGE-small weights scoped exclusively to the query Lambda's fast path. `torch`, `transformers`, etc., remain strictly forbidden. Lambda zip limit is 250MB unzipped; container limit is 10GB.
+27. Heavy ML framework binaries (`torch`, `transformers`, GPU runtimes) and Java runtimes are strictly forbidden in the core backend package. Heavy workloads are isolated into specialized auxiliary Lambdas: PDF parsing with JRE runs in the containerized `odl-parser-lambda`, and BGE embedding runs in `bge_microservice`. The core backend package utilizes `onnxruntime` with local ONNX weights as a resilient fallback when auxiliary Lambdas are unprovisioned. Zip deployment limit is 250MB unzipped; container limit is 10GB.
 28. All embedding (full-path), reranking, and LLM calls route through providers/*.py.
-29. MODEL_PROVIDER=dev is prohibited in any environment tagged "production".
+29. MODEL_PROVIDER=dev is prohibited in any environment tagged "prod".
 30. Query embeddings and chunk embeddings compared in a similarity search must come from the SAME provider.
 
 > **CRITICAL NOTE ON PROVIDER TESTS:**
@@ -379,7 +379,7 @@ def test_r28_no_direct_sdk_imports_in_retrieval():
 ### RULE 29 — Prod cannot use dev provider
 
 def test_r29_prod_env_blocks_dev_provider():
-    with mock_env(ENVIRONMENT="production", MODEL_PROVIDER="dev"):
+    with mock_env(ENVIRONMENT="prod", MODEL_PROVIDER="dev"):
         with ASSERT_RAISES(ConfigurationError):
             provider_client.get_active_provider()
 

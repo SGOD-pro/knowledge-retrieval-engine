@@ -11,16 +11,26 @@ def test_r28_provider_routing_enforced():
     assert "rerank" in get_reranker_model()
     assert "nova" in get_llm_model()
 
-@patch.dict(os.environ, {"ENVIRONMENT": "production", "MODEL_PROVIDER": "dev"}, clear=True)
+@patch("providers.provider_client.settings.ENVIRONMENT", "prod")
+@patch("providers.provider_client.settings.MODEL_PROVIDER", "dev")
 def test_r29_no_dev_in_prod():
     """Rule 29: MODEL_PROVIDER=dev is prohibited in production environment."""
-    with pytest.raises(ConfigurationError, match="MODEL_PROVIDER=dev is strictly prohibited in production"):
+    with pytest.raises(ConfigurationError, match="MODEL_PROVIDER=dev is strictly prohibited in prod"):
         get_active_provider()
 
-@patch.dict(os.environ, {"ENVIRONMENT": "development", "MODEL_PROVIDER": "dev"}, clear=True)
+@patch("providers.provider_client.settings.ENVIRONMENT", "dev")
+@patch("providers.provider_client.settings.MODEL_PROVIDER", "dev")
 def test_dev_in_dev_allowed():
     assert get_active_provider() == "dev"
 
-@patch.dict(os.environ, {"ENVIRONMENT": "production", "MODEL_PROVIDER": "prod"}, clear=True)
+def test_production_is_invalid_literal():
+    """Prove the mismatch case is impossible at the schema level."""
+    from config import Settings
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError):
+        Settings(ENVIRONMENT="production")
+
+@patch("providers.provider_client.settings.ENVIRONMENT", "prod")
+@patch("providers.provider_client.settings.MODEL_PROVIDER", "prod")
 def test_prod_in_prod_allowed():
     assert get_active_provider() == "prod"

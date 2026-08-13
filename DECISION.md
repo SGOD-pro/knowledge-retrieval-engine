@@ -12,41 +12,44 @@ Dev environment is NOT fully local or fully cloud. It is a strict split:
 
 `provider_client.py` reads `MODEL_PROVIDER` env var (dev|prod).
 - dev: Bedrock models + local Redis + QdrantDB + DynamoDB (dev credentials) + local BGE-small microservice.
-- prod: Bedrock models + ElastiCache + Qdrant Cloud + DynamoDB + BGE-small microservice (deployed).
+## Hybrid Architecture Decision (FastAPI Engine + Auxiliary Lambdas)
+
+The system adopts a **Hybrid Architecture**:
+1. **Core Engine:** The query pipeline, LangGraph state machine, and document ingestion are consolidated into a unified FastAPI application (`backend/src/main.py`), with an AWS Lambda adapter (`backend/src/lambda.py` via Mangum). This eliminates network latency between retrieval stages while supporting both standalone container and serverless deployments.
+2. **Auxiliary Lambdas:** Heavy external runtimes (Java JRE for `odl-parser-lambda`, and isolated BGE ONNX embedding in `bge_microservice`) remain separate deployables.
+3. **Resilient Local Fallback:** When auxiliary Lambdas are unprovisioned, `embed_service.py` falls back gracefully to in-process ONNX execution (`bge-onnx/model.onnx`).
 
 ## Embedding Model — Dual Path
 
-Fast path: **BGE-small-en-v1.5 (ONNX Microservice)**
-- Runs as a standalone FastAPI microservice. Zero Bedrock network calls. Fastest p95 latency.
-- Query Lambda calls the microservice HTTP endpoint — does NOT bundle the ONNX weights.
+Fast path: **BGE-small-en-v1.5 (Lambda / Local ONNX Fallback)**
+- 384-dim normalized vectors.
+- Prod: invokes `bge-small-en-v1-5-lambda-prod` via boto3 (falling back to local ONNX if unprovisioned).
+- Dev/Test: runs local ONNX or deterministic vector.
 
 Full path & Ingestion: **amazon.titan-embed-text-v2 (Bedrock)**
 - 1024-dim vectors via Bedrock API.
 
-`embedding_provider.py` contains TWO distinct code paths to handle this split. Microservice inference is ONLY allowed for the fast path query.
+`embed_service.py` and `vector_retriever.py` maintain strict schema-level isolation (Rule 30): fast-path only searches `embedding_fast`, full-path only searches `embedding_full`.
 
-## BGE-Small Microservice
+## BGE-Small Microservice / Lambda
 
-- Deployed as a separate service (can be Lambda, ECS, or local FastAPI).
-- Exposes `/embed` endpoint accepting `{"text": "..."}` and returning `{"embedding": [...]}`.
-- Model file: `model.onnx` (BGE-small-en-v1.5 exported to ONNX format).
-- User provides the model file. Do NOT download or generate it.
+- Deployed as a dedicated AWS Lambda function (`bge_microservice/main.py:lambda_handler`).
+- Model files: `bge-onnx/` (`model.onnx`, `tokenizer.json`).
+- Core backend delegates embedding to this Lambda or loads the ONNX weights locally as a fallback.
 
 ## Lambda Packaging Limits
 
 The functional deployment limits are:
-- Zip deployment: **<250MB unzipped**.
-- Container image: **10GB limit** via ECR.
-
-Query Lambda uses Zip (NO BGE-small weights — calls microservice). Ingestion Lambda uses Zip. PDF Extraction Lambda uses Container Image (JRE required). BGE-small microservice is standalone.
+- Zip deployment: **<250MB unzipped** (FastAPI Core Engine via Mangum).
+- Container image: **10GB limit** via ECR (`odl-parser-lambda` bundling Java JRE).
 
 ## PDF Extraction Invocation Contract
 
 `odl-parser-lambda` is invoked synchronously via boto3 from `pdf_adapter.py`. 
 - Payload IN: S3 object reference to the PDF.
 - Payload OUT: Parsed chunks as JSON.
-- **Dev:** Direct Python import of `odl/main.py` with `{"local_file_path": "..."}`.
-- **Prod:** `boto3.client('lambda').invoke(FunctionName='odl-parser-lambda', ...)`.
+- **Dev:** Direct Python import of `odl/main.py` with `{"local_file_path": "..."}` or local parser adapter.
+- **Prod:** `boto3.client('lambda').invoke(FunctionName='odl-parser-lambda-prod', ...)`.
 
 ## Query Complexity Score
 
@@ -136,8 +139,8 @@ sim < 0.85          → separate nodes, add to manual review queue
 ## Confidence Score (deterministic, post-LLM)
 
 Formulas:
-- Fast path: `confidence = (vector_similarity_avg * 0.6) + (coverage_ratio * 0.4)`
-- Full path: `confidence = (reranker_score_avg * 0.6) + (coverage_ratio * 0.4)`
+- Fast path: `confidence = vector_similarity_avg`
+- Full path: `confidence = reranker_score_avg`
 
 Bands:
 - `>= 0.75` → **HIGH**

@@ -43,8 +43,10 @@
 
 - Max graph: 5,000 nodes, 50,000 edges.
 - Max file size: 500 pages per PDF, 200 slides per PPTX, 10,000 rows per XLSX sheet, 500 pages per DOCX.
-- Language: Nemotron-1B supports 34 languages natively. v1 tested on English only.
-- Ingestion is batch/async. Not synchronous per-upload.
+- Ingestion is executed via the canonical FastAPI `/ingest` API (synchronous HTTP multipart upload). The S3-event-driven async worker (`ingestion_lambda/main.py`) is intentionally deferred to v2 as a backlog scaling item for large bulk document drops.
+- **Citation Semantics**: The API currently returns the *entire pool* of `top_chunks` that survived the Reranker as "citations" for a given response, provided the LLM's final answer passes the Fidelity Check (meaning the answer was successfully extracted from that context pool). It does *not* filter down to the actually-cited subset of chunks. This guarantees 100% grounded chunk IDs with correct locations (eliminating LLM hallucinated citations) but introduces a precision tradeoff where some returned citations may not have directly contributed to the generated answer.
+- **Fast-Path Routing Gate**: The fast-path routing decision (which bypasses the LLM and Reranker for simple factual lookups) relies entirely on a keyword-based flag system (checking for synthesis, comparison, temporal, and relationship tokens). This has a known structural limitation: synthesis queries phrased with vocabulary outside the current flag families will be silently misrouted to the fast-path. This is currently mitigated by a broad `synthesis_flag`, but the problem is not fully solved until a semantic/embedding-based routing signal is implemented.
+- **LLM Activation Rate Margin**: Our LLM activation metric is currently sitting at `0.5882` (10/17 queries), which mathematically satisfies the strict `< 0.60` target. However, this is a razor-thin margin achieved on a small benchmark sample (17 queries) that has already been extensively tuned against. Because this rate depends directly on the `synthesis_flag` mitigation (which has known structural keyword-evasion vulnerabilities), this target should not be considered robustly or permanently met until the semantic routing signal is implemented.
 
 ## Out of Scope v1
 - Image/chart description (Extraction logic exists in odl-parser-lambda but remains inert and out of scope for Phase 4 UI/client responses).

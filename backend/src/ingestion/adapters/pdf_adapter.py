@@ -4,7 +4,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from models import Chunk
+from schemas.models import Chunk
 
 
 def parse(path: Path, document_id: str, executable: str = "opendataloader-pdf") -> list[Chunk]:

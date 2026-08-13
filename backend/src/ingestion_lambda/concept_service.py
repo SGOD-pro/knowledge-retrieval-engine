@@ -2,7 +2,7 @@ import os
 import json
 import logging
 import re
-from models import Chunk
+from schemas.models import Chunk
 from providers.provider_client import get_active_provider, enforce_rate_limit
 from providers.bedrock_models import get_concept_model
 

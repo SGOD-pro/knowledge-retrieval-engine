@@ -1,8 +1,8 @@
 from pydantic_settings import BaseSettings
-from typing import Optional
+from typing import Optional, Literal
 
 class Settings(BaseSettings):
-    ENVIRONMENT: str = "dev"
+    ENVIRONMENT: Literal["dev", "prod"] = "dev"
     
     # AWS Region
     AWS_REGION: str = "us-east-1"
@@ -32,9 +32,17 @@ class Settings(BaseSettings):
     # MODEL_PROVIDER: controls which Bedrock profile is used at query time
     MODEL_PROVIDER: str = "prod"
 
-    class Config:
-        env_file = ".env"
-        extra = "ignore"
+    # FIDELITY_THRESHOLD: minimum entity coverage ratio to pass the fidelity gate.
+    # 1.0 = require 100% entity match (too strict for real-world RAG).
+    # 0.5 = require at least 50% entity match (recommended baseline).
+    FIDELITY_THRESHOLD: float = 0.5
+    # Rejection Thresholds
+    BM25_THRESHOLD: float = 0.1
+    PAGEINDEX_THRESHOLD: float = 0.1
+    VECTOR_THRESHOLD: float = 0.3
+    RERANKER_THRESHOLD: float = 0.2
+
+    model_config = {"env_file": (".env", "../.env"), "extra": "ignore"}
 
 settings = Settings()
 

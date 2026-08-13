@@ -14,9 +14,32 @@ class Plan:
 
 
 def extract_entities(query: str) -> list[str]:
-    # Simple capitalization / noun phrase entity extraction without external NER (per Section 3)
-    words = re.findall(r"\b[A-Z][a-z0-9]+\b|\b[0-9]+\b", query)
-    return list(dict.fromkeys(words))
+    # Simple capitalization / noun phrase entity extraction without external NER
+    # R2: match consecutive capitalized tokens (TitleCase or ALLCAPS), separated by spaces or hyphens
+    pattern = r"\b(?:[A-Z][a-zA-Z0-9]*)(?:(?:-|\s+)(?:[A-Z][a-zA-Z0-9]*))*\b"
+    matches = re.findall(pattern, query)
+    
+    stop_words = {
+        "What", "How", "Why", "Who", "When", "Where", "Which", "Is", "Are", 
+        "Do", "Does", "Can", "Could", "Should", "Would", 
+        "The", "A", "An", "In", "On", "At", "To", "For", "Of", "With", "By"
+    }
+    
+    entities = []
+    for span in matches:
+        span = span.strip()
+        if span in stop_words:
+            continue
+            
+        parts = re.split(r'[- ]+', span)
+        filtered_parts = [p for p in parts if p not in stop_words and not p.isdigit()]
+        
+        if filtered_parts:
+            merged = " ".join(filtered_parts)
+            if merged not in entities:
+                entities.append(merged)
+                
+    return entities
 
 
 def compute_complexity(query: str) -> tuple[float, dict[str, bool | int]]:
@@ -25,21 +48,29 @@ def compute_complexity(query: str) -> tuple[float, dict[str, bool | int]]:
     entity_count = len(entities)
 
     multi_entity_flag = entity_count > 1
-    temporal_flag = any(k in q_lower for k in ["q1", "q2", "q3", "q4", "202", "201", "between", "during", "since", "year", "month"])
+    import re
+    temporal_words = {"q1", "q2", "q3", "q4", "2020", "2021", "2022", "2023", "2024", "2025", "between", "during", "since", "year", "month"}
+    temporal_flag = any(re.search(rf"\b{w}\b", q_lower) for w in temporal_words)
     comparison_flag = any(k in q_lower for k in ["vs", "compare", "difference", "higher", "lower", "better", "than"])
     negation_flag = any(k in q_lower for k in ["not", "except", "without", "other than"])
     relationship_flag = any(
         k in q_lower
-        for k in ["cause", "affect", "depend", "lead to", "because", "impact", "relation between", "why did", "result of", "due to"]
+        for k in ["cause", "affect", "depend", "lead to", "because", "impact", "relation between", "why", "result of", "due to"]
+    )
+    synthesis_flag = any(
+        k in q_lower
+        for k in ["explain", "describe", "summarize", "outline", "connection", "influence", "consequence", "effect", "role of", "meaning"]
     )
 
+    # Base score using entities and flags as soft indicators (kept for logging/analytics)
     score = (
         min(entity_count, 3) * 0.25
         + (0.20 if multi_entity_flag else 0.0)
         + (0.15 if temporal_flag else 0.0)
-        + (0.15 if comparison_flag else 0.0)
-        + (0.10 if negation_flag else 0.0)
-        + (0.15 if relationship_flag else 0.0)
+        + (0.30 if comparison_flag else 0.0)
+        + (0.25 if negation_flag else 0.0)
+        + (0.30 if relationship_flag else 0.0)
+        + (0.30 if synthesis_flag else 0.0)
     )
 
     flags = {
@@ -49,8 +80,9 @@ def compute_complexity(query: str) -> tuple[float, dict[str, bool | int]]:
         "comparison_flag": comparison_flag,
         "negation_flag": negation_flag,
         "relationship_flag": relationship_flag,
+        "synthesis_flag": synthesis_flag
     }
-    return min(1.0, score), flags
+    return min(score, 1.0), flags
 
 
 class Planner:
@@ -65,20 +97,24 @@ class Planner:
 
     def route(self, query: str) -> Plan:
         score, flags = compute_complexity(query)
+        
+        # Redesigned Fast Path Gate: Purely flag-based.
+        fast_path = not (
+            flags["temporal_flag"] or 
+            flags["comparison_flag"] or 
+            flags["negation_flag"] or 
+            flags["relationship_flag"] or
+            flags["synthesis_flag"]
+        )
 
-        # Rule 1 — FAST PATH
-        if (
-            score < 0.30
-            and flags["entity_count"] <= 1
-            and not flags["relationship_flag"]
-            and not flags["temporal_flag"]
-            and not flags["comparison_flag"]
-        ):
+        use_graph = False
+
+        if fast_path:
             return Plan(
                 fast_path=True,
                 use_graph=False,
                 stages=["bm25", "page_index", "vector"],
-                complexity_score=score,
+                complexity_score=score
             )
 
         # Rule 2 — RELATIONSHIP PATH

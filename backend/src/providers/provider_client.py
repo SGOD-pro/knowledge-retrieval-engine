@@ -22,8 +22,8 @@ def get_active_provider() -> str:
     environment = settings.ENVIRONMENT.lower()
     provider = settings.MODEL_PROVIDER.lower()
 
-    if environment == "production" and provider == "dev":
-        raise ConfigurationError("MODEL_PROVIDER=dev is strictly prohibited in production environment (Rule 29).")
+    if environment == "prod" and provider == "dev":
+        raise ConfigurationError("MODEL_PROVIDER=dev is strictly prohibited in prod environment (Rule 29).")
 
     return provider
 

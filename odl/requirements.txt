@@ -1,2 +1,0 @@
-opendataloader-pdf
-boto3

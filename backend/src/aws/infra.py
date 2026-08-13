@@ -2,7 +2,7 @@
 
 Profile routing rules:
   - Local services  (DynamoDB, S3, SQS, SNS, ElastiCache, RDS):
-        dev  → profile=local, endpoint=http://localhost:4566 (LocalStack)
+        dev  → profile=local, endpoint=http://localhost:4566 (FLOCI)
         prod → no profile, standard boto3 session from IAM role
   - Cloud services  (bedrock-runtime, lambda):
         dev  → profile=aws, standard AWS endpoint
@@ -28,7 +28,7 @@ from config import settings
 
 logger = logging.getLogger(__name__)
 
-# Services that run locally via LocalStack in dev mode
+# Services that run locally via FLOCI in dev mode
 _LOCAL_SERVICES = frozenset({
     "dynamodb",
     "s3",
@@ -44,7 +44,7 @@ _CLOUD_SERVICES = frozenset({
     "lambda",
 })
 
-_LOCALSTACK_ENDPOINT = "http://localhost:4566"
+_FLOCI_ENDPOINT = "http://localhost:4566"
 _AWS_PROFILE = "aws"
 _LOCAL_PROFILE = "local"
 _LOCAL_REGION = "us-east-1"
@@ -55,56 +55,60 @@ _resources: dict = {}
 _RETRY_CONFIG = Config(retries={"max_attempts": 3, "mode": "adaptive"})
 
 
-def _build_client(service: str):
+def _build_client(service: str, region_name: str | None = None):
     env = settings.ENVIRONMENT
 
-    if env in ("dev",):
-        if service in _LOCAL_SERVICES:
-            logger.debug("aws.infra.client service=%s profile=%s endpoint=%s", service, _LOCAL_PROFILE, _LOCALSTACK_ENDPOINT)
-            session = boto3.Session(profile_name=_LOCAL_PROFILE, region_name=_LOCAL_REGION)
-            return session.client(service, endpoint_url=_LOCALSTACK_ENDPOINT, config=_RETRY_CONFIG)
-        else:
-            # cloud services (bedrock-runtime, lambda) — profile=aws
-            region = settings.AWS_REGION
-            logger.debug("aws.infra.client service=%s profile=%s region=%s", service, _AWS_PROFILE, region)
-            session = boto3.Session(profile_name=_AWS_PROFILE, region_name=region)
-            return session.client(service, config=_RETRY_CONFIG)
+    if service in _CLOUD_SERVICES:
+        # User requirement: lambda and bedrock always use profile=aws, region=ap-south-1
+        # regardless of env (prod or dev).
+        region = region_name or "ap-south-1"
+        logger.debug("aws.infra.client service=%s profile=%s region=%s", service, _AWS_PROFILE, region)
+        session = boto3.Session(profile_name=_AWS_PROFILE, region_name=region)
+        return session.client(service, config=_RETRY_CONFIG)
+
+    if env == "dev":
+        # Dev local services use local profile and endpoint
+        logger.debug("aws.infra.client service=%s profile=%s endpoint=%s", service, _LOCAL_PROFILE, _FLOCI_ENDPOINT)
+        session = boto3.Session(profile_name=_LOCAL_PROFILE, region_name=_LOCAL_REGION)
+        return session.client(service, endpoint_url=_FLOCI_ENDPOINT, config=_RETRY_CONFIG)
     else:
-        # prod / test — standard IAM role-based auth
-        region = settings.AWS_REGION
-        logger.debug("aws.infra.client service=%s env=%s region=%s", service, env, region)
-        session = boto3.Session(region_name=region)
+        # Prod local services use aws profile and ap-south-1
+        region = region_name or "ap-south-1"
+        logger.debug("aws.infra.client service=%s env=%s profile=%s region=%s", service, env, _AWS_PROFILE, region)
+        session = boto3.Session(profile_name=_AWS_PROFILE, region_name=region)
         return session.client(service, config=_RETRY_CONFIG)
 
 
 def _build_resource(service: str):
     env = settings.ENVIRONMENT
 
-    if env in ("dev",):
-        if service in _LOCAL_SERVICES:
-            session = boto3.Session(profile_name=_LOCAL_PROFILE, region_name=_LOCAL_REGION)
-            return session.resource(service, endpoint_url=_LOCALSTACK_ENDPOINT, config=_RETRY_CONFIG)
-        else:
-            region = settings.AWS_REGION
-            session = boto3.Session(profile_name=_AWS_PROFILE, region_name=region)
-            return session.resource(service, config=_RETRY_CONFIG)
+    if service in _CLOUD_SERVICES:
+        logger.debug("aws.infra.resource service=%s profile=%s region=%s", service, _AWS_PROFILE, "ap-south-1")
+        session = boto3.Session(profile_name=_AWS_PROFILE, region_name="ap-south-1")
+        return session.resource(service, config=_RETRY_CONFIG)
+
+    if env == "dev":
+        logger.debug("aws.infra.resource service=%s profile=%s endpoint=%s", service, _LOCAL_PROFILE, _FLOCI_ENDPOINT)
+        session = boto3.Session(profile_name=_LOCAL_PROFILE, region_name=_LOCAL_REGION)
+        return session.resource(service, endpoint_url=_FLOCI_ENDPOINT, config=_RETRY_CONFIG)
     else:
-        region = settings.AWS_REGION
-        session = boto3.Session(region_name=region)
+        logger.debug("aws.infra.resource service=%s env=%s profile=%s region=%s", service, env, _AWS_PROFILE, "ap-south-1")
+        session = boto3.Session(profile_name=_AWS_PROFILE, region_name="ap-south-1")
         return session.resource(service, config=_RETRY_CONFIG)
 
 
-def get_client(service: str):
+def get_client(service: str, region_name: str | None = None):
     """Return a cached boto3 client for the given service.
 
     Routing:
-      dev  + local service  → LocalStack  (profile=local, localhost:4566)
+      dev  + local service  → FLOCI  (profile=local, localhost:4566)
       dev  + cloud service  → Real AWS    (profile=aws)
       prod                  → Real AWS    (IAM role)
     """
-    if service not in _clients:
-        _clients[service] = _build_client(service)
-    return _clients[service]
+    cache_key = f"{service}:{region_name}" if region_name else service
+    if cache_key not in _clients:
+        _clients[cache_key] = _build_client(service, region_name=region_name)
+    return _clients[cache_key]
 
 
 def get_resource(service: str):

@@ -29,8 +29,15 @@ def rerank(query: str, candidates: list[Chunk], top_k: int = 6, provider: str | 
     # Sort descending by score
     candidates.sort(key=lambda c: getattr(c, "reranker_score", 0.0), reverse=True)
     
+    # Filter by threshold
+    from config import settings
+    pre_count = len(candidates)
+    filtered = [c for c in candidates if getattr(c, "reranker_score", 0.0) >= settings.RERANKER_THRESHOLD]
+    post_count = len(filtered)
+    print(f"[DEBUG Reranker] Threshold: {settings.RERANKER_THRESHOLD}, Pre-filter: {pre_count}, Post-filter: {post_count}")
+    
     # Take top_k
-    top_chunks = candidates[:top_k]
+    top_chunks = filtered[:top_k]
     
     # Log latency and confidence score for this stage
     avg_score = sum(getattr(c, "reranker_score", 0.0) for c in top_chunks) / len(top_chunks) if top_chunks else 0.0

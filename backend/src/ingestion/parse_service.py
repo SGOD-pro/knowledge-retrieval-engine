@@ -2,7 +2,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from ingestion.format_router import route
-from models import Document
+from schemas.models import Document
 
 
 def parse_file(path: Path, document_id: str | None = None) -> Document:

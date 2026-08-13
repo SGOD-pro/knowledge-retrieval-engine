@@ -20,7 +20,7 @@ from pathlib import Path
 
 import numpy as np
 
-from models import Chunk
+from schemas.models import Chunk
 from providers.embedding_provider import embed_text as api_embed_text
 
 logger = logging.getLogger(__name__)

@@ -23,6 +23,21 @@ logger = logging.getLogger(__name__)
 
 FULL_EMBEDDING_DIM = 1024
 
+# Module-level token accumulator for cost tracking across a benchmark run.
+# Reset with reset_token_counter(). Read with get_token_counter().
+_token_counter = {"embed_calls": 0, "embed_input_tokens": 0}
+
+
+def reset_token_counter() -> None:
+    """Reset the embedding token counter (call at start of each benchmark query)."""
+    _token_counter["embed_calls"] = 0
+    _token_counter["embed_input_tokens"] = 0
+
+
+def get_token_counter() -> dict:
+    """Return a copy of the current embedding token counter."""
+    return dict(_token_counter)
+
 def get_embedding_dimension(provider: str | None = None) -> int:
     """Return the dimension for API-based (full-path) embeddings."""
     return FULL_EMBEDDING_DIM
@@ -51,6 +66,12 @@ def embed_text(text: str, provider: str | None = None) -> list[float]:
             }),
         )
         response_body = json.loads(response.get("body").read())
+        # Track token usage from Titan V2 response
+        input_token_count = response_body.get("inputTextTokenCount", 0)
+        _token_counter["embed_calls"] += 1
+        _token_counter["embed_input_tokens"] += input_token_count
+        logger.info("embed_provider.tokens input=%d total_embed_tokens=%d",
+                    input_token_count, _token_counter["embed_input_tokens"])
         vec = response_body.get("embedding")
         if vec:
             import numpy as np
@@ -78,7 +99,7 @@ def _deterministic_vector(text: str, dim: int) -> list[float]:
 
 def embed_batch(texts: Sequence[str], provider: str | None = None) -> list[list[float]]:
     from config import settings
-    if provider == "dev" or settings.ENVIRONMENT in ("dev", "test"):
+    if provider == "dev" or (provider is None and settings.ENVIRONMENT in ("dev", "test")):
         from ingestion.embed_service import _run_onnx_batch
         fast_vecs = _run_onnx_batch(list(texts))
         # Pad 384-dim ONNX vectors with zeros to 1024-dim for embedding_full compatibility in dev mode

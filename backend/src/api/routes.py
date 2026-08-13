@@ -96,10 +96,13 @@ def query_endpoint(req: QueryRequest):
     latency_breakdown = {**stage_timings, "total_ms": total_ms}
 
     fast_path = response.fast_path
+    
+    # response.citations are now fully built citation dictionaries directly from the pipeline
+    final_citations = response.citations
 
     response_dict = {
         "answer": response.answer,
-        "citations": response.citations,
+        "citations": final_citations,
         "confidence_score": response.confidence_score,
         "latency_breakdown": latency_breakdown,
         "fast_path": fast_path,

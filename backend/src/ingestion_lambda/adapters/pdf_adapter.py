@@ -83,7 +83,7 @@ def parse(path, document_id: str) -> list[Chunk]:
         # odl-parser normalizer contract (Prompt 1 fix). Flat {s3_bucket,
         # s3_key, document_id} was wrong — the Lambda expects a batch envelope.
         from aws.infra import get_client
-        client = get_client("lambda")
+        client = get_client("lambda", region_name="ap-south-1")
 
         s3_bucket = settings.S3_BUCKET_NAME
         s3_key = path.name

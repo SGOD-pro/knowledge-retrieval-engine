@@ -139,10 +139,11 @@ Phase 3 completion status was INVALIDATED. The prior tests were run against prov
 ## Session State — Phase 3 Completion (Rev 5 Alignment)
 
 - Documented final verified metrics:
-  - Recall@5: 0.908
-  - Faithfulness: 0.894 (89.4%)
-  - LLM Activation: 0.55 (55%)
-  - p95 Latency: <4000ms (3678ms final logged)
+  - **[RETRACTED]** Recall@5: 0.908
+  - **[RETRACTED]** Faithfulness: 0.894 (89.4%)
+  - **[RETRACTED]** LLM Activation: 0.55 (55%)
+  - **[RETRACTED]** p95 Latency: <4000ms (3678ms final logged)
+  *(Note: Metrics retracted on 2026-08-12 because they contradict benchmark_results.json showing scored_queries: 0. See kre_phase1_audit.md for full details.)*
 - Documented that the Zero Hallucination guardrail (Fidelity check + ruthless system prompt) successfully forces `NOT_FOUND` on incomplete context.
 
 ---

@@ -6,7 +6,7 @@ import time
 from decimal import Decimal
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
-from models import Chunk, Document
+from schemas.models import Chunk, Document
 from config import settings
 
 logger = logging.getLogger(__name__)

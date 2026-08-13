@@ -1,0 +1,422 @@
+[
+  {
+    "id": "Q112",
+    "query": "How many Assistant Professors are at GHMC, Bangalore?",
+    "expected_answer": "20",
+    "type": "factual",
+    "source_file": "Govt_Colleges_TeachingStaff_Position_2024_25_0.csv"
+  },
+  {
+    "id": "Q113",
+    "query": "Which college has the highest number of Professors?",
+    "expected_answer": "GAMC, Bangalore",
+    "type": "analytical",
+    "source_file": "Govt_Colleges_TeachingStaff_Position_2024_25_0.csv"
+  },
+  {
+    "id": "Q019",
+    "query": "How many Associate Professors are at GAMC, Shimoga?",
+    "expected_answer": "4",
+    "type": "factual",
+    "source_file": "Govt_Colleges_TeachingStaff_Position_2024_25_0.csv"
+  },
+  {
+    "id": "Q020",
+    "query": "Which college has 18 Professors and 19 Associate Professors?",
+    "expected_answer": "GHMC, Bangalore",
+    "type": "factual",
+    "source_file": "Govt_Colleges_TeachingStaff_Position_2024_25_0.csv"
+  },
+  {
+    "id": "Q021",
+    "query": "How many Assistant Professors are at TGAMC, Bellary?",
+    "expected_answer": "18",
+    "type": "factual",
+    "source_file": "Govt_Colleges_TeachingStaff_Position_2024_25_0.csv"
+  },
+  {
+    "id": "Q022",
+    "query": "What is the total number of Principal positions listed across all colleges?",
+    "expected_answer": "7",
+    "type": "analytical",
+    "source_file": "Govt_Colleges_TeachingStaff_Position_2024_25_0.csv"
+  },
+  {
+    "id": "Q023",
+    "query": "Which college has the highest number of Professors?",
+    "expected_answer": "GAMC, Bangalore",
+    "type": "analytical",
+    "source_file": "Govt_Colleges_TeachingStaff_Position_2024_25_0.csv"
+  },
+  {
+    "id": "Q024",
+    "query": "How many Professors are at Nature cure and Yoga college, Mysore?",
+    "expected_answer": "2",
+    "type": "factual",
+    "source_file": "Govt_Colleges_TeachingStaff_Position_2024_25_0.csv"
+  },
+  {
+    "id": "Q025",
+    "query": "What is the total number of Assistant Professors at GUMC, Bangalore?",
+    "expected_answer": "18",
+    "type": "factual",
+    "source_file": "Govt_Colleges_TeachingStaff_Position_2024_25_0.csv"
+  },
+  {
+    "id": "Q026",
+    "query": "How many colleges are listed in the Govt Colleges CSV?",
+    "expected_answer": "7",
+    "type": "analytical",
+    "source_file": "Govt_Colleges_TeachingStaff_Position_2024_25_0.csv"
+  },
+  {
+    "id": "Q114",
+    "query": "What was the title of Bill No. 64 of 2009?",
+    "expected_answer": "The Metro Railways (Amendment) Bill, 2009",
+    "type": "factual",
+    "source_file": "rs_Bills_Passed_Returned_from_session_217-241.csv"
+  },
+  {
+    "id": "Q115",
+    "query": "In which session was the Right of Children to Free and Compulsory Education Bill passed?",
+    "expected_answer": "217",
+    "type": "factual",
+    "source_file": "rs_Bills_Passed_Returned_from_session_217-241.csv"
+  },
+  {
+    "id": "Q029",
+    "query": "What was the title of Bill No. 64 of 2009?",
+    "expected_answer": "The Metro Railways (Amendment) Bill, 2009",
+    "type": "factual",
+    "source_file": "rs_Bills_Passed_Returned_from_session_217-241.csv"
+  },
+  {
+    "id": "Q030",
+    "query": "In which session was the Right of Children to Free and Compulsory Education Bill passed?",
+    "expected_answer": "217",
+    "type": "factual",
+    "source_file": "rs_Bills_Passed_Returned_from_session_217-241.csv"
+  },
+  {
+    "id": "Q031",
+    "query": "Which ministry passed the Finance (No.2) Bill, 2009?",
+    "expected_answer": "FINANCE",
+    "type": "factual",
+    "source_file": "rs_Bills_Passed_Returned_from_session_217-241.csv"
+  },
+  {
+    "id": "Q032",
+    "query": "What is the date of passing for the Jharkhand Appropriation (No. 2) Bill, 2009?",
+    "expected_answer": "17/07/2009",
+    "type": "factual",
+    "source_file": "rs_Bills_Passed_Returned_from_session_217-241.csv"
+  },
+  {
+    "id": "Q033",
+    "query": "How many bills were passed in session 218?",
+    "expected_answer": "18",
+    "type": "analytical",
+    "source_file": "rs_Bills_Passed_Returned_from_session_217-241.csv"
+  },
+  {
+    "id": "Q034",
+    "query": "Which bill was passed by the Ministry of Railways on 3/12/2010?",
+    "expected_answer": "THE APPROPRIATION (RAILWAYS) No. 6 BILL, 2010",
+    "type": "factual",
+    "source_file": "rs_Bills_Passed_Returned_from_session_217-241.csv"
+  },
+  {
+    "id": "Q035",
+    "query": "What is the bill number for the Mental Healthcare Bill, 2016?",
+    "expected_answer": "LIV of 2013",
+    "type": "factual",
+    "source_file": "rs_Bills_Passed_Returned_from_session_217-241.csv"
+  },
+  {
+    "id": "Q036",
+    "query": "Who was the member/ministry for the Rights of Transgender Persons Bill, 2014?",
+    "expected_answer": "Tiruchi Siva Shri SOCIAL JUSTICE AND EMPOWERMENT",
+    "type": "factual",
+    "source_file": "rs_Bills_Passed_Returned_from_session_217-241.csv"
+  },
+  {
+    "id": "Q116",
+    "query": "What is the cost per citizen per month for WB Digital Sahayak?",
+    "expected_answer": "\u20b92/month",
+    "type": "factual",
+    "source_file": "submission.pptx"
+  },
+  {
+    "id": "Q117",
+    "query": "Which AI is used for Bengali STT and TTS in WB Digital Sahayak?",
+    "expected_answer": "Sarvam AI",
+    "type": "factual",
+    "source_file": "submission.pptx"
+  },
+  {
+    "id": "Q118",
+    "query": "What is the USP of WB Digital Sahayak regarding its architecture?",
+    "expected_answer": "Zero-Hallucination Architecture",
+    "type": "analytical",
+    "source_file": "submission.pptx"
+  },
+  {
+    "id": "Q041",
+    "query": "What is the cost per citizen per month for WB Digital Sahayak?",
+    "expected_answer": "\u20b92/month",
+    "type": "factual",
+    "source_file": "submission.pptx"
+  },
+  {
+    "id": "Q042",
+    "query": "How much annual welfare benefits are going unclaimed in West Bengal?",
+    "expected_answer": "\u20b925K+ Crores",
+    "type": "factual",
+    "source_file": "submission.pptx"
+  },
+  {
+    "id": "Q043",
+    "query": "What is the average expense for failed office trips by rural families?",
+    "expected_answer": "\u20b9500",
+    "type": "factual",
+    "source_file": "submission.pptx"
+  },
+  {
+    "id": "Q044",
+    "query": "Which AI is used for Bengali STT and TTS in WB Digital Sahayak?",
+    "expected_answer": "Sarvam AI",
+    "type": "factual",
+    "source_file": "submission.pptx"
+  },
+  {
+    "id": "Q045",
+    "query": "What is the USP of WB Digital Sahayak regarding its architecture?",
+    "expected_answer": "Zero-Hallucination Architecture",
+    "type": "analytical",
+    "source_file": "submission.pptx"
+  },
+  {
+    "id": "Q046",
+    "query": "What is the MVP focus scheme for WB Digital Sahayak?",
+    "expected_answer": "Lakshmir Bhandar scheme",
+    "type": "factual",
+    "source_file": "submission.pptx"
+  },
+  {
+    "id": "Q047",
+    "query": "What percentage of applications are rejected due to missing or incorrect documents?",
+    "expected_answer": "40%+",
+    "type": "factual",
+    "source_file": "submission.pptx"
+  },
+  {
+    "id": "Q119",
+    "query": "What are the three architectural USPs of CodeCouncil?",
+    "expected_answer": "Proactive Agentic Oversight, Temporal Code Intelligence, Persistent Project Memory Vault",
+    "type": "analytical",
+    "source_file": "Workflow Documentation.docx"
+  },
+  {
+    "id": "Q120",
+    "query": "Why was Supabase not integrated into CodeCouncil?",
+    "expected_answer": "Venue network restrictions prevented Supabase integration",
+    "type": "factual",
+    "source_file": "Workflow Documentation.docx"
+  },
+  {
+    "id": "Q054",
+    "query": "What are the three architectural USPs of CodeCouncil?",
+    "expected_answer": "Proactive Agentic Oversight, Temporal Code Intelligence, Persistent Project Memory Vault",
+    "type": "analytical",
+    "source_file": "Workflow Documentation.docx"
+  },
+  {
+    "id": "Q055",
+    "query": "Why was Supabase not integrated into CodeCouncil?",
+    "expected_answer": "Venue network restrictions prevented Supabase integration",
+    "type": "factual",
+    "source_file": "Workflow Documentation.docx"
+  },
+  {
+    "id": "Q056",
+    "query": "What frontend framework is used by CodeCouncil?",
+    "expected_answer": "Next.js 16",
+    "type": "factual",
+    "source_file": "Workflow Documentation.docx"
+  },
+  {
+    "id": "Q057",
+    "query": "What is the backend technology stack for CodeCouncil?",
+    "expected_answer": "Node.js, Express, WebSocket",
+    "type": "factual",
+    "source_file": "Workflow Documentation.docx"
+  },
+  {
+    "id": "Q058",
+    "query": "What feature allows teams to time-travel through their codebase?",
+    "expected_answer": "Timeline Intelligence",
+    "type": "factual",
+    "source_file": "Workflow Documentation.docx"
+  },
+  {
+    "id": "Q059",
+    "query": "What percentage of sprint time do teams lose to reconstructing lost context?",
+    "expected_answer": "30%",
+    "type": "factual",
+    "source_file": "Workflow Documentation.docx"
+  },
+  {
+    "id": "Q060",
+    "query": "What is the deployment platform for CodeCouncil frontend?",
+    "expected_answer": "Vercel",
+    "type": "factual",
+    "source_file": "Workflow Documentation.docx"
+  },
+  {
+    "id": "Q061",
+    "query": "What editor is used in the frontend?",
+    "expected_answer": "Monaco Editor",
+    "type": "factual",
+    "source_file": "Workflow Documentation.docx"
+  },
+  {
+    "id": "Q124",
+    "query": "What is the small high-resolution patch called according to the Scanpath theory?",
+    "expected_answer": "Fovea",
+    "type": "factual",
+    "source_file": "2204.13154v1.pdf"
+  },
+  {
+    "id": "Q125",
+    "query": "What does the hard (stochastic) attention mechanism define to decide where to focus?",
+    "expected_answer": "A location variable st",
+    "type": "analytical",
+    "source_file": "2204.13154v1.pdf"
+  },
+  {
+    "id": "Q075",
+    "query": "What is the small high-resolution patch called according to the Scanpath theory?",
+    "expected_answer": "Fovea",
+    "type": "factual",
+    "source_file": "2204.13154v1.pdf"
+  },
+  {
+    "id": "Q076",
+    "query": "What does the hard (stochastic) attention mechanism define to decide where to focus?",
+    "expected_answer": "A location variable st",
+    "type": "analytical",
+    "source_file": "2204.13154v1.pdf"
+  },
+  {
+    "id": "Q077",
+    "query": "What are the two classes of attention mechanisms for NMT introduced by the third study in 2015?",
+    "expected_answer": "Global attention and local attention",
+    "type": "factual",
+    "source_file": "2204.13154v1.pdf"
+  },
+  {
+    "id": "Q078",
+    "query": "Which model introduced the concept of bidirectional RNN (BiRNN) for NMT?",
+    "expected_answer": "The first study in 2015",
+    "type": "factual",
+    "source_file": "2204.13154v1.pdf"
+  },
+  {
+    "id": "Q079",
+    "query": "What does the acronym BERT stand for?",
+    "expected_answer": "Bidirectional Encoder Representations from Transformers",
+    "type": "factual",
+    "source_file": "2204.13154v1.pdf"
+  },
+  {
+    "id": "Q080",
+    "query": "What is the purpose of the masked language model pre-training objective in BERT?",
+    "expected_answer": "To pre-train deep bidirectional representations",
+    "type": "analytical",
+    "source_file": "2204.13154v1.pdf"
+  },
+  {
+    "id": "Q081",
+    "query": "Which model replaces softmax with \u03b1-entmax?",
+    "expected_answer": "Adaptively Sparse Transformer",
+    "type": "factual",
+    "source_file": "2204.13154v1.pdf"
+  },
+  {
+    "id": "Q082",
+    "query": "What does BIGBIRD aim to reduce?",
+    "expected_answer": "The quadratic dependency of Transformer-based models to linear",
+    "type": "analytical",
+    "source_file": "2204.13154v1.pdf"
+  },
+  {
+    "id": "Q126",
+    "query": "What are the two principal categories of efficient attention mechanisms for large language models?",
+    "expected_answer": "Linear attention and Sparse attention",
+    "type": "analytical",
+    "source_file": "2507.19595v3.pdf"
+  },
+  {
+    "id": "Q127",
+    "query": "How does Linear Transformer reduce memory and time complexity?",
+    "expected_answer": "By changing the self-attention from the softmax function to a feature map based dot-product attention",
+    "type": "analytical",
+    "source_file": "2507.19595v3.pdf"
+  },
+  {
+    "id": "Q085",
+    "query": "What are the two principal categories of efficient attention mechanisms for large language models?",
+    "expected_answer": "Linear attention and Sparse attention",
+    "type": "analytical",
+    "source_file": "2507.19595v3.pdf"
+  },
+  {
+    "id": "Q086",
+    "query": "How does Linear Transformer reduce memory and time complexity?",
+    "expected_answer": "By changing the self-attention from the softmax function to a feature map based dot-product attention",
+    "type": "analytical",
+    "source_file": "2507.19595v3.pdf"
+  },
+  {
+    "id": "Q087",
+    "query": "What is the core idea behind Routing-based Block-Sparse Attention?",
+    "expected_answer": "To learn the importance of each token block through trainable MLP layers",
+    "type": "factual",
+    "source_file": "2507.19595v3.pdf"
+  },
+  {
+    "id": "Q088",
+    "query": "What mechanism does the forgetting mechanism in Linear Attention introduce?",
+    "expected_answer": "Position-aware recurrence",
+    "type": "analytical",
+    "source_file": "2507.19595v3.pdf"
+  },
+  {
+    "id": "Q089",
+    "query": "What is the update rule for Retentive Networks (RetNet)?",
+    "expected_answer": "St = \u03b3St-1 + kTtvt",
+    "type": "factual",
+    "source_file": "2507.19595v3.pdf"
+  },
+  {
+    "id": "Q090",
+    "query": "What mechanism does Mamba use for its state decay rates?",
+    "expected_answer": "Data-dependent decay",
+    "type": "analytical",
+    "source_file": "2507.19595v3.pdf"
+  },
+  {
+    "id": "Q091",
+    "query": "What is the minimum block size recommended for Block-Sparse Attention to avoid inconsistency in memory access?",
+    "expected_answer": "64",
+    "type": "factual",
+    "source_file": "2507.19595v3.pdf"
+  },
+  {
+    "id": "Q092",
+    "query": "What is the main difference between Linear Attention and Sparse Attention regarding memory footprint?",
+    "expected_answer": "Linear Attention reduces memory footprint, while Sparse Attention still requires storing the full KV cache",
+    "type": "analytical",
+    "source_file": "2507.19595v3.pdf"
+  }
+]

@@ -4,6 +4,7 @@ from typing import Sequence
 
 from ingestion.page_index_service import score as structural_score
 from schemas.models import Chunk
+from config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,12 @@ class PageIndexRetriever:
             return [], [], []
 
         scored_chunks = [(chunk, structural_score(chunk, query)) for chunk in candidates]
+        from config import settings
+        pre_count = len(scored_chunks)
+        scored_chunks = [item for item in scored_chunks if item[1] >= settings.PAGEINDEX_THRESHOLD]
+        post_count = len(scored_chunks)
+        print(f"[DEBUG PageIndex] Threshold: {settings.PAGEINDEX_THRESHOLD}, Pre-filter: {pre_count}, Post-filter: {post_count}")
+        
         scored_chunks.sort(key=lambda item: item[1], reverse=True)
 
         selected = [chunk for chunk, _ in scored_chunks[:top_k]]
