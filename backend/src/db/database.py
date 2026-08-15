@@ -24,7 +24,7 @@ class CloudRepository:
         self.dynamodb = get_resource('dynamodb')
         self.table = self.dynamodb.Table(self.table_name)
         
-        self.qclient = QdrantClient(url=settings.QDRANT_URL, api_key=settings.QDRANT_API_KEY)
+        self.qclient = QdrantClient(url=settings.QDRANT_URL, api_key=settings.QDRANT_API_KEY, timeout=60.0)
         self.collection_name = "kre_chunks"
         
         self.okf_entities_table = self.dynamodb.Table("okf_entities")
@@ -41,6 +41,9 @@ class CloudRepository:
                         "embedding_full": qmodels.VectorParams(size=1024, distance=qmodels.Distance.COSINE)
                     }
                 )
+                self.qclient.create_payload_index(collection_name=self.collection_name, field_name="page_number", field_schema=qmodels.PayloadSchemaType.INTEGER)
+                self.qclient.create_payload_index(collection_name=self.collection_name, field_name="document_id", field_schema=qmodels.PayloadSchemaType.KEYWORD)
+                self.qclient.create_payload_index(collection_name=self.collection_name, field_name="original_id", field_schema=qmodels.PayloadSchemaType.KEYWORD)
         except Exception as e:
             logger.warning("Qdrant init error: %s", e)
             
@@ -99,6 +102,25 @@ class CloudRepository:
                 logger.warning("DynamoDB okf_properties init error: %s", e)
 
     def save(self, document: Document) -> None:
+        # Hard integrity validation: Every chunk must have valid non-null, non-zero, non-padded embeddings
+        for chunk in document.chunks:
+            if chunk.embedding_fast is None or len(chunk.embedding_fast) != 384:
+                raise ValueError(
+                    f"DataIntegrityError: Chunk {chunk.id} has invalid embedding_fast "
+                    f"(expected 384-dim, got {len(chunk.embedding_fast) if chunk.embedding_fast else None})"
+                )
+            if chunk.embedding_full is None or len(chunk.embedding_full) != 1024:
+                raise ValueError(
+                    f"DataIntegrityError: Chunk {chunk.id} has invalid embedding_full "
+                    f"(expected 1024-dim, got {len(chunk.embedding_full) if chunk.embedding_full else None})"
+                )
+            if all(x == 0.0 for x in chunk.embedding_fast):
+                raise ValueError(f"DataIntegrityError: Chunk {chunk.id} has all-zero embedding_fast")
+            if all(x == 0.0 for x in chunk.embedding_full):
+                raise ValueError(f"DataIntegrityError: Chunk {chunk.id} has all-zero embedding_full")
+            if all(x == 0.0 for x in chunk.embedding_full[384:]):
+                raise ValueError(f"DataIntegrityError: Chunk {chunk.id} has zero-padded embedding_full (dims 384:1024 are all zero)")
+
         _IN_MEMORY_DOCS[str(document.id)] = document
         for chunk in document.chunks:
             _IN_MEMORY_CHUNKS[str(chunk.id)] = chunk
@@ -138,14 +160,10 @@ class CloudRepository:
             
             points = []
             for chunk in document.chunks:
-                vectors = {}
-                if chunk.embedding_fast:
-                    vectors["embedding_fast"] = chunk.embedding_fast
-                if chunk.embedding_full:
-                    vectors["embedding_full"] = chunk.embedding_full
-                
-                if not vectors:
-                    continue
+                vectors = {
+                    "embedding_fast": chunk.embedding_fast,
+                    "embedding_full": chunk.embedding_full,
+                }
                     
                 qdrant_uuid = str(uuid.uuid5(uuid.NAMESPACE_OID, str(chunk.id)))
                 
@@ -164,21 +182,26 @@ class CloudRepository:
                 batch_size = 50  # Qdrant cloud rate limit mitigation
                 for i in range(0, len(points), batch_size):
                     batch = points[i:i+batch_size]
-                    try:
-                        self.qclient.upsert(
-                            collection_name=self.collection_name,
-                            points=batch
-                        )
-                        time.sleep(0.5)
-                    except Exception as qe:
-                        if "429" in str(qe) or "Too Many Requests" in str(qe):
-                            logger.warning("Qdrant rate limit hit. Sleeping 5s and retrying...")
-                            time.sleep(5)
-                            self.qclient.upsert(collection_name=self.collection_name, points=batch)
-                        else:
-                            raise qe
+                    for attempt in range(3):
+                        try:
+                            self.qclient.upsert(
+                                collection_name=self.collection_name,
+                                points=batch,
+                                wait=True
+                            )
+                            time.sleep(0.2)
+                            break
+                        except Exception as qe:
+                            if "429" in str(qe) or "Too Many Requests" in str(qe) or "timed out" in str(qe).lower():
+                                logger.warning("Qdrant rate limit/timeout hit (attempt %d/3). Sleeping 5s...", attempt + 1)
+                                time.sleep(5)
+                            else:
+                                raise qe
+                    else:
+                        raise RuntimeError("Qdrant upsert failed after 3 attempts")
         except Exception as e:
-            logger.warning("Failed to save to cloud database: %s", e)
+            logger.error("Failed to save to cloud database: %s", e)
+            raise RuntimeError(f"Failed to save document to cloud database: {e}") from e
 
     def _parse_chunk(self, row: dict) -> Chunk:
         sw = float(row.get('structural_weight', 1.0))
@@ -277,10 +300,17 @@ class CloudRepository:
             import numpy as np
             results = []
             q_vec = np.array(query_embedding)
+            has_page_constraint = candidate_page_ids is not None and len(candidate_page_ids) > 0
+            has_chunk_constraint = candidate_chunk_ids is not None and len(candidate_chunk_ids) > 0
+            
             for chunk in _IN_MEMORY_CHUNKS.values():
-                if document_ids and str(chunk.document_id) not in document_ids: continue
-                if candidate_page_ids and chunk.page_number not in candidate_page_ids: continue
-                if candidate_chunk_ids and str(chunk.id) not in candidate_chunk_ids: continue
+                if document_ids and str(chunk.document_id) not in document_ids:
+                    continue
+                if has_page_constraint or has_chunk_constraint:
+                    page_match = has_page_constraint and chunk.page_number in candidate_page_ids
+                    chunk_match = has_chunk_constraint and str(chunk.id) in candidate_chunk_ids
+                    if not (page_match or chunk_match):
+                        continue
                 c_vec = chunk.embedding_fast if embedding_column == "embedding_fast" else chunk.embedding_full
                 if c_vec:
                     score = float(np.dot(q_vec, np.array(c_vec)))

@@ -27,10 +27,12 @@ OKF_BOOST = 2.0
 
 class PipelineState(TypedDict):
     query: str
+    query_embedding: list[float] | None
     document_ids: list[str] | None
     plan: Plan | None
     bm25_candidates: list[Chunk]      # preserved BM25 results for RRF
     candidate_page_ids: list[int]     # pages narrowed by PageIndex
+    candidate_chunk_ids: list[str]    # chunk IDs without pages narrowed by PageIndex (DOCX, PPTX, CSV)
     candidate_chunks: list[Chunk]     # vector results (also used for fast-path)
     okf_properties: list[dict[str, Any]]
     okf_seed_chunk_ids: list[str]     # chunk IDs from OKF lookup for BM25 boost
@@ -43,6 +45,7 @@ class PipelineState(TypedDict):
     citations: list[str]
     error: str | None
     stage_timings: dict[str, float]   # real per-stage measurements (Component 4)
+    force_full_path: bool
 
 
 # ---------------------------------------------------------------------------
@@ -69,10 +72,13 @@ def _rrf_merge(bm25_chunks: list, vector_chunks: list, k: int = 60) -> list:
 
 def route_query(state: PipelineState):
     t0 = time.perf_counter()
-    plan = planner.route(state["query"])
+    from providers.embedding_provider import embed_text
+    query_embedding = embed_text(state["query"])
+    plan = planner.route(state["query"], query_embedding)
     latency_ms = (time.perf_counter() - t0) * 1000.0
     logger.info("route_query.latency_ms=%.2f fast_path=%s", latency_ms, plan.fast_path)
     return {
+        "query_embedding": query_embedding,
         "plan": plan,
         "stage_timings": {"route_query_ms": latency_ms},
     }
@@ -162,10 +168,11 @@ def run_vector(state: PipelineState):
 
     chunks = retriever.search(
         query=state["query"],
+        query_embedding=state.get("query_embedding"),
         fast_path=is_fast_path,
         document_ids=state.get("document_ids"),
         candidate_page_ids=state.get("candidate_page_ids"),
-        candidate_chunk_ids=None,
+        candidate_chunk_ids=state.get("candidate_chunk_ids"),
         top_k=10,
     )
 
@@ -390,7 +397,7 @@ def end_fast_path(state: PipelineState):
 
 def route_after_vector(state: PipelineState):
     plan = state["plan"]
-    if plan.fast_path:
+    if plan.fast_path and not state.get("force_full_path", False):
         return "end_fast_path"
     return "run_okf_router_post"   # OKF already ran pre-BM25; this routes to reranker or graph
 
@@ -480,13 +487,16 @@ app = workflow.compile()
 # ---------------------------------------------------------------------------
 
 class Pipeline:
-    def run(self, query: str, document_ids: list[str] | None = None):
+    def run(self, query: str, document_ids: list[str] | None = None, force_full_path: bool = False):
         initial_state = {
             "query": query,
+            "query_embedding": None,
             "document_ids": document_ids,
+            "force_full_path": force_full_path,
             "plan": None,
             "bm25_candidates": [],
             "candidate_page_ids": [],
+            "candidate_chunk_ids": [],
             "candidate_chunks": [],
             "okf_properties": [],
             "okf_seed_chunk_ids": [],

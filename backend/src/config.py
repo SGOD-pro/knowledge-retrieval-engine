@@ -2,7 +2,7 @@ from pydantic_settings import BaseSettings
 from typing import Optional, Literal
 
 class Settings(BaseSettings):
-    ENVIRONMENT: Literal["dev", "prod"] = "dev"
+    ENVIRONMENT: Literal["dev", "prod", "test"] = "dev"
     
     # AWS Region
     AWS_REGION: str = "us-east-1"

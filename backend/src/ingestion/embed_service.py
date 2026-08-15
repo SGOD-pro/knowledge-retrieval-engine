@@ -245,7 +245,7 @@ def _deterministic_vector(text: str, dim: int) -> list[float]:
     return vector
 
 
-def embed_chunks_dual(chunks: list[Chunk], provider: str = "dev") -> list[Chunk]:
+def embed_chunks_dual(chunks: list[Chunk], provider: str | None = None) -> list[Chunk]:
     """Populate both embedding columns for all chunks at ingestion time.
 
     - embedding_fast: BGE-small (384-dim). Prod=Lambda, dev=ONNX, test=deterministic.
@@ -259,12 +259,21 @@ def embed_chunks_dual(chunks: list[Chunk], provider: str = "dev") -> list[Chunk]
 
     from providers.embedding_provider import embed_batch as api_embed_batch
     t1 = time.perf_counter()
-    try:
-        full_embeddings = api_embed_batch(texts, provider=provider)
-    except Exception as e:
-        logger.error("embed_service.full_failed error=%s", e)
-        full_embeddings = [None] * len(texts)
+    full_embeddings = api_embed_batch(texts, provider=provider)
     logger.info("embed_service.full_done count=%d latency_ms=%.2f", len(texts), (time.perf_counter() - t1) * 1000)
+
+    # Hard integrity check before returning
+    for i, (f_emb, full_emb) in enumerate(zip(fast_embeddings, full_embeddings)):
+        if f_emb is None or len(f_emb) != 384:
+            raise ValueError(f"Chunk {chunks[i].id} has invalid embedding_fast (expected 384-dim, got {len(f_emb) if f_emb else None})")
+        if full_emb is None or len(full_emb) != 1024:
+            raise ValueError(f"Chunk {chunks[i].id} has invalid embedding_full (expected 1024-dim, got {len(full_emb) if full_emb else None})")
+        if all(x == 0.0 for x in f_emb):
+            raise ValueError(f"Chunk {chunks[i].id} has all-zero embedding_fast")
+        if all(x == 0.0 for x in full_emb):
+            raise ValueError(f"Chunk {chunks[i].id} has all-zero embedding_full")
+        if all(x == 0.0 for x in full_emb[384:]):
+            raise ValueError(f"Chunk {chunks[i].id} has zero-padded embedding_full (dimensions 384:1024 are all zero)")
 
     return [
         replace(chunk, embedding_fast=emb_fast, embedding_full=emb_full)

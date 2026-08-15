@@ -1,6 +1,7 @@
 import logging
 import re
 from dataclasses import dataclass, field
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -86,37 +87,12 @@ def compute_complexity(query: str) -> tuple[float, dict[str, bool | int]]:
 
 
 class Planner:
-    """Deterministic Query Planner.
-
-    Rules from DECISION.md:
-    Rule 1: Fast Path (complexity < 0.30, entity_count <= 1, no relationship/temporal/comparison flags).
-    Rule 2: Relationship Path (relationship_flag=True -> use_graph=True).
-    Rule 3: Analytical Path (temporal or comparison flag -> fast_path=False, use_graph=False).
-    Rule 4: Full Path default.
+    """Deterministic Query Planner using Semantic Centroids.
     """
 
-    def route(self, query: str) -> Plan:
+    def route(self, query: str, query_embedding: list[float] | None = None) -> Plan:
         score, flags = compute_complexity(query)
         
-        # Redesigned Fast Path Gate: Purely flag-based.
-        fast_path = not (
-            flags["temporal_flag"] or 
-            flags["comparison_flag"] or 
-            flags["negation_flag"] or 
-            flags["relationship_flag"] or
-            flags["synthesis_flag"]
-        )
-
-        use_graph = False
-
-        if fast_path:
-            return Plan(
-                fast_path=True,
-                use_graph=False,
-                stages=["bm25", "page_index", "vector"],
-                complexity_score=score
-            )
-
         # Rule 2 — RELATIONSHIP PATH
         if flags["relationship_flag"]:
             return Plan(
@@ -126,16 +102,34 @@ class Planner:
                 complexity_score=score,
             )
 
-        # Rule 3 — ANALYTICAL PATH
-        if flags["temporal_flag"] or flags["comparison_flag"]:
-            return Plan(
-                fast_path=False,
-                use_graph=False,
-                stages=["bm25", "page_index", "vector", "okf", "reranker", "fidelity_check", "compressor", "llm"],
-                complexity_score=score,
+        fast_path = False
+        if query_embedding is not None:
+            from services.retrieval.centroids import CENTROID_SIMPLE, CENTROID_SYNTHESIS
+            import numpy as np
+            q_emb = np.array(query_embedding)
+            sim_simple = np.dot(q_emb, CENTROID_SIMPLE)
+            sim_synth = np.dot(q_emb, CENTROID_SYNTHESIS)
+            # If similarity to simple is greater, use fast path
+            fast_path = (sim_simple > sim_synth)
+        else:
+            # Fallback if embedding fails
+            fast_path = not (
+                flags["temporal_flag"] or 
+                flags["comparison_flag"] or 
+                flags["negation_flag"] or 
+                flags["relationship_flag"] or
+                flags["synthesis_flag"]
             )
 
-        # Rule 4 — FULL PATH (default)
+        if fast_path:
+            return Plan(
+                fast_path=True,
+                use_graph=False,
+                stages=["bm25", "page_index", "vector"],
+                complexity_score=score
+            )
+
+        # Rule 4 — FULL PATH (default analytical/synthesis)
         return Plan(
             fast_path=False,
             use_graph=False,

@@ -18,6 +18,13 @@ from schemas.models import Document
 logger = logging.getLogger(__name__)
 
 
+import uuid
+
+def generate_deterministic_doc_id(path: Path) -> str:
+    """Generate a deterministic UUID5 for a document based on its filename."""
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, path.name))
+
+
 def parse_file(path: Path, document_id: str | None = None) -> Document:
     """Parse a file to a Document with chunks. Does NOT embed or run OKF.
 
@@ -25,7 +32,7 @@ def parse_file(path: Path, document_id: str | None = None) -> Document:
     so they can be skipped in unit tests that only care about parsing.
     """
     t0 = time.perf_counter()
-    document_id = document_id or str(uuid4())
+    document_id = document_id or generate_deterministic_doc_id(path)
     source_format, adapter = route(path)
     chunks = tuple(adapter(path, document_id))
     doc = Document(document_id, path.name, source_format, chunks)

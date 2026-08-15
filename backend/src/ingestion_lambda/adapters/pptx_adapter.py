@@ -9,7 +9,9 @@ def parse(path: Path, document_id: str) -> list[Chunk]:
     presentation = Presentation(path)
     chunks: list[Chunk] = []
     for slide_number, slide in enumerate(presentation.slides, 1):
-        for shape_number, shape in enumerate(slide.shapes):
+        shapes = list(slide.shapes)
+        shapes.sort(key=lambda s: (getattr(s, "top", 0) or 0, getattr(s, "left", 0) or 0))
+        for shape_number, shape in enumerate(shapes):
             text = getattr(shape, "text", "").strip()
             if text:
                 chunks.append(Chunk(

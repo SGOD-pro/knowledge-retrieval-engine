@@ -87,6 +87,10 @@ def parse(path, document_id: str) -> list[Chunk]:
 
         s3_bucket = settings.S3_BUCKET_NAME
         s3_key = path.name
+        
+        # Upload the local temp file to S3 so the Lambda can access it
+        s3_client = get_client("s3")
+        s3_client.upload_file(str(path), s3_bucket, s3_key)
 
         payload = {
             "documents": [{

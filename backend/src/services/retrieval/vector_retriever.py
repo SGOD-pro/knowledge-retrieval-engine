@@ -25,6 +25,7 @@ class VectorRetriever:
     def search(
         self,
         query: str,
+        query_embedding: list[float] | None = None,
         fast_path: bool = False,
         document_ids: list[str] | None = None,
         candidate_page_ids: list[int] | None = None,
@@ -55,7 +56,7 @@ class VectorRetriever:
             from providers.provider_client import get_active_provider
 
             active_provider = get_active_provider()
-            query_embedding = embed_text(query, provider=active_provider)
+            query_embedding = query_embedding if query_embedding is not None else embed_text(query, provider=active_provider)
             embedding_column = "embedding_full"
 
         results = self.repository.search_vector(

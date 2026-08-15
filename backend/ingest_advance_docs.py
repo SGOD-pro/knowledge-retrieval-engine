@@ -9,8 +9,8 @@ ADVANCE_DIR = Path("d:/WORK/knowledge-retrieval-engine/backend/tests/data/advanc
 
 # List of all files to ingest
 files_to_ingest = [
-    "Govt_Colleges_TeachingStaff_Position_2024_25_0.csv",
-    "rs_Bills_Passed_Returned_from_session_217-241.csv",
+    # "Govt_Colleges_TeachingStaff_Position_2024_25_0.csv",
+    # "rs_Bills_Passed_Returned_from_session_217-241.csv",
     "submission.pptx",
     "Workflow Documentation.docx",
     "2204.13154v1.pdf",

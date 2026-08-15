@@ -2,7 +2,7 @@ import re
 from typing import List
 from schemas.models import Chunk
 
-def merge_and_split_chunks(chunks: List[Chunk], min_tokens: int = 100, max_tokens: int = 500) -> List[Chunk]:
+def merge_and_split_chunks(chunks: List[Chunk], min_tokens: int = 30, max_tokens: int = 400) -> List[Chunk]:
     """
     Adjusts chunk sizes to ensure they are between min_tokens and max_tokens.
     - If a paragraph is smaller, merge it with the next one.
@@ -62,7 +62,7 @@ def merge_and_split_chunks(chunks: List[Chunk], min_tokens: int = 100, max_token
         else:
             split_chunks.append(chunk)
 
-    # Step 2: Merge small chunks
+    # Step 2: Merge small chunks conservatively
     merged_chunks = []
     current_chunk = None
 
@@ -73,9 +73,23 @@ def merge_and_split_chunks(chunks: List[Chunk], min_tokens: int = 100, max_token
         
         current_words = len(current_chunk.text.split())
         
-        if current_words < min_tokens:
+        # Determine if we can safely merge chunk into current_chunk
+        # 1. Must be the same element type (e.g., don't merge a table into a paragraph)
+        # 2. Must be in the same section path
+        # 3. Must both be paragraphs (we generally don't want to merge tables together)
+        is_same_structure = (
+            current_chunk.element_type == chunk.element_type == "paragraph" and
+            current_chunk.section_path == chunk.section_path
+        )
+        
+        # 4. Don't merge across a topical boundary. We consider a topical boundary
+        # to be anything that looks like a bullet point, numbered list, or a "Key: Value" block.
+        # This prevents smashing distinct bullet points into an unreadable run-on sentence.
+        is_topical_boundary = bool(re.match(r"^(\*|-|\u2022|\d+\.|[A-Z][\w\s/]{1,30}:)", chunk.text.strip()))
+        
+        if current_words < min_tokens and is_same_structure and not is_topical_boundary:
             # Merge text
-            merged_text = current_chunk.text + " " + chunk.text
+            merged_text = current_chunk.text + "\n" + chunk.text
             
             # Create a new chunk that inherits properties from the first one
             current_chunk = Chunk(
@@ -83,7 +97,7 @@ def merge_and_split_chunks(chunks: List[Chunk], min_tokens: int = 100, max_token
                 document_id=current_chunk.document_id,
                 source_format=current_chunk.source_format,
                 text=merged_text,
-                element_type="paragraph", # it's mixed now, default to paragraph
+                element_type="paragraph",
                 page_number=current_chunk.page_number,
                 section_path=current_chunk.section_path,
                 bounding_box=current_chunk.bounding_box,
