@@ -24,7 +24,6 @@ Token tracking uses DynamoDB ADD (atomic increment) — never re-aggregate on re
 
 import json
 import logging
-import os
 import time
 from decimal import Decimal
 
@@ -40,6 +39,7 @@ _MAX_PROMPT_CHARS = _MAX_PROMPT_TOKENS * _CHARS_PER_TOKEN
 # Public entry point
 # ---------------------------------------------------------------------------
 
+
 def build_okf(document) -> None:
     """Extract OKF facts from a Document and persist to DynamoDB.
 
@@ -54,21 +54,29 @@ def build_okf(document) -> None:
 
     try:
         # --- System 1: Smart Tier-1 extraction ---
-        from ingestion.concept_service import gate_and_rank_chunks, extract_tier1_patterns
+        from ingestion.concept_service import (
+            extract_tier1_patterns,
+            gate_and_rank_chunks,
+        )
 
         gated = gate_and_rank_chunks(chunks)
         gated_chunks = [c for c, _ in gated]
 
         tier1_props = extract_tier1_patterns(gated_chunks)
-        logger.info("okf_builder.tier1 doc_id=%s property_count=%d", doc_id, len(tier1_props))
+        logger.info(
+            "okf_builder.tier1 doc_id=%s property_count=%d", doc_id, len(tier1_props)
+        )
 
         # --- System 1: Smart Tier-3 extraction (dynamic batching) ---
         tier3_props, token_stats = _extract_tier3_smart(gated_chunks)
         logger.info(
             "okf_builder.tier3 doc_id=%s property_count=%d "
             "input_tokens=%d output_tokens=%d calls=%d",
-            doc_id, len(tier3_props),
-            token_stats["input_tokens"], token_stats["output_tokens"], token_stats["calls"],
+            doc_id,
+            len(tier3_props),
+            token_stats["input_tokens"],
+            token_stats["output_tokens"],
+            token_stats["calls"],
         )
 
         all_props = tier1_props + tier3_props
@@ -78,9 +86,14 @@ def build_okf(document) -> None:
         else:
             # Cluster / normalize entity names
             from ingestion.normalize_service import cluster_entities
+
             entity_names = list({p["concept"] for p in all_props if p.get("concept")})
             canonical_map = cluster_entities(entity_names)
-            logger.info("okf_builder.normalize doc_id=%s clusters=%d", doc_id, len(set(canonical_map.values())))
+            logger.info(
+                "okf_builder.normalize doc_id=%s clusters=%d",
+                doc_id,
+                len(set(canonical_map.values())),
+            )
 
             # Build concept registry
             concepts: dict[str, dict] = {}
@@ -115,16 +128,20 @@ def build_okf(document) -> None:
         latency_ms = (time.perf_counter() - t0) * 1000.0
         logger.info(
             "okf_builder.done doc_id=%s prop_count=%d latency_ms=%.2f",
-            doc_id, len(all_props), latency_ms,
+            doc_id,
+            len(all_props),
+            latency_ms,
         )
 
     except Exception as e:
-        logger.error("okf_builder.failed doc_id=%s error=%s", doc_id, e, exc_info=True)
+        _check_infra_error(e)
+        logger.exception("okf_builder.failed doc_id=%s", doc_id)
 
 
 # ---------------------------------------------------------------------------
 # System 1: Smart Tier-3 extraction with dynamic batching
 # ---------------------------------------------------------------------------
+
 
 def _estimate_tokens(text: str) -> int:
     """Rough token count estimate: characters / 4."""
@@ -140,15 +157,16 @@ def _extract_tier3_smart(gated_chunks: list) -> tuple[list[dict], dict]:
     token_stats = {"input_tokens": 0, "output_tokens": 0, "calls": 0}
 
     from config import settings
+
     if settings.ENVIRONMENT == "test":
         return [], token_stats
 
     if not gated_chunks:
         return [], token_stats
 
+    from aws.infra import get_client
     from providers.bedrock_models import get_concept_model
     from providers.provider_client import enforce_rate_limit
-    from aws.infra import get_client
 
     model_id = get_concept_model()
     enforce_rate_limit(model_id)
@@ -186,7 +204,8 @@ def _extract_tier3_smart(gated_chunks: list) -> tuple[list[dict], dict]:
 
     logger.info(
         "okf_builder.tier3_batches gated_chunks=%d batches=%d",
-        len(gated_chunks), len(batches),
+        len(gated_chunks),
+        len(batches),
     )
 
     for batch_idx, batch in enumerate(batches):
@@ -212,7 +231,11 @@ def _extract_tier3_smart(gated_chunks: list) -> tuple[list[dict], dict]:
 
             logger.info(
                 "okf_builder.tier3_call batch_idx=%d chunks=%d input_tokens=%d output_tokens=%d latency_ms=%.2f",
-                batch_idx, len(batch), in_tok, out_tok, latency_ms,
+                batch_idx,
+                len(batch),
+                in_tok,
+                out_tok,
+                latency_ms,
             )
 
             output_text = response["output"]["message"]["content"][0]["text"].strip()
@@ -220,8 +243,7 @@ def _extract_tier3_smart(gated_chunks: list) -> tuple[list[dict], dict]:
                 output_text = output_text[7:]
             elif output_text.startswith("```"):
                 output_text = output_text[3:]
-            if output_text.endswith("```"):
-                output_text = output_text[:-3]
+            output_text = output_text.removesuffix("```")
             output_text = output_text.strip()
 
             extracted = json.loads(output_text)
@@ -229,7 +251,9 @@ def _extract_tier3_smart(gated_chunks: list) -> tuple[list[dict], dict]:
                 results.extend(extracted)
 
         except Exception as e:
-            logger.error("okf_builder.tier3_call_failed batch_idx=%d error=%s", batch_idx, e)
+            logger.error(
+                "okf_builder.tier3_call_failed batch_idx=%d error=%s", batch_idx, e
+            )
 
     return results, token_stats
 
@@ -238,11 +262,9 @@ def _extract_tier3_smart(gated_chunks: list) -> tuple[list[dict], dict]:
 # System 2: Deterministic Knowledge Graph Edges
 # ---------------------------------------------------------------------------
 
+
 def _write_structural_edges(repo, chunks: list, doc_id: str) -> None:
     """Edge Type 1 & 2: CHILD_OF and LOCATED_ON edges from chunk structure."""
-    # Build chunk_id → chunk lookup
-    chunk_map = {str(c.id): c for c in chunks}
-
     # Build heading hierarchy from section_path (index 0 = top-level heading)
     # We create edges from each chunk to its structural parent
     for chunk in chunks:
@@ -251,8 +273,16 @@ def _write_structural_edges(repo, chunks: list, doc_id: str) -> None:
             section_path = list(chunk.section_path) if chunk.section_path else []
 
             # LOCATED_ON: table cell → page (for all non-text chunks with a page number)
-            if chunk.element_type in ("cell", "table") and chunk.page_number is not None:
-                _put_edge(repo, f"CHUNK#{chunk_id}", "LOCATED_ON", f"PAGE#{doc_id}#{chunk.page_number}")
+            if (
+                chunk.element_type in ("cell", "table")
+                and chunk.page_number is not None
+            ):
+                _put_edge(
+                    repo,
+                    f"CHUNK#{chunk_id}",
+                    "LOCATED_ON",
+                    f"PAGE#{doc_id}#{chunk.page_number}",
+                )
 
             # CHILD_OF: if section_path has a parent heading, draw the edge
             if len(section_path) > 1:
@@ -261,10 +291,14 @@ def _write_structural_edges(repo, chunks: list, doc_id: str) -> None:
                 _put_edge(repo, f"CHUNK#{chunk_id}", "CHILD_OF", parent_id)
 
         except Exception as e:
-            logger.warning("okf_builder.structural_edge_failed chunk_id=%s error=%s", chunk.id, e)
+            logger.warning(
+                "okf_builder.structural_edge_failed chunk_id=%s error=%s", chunk.id, e
+            )
 
 
-def _write_entity_chunk_edges(repo, props: list[dict], canonical_map: dict, doc_id: str) -> None:
+def _write_entity_chunk_edges(
+    repo, props: list[dict], canonical_map: dict, doc_id: str
+) -> None:
     """Edge Type 3: CONTAINS_FACT — source chunk → OKF Entity Node."""
     for prop in props:
         try:
@@ -283,6 +317,7 @@ def _write_semantic_edges(repo, gated_chunks: list, doc_id: str) -> None:
     """Edge Type 4: SEMANTICALLY_RELATED — cross-doc cosine > 0.85 via Qdrant (max 5/node)."""
     try:
         from db.database import CloudRepository
+
         db = CloudRepository()
 
         # Cap semantic edge discovery to top 15 highest-priority gated chunks per doc to keep ingestion fast
@@ -314,17 +349,41 @@ def _write_semantic_edges(repo, gated_chunks: list, doc_id: str) -> None:
                         f"CHUNK#{chunk.id}",
                         "SEMANTICALLY_RELATED",
                         f"CHUNK#{related_chunk_id}",
-                        extra={"score": Decimal(str(round(score, 4))), "related_doc_id": related_doc_id},
+                        extra={
+                            "score": Decimal(str(round(score, 4))),
+                            "related_doc_id": related_doc_id,
+                        },
                     )
                     edge_count += 1
             except Exception as e:
-                logger.debug("okf_builder.semantic_edge_skip chunk_id=%s error=%s", chunk.id, e)
+                logger.debug(
+                    "okf_builder.semantic_edge_skip chunk_id=%s error=%s", chunk.id, e
+                )
 
     except Exception as e:
         logger.warning("okf_builder.semantic_edges_failed error=%s", e)
 
 
-def _put_edge(repo, from_id: str, rel_type: str, to_id: str, extra: dict | None = None) -> None:
+def _check_infra_error(e: Exception) -> None:
+    """Raise loudly on infrastructure-level AWS errors (e.g. missing tables), while permitting soft per-item degradation."""
+    from botocore.exceptions import ClientError
+
+    if isinstance(e, ClientError):
+        code = e.response.get("Error", {}).get("Code", "")
+        if code in (
+            "ResourceNotFoundException",
+            "AccessDeniedException",
+            "UnrecognizedClientException",
+            "TableNotFoundException",
+        ):
+            raise e
+    if "ResourceNotFoundException" in str(e):
+        raise e
+
+
+def _put_edge(
+    repo, from_id: str, rel_type: str, to_id: str, extra: dict | None = None
+) -> None:
     """Write a single directed edge to okf_relations table."""
     item = {
         "PK": from_id,
@@ -334,12 +393,19 @@ def _put_edge(repo, from_id: str, rel_type: str, to_id: str, extra: dict | None 
     }
     if extra:
         item.update(extra)
-    repo.okf_relations_table.put_item(Item=item)
+    try:
+        repo.okf_relations_table.put_item(Item=item)
+    except Exception as e:
+        _check_infra_error(e)
+        logger.warning(
+            "okf_builder.put_edge_failed from=%s to=%s error=%s", from_id, to_id, e
+        )
 
 
 # ---------------------------------------------------------------------------
 # DynamoDB writes
 # ---------------------------------------------------------------------------
+
 
 def _concept_key(name: str) -> str:
     """Canonical concept ID — uppercase stripped."""
@@ -349,9 +415,11 @@ def _concept_key(name: str) -> str:
 def _get_repo():
     """Return CloudRepository or None in test env."""
     from config import settings
+
     if settings.ENVIRONMENT == "test":
         return None
     from db.database import CloudRepository
+
     return CloudRepository()
 
 
@@ -359,18 +427,25 @@ def _write_entities(repo, concepts: dict) -> None:
     """Write/update concept META items in okf_entities table."""
     for concept_id, meta in concepts.items():
         try:
-            repo.okf_entities_table.put_item(Item={
-                "PK": f"ENTITY#{concept_id}",
-                "SK": "META",
-                "name": meta["name"],
-                "document_ids": list(meta["document_ids"]),
-                "property_count": Decimal(str(meta["property_count"])),
-            })
+            repo.okf_entities_table.put_item(
+                Item={
+                    "PK": f"ENTITY#{concept_id}",
+                    "SK": "META",
+                    "name": meta["name"],
+                    "document_ids": list(meta["document_ids"]),
+                    "property_count": Decimal(str(meta["property_count"])),
+                }
+            )
         except Exception as e:
-            logger.warning("okf_builder.write_entity_failed concept_id=%s error=%s", concept_id, e)
+            _check_infra_error(e)
+            logger.warning(
+                "okf_builder.write_entity_failed concept_id=%s error=%s", concept_id, e
+            )
 
 
-def _write_properties(repo, props: list[dict], canonical_map: dict, doc_id: str) -> None:
+def _write_properties(
+    repo, props: list[dict], canonical_map: dict, doc_id: str
+) -> None:
     """Write property items to okf_properties table."""
     for prop in props:
         raw_name = prop.get("concept", "")
@@ -384,19 +459,26 @@ def _write_properties(repo, props: list[dict], canonical_map: dict, doc_id: str)
             continue
 
         try:
-            repo.okf_properties_table.put_item(Item={
-                "PK": f"ENTITY#{concept_id}",
-                "SK": f"PROP#{prop_name}#{chunk_id}",
-                "property_name": prop_name,
-                "property_value": str(prop.get("property_value", "")),
-                "source_chunk_id": chunk_id,
-                "confidence": Decimal(str(round(float(prop.get("confidence", 1.0)), 4))),
-                "doc_id": doc_id,
-            })
+            repo.okf_properties_table.put_item(
+                Item={
+                    "PK": f"ENTITY#{concept_id}",
+                    "SK": f"PROP#{prop_name}#{chunk_id}",
+                    "property_name": prop_name,
+                    "property_value": str(prop.get("property_value", "")),
+                    "source_chunk_id": chunk_id,
+                    "confidence": Decimal(
+                        str(round(float(prop.get("confidence", 1.0)), 4))
+                    ),
+                    "doc_id": doc_id,
+                }
+            )
         except Exception as e:
+            _check_infra_error(e)
             logger.warning(
                 "okf_builder.write_property_failed concept=%s prop=%s error=%s",
-                concept_id, prop_name, e,
+                concept_id,
+                prop_name,
+                e,
             )
 
 
@@ -430,8 +512,7 @@ def _update_token_usage(repo, doc_id: str, token_stats: dict) -> None:
             token_stats["calls"],
         )
     except Exception as e:
-        logger.warning("okf_builder.token_usage_write_failed doc_id=%s error=%s", doc_id, e)
-
-
-
-
+        _check_infra_error(e)
+        logger.warning(
+            "okf_builder.token_usage_write_failed doc_id=%s error=%s", doc_id, e
+        )

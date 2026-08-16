@@ -71,7 +71,7 @@ Deliverables:
   - POST /query (full pipeline).
 
 OKF Architecture:
-  - OKF follows Open Knowledge Format v0.1 philosophy — concepts, typed properties, and cross-references.
+  - OKF (Ontology-driven Knowledge Framework) — concepts, typed properties, and cross-references.
   - Nova Micro extracts structured facts at ingestion time: `{Concept: "Revenue", Type: "METRIC", Property: "Q3 2024", Value: "$1.2M"}`.
   - Facts stored in DynamoDB for <10ms query-time lookup.
   - At query time, `okf_retriever.py` does a pure database lookup — zero LLM calls.

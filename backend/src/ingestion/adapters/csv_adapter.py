@@ -43,7 +43,9 @@ def parse(path: Path, document_id: str) -> list[Chunk]:
             if not val_text:
                 continue
             header_name = (
-                headers[col_idx].strip() if col_idx < len(headers) else f"Col {col_idx + 1}"
+                headers[col_idx].strip()
+                if col_idx < len(headers)
+                else f"Col {col_idx + 1}"
             )
             parts.append(f"{header_name}: {val_text}")
 

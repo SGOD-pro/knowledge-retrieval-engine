@@ -21,7 +21,6 @@ from pathlib import Path
 import numpy as np
 
 from schemas.models import Chunk
-from providers.embedding_provider import embed_text as api_embed_text
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +38,11 @@ _BGE_LAMBDA_NAME = settings.BGE_EMBEDDING_LAMBDA_NAME
 
 _BGE_MODEL_DIR = os.environ.get(
     "BGE_SMALL_MODEL_DIR",
-    str(Path(__file__).resolve().parent.parent.parent.parent / "bge_microservice" / "bge-onnx"),
+    str(
+        Path(__file__).resolve().parent.parent.parent.parent
+        / "bge_microservice"
+        / "bge-onnx"
+    ),
 )
 
 _BGE_ONNX_SESSION = None
@@ -50,6 +53,7 @@ def _get_bge_session():
     global _BGE_ONNX_SESSION
     if _BGE_ONNX_SESSION is None:
         import onnxruntime as ort
+
         model_path = os.path.join(_BGE_MODEL_DIR, "model.onnx")
         if os.path.exists(model_path):
             _BGE_ONNX_SESSION = ort.InferenceSession(
@@ -65,6 +69,7 @@ def _get_bge_tokenizer():
     global _BGE_TOKENIZER
     if _BGE_TOKENIZER is None:
         from tokenizers import Tokenizer
+
         tokenizer_path = os.path.join(_BGE_MODEL_DIR, "tokenizer.json")
         if os.path.exists(tokenizer_path):
             _BGE_TOKENIZER = Tokenizer.from_file(tokenizer_path)
@@ -79,6 +84,7 @@ def _get_bge_tokenizer():
 # embed_fast_local — routes by ENVIRONMENT
 # ---------------------------------------------------------------------------
 
+
 def embed_fast_local(text: str) -> list[float]:
     """Generate a 384-dim embedding.
 
@@ -91,17 +97,24 @@ def embed_fast_local(text: str) -> list[float]:
 
     if environment == "test":
         vec = _deterministic_vector(text, 384)
-        logger.debug("bge.mode=deterministic_fallback latency_ms=%.2f", (time.perf_counter() - t0) * 1000)
+        logger.debug(
+            "bge.mode=deterministic_fallback latency_ms=%.2f",
+            (time.perf_counter() - t0) * 1000,
+        )
         return vec
 
     if environment == "prod":
         vec = _call_bge_lambda(text)
-        logger.info("bge.mode=lambda latency_ms=%.2f", (time.perf_counter() - t0) * 1000)
+        logger.info(
+            "bge.mode=lambda latency_ms=%.2f", (time.perf_counter() - t0) * 1000
+        )
         return vec
 
     # dev — local ONNX
     vec = _run_onnx(text)
-    logger.info("bge.mode=local_onnx latency_ms=%.2f", (time.perf_counter() - t0) * 1000)
+    logger.info(
+        "bge.mode=local_onnx latency_ms=%.2f", (time.perf_counter() - t0) * 1000
+    )
     return vec
 
 
@@ -109,6 +122,7 @@ def _call_bge_lambda(text: str) -> list[float]:
     """Invoke the deployed BGE Lambda and return the 384-dim embedding."""
     try:
         from aws.infra import get_client
+
         client = get_client("lambda")
         response = client.invoke(
             FunctionName=_BGE_LAMBDA_NAME,
@@ -128,6 +142,7 @@ def _call_bge_lambda_batch(texts: list[str]) -> list[list[float]]:
     """Invoke the deployed BGE Lambda with a batch of texts."""
     try:
         from aws.infra import get_client
+
         client = get_client("lambda")
         response = client.invoke(
             FunctionName=_BGE_LAMBDA_NAME,
@@ -139,7 +154,9 @@ def _call_bge_lambda_batch(texts: list[str]) -> list[list[float]]:
             raise RuntimeError(f"BGE Lambda batch error: {payload['error']}")
         return payload["embeddings"]
     except Exception as e:
-        logger.warning("bge.lambda_batch_failed error=%s — falling back to local ONNX", e)
+        logger.warning(
+            "bge.lambda_batch_failed error=%s — falling back to local ONNX", e
+        )
         return [_run_onnx(t) for t in texts]
 
 
@@ -191,7 +208,9 @@ def _run_onnx_batch(texts: list[str], batch_size: int = 64) -> list[list[float]]
         encoded_batch = tokenizer.encode_batch(sub_texts)
 
         input_ids = np.array([e.ids for e in encoded_batch], dtype=np.int64)
-        attention_mask = np.array([e.attention_mask for e in encoded_batch], dtype=np.int64)
+        attention_mask = np.array(
+            [e.attention_mask for e in encoded_batch], dtype=np.int64
+        )
         token_type_ids = np.zeros_like(input_ids, dtype=np.int64)
 
         outputs = session.run(
@@ -230,7 +249,9 @@ def embed_fast_batch(texts: list[str]) -> list[list[float]]:
 
     logger.info(
         "bge.batch_embed count=%d env=%s latency_ms=%.2f",
-        len(texts), environment, (time.perf_counter() - t0) * 1000,
+        len(texts),
+        environment,
+        (time.perf_counter() - t0) * 1000,
     )
     return result
 
@@ -255,25 +276,40 @@ def embed_chunks_dual(chunks: list[Chunk], provider: str | None = None) -> list[
 
     t0 = time.perf_counter()
     fast_embeddings = embed_fast_batch(texts)
-    logger.info("embed_service.fast_done count=%d latency_ms=%.2f", len(texts), (time.perf_counter() - t0) * 1000)
+    logger.info(
+        "embed_service.fast_done count=%d latency_ms=%.2f",
+        len(texts),
+        (time.perf_counter() - t0) * 1000,
+    )
 
     from providers.embedding_provider import embed_batch as api_embed_batch
+
     t1 = time.perf_counter()
     full_embeddings = api_embed_batch(texts, provider=provider)
-    logger.info("embed_service.full_done count=%d latency_ms=%.2f", len(texts), (time.perf_counter() - t1) * 1000)
+    logger.info(
+        "embed_service.full_done count=%d latency_ms=%.2f",
+        len(texts),
+        (time.perf_counter() - t1) * 1000,
+    )
 
     # Hard integrity check before returning
     for i, (f_emb, full_emb) in enumerate(zip(fast_embeddings, full_embeddings)):
         if f_emb is None or len(f_emb) != 384:
-            raise ValueError(f"Chunk {chunks[i].id} has invalid embedding_fast (expected 384-dim, got {len(f_emb) if f_emb else None})")
+            raise ValueError(
+                f"Chunk {chunks[i].id} has invalid embedding_fast (expected 384-dim, got {len(f_emb) if f_emb else None})"
+            )
         if full_emb is None or len(full_emb) != 1024:
-            raise ValueError(f"Chunk {chunks[i].id} has invalid embedding_full (expected 1024-dim, got {len(full_emb) if full_emb else None})")
+            raise ValueError(
+                f"Chunk {chunks[i].id} has invalid embedding_full (expected 1024-dim, got {len(full_emb) if full_emb else None})"
+            )
         if all(x == 0.0 for x in f_emb):
             raise ValueError(f"Chunk {chunks[i].id} has all-zero embedding_fast")
         if all(x == 0.0 for x in full_emb):
             raise ValueError(f"Chunk {chunks[i].id} has all-zero embedding_full")
         if all(x == 0.0 for x in full_emb[384:]):
-            raise ValueError(f"Chunk {chunks[i].id} has zero-padded embedding_full (dimensions 384:1024 are all zero)")
+            raise ValueError(
+                f"Chunk {chunks[i].id} has zero-padded embedding_full (dimensions 384:1024 are all zero)"
+            )
 
     return [
         replace(chunk, embedding_fast=emb_fast, embedding_full=emb_full)

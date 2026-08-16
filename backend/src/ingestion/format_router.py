@@ -1,8 +1,14 @@
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
+from ingestion.adapters import (
+    csv_adapter,
+    docx_adapter,
+    pdf_adapter,
+    pptx_adapter,
+    xlsx_adapter,
+)
 from schemas.models import Chunk
-from ingestion.adapters import csv_adapter, docx_adapter, pdf_adapter, pptx_adapter, xlsx_adapter
 
 SUPPORTED_FORMATS = {".pdf", ".docx", ".xlsx", ".pptx", ".csv"}
 Adapter = Callable[[Path, str], list[Chunk]]
@@ -11,7 +17,7 @@ Adapter = Callable[[Path, str], list[Chunk]]
 def route(path: Path) -> tuple[str, Adapter]:
     suffix = path.suffix.lower()
     adapters: dict[str, tuple[str, Adapter]] = {
-        ".pdf": ("pdf", lambda path, doc_id: __import__('ingestion_lambda.adapters.pdf_adapter', fromlist=['']).parse(path, doc_id)),
+        ".pdf": ("pdf", pdf_adapter.parse),
         ".docx": ("docx", docx_adapter.parse),
         ".xlsx": ("xlsx", xlsx_adapter.parse),
         ".pptx": ("pptx", pptx_adapter.parse),
@@ -21,4 +27,3 @@ def route(path: Path) -> tuple[str, Adapter]:
         return adapters[suffix]
     except KeyError as exc:
         raise ValueError(f"Unsupported format: {suffix or '<none>'}") from exc
-

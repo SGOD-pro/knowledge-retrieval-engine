@@ -14,7 +14,6 @@ Returns: (text: str, usage: dict) — usage contains input_tokens, output_tokens
 
 import logging
 
-from providers.provider_client import get_active_provider
 from providers.bedrock_models import get_llm_model
 
 logger = logging.getLogger(__name__)
@@ -36,6 +35,7 @@ def generate_completion(
     """
     try:
         from aws.infra import get_client
+
         client = get_client("bedrock-runtime")
 
         messages = [{"role": "user", "content": [{"text": user_prompt}]}]

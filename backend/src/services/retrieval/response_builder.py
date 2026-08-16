@@ -7,21 +7,21 @@ Image URLs: Generated at query time via presigned S3 URLs — NEVER at ingest
 time — because presigned URLs expire.  No public ACLs are used.
 """
 
-import os
-from dataclasses import asdict, dataclass, field
-from typing import Any, Sequence
+from collections.abc import Sequence
+from dataclasses import asdict, dataclass
+from typing import Any
 
-from schemas.models import Chunk
 from aws.infra import get_client
 from config import settings
+from schemas.models import Chunk
+
 
 def get_signed_image_url(key: str, bucket: str) -> str:
     s3 = get_client("s3")
     return s3.generate_presigned_url(
-        "get_object",
-        Params={"Bucket": bucket, "Key": key},
-        ExpiresIn=3600
+        "get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=3600
     )
+
 
 # Bucket used when the document record does not carry an explicit per-doc bucket.
 _DEFAULT_IMAGE_BUCKET = settings.S3_BUCKET_NAME
@@ -84,7 +84,13 @@ def build_citation(
     # Rule 20 fallback check
     if chunk.source_format == "pdf":
         if bbox is None:
-            bbox = {"x1": 0.0, "y1": 0.0, "x2": 1.0, "y2": 1.0, "page_number": chunk.page_number or 1}
+            bbox = {
+                "x1": 0.0,
+                "y1": 0.0,
+                "x2": 1.0,
+                "y2": 1.0,
+                "page_number": chunk.page_number or 1,
+            }
     else:
         if not loc_ref:
             if chunk.element_type == "heading":
@@ -142,13 +148,19 @@ def build_fast_path_response(
     combined_answers = " ".join([c.text for c in top_chunks])
     answer = combined_answers[:500]
 
-    vector_similarity_avg = sum(s for _, s in scored_chunks[:3]) / max(1, len(top_chunks))
+    vector_similarity_avg = sum(s for _, s in scored_chunks[:3]) / max(
+        1, len(top_chunks)
+    )
     # Coverage ratio estimate
     query_words = set(query.lower().split())
     answer_words = set(answer.lower().split())
-    coverage_ratio = len(query_words.intersection(answer_words)) / max(1, len(query_words))
+    coverage_ratio = len(query_words.intersection(answer_words)) / max(
+        1, len(query_words)
+    )
 
-    confidence = min(1.0, max(0.0, (vector_similarity_avg * 0.6) + (coverage_ratio * 0.4)))
+    confidence = min(
+        1.0, max(0.0, (vector_similarity_avg * 0.6) + (coverage_ratio * 0.4))
+    )
 
     if confidence >= 0.75:
         band = "HIGH"

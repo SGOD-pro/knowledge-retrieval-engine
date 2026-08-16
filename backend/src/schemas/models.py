@@ -47,8 +47,8 @@ class Document:
 
 from pydantic import BaseModel
 
+
 class QueryRequest(BaseModel):
     query: str
     document_ids: list[str] | None = None
     provider: str | None = None
-

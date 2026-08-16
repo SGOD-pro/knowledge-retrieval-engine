@@ -16,11 +16,16 @@ def parse(path: Path, document_id: str) -> list[Chunk]:
                 text = str(cell.value).strip()
                 if not text:
                     continue
-                chunks.append(Chunk(
-                    id=f"{document_id}:xlsx:{sheet.title}:{cell.coordinate}",
-                    document_id=document_id, source_format="xlsx", text=text,
-                    element_type="cell", section_path=(sheet.title,),
-                    location_reference=f"Sheet: {sheet.title}, Cell: {cell.coordinate}",
-                    metadata={"sheet": sheet.title, "coordinate": cell.coordinate},
-                ))
+                chunks.append(
+                    Chunk(
+                        id=f"{document_id}:xlsx:{sheet.title}:{cell.coordinate}",
+                        document_id=document_id,
+                        source_format="xlsx",
+                        text=text,
+                        element_type="cell",
+                        section_path=(sheet.title,),
+                        location_reference=f"Sheet: {sheet.title}, Cell: {cell.coordinate}",
+                        metadata={"sheet": sheet.title, "coordinate": cell.coordinate},
+                    )
+                )
     return chunks

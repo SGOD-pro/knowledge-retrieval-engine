@@ -39,14 +39,23 @@ class VectorRetriever:
         """
         start_time = time.perf_counter()
 
-        if candidate_page_ids is not None and not candidate_page_ids and candidate_chunk_ids is not None and not candidate_chunk_ids:
+        if (
+            candidate_page_ids is not None
+            and not candidate_page_ids
+            and candidate_chunk_ids is not None
+            and not candidate_chunk_ids
+        ):
             # PageIndex explicitly filtered down to 0 matching pages/chunks
-            logger.info("vector.latency_ms=0.00 vector.confidence_score=0.00 (short-circuited by page_index)")
+            logger.info(
+                "vector.latency_ms=0.00 vector.confidence_score=0.00 (short-circuited by page_index)"
+            )
             return []
 
         if fast_path:
             # Local ONNX embedding — zero network calls (Rule 19)
-            from ingestion.embed_service import embed_fast_local  # correct source — providers.embedding_provider does not define this
+            from ingestion.embed_service import (
+                embed_fast_local,  # correct source — providers.embedding_provider does not define this
+            )
 
             query_embedding = embed_fast_local(query)
             embedding_column = "embedding_fast"
@@ -56,7 +65,11 @@ class VectorRetriever:
             from providers.provider_client import get_active_provider
 
             active_provider = get_active_provider()
-            query_embedding = query_embedding if query_embedding is not None else embed_text(query, provider=active_provider)
+            query_embedding = (
+                query_embedding
+                if query_embedding is not None
+                else embed_text(query, provider=active_provider)
+            )
             embedding_column = "embedding_full"
 
         results = self.repository.search_vector(
@@ -67,18 +80,30 @@ class VectorRetriever:
             candidate_chunk_ids=candidate_chunk_ids,
             limit=top_k,
         )
-        
+
         from config import settings
+
         pre_count = len(results)
         results = [res for res in results if res[1] >= settings.VECTOR_THRESHOLD]
         post_count = len(results)
-        print(f"[DEBUG Vector] Threshold: {settings.VECTOR_THRESHOLD}, Pre-filter: {pre_count}, Post-filter: {post_count}")
+        logger.debug(
+            "vector.filter_stats threshold=%.2f pre=%d post=%d",
+            settings.VECTOR_THRESHOLD,
+            pre_count,
+            post_count,
+        )
 
-        avg_sim = sum(sim for _, sim in results) / max(1, len(results)) if results else 0.0
+        avg_sim = (
+            sum(sim for _, sim in results) / max(1, len(results)) if results else 0.0
+        )
         confidence_score = min(1.0, max(0.0, avg_sim))
         latency_ms = (time.perf_counter() - start_time) * 1000.0
 
-        logger.info("vector.latency_ms=%.2f vector.confidence_score=%.2f", latency_ms, confidence_score)
+        logger.info(
+            "vector.latency_ms=%.2f vector.confidence_score=%.2f",
+            latency_ms,
+            confidence_score,
+        )
         return results
 
     def build_query_sql(self, query: str, plan) -> str:

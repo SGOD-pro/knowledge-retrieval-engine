@@ -8,16 +8,14 @@ Rule 6: Reranker runs before compression. Always.
 Rule 28: All reranker calls route through this module.
 """
 
-import json
 import logging
-import os
-import time
 import math
 import random
 import threading
+import time
+
 import requests
 
-from providers.provider_client import get_active_provider
 from config import settings
 
 logger = logging.getLogger(__name__)
@@ -31,6 +29,7 @@ _rl_lock = threading.Lock()
 _last_request_time = 0.0
 REQUEST_INTERVAL_SECONDS = 0.5  # Max 2 requests per second globally
 
+
 def _wait_for_rate_limit():
     global _last_request_time
     with _rl_lock:
@@ -39,6 +38,7 @@ def _wait_for_rate_limit():
         if elapsed < REQUEST_INTERVAL_SECONDS:
             time.sleep(REQUEST_INTERVAL_SECONDS - elapsed)
         _last_request_time = time.monotonic()
+
 
 def _sigmoid(x: float) -> float:
     try:
@@ -51,8 +51,9 @@ def _sigmoid(x: float) -> float:
     except OverflowError:
         return 1.0 if x > 0 else 0.0
 
+
 def nvidia_nim_reranker(query: str, documents: list[str]) -> list[float]:
-    invoke_url = f"https://ai.api.nvidia.com/v1/retrieval/nvidia/llama-nemotron-rerank-1b-v2/reranking"
+    invoke_url = "https://ai.api.nvidia.com/v1/retrieval/nvidia/llama-nemotron-rerank-1b-v2/reranking"
     api_key = settings.NVIDIA_API_KEY
     logger.info("reranker.mode=nvidia_nim model=%s", _NVIDIA_RERANKER_MODEL)
     headers = {
@@ -63,59 +64,68 @@ def nvidia_nim_reranker(query: str, documents: list[str]) -> list[float]:
     payload = {
         "model": _NVIDIA_RERANKER_MODEL,
         "query": {"text": query},
-        "passages": [{"text": doc} for doc in documents]
+        "passages": [{"text": doc} for doc in documents],
     }
-    
+
     session = requests.Session()
     max_retries = 5
     base_backoff = 1.0
-    
+
     for attempt in range(max_retries):
         _wait_for_rate_limit()
         try:
-            response = session.post(invoke_url, headers=headers, json=payload, timeout=15)
-            
+            response = session.post(
+                invoke_url, headers=headers, json=payload, timeout=15
+            )
+
             if response.status_code == 429 or response.status_code >= 500:
                 if attempt == max_retries - 1:
                     response.raise_for_status()
                 # Exponential backoff with jitter
-                sleep_time = (base_backoff * (2 ** attempt)) + random.uniform(0, 1)
-                logger.warning(f"Reranker API returned {response.status_code}. Retrying in {sleep_time:.2f}s (Attempt {attempt+1}/{max_retries})")
+                sleep_time = (base_backoff * (2**attempt)) + random.uniform(0, 1)
+                logger.warning(
+                    f"Reranker API returned {response.status_code}. Retrying in {sleep_time:.2f}s (Attempt {attempt+1}/{max_retries})"
+                )
                 time.sleep(sleep_time)
                 continue
-                
+
             response.raise_for_status()
-            
+
             response_body = response.json()
             rankings = response_body.get("rankings", [])
-            
+
             scores = [0.0] * len(documents)
             for r in rankings:
                 idx = r.get("index")
                 if idx is not None and idx < len(documents):
                     logit = r.get("logit", 0.0)
                     scores[idx] = _sigmoid(logit)
-                    
+
             return scores
-            
+
         except requests.exceptions.RequestException as e:
             if attempt == max_retries - 1:
-                logger.error(f"Reranker failed after {max_retries} attempts: {str(e)}")
+                logger.error(f"Reranker failed after {max_retries} attempts: {e!s}")
                 raise
-            sleep_time = (base_backoff * (2 ** attempt)) + random.uniform(0, 1)
-            logger.warning(f"Reranker request exception: {str(e)}. Retrying in {sleep_time:.2f}s")
+            sleep_time = (base_backoff * (2**attempt)) + random.uniform(0, 1)
+            logger.warning(
+                f"Reranker request exception: {e!s}. Retrying in {sleep_time:.2f}s"
+            )
             time.sleep(sleep_time)
-    
+
     raise RuntimeError("Reranker failed (max retries exceeded)")
 
-def rerank_documents(query: str, documents: list[str], provider: str | None = None) -> list[float]:
+
+def rerank_documents(
+    query: str, documents: list[str], provider: str | None = None
+) -> list[float]:
     """Score a list of document strings against a query using NVIDIA NIM reranker.
 
     Returns a list of relevance scores (floats) aligned with the input documents list.
     """
     if not documents:
         return []
-        
+
     try:
         return nvidia_nim_reranker(query, documents)
     except Exception as e:
@@ -123,7 +133,9 @@ def rerank_documents(query: str, documents: list[str], provider: str | None = No
 
     # Deterministic fallback — Jaccard word overlap scoring.
     # This path runs when NVIDIA NIM is unavailable (e.g. missing/invalid NVIDIA_API_KEY).
-    logger.warning("reranker.mode=jaccard_fallback reason=nvidia_nim_failed — check NVIDIA_API_KEY")
+    logger.warning(
+        "reranker.mode=jaccard_fallback reason=nvidia_nim_failed — check NVIDIA_API_KEY"
+    )
     query_words = set(query.lower().split())
     if not query_words:
         return [0.0] * len(documents)

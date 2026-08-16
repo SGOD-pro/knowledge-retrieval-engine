@@ -1,9 +1,11 @@
+from typing import Literal
+
 from pydantic_settings import BaseSettings
-from typing import Optional, Literal
+
 
 class Settings(BaseSettings):
     ENVIRONMENT: Literal["dev", "prod", "test"] = "dev"
-    
+
     # AWS Region
     AWS_REGION: str = "us-east-1"
 
@@ -18,7 +20,7 @@ class Settings(BaseSettings):
 
     # Qdrant Cloud — always prod, no LocalStack equivalent
     QDRANT_URL: str = "http://localhost:6333"
-    QDRANT_API_KEY: Optional[str] = None
+    QDRANT_API_KEY: str | None = None
 
     # PROD Models (Bedrock) — always prod
     PROD_LLM_MODEL: str = "apac.amazon.nova-lite-v1:0"
@@ -43,6 +45,7 @@ class Settings(BaseSettings):
     RERANKER_THRESHOLD: float = 0.2
 
     model_config = {"env_file": (".env", "../.env"), "extra": "ignore"}
+
 
 settings = Settings()
 

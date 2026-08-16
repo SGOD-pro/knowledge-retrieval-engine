@@ -1,10 +1,12 @@
 import os
 import time
-import pytest
-from main import app
+
 from fastapi.testclient import TestClient
 
+from main import app
+
 client = TestClient(app)
+
 
 def test_full_pipeline_p95_under_4000ms_prod(monkeypatch):
     monkeypatch.setenv("MODEL_PROVIDER", "prod")
@@ -31,6 +33,7 @@ def test_full_pipeline_p95_under_4000ms_prod(monkeypatch):
     p95 = latencies[int(len(latencies) * 0.95)]
     assert p95 < 4000.0, f"Full pipeline p95 latency exceeded: {p95}ms"
 
+
 def test_full_pipeline_p95_under_4000ms_dev(monkeypatch):
     monkeypatch.setenv("MODEL_PROVIDER", "dev")
     latencies = []
@@ -55,6 +58,7 @@ def test_full_pipeline_p95_under_4000ms_dev(monkeypatch):
     p95 = latencies[int(len(latencies) * 0.95)]
     assert p95 < 4000.0, f"Full pipeline p95 latency (dev) exceeded: {p95}ms"
 
+
 def test_lambda_package_size_under_250mb():
     # Simulates checking zipped lambda bundle size threshold (< 250 MB)
     max_bytes = 250 * 1024 * 1024
@@ -68,7 +72,10 @@ def test_lambda_package_size_under_250mb():
             fp = os.path.join(root, f)
             if os.path.exists(fp):
                 total_size += os.path.getsize(fp)
-    assert total_size < max_bytes, f"Package size {total_size} bytes exceeds {max_bytes} bytes limit"
+    assert (
+        total_size < max_bytes
+    ), f"Package size {total_size} bytes exceeds {max_bytes} bytes limit"
+
 
 def test_fast_path_cold_start_under_1500ms(monkeypatch):
     # Cold start simulation
@@ -81,17 +88,24 @@ def test_fast_path_cold_start_under_1500ms(monkeypatch):
         fast_path = True
         top_chunks = []
 
-    monkeypatch.setattr(pipeline, "run", lambda query, doc_ids=None: ColdStartMockResponse())
+    monkeypatch.setattr(
+        pipeline, "run", lambda query, doc_ids=None: ColdStartMockResponse()
+    )
 
     t0 = time.perf_counter()
     res = client.post("/query", json={"query": "cold start query"})
     assert res.status_code == 200
     cold_start_ms = (time.perf_counter() - t0) * 1000
-    assert cold_start_ms < 1500.0, f"Cold start latency {cold_start_ms}ms exceeded 1500ms limit"
+    assert (
+        cold_start_ms < 1500.0
+    ), f"Cold start latency {cold_start_ms}ms exceeded 1500ms limit"
+
 
 def test_cold_start_delta_under_1200ms():
     # cold_start_delta = p95_cold - p95_warm
     p95_warm = 150.0  # ms
     p95_cold = 800.0  # ms
     cold_start_delta = p95_cold - p95_warm
-    assert cold_start_delta < 1200.0, f"Cold start delta {cold_start_delta}ms exceeded 1200ms limit"
+    assert (
+        cold_start_delta < 1200.0
+    ), f"Cold start delta {cold_start_delta}ms exceeded 1200ms limit"

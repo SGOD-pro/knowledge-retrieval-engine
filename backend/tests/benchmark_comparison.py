@@ -30,8 +30,8 @@ import sys
 import time
 from pathlib import Path
 
-if sys.stdout.encoding.lower() != 'utf-8':
-    sys.stdout.reconfigure(encoding='utf-8')
+if sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout.reconfigure(encoding="utf-8")
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -79,6 +79,7 @@ QUERY_SAMPLE_SIZE = 60
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _rouge_l(hypothesis: str, reference: str) -> float:
     """Approximate ROUGE-L: LCS length / reference length."""
     if not reference or not hypothesis:
@@ -89,10 +90,10 @@ def _rouge_l(hypothesis: str, reference: str) -> float:
     dp = [[0] * (n + 1) for _ in range(m + 1)]
     for i in range(1, m + 1):
         for j in range(1, n + 1):
-            if ref_words[i-1] == hyp_words[j-1]:
-                dp[i][j] = dp[i-1][j-1] + 1
+            if ref_words[i - 1] == hyp_words[j - 1]:
+                dp[i][j] = dp[i - 1][j - 1] + 1
             else:
-                dp[i][j] = max(dp[i-1][j], dp[i][j-1])
+                dp[i][j] = max(dp[i - 1][j], dp[i][j - 1])
     lcs = dp[m][n]
     return lcs / max(1, m)
 
@@ -103,6 +104,7 @@ def _faithfulness_score(query: str, answer: str, context: str) -> tuple[float, d
         return 0.0, {"input_tokens": 0, "output_tokens": 0}
     try:
         from aws.infra import get_client
+
         client = get_client("bedrock-runtime")
         prompt = (
             f"Query: {query}\n\nContext: {context[:2000]}\n\nAnswer: {answer}\n\n"
@@ -111,7 +113,7 @@ def _faithfulness_score(query: str, answer: str, context: str) -> tuple[float, d
             "No explanation."
         )
         from providers.bedrock_models import get_llm_model
-        
+
         resp = client.converse(
             modelId=get_llm_model(),
             messages=[{"role": "user", "content": [{"text": prompt}]}],
@@ -132,6 +134,7 @@ def _faithfulness_score(query: str, answer: str, context: str) -> tuple[float, d
 
 def _qdrant_tracker():
     """Returns a context-managed tracker that monkey-patches Qdrant to count queries."""
+
     class QdrantTracker:
         def __init__(self):
             self.query_count = 0
@@ -140,7 +143,11 @@ def _qdrant_tracker():
         def record(self, result_points: list):
             self.query_count += 1
             for pt in result_points:
-                self.total_payload_bytes += len(json.dumps(pt.payload if hasattr(pt, "payload") else {}, default=str))
+                self.total_payload_bytes += len(
+                    json.dumps(
+                        pt.payload if hasattr(pt, "payload") else {}, default=str
+                    )
+                )
 
     return QdrantTracker()
 
@@ -149,10 +156,16 @@ def _qdrant_tracker():
 # Method A: Traditional RAG (naive cosine only, no guardrails)
 # ---------------------------------------------------------------------------
 
+
 def run_traditional_rag(query: str, all_chunks) -> dict:
     """Embed query via Titan → cosine similarity → top-5 → LLM."""
-    from providers.embedding_provider import embed_text, reset_token_counter, get_token_counter
     import numpy as np
+
+    from providers.embedding_provider import (
+        embed_text,
+        get_token_counter,
+        reset_token_counter,
+    )
 
     t0 = time.perf_counter()
     result = {"method": "traditional_rag", "query": query}
@@ -174,26 +187,29 @@ def run_traditional_rag(query: str, all_chunks) -> dict:
         context = "\n\n".join(c.text for c in top5)
 
         from services.llm.llm_service import call as llm_call
+
         t_llm = time.perf_counter()
         llm_resp = llm_call(query, context)
         llm_latency = (time.perf_counter() - t_llm) * 1000.0
         llm_usage = llm_resp.get("usage", {"input_tokens": 0, "output_tokens": 0})
 
         answer = llm_resp.get("answer", "NOT_FOUND")
-        result.update({
-            "answer": answer,
-            "context_snippet": context[:500],
-            "context_chunks": len(top5),
-            "latency_ms": (time.perf_counter() - t0) * 1000.0,
-            "llm_latency_ms": llm_latency,
-            "llm_input_tokens": llm_usage.get("input_tokens", 0),
-            "llm_output_tokens": llm_usage.get("output_tokens", 0),
-            "llm_calls": 0 if answer == "NOT_FOUND" and not context.strip() else 1,
-            "embed_input_tokens": embed_usage_q.get("embed_input_tokens", 0),
-            "embed_calls": embed_usage_q.get("embed_calls", 0),
-            "qdrant_queries": 0,  # Traditional RAG uses in-memory cosine, not Qdrant
-            "top_sim_score": scored[0][0] if scored else 0.0,
-        })
+        result.update(
+            {
+                "answer": answer,
+                "context_snippet": context[:500],
+                "context_chunks": len(top5),
+                "latency_ms": (time.perf_counter() - t0) * 1000.0,
+                "llm_latency_ms": llm_latency,
+                "llm_input_tokens": llm_usage.get("input_tokens", 0),
+                "llm_output_tokens": llm_usage.get("output_tokens", 0),
+                "llm_calls": 0 if answer == "NOT_FOUND" and not context.strip() else 1,
+                "embed_input_tokens": embed_usage_q.get("embed_input_tokens", 0),
+                "embed_calls": embed_usage_q.get("embed_calls", 0),
+                "qdrant_queries": 0,  # Traditional RAG uses in-memory cosine, not Qdrant
+                "top_sim_score": scored[0][0] if scored else 0.0,
+            }
+        )
     except Exception as e:
         result["error"] = str(e)
         result["latency_ms"] = (time.perf_counter() - t0) * 1000.0
@@ -206,9 +222,11 @@ def run_traditional_rag(query: str, all_chunks) -> dict:
 # Method B: PageIndex only
 # ---------------------------------------------------------------------------
 
+
 def run_page_index(query: str, all_chunks) -> dict:
     """BM25 → PageIndex structural filter → Vector search → top-5 → LLM."""
-    from providers.embedding_provider import reset_token_counter, get_token_counter
+    from providers.embedding_provider import get_token_counter, reset_token_counter
+
     t0 = time.perf_counter()
     result = {"method": "page_index", "query": query}
 
@@ -216,15 +234,17 @@ def run_page_index(query: str, all_chunks) -> dict:
     qdrant_queries = 0
 
     try:
+        from db.database import CloudRepository
         from services.retrieval.bm25_retriever import BM25Retriever
         from services.retrieval.page_index_retriever import PageIndexRetriever
         from services.retrieval.vector_retriever import VectorRetriever
-        from db.database import CloudRepository
 
         bm25_results = BM25Retriever().search(query, all_chunks, top_k=20)
         bm25_chunks = [c for c, _ in bm25_results]
 
-        _, candidate_pages, c_ids = PageIndexRetriever().filter_and_rank(query, bm25_chunks)
+        _, candidate_pages, c_ids = PageIndexRetriever().filter_and_rank(
+            query, bm25_chunks
+        )
 
         repo = CloudRepository()
         vec_results = VectorRetriever(repository=repo).search(
@@ -240,26 +260,29 @@ def run_page_index(query: str, all_chunks) -> dict:
         embed_usage = get_token_counter().copy()
 
         from services.llm.llm_service import call as llm_call
+
         t_llm = time.perf_counter()
         llm_resp = llm_call(query, context)
         llm_latency = (time.perf_counter() - t_llm) * 1000.0
         llm_usage = llm_resp.get("usage", {"input_tokens": 0, "output_tokens": 0})
 
         answer = llm_resp.get("answer", "NOT_FOUND")
-        result.update({
-            "answer": answer,
-            "context_snippet": context[:500],
-            "context_chunks": len(top5),
-            "candidate_pages": len(candidate_pages),
-            "latency_ms": (time.perf_counter() - t0) * 1000.0,
-            "llm_latency_ms": llm_latency,
-            "llm_input_tokens": llm_usage.get("input_tokens", 0),
-            "llm_output_tokens": llm_usage.get("output_tokens", 0),
-            "llm_calls": 0 if answer == "NOT_FOUND" and not context.strip() else 1,
-            "embed_input_tokens": embed_usage.get("embed_input_tokens", 0),
-            "embed_calls": embed_usage.get("embed_calls", 0),
-            "qdrant_queries": qdrant_queries,
-        })
+        result.update(
+            {
+                "answer": answer,
+                "context_snippet": context[:500],
+                "context_chunks": len(top5),
+                "candidate_pages": len(candidate_pages),
+                "latency_ms": (time.perf_counter() - t0) * 1000.0,
+                "llm_latency_ms": llm_latency,
+                "llm_input_tokens": llm_usage.get("input_tokens", 0),
+                "llm_output_tokens": llm_usage.get("output_tokens", 0),
+                "llm_calls": 0 if answer == "NOT_FOUND" and not context.strip() else 1,
+                "embed_input_tokens": embed_usage.get("embed_input_tokens", 0),
+                "embed_calls": embed_usage.get("embed_calls", 0),
+                "qdrant_queries": qdrant_queries,
+            }
+        )
     except Exception as e:
         result["error"] = str(e)
         result["latency_ms"] = (time.perf_counter() - t0) * 1000.0
@@ -272,14 +295,15 @@ def run_page_index(query: str, all_chunks) -> dict:
 # Method C: OKF only
 # ---------------------------------------------------------------------------
 
+
 def run_okf_only(query: str) -> dict:
     """Entity extraction → DynamoDB lookup → answer from typed facts (zero LLM)."""
     t0 = time.perf_counter()
     result = {"method": "okf_only", "query": query}
 
     try:
-        from services.retrieval.planner import extract_entities
         from services.retrieval.okf_retriever import OKFRetriever
+        from services.retrieval.planner import extract_entities
 
         entities = extract_entities(query)
         t_okf = time.perf_counter()
@@ -294,20 +318,22 @@ def run_okf_only(query: str) -> dict:
         else:
             answer = "NOT_FOUND"
 
-        result.update({
-            "answer": answer,
-            "context_snippet": "",
-            "entities_extracted": entities,
-            "properties_found": len(props),
-            "okf_latency_ms": okf_latency,
-            "latency_ms": (time.perf_counter() - t0) * 1000.0,
-            "llm_calls": 0,
-            "llm_input_tokens": 0,
-            "llm_output_tokens": 0,
-            "embed_input_tokens": 0,
-            "embed_calls": 0,
-            "qdrant_queries": 0,
-        })
+        result.update(
+            {
+                "answer": answer,
+                "context_snippet": "",
+                "entities_extracted": entities,
+                "properties_found": len(props),
+                "okf_latency_ms": okf_latency,
+                "latency_ms": (time.perf_counter() - t0) * 1000.0,
+                "llm_calls": 0,
+                "llm_input_tokens": 0,
+                "llm_output_tokens": 0,
+                "embed_input_tokens": 0,
+                "embed_calls": 0,
+                "qdrant_queries": 0,
+            }
+        )
     except Exception as e:
         result["error"] = str(e)
         result["latency_ms"] = (time.perf_counter() - t0) * 1000.0
@@ -320,9 +346,11 @@ def run_okf_only(query: str) -> dict:
 # Method D: KRE full pipeline
 # ---------------------------------------------------------------------------
 
+
 def run_kre(query: str) -> dict:
     """KRE full pipeline: BM25+PageIndex+OKF+Vector+Rerank+Fidelity+LLM."""
-    from providers.embedding_provider import reset_token_counter, get_token_counter
+    from providers.embedding_provider import get_token_counter, reset_token_counter
+
     t0 = time.perf_counter()
     result = {"method": "kre", "query": query}
 
@@ -330,24 +358,29 @@ def run_kre(query: str) -> dict:
 
     try:
         from services.langgraph_pipeline import pipeline
+
         response = pipeline.run(query)
         embed_usage = get_token_counter().copy()
 
-        result.update({
-            "answer": response.answer,
-            "context_snippet": response.context_snippet,
-            "fast_path": response.fast_path,
-            "confidence_score": response.confidence_score,
-            "latency_ms": (time.perf_counter() - t0) * 1000.0,
-            "stage_timings": response.stage_timings,
-            "citation_count": len(response.citations),
-            "llm_calls": 0 if response.fast_path else 1,
-            "llm_input_tokens": 0,   # pipeline doesn't expose per-call usage yet — tracked via llm_service log
-            "llm_output_tokens": 0,
-            "embed_input_tokens": embed_usage.get("embed_input_tokens", 0),
-            "embed_calls": embed_usage.get("embed_calls", 0),
-            "qdrant_queries": len([k for k in response.stage_timings if "vector" in k]),
-        })
+        result.update(
+            {
+                "answer": response.answer,
+                "context_snippet": response.context_snippet,
+                "fast_path": response.fast_path,
+                "confidence_score": response.confidence_score,
+                "latency_ms": (time.perf_counter() - t0) * 1000.0,
+                "stage_timings": response.stage_timings,
+                "citation_count": len(response.citations),
+                "llm_calls": 0 if response.fast_path else 1,
+                "llm_input_tokens": 0,  # pipeline doesn't expose per-call usage yet — tracked via llm_service log
+                "llm_output_tokens": 0,
+                "embed_input_tokens": embed_usage.get("embed_input_tokens", 0),
+                "embed_calls": embed_usage.get("embed_calls", 0),
+                "qdrant_queries": len(
+                    [k for k in response.stage_timings if "vector" in k]
+                ),
+            }
+        )
     except Exception as e:
         result["error"] = str(e)
         result["latency_ms"] = (time.perf_counter() - t0) * 1000.0
@@ -360,6 +393,7 @@ def run_kre(query: str) -> dict:
 # Ingest documents
 # ---------------------------------------------------------------------------
 
+
 def ingest_all() -> list:
     """Ingest all advance/ documents and return all chunks.
 
@@ -367,13 +401,13 @@ def ingest_all() -> list:
     CSVs → row-level sentence chunking.
     All others → parse_file from ingestion_lambda.parse_service.
     """
-    import uuid
     from ingestion_lambda.parse_service import parse_file
+
+    from config import settings
+    from db.database import CloudRepository
     from ingestion.embed_service import embed_chunks_dual
     from ingestion.okf_builder import build_okf
-    from db.database import CloudRepository
     from schemas.models import Document
-    from config import settings
 
     repo = CloudRepository()
     all_chunks = []
@@ -391,14 +425,18 @@ def ingest_all() -> list:
             doc_format = doc.source_format
             chunks_raw = list(doc.chunks)
             raw_count = len(chunks_raw)
-            logger.info("benchmark.parsed doc=%s raw_chunks=%d", doc_path.name, raw_count)
+            logger.info(
+                "benchmark.parsed doc=%s raw_chunks=%d", doc_path.name, raw_count
+            )
 
             # Cap chunks for very large documents
             chunks_to_embed = chunks_raw[:DOC_CHUNK_CAP]
             if raw_count > DOC_CHUNK_CAP:
                 logger.warning(
                     "benchmark.doc_capped doc=%s total=%d using=%d",
-                    doc_path.name, raw_count, DOC_CHUNK_CAP,
+                    doc_path.name,
+                    raw_count,
+                    DOC_CHUNK_CAP,
                 )
 
             # Embed: fast path (BGE ONNX) + full path (Titan API)
@@ -408,7 +446,9 @@ def ingest_all() -> list:
             settings.ENVIRONMENT = orig_env
 
             # Save to Qdrant + DynamoDB
-            full_doc = Document(doc_id, doc_filename, doc_format, tuple(embedded_chunks))
+            full_doc = Document(
+                doc_id, doc_filename, doc_format, tuple(embedded_chunks)
+            )
             repo.save(full_doc)
             all_chunks.extend(embedded_chunks)
 
@@ -417,20 +457,27 @@ def ingest_all() -> list:
             if len(embedded_chunks) > OKF_CHUNK_CAP:
                 logger.warning(
                     "benchmark.okf_capped doc=%s total=%d capped=%d",
-                    doc_path.name, len(embedded_chunks), OKF_CHUNK_CAP,
+                    doc_path.name,
+                    len(embedded_chunks),
+                    OKF_CHUNK_CAP,
                 )
             cap_doc = Document(doc_id, doc_filename, doc_format, tuple(capped))
             build_okf(cap_doc)
 
             logger.info(
                 "benchmark.ingested doc=%s chunks=%d latency_ms=%.2f",
-                doc_path.name, len(embedded_chunks), (time.perf_counter() - t0) * 1000,
+                doc_path.name,
+                len(embedded_chunks),
+                (time.perf_counter() - t0) * 1000,
             )
         except Exception as e:
             import traceback
+
             logger.error(
                 "benchmark.ingest_failed doc=%s error=%s\n%s",
-                doc_path.name, e, traceback.format_exc(),
+                doc_path.name,
+                e,
+                traceback.format_exc(),
             )
 
     if not all_chunks:
@@ -444,23 +491,32 @@ def ingest_all() -> list:
 # Load and sample queries
 # ---------------------------------------------------------------------------
 
+
 def load_queries() -> list[dict]:
     """Load queries from query.json, randomly sample QUERY_SAMPLE_SIZE (seed=42)."""
     if QUERY_FILE.exists():
         with open(QUERY_FILE, encoding="utf-8") as f:
             all_queries = json.load(f)
-        logger.info("benchmark.queries_loaded total=%d from %s", len(all_queries), QUERY_FILE.name)
+        logger.info(
+            "benchmark.queries_loaded total=%d from %s",
+            len(all_queries),
+            QUERY_FILE.name,
+        )
 
         if len(all_queries) > QUERY_SAMPLE_SIZE:
             rng = random.Random(QUERY_SAMPLE_SEED)
             sampled = rng.sample(all_queries, QUERY_SAMPLE_SIZE)
             logger.info(
-                "benchmark.queries_sampled count=%d seed=%d", QUERY_SAMPLE_SIZE, QUERY_SAMPLE_SEED
+                "benchmark.queries_sampled count=%d seed=%d",
+                QUERY_SAMPLE_SIZE,
+                QUERY_SAMPLE_SEED,
             )
             return sampled
         return all_queries
     else:
-        logger.warning("benchmark.query_file_missing path=%s — using 0 queries", QUERY_FILE)
+        logger.warning(
+            "benchmark.query_file_missing path=%s — using 0 queries", QUERY_FILE
+        )
         return []
 
 
@@ -468,16 +524,20 @@ def load_queries() -> list[dict]:
 # Main
 # ---------------------------------------------------------------------------
 
+
 def preflight_check():
     """Verify Bedrock is accessible before running the full benchmark."""
     logger.info("benchmark.preflight_check verifying Bedrock connection...")
     try:
         from providers.llm_provider import generate_completion
+
         text, usage = generate_completion(
             system_prompt="You are a helpful assistant.",
-            user_prompt="Say 'OK' if you can read this."
+            user_prompt="Say 'OK' if you can read this.",
         )
-        logger.info("benchmark.preflight_check OK response=%r tokens=%s", text[:30], usage)
+        logger.info(
+            "benchmark.preflight_check OK response=%r tokens=%s", text[:30], usage
+        )
     except Exception as e:
         logger.error("benchmark.preflight_check FAILED error=%s", e)
         sys.exit(1)
@@ -487,7 +547,9 @@ def main():
     if OUT_FILE.exists():
         backup = OUT_FILE.with_suffix(f".{int(time.time())}.bak.json")
         OUT_FILE.rename(backup)
-        logger.warning("benchmark.prev_result_backed_up old=%s new=%s", OUT_FILE.name, backup.name)
+        logger.warning(
+            "benchmark.prev_result_backed_up old=%s new=%s", OUT_FILE.name, backup.name
+        )
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -503,6 +565,7 @@ def main():
 
     # Create tables if not exist
     from aws.infra import setup_infrastructure
+
     setup_infrastructure()
 
     # Ingest
@@ -512,12 +575,16 @@ def main():
     # Keep ENVIRONMENT="dev" for the benchmark run
     # (Qdrant uses cloud by default, dev uses local endpoints for DynamoDB etc)
 
-    results = {"queries": [], "summary": {}, "metadata": {
-        "query_sample_seed": QUERY_SAMPLE_SEED,
-        "query_count": len(QUERIES),
-        "doc_chunk_cap": DOC_CHUNK_CAP,
-        "docs_ingested": [d.name for d in DOCS if d.exists()],
-    }}
+    results = {
+        "queries": [],
+        "summary": {},
+        "metadata": {
+            "query_sample_seed": QUERY_SAMPLE_SEED,
+            "query_count": len(QUERIES),
+            "doc_chunk_cap": DOC_CHUNK_CAP,
+            "docs_ingested": [d.name for d in DOCS if d.exists()],
+        },
+    }
 
     # ---------------------------------------------------------------------------
     # Run each query against all 4 methods
@@ -531,8 +598,12 @@ def main():
         logger.info("benchmark.query qid=%s type=%s query=%s", qid, qtype, query[:60])
 
         row = {
-            "id": qid, "query": query, "type": qtype,
-            "expected_answer": expected, "source_file": source_file, "methods": {}
+            "id": qid,
+            "query": query,
+            "type": qtype,
+            "expected_answer": expected,
+            "source_file": source_file,
+            "methods": {},
         }
 
         time.sleep(1.5)  # Respect NVIDIA 40 RPM reranker limit
@@ -548,8 +619,13 @@ def main():
         a_result["rouge_l"] = round(a_rouge, 3) if a_rouge is not None else None
         a_result["faith_input_tokens"] = a_faith_usage.get("input_tokens", 0)
         row["methods"]["traditional_rag"] = a_result
-        logger.info("benchmark.traditional_rag qid=%s latency_ms=%.2f answer_len=%d faith=%.2f",
-                    qid, a_result.get("latency_ms", 0), len(a_answer), a_faith)
+        logger.info(
+            "benchmark.traditional_rag qid=%s latency_ms=%.2f answer_len=%d faith=%.2f",
+            qid,
+            a_result.get("latency_ms", 0),
+            len(a_answer),
+            a_faith,
+        )
 
         # Method B: PageIndex
         logger.info("benchmark.method=page_index qid=%s", qid)
@@ -562,8 +638,13 @@ def main():
         b_result["rouge_l"] = round(b_rouge, 3) if b_rouge is not None else None
         b_result["faith_input_tokens"] = b_faith_usage.get("input_tokens", 0)
         row["methods"]["page_index"] = b_result
-        logger.info("benchmark.page_index qid=%s latency_ms=%.2f pages=%d faith=%.2f",
-                    qid, b_result.get("latency_ms", 0), b_result.get("candidate_pages", 0), b_faith)
+        logger.info(
+            "benchmark.page_index qid=%s latency_ms=%.2f pages=%d faith=%.2f",
+            qid,
+            b_result.get("latency_ms", 0),
+            b_result.get("candidate_pages", 0),
+            b_faith,
+        )
 
         # Method C: OKF only
         logger.info("benchmark.method=okf_only qid=%s", qid)
@@ -575,8 +656,13 @@ def main():
         c_result["rouge_l"] = round(c_rouge, 3) if c_rouge is not None else None
         c_result["faith_input_tokens"] = c_faith_usage.get("input_tokens", 0)
         row["methods"]["okf_only"] = c_result
-        logger.info("benchmark.okf_only qid=%s latency_ms=%.2f props=%d faith=%.2f",
-                    qid, c_result.get("latency_ms", 0), c_result.get("properties_found", 0), c_faith)
+        logger.info(
+            "benchmark.okf_only qid=%s latency_ms=%.2f props=%d faith=%.2f",
+            qid,
+            c_result.get("latency_ms", 0),
+            c_result.get("properties_found", 0),
+            c_faith,
+        )
 
         # Method D: KRE
         logger.info("benchmark.method=kre qid=%s", qid)
@@ -589,9 +675,14 @@ def main():
         d_result["rouge_l"] = round(d_rouge, 3) if d_rouge is not None else None
         d_result["faith_input_tokens"] = d_faith_usage.get("input_tokens", 0)
         row["methods"]["kre"] = d_result
-        logger.info("benchmark.kre qid=%s latency_ms=%.2f fast_path=%s conf=%.3f faith=%.2f",
-                    qid, d_result.get("latency_ms", 0),
-                    d_result.get("fast_path"), d_result.get("confidence_score", 0), d_faith)
+        logger.info(
+            "benchmark.kre qid=%s latency_ms=%.2f fast_path=%s conf=%.3f faith=%.2f",
+            qid,
+            d_result.get("latency_ms", 0),
+            d_result.get("fast_path"),
+            d_result.get("confidence_score", 0),
+            d_faith,
+        )
 
         results["queries"].append(row)
 
@@ -600,16 +691,16 @@ def main():
     # ---------------------------------------------------------------------------
     for method in ("traditional_rag", "page_index", "okf_only", "kre"):
         method_rows = [
-            r["methods"][method]
-            for r in results["queries"]
-            if method in r["methods"]
+            r["methods"][method] for r in results["queries"] if method in r["methods"]
         ]
         n = len(method_rows)
         if n == 0:
             continue
 
         latencies = [r.get("latency_ms", 0) for r in method_rows]
-        not_found = sum(1 for r in method_rows if r.get("answer", "") in ("NOT_FOUND", ""))
+        not_found = sum(
+            1 for r in method_rows if r.get("answer", "") in ("NOT_FOUND", "")
+        )
         errors = sum(1 for r in method_rows if "error" in r)
         avg_lat = sum(latencies) / n
         p95_lat = sorted(latencies)[int(n * 0.95)]
@@ -621,7 +712,11 @@ def main():
         avg_in = sum(llm_in_tokens) / n
         avg_out = sum(llm_out_tokens) / n
         max_in = max(llm_in_tokens) if llm_in_tokens else 0
-        min_in = min(t for t in llm_in_tokens if t > 0) if any(t > 0 for t in llm_in_tokens) else 0
+        min_in = (
+            min(t for t in llm_in_tokens if t > 0)
+            if any(t > 0 for t in llm_in_tokens)
+            else 0
+        )
 
         # Embedding token usage
         embed_tokens = [r.get("embed_input_tokens", 0) for r in method_rows]
@@ -637,8 +732,11 @@ def main():
         avg_rouge = sum(rouge_vals) / len(rouge_vals) if rouge_vals else None
 
         # Faithfulness (only over answered queries)
-        faith_vals = [r["faithfulness"] for r in method_rows
-                      if r.get("answer", "NOT_FOUND") not in ("NOT_FOUND", "")]
+        faith_vals = [
+            r["faithfulness"]
+            for r in method_rows
+            if r.get("answer", "NOT_FOUND") not in ("NOT_FOUND", "")
+        ]
         avg_faith = sum(faith_vals) / len(faith_vals) if faith_vals else None
 
         results["summary"][method] = {
@@ -672,13 +770,23 @@ def main():
     print("\n" + "=" * W)
     print("BASELINE COMPARISON RESULTS — NO SUGARCOATING")
     print("=" * W)
-    print(f"{'Method':<20} {'Lat(avg)':>9} {'Lat(p95)':>9} {'NOT_FOUND%':>11} {'Errors':>7} "
-          f"{'LLM calls':>10} {'InTok(avg)':>11} {'OutTok(avg)':>12} {'EmbTok(avg)':>12} "
-          f"{'QdrantQ':>8} {'ROUGE-L':>8} {'Faith':>7}")
+    print(
+        f"{'Method':<20} {'Lat(avg)':>9} {'Lat(p95)':>9} {'NOT_FOUND%':>11} {'Errors':>7} "
+        f"{'LLM calls':>10} {'InTok(avg)':>11} {'OutTok(avg)':>12} {'EmbTok(avg)':>12} "
+        f"{'QdrantQ':>8} {'ROUGE-L':>8} {'Faith':>7}"
+    )
     print("-" * W)
     for method, s in results["summary"].items():
-        rouge_str = f"{s['avg_rouge_l']:>8.3f}" if isinstance(s["avg_rouge_l"], float) else f"{'N/A':>8}"
-        faith_str = f"{s['avg_faithfulness']:>7.3f}" if isinstance(s["avg_faithfulness"], float) else f"{'N/A':>7}"
+        rouge_str = (
+            f"{s['avg_rouge_l']:>8.3f}"
+            if isinstance(s["avg_rouge_l"], float)
+            else f"{'N/A':>8}"
+        )
+        faith_str = (
+            f"{s['avg_faithfulness']:>7.3f}"
+            if isinstance(s["avg_faithfulness"], float)
+            else f"{'N/A':>7}"
+        )
         print(
             f"{method:<20} {s['avg_latency_ms']:>9.1f} {s['p95_latency_ms']:>9.1f} "
             f"{s['not_found_rate_pct']:>10.1f}% {s['error_count']:>7} "
@@ -688,7 +796,9 @@ def main():
         )
     print("=" * W)
     print(f"\nFull results: {OUT_FILE}")
-    print(f"Queries: {len(QUERIES)} (sampled from {QUERY_FILE.name} with seed={QUERY_SAMPLE_SEED})")
+    print(
+        f"Queries: {len(QUERIES)} (sampled from {QUERY_FILE.name} with seed={QUERY_SAMPLE_SEED})"
+    )
 
 
 if __name__ == "__main__":

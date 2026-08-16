@@ -14,13 +14,12 @@ import sys
 import time
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from schemas.models import Chunk, Document
 
 # ── fixtures ─────────────────────────────────────────────────────────────────
+
 
 def _make_chunk(i: int = 0, text: str = "Revenue was $1.2M in Q3 2024.") -> Chunk:
     return Chunk(
@@ -33,6 +32,7 @@ def _make_chunk(i: int = 0, text: str = "Revenue was $1.2M in Q3 2024.") -> Chun
         structural_weight=0.5,
     )
 
+
 def _make_doc() -> Document:
     chunks = (_make_chunk(0), _make_chunk(1, "Refund rate was 3.2% in Q3."))
     return Document("doc1", "test.pdf", "pdf", chunks)
@@ -40,16 +40,25 @@ def _make_doc() -> Document:
 
 # ── T1: BGE Lambda routing ───────────────────────────────────────────────────
 
+
 def test_bge_lambda_invoked_in_prod_mode():
     """prod → bge-embedding-lambda via boto3. Zero local ONNX."""
-    with patch.dict("os.environ", {"ENVIRONMENT": "prod", "BGE_EMBEDDING_LAMBDA_NAME": "bge-embedding-lambda"}):
+    with patch.dict(
+        "os.environ",
+        {"ENVIRONMENT": "prod", "BGE_EMBEDDING_LAMBDA_NAME": "bge-embedding-lambda"},
+    ):
         mock_client = MagicMock()
         mock_payload = MagicMock()
-        mock_payload.read.return_value = json.dumps({"embedding": [0.1] * 384, "dim": 384}).encode()
+        mock_payload.read.return_value = json.dumps(
+            {"embedding": [0.1] * 384, "dim": 384}
+        ).encode()
         mock_client.invoke.return_value = {"Payload": mock_payload}
 
         with patch("aws.infra.get_client", return_value=mock_client):
-            import importlib, ingestion.embed_service as es
+            import importlib
+
+            import ingestion.embed_service as es
+
             importlib.reload(es)
             result = es.embed_fast_local("test query")
 
@@ -64,7 +73,10 @@ def test_bge_deterministic_in_test_mode():
     """test → deterministic vector. Zero network calls."""
     with patch.dict("os.environ", {"ENVIRONMENT": "test"}):
         with patch("aws.infra.get_client") as mock_get_client:
-            import importlib, ingestion.embed_service as es
+            import importlib
+
+            import ingestion.embed_service as es
+
             importlib.reload(es)
             r1 = es.embed_fast_local("hello world")
             r2 = es.embed_fast_local("hello world")
@@ -72,10 +84,13 @@ def test_bge_deterministic_in_test_mode():
         assert r1 == r2
         assert len(r1) == 384
         mock_get_client.assert_not_called()
-        logging.info("T1b PASSED bge.mode=deterministic_fallback dim=384 network_calls=0")
+        logging.info(
+            "T1b PASSED bge.mode=deterministic_fallback dim=384 network_calls=0"
+        )
 
 
 # ── T2: OKF builder → DynamoDB writes ───────────────────────────────────────
+
 
 def test_okf_builder_stores_properties_to_dynamodb():
     """Tier 1 patterns extracted from chunks must be written to okf_properties."""
@@ -88,14 +103,23 @@ def test_okf_builder_stores_properties_to_dynamodb():
 
     with patch.dict("os.environ", {"ENVIRONMENT": "dev"}):
         with patch("ingestion.okf_builder._get_repo", return_value=mock_repo):
-            with patch("ingestion.okf_builder._extract_tier3_with_tracking",
-                       return_value=([], {"input_tokens": 0, "output_tokens": 0, "calls": 0})):
-                with patch("ingestion.normalize_service.cluster_entities", return_value={}):
-                    import importlib, ingestion.okf_builder as ob
+            with patch(
+                "ingestion.okf_builder._extract_tier3_with_tracking",
+                return_value=([], {"input_tokens": 0, "output_tokens": 0, "calls": 0}),
+            ):
+                with patch(
+                    "ingestion.normalize_service.cluster_entities", return_value={}
+                ):
+                    import importlib
+
+                    import ingestion.okf_builder as ob
+
                     importlib.reload(ob)
                     ob._get_repo = lambda: mock_repo
-                    ob._extract_tier3_with_tracking = lambda c: ([], {"input_tokens": 0, "output_tokens": 0, "calls": 0})
-                    from ingestion.normalize_service import cluster_entities
+                    ob._extract_tier3_with_tracking = lambda c: (
+                        [],
+                        {"input_tokens": 0, "output_tokens": 0, "calls": 0},
+                    )
                     ob.build_okf(doc)
 
     prop_calls = mock_repo.okf_properties_table.put_item.call_count
@@ -106,10 +130,15 @@ def test_okf_builder_tracks_token_usage():
     """Token usage atomically updated with DynamoDB ADD, not SET."""
     doc = _make_doc()
     token_stats = {"input_tokens": 500, "output_tokens": 120, "calls": 3}
-    tier3_props = [{
-        "concept": "Revenue", "property_name": "Q3", "property_value": "$1.2M",
-        "source_chunk_id": "doc1:page:1:element:0", "confidence": 0.95,
-    }]
+    tier3_props = [
+        {
+            "concept": "Revenue",
+            "property_name": "Q3",
+            "property_value": "$1.2M",
+            "source_chunk_id": "doc1:page:1:element:0",
+            "confidence": 0.95,
+        }
+    ]
 
     mock_repo = MagicMock()
     mock_repo.okf_entities_table = MagicMock()
@@ -117,14 +146,19 @@ def test_okf_builder_tracks_token_usage():
     mock_repo.table = MagicMock()
 
     import importlib
+
     import ingestion.okf_builder as ob
+
     importlib.reload(ob)
 
     ob._get_repo = lambda: mock_repo
     ob._extract_tier3_with_tracking = lambda c: (tier3_props, token_stats)
 
     from ingestion import normalize_service
-    with patch.object(normalize_service, "cluster_entities", return_value={"Revenue": "Revenue"}):
+
+    with patch.object(
+        normalize_service, "cluster_entities", return_value={"Revenue": "Revenue"}
+    ):
         ob.build_okf(doc)
 
     mock_repo.table.update_item.assert_called_once()
@@ -134,23 +168,31 @@ def test_okf_builder_tracks_token_usage():
     logging.info(
         "T2b PASSED okf_builder.token_usage_persisted=True "
         "input_tokens=%d output_tokens=%d calls=%d",
-        token_stats["input_tokens"], token_stats["output_tokens"], token_stats["calls"],
+        token_stats["input_tokens"],
+        token_stats["output_tokens"],
+        token_stats["calls"],
     )
 
 
-
 # ── T3: OKF retriever — zero LLM calls ───────────────────────────────────────
+
 
 def test_okf_retriever_zero_llm_calls():
     """OKF retriever is pure DynamoDB. No Bedrock call allowed."""
     mock_repo = MagicMock()
     mock_repo.get_okf_properties.return_value = [
-        {"concept": "Revenue", "property_name": "Q3", "property_value": "$1.2M",
-         "source_chunk_id": "doc1:page:1:element:0", "confidence": 0.95}
+        {
+            "concept": "Revenue",
+            "property_name": "Q3",
+            "property_value": "$1.2M",
+            "source_chunk_id": "doc1:page:1:element:0",
+            "confidence": 0.95,
+        }
     ]
 
     with patch("aws.infra.get_client") as mock_bedrock:
         from services.retrieval.okf_retriever import OKFRetriever
+
         t0 = time.perf_counter()
         results = OKFRetriever(repository=mock_repo).lookup(["Revenue"])
         latency_ms = (time.perf_counter() - t0) * 1000.0
@@ -159,16 +201,20 @@ def test_okf_retriever_zero_llm_calls():
     assert results[0]["concept"] == "Revenue"
     mock_bedrock.assert_not_called()
     logging.info(
-        "T3 PASSED okf_retriever.latency_ms=%.2f okf_retriever.bedrock_calls=0", latency_ms
+        "T3 PASSED okf_retriever.latency_ms=%.2f okf_retriever.bedrock_calls=0",
+        latency_ms,
     )
 
 
 # ── T4: Full path — exactly 1 LLM call ────────────────────────────────────────
 
+
 def test_full_path_llm_call_count_is_one():
     """Full-path query must produce exactly 1 LLM call."""
     from fastapi.testclient import TestClient
+
     from main import app
+
     client = TestClient(app)
 
     llm_calls = []
@@ -182,13 +228,17 @@ def test_full_path_llm_call_count_is_one():
     with patch.dict("os.environ", {"ENVIRONMENT": "test"}):
         with patch("services.langgraph_pipeline.call_llm", side_effect=mock_llm):
             with patch("services.langgraph_pipeline.check_fidelity", return_value=1.0):
-                with patch("services.langgraph_pipeline.rerank",
-                           return_value=[]):  # empty list → compressor gets nothing → still reaches LLM
+                with patch(
+                    "services.langgraph_pipeline.rerank", return_value=[]
+                ):  # empty list → compressor gets nothing → still reaches LLM
                     t0 = time.perf_counter()
-                    resp = client.post("/query", json={
-                        "query": "Compare refund rates between Q1 and Q2",
-                        "provider": "dev",
-                    })
+                    resp = client.post(
+                        "/query",
+                        json={
+                            "query": "Compare refund rates between Q1 and Q2",
+                            "provider": "dev",
+                        },
+                    )
                     latency_ms = (time.perf_counter() - t0) * 1000.0
 
     assert resp.status_code == 200
@@ -196,13 +246,14 @@ def test_full_path_llm_call_count_is_one():
     assert resp.json()["fast_path"] is False
     logging.info(
         "T4 PASSED full_path.llm_calls=%d fast_path=%s latency_ms=%.2f",
-        len(llm_calls), resp.json()["fast_path"], latency_ms,
+        len(llm_calls),
+        resp.json()["fast_path"],
+        latency_ms,
     )
 
 
-
-
 # ── T5: Graph retriever — BFS max hops=2 ────────────────────────────────────
+
 
 def test_graph_retriever_bfs_max_hops():
     """BFS must not traverse past hop=2. Hop-3 nodes must NOT appear."""
@@ -210,11 +261,36 @@ def test_graph_retriever_bfs_max_hops():
 
     def fake_expand(start_entities, max_hops=2):
         graph = {
-            "A": [{"concept_id": "B", "relation_type": "REL", "relation_weight": 0.9, "hop": 1}],
-            "B": [{"concept_id": "C", "relation_type": "REL", "relation_weight": 0.8, "hop": 2}],
-            "C": [{"concept_id": "D", "relation_type": "REL", "relation_weight": 0.7, "hop": 3}],
+            "A": [
+                {
+                    "concept_id": "B",
+                    "relation_type": "REL",
+                    "relation_weight": 0.9,
+                    "hop": 1,
+                }
+            ],
+            "B": [
+                {
+                    "concept_id": "C",
+                    "relation_type": "REL",
+                    "relation_weight": 0.8,
+                    "hop": 2,
+                }
+            ],
+            "C": [
+                {
+                    "concept_id": "D",
+                    "relation_type": "REL",
+                    "relation_weight": 0.7,
+                    "hop": 3,
+                }
+            ],
         }
-        results, visited, queue = [], set(), [(e.strip().upper(), 1) for e in start_entities]
+        results, visited, queue = (
+            [],
+            set(),
+            [(e.strip().upper(), 1) for e in start_entities],
+        )
         while queue and len(results) < 40:
             cur, hop = queue.pop(0)
             if cur in visited or hop > max_hops:
@@ -229,6 +305,7 @@ def test_graph_retriever_bfs_max_hops():
     mock_repo.expand_graph.side_effect = fake_expand
 
     from services.retrieval.graph_retriever import GraphRetriever
+
     t0 = time.perf_counter()
     results = GraphRetriever(repository=mock_repo).expand(["A"])
     latency_ms = (time.perf_counter() - t0) * 1000.0
@@ -236,20 +313,27 @@ def test_graph_retriever_bfs_max_hops():
     found = {r["concept_id"] for r in results}
     assert "D" not in found, f"Hop-3 node D found in results: {found}"
     logging.info(
-        "T5 PASSED graph.bfs_max_hops=2 nodes_found=%s latency_ms=%.2f", found, latency_ms
+        "T5 PASSED graph.bfs_max_hops=2 nodes_found=%s latency_ms=%.2f",
+        found,
+        latency_ms,
     )
 
 
 # ── T6: Nova Micro NOT called at query time ───────────────────────────────────
 
+
 def test_nova_micro_zero_calls_at_query_time():
     """concept_service must never be invoked during /query."""
     from fastapi.testclient import TestClient
+
     from main import app
+
     client = TestClient(app)
 
     with patch.dict("os.environ", {"ENVIRONMENT": "test"}):
-        with patch("ingestion.concept_service.extract_properties_nova_micro") as mock_nova:
+        with patch(
+            "ingestion.concept_service.extract_properties_nova_micro"
+        ) as mock_nova:
             resp = client.post("/query", json={"query": "What is the refund policy?"})
 
     assert resp.status_code == 200

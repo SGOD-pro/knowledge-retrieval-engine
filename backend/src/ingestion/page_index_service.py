@@ -2,7 +2,15 @@ import re
 
 from schemas.models import Chunk
 
-_WEIGHTS = {"title": 3.0, "heading": 2.5, "section": 2.0, "paragraph": 1.0, "cell": 1.0, "caption": 0.8, "footnote": 0.75}
+_WEIGHTS = {
+    "title": 3.0,
+    "heading": 2.5,
+    "section": 2.0,
+    "paragraph": 1.0,
+    "cell": 1.0,
+    "caption": 0.8,
+    "footnote": 0.75,
+}
 
 
 def score(chunk: Chunk, query: str) -> float:

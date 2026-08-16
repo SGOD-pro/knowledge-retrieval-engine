@@ -1,17 +1,16 @@
 from pathlib import Path
+
 import pytest
 from docx import Document as DocxDocument
+from ingestion_lambda.adapters.docx_adapter import parse as parse_docx
+from ingestion_lambda.adapters.pptx_adapter import parse as parse_pptx
+from ingestion_lambda.adapters.xlsx_adapter import parse as parse_xlsx
+from ingestion_lambda.format_router import route
+from ingestion_lambda.page_index_service import rank, score
+from ingestion_lambda.parse_service import parse_file
 from openpyxl import Workbook
 from pptx import Presentation
 
-from ingestion_lambda.format_router import route
-from ingestion_lambda.adapters.docx_adapter import parse as parse_docx
-from ingestion_lambda.adapters.pdf_adapter import parse as parse_pdf
-from ingestion_lambda.adapters.pptx_adapter import parse as parse_pptx
-from ingestion_lambda.adapters.xlsx_adapter import parse as parse_xlsx
-from ingestion_lambda.adapters.csv_adapter import parse as parse_csv
-from ingestion_lambda.parse_service import parse_file
-from ingestion_lambda.page_index_service import rank, score
 from schemas.models import Chunk
 
 DATA_DIR = Path(__file__).parent / "data"
@@ -52,7 +51,9 @@ def test_xlsx_uses_computed_values(tmp_path: Path):
 def test_pptx_speaker_notes_are_caption(tmp_path: Path):
     path = tmp_path / "sample.pptx"
     presentation = Presentation()
-    presentation.slides.add_slide(presentation.slide_layouts[1]).notes_slide.notes_text_frame.text = "Presenter note"
+    presentation.slides.add_slide(
+        presentation.slide_layouts[1]
+    ).notes_slide.notes_text_frame.text = "Presenter note"
     presentation.save(path)
     chunks = parse_pptx(path, "doc")
     assert any(chunk.element_type == "caption" for chunk in chunks)

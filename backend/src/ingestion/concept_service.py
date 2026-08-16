@@ -41,20 +41,21 @@ _DATE_PATTERN = re.compile(
 
 _CURRENCY_PATTERN = re.compile(
     r"(?:\$[\d,]+(?:\.\d+)?(?:[MBKmk]b?)?\b"  # $1.2M, $500K
-    r"|\b\d+(?:\.\d+)?%"                       # 12%, 0.5%
+    r"|\b\d+(?:\.\d+)?%"  # 12%, 0.5%
     r"|\b\d+(?:\.\d+)?\s*(?:million|billion|thousand)\b"  # 12 million
-    r"|\b\d+(?:\.\d+)?[MBK]\b)",               # 5B, 300M
+    r"|\b\d+(?:\.\d+)?[MBK]\b)",  # 5B, 300M
     re.IGNORECASE,
 )
 
 _CAPITALIZED_ENTITY = re.compile(
-    r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b"   # 2+ consecutive Title Case words
+    r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b"  # 2+ consecutive Title Case words
 )
 
 
 # ---------------------------------------------------------------------------
 # Core API
 # ---------------------------------------------------------------------------
+
 
 def compute_tier1_score(text: str) -> int:
     """Calculate tier1_signal_score for a single piece of text.
@@ -118,7 +119,9 @@ def gate_and_rank_chunks(chunks: list[Chunk]) -> list[tuple[Chunk, int]]:
     result = [(c, s) for c, s, _ in scored]
     logger.info(
         "okf.gate total=%d passed=%d skipped=%d",
-        len(chunks), len(result), len(chunks) - len(result),
+        len(chunks),
+        len(result),
+        len(chunks) - len(result),
     )
     return result
 
@@ -134,34 +137,40 @@ def extract_tier1_patterns(chunks: list[Chunk]) -> list[dict]:
     for chunk in chunks:
         # Dates
         for match in _DATE_PATTERN.finditer(chunk.text):
-            results.append({
-                "concept": "DocumentEntity",
-                "property_name": "Date",
-                "property_value": match.group(0),
-                "source_chunk_id": chunk.id,
-                "confidence": 1.0,
-            })
+            results.append(
+                {
+                    "concept": "DocumentEntity",
+                    "property_name": "Date",
+                    "property_value": match.group(0),
+                    "source_chunk_id": chunk.id,
+                    "confidence": 1.0,
+                }
+            )
         # Currency / percentages
         for match in _CURRENCY_PATTERN.finditer(chunk.text):
-            results.append({
-                "concept": "DocumentEntity",
-                "property_name": "CurrencyOrPercent",
-                "property_value": match.group(0),
-                "source_chunk_id": chunk.id,
-                "confidence": 1.0,
-            })
+            results.append(
+                {
+                    "concept": "DocumentEntity",
+                    "property_name": "CurrencyOrPercent",
+                    "property_value": match.group(0),
+                    "source_chunk_id": chunk.id,
+                    "confidence": 1.0,
+                }
+            )
         # Named entities
         for match in _CAPITALIZED_ENTITY.finditer(chunk.text):
             entity = match.group(1)
             # Skip very generic short patterns
             if len(entity) < 5:
                 continue
-            results.append({
-                "concept": entity,
-                "property_name": "Identifier",
-                "property_value": entity,
-                "source_chunk_id": chunk.id,
-                "confidence": 0.85,
-            })
+            results.append(
+                {
+                    "concept": entity,
+                    "property_name": "Identifier",
+                    "property_value": entity,
+                    "source_chunk_id": chunk.id,
+                    "confidence": 0.85,
+                }
+            )
 
     return results

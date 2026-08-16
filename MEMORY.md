@@ -186,7 +186,7 @@ Phase 3 completion status was INVALIDATED. The prior tests were run against prov
 
 - **Codebase Restructured**: Flattened `shared/` and `query_lambda/` into flat `src/` directory.
 - **BGE-Small Microservice**: Extracted as a separate deployment unit (`bge_microservice/`). Model file (`model.onnx`) to be provided by user.
-- **OKF Layer**: Confirmed as DynamoDB-backed typed fact store. NOT file-based markdown. OKF follows the Open Knowledge Format philosophy for extraction, but stores structured data in DynamoDB for <10ms lookup latency.
+- **OKF Layer**: Confirmed as DynamoDB-backed typed fact store (Ontology-driven Knowledge Framework). NOT file-based markdown. Stores structured concept/property/relation data in DynamoDB for <10ms lookup latency.
 - **Postgres Removal**: All PostgreSQL/pgvector references removed from codebase and documentation. Storage is exclusively DynamoDB (metadata) + QdrantDB (vectors) + Redis (cache).
 
 ---
@@ -206,13 +206,19 @@ Phase 3 completion status was INVALIDATED. The prior tests were run against prov
 
 ---
 
-## Session State — KRE Audit & Architecture Remediation (Phases AA-AH) (2026-08-15)
+## Session State — KRE Audit & Architecture Remediation (Phases AA-AN) (2026-08-16)
 
-- **Audit Completion**: Successfully completed deep-dive audit of end-to-end retrieval metrics.
+- **Audit Completion**: Successfully completed deep-dive audit of end-to-end retrieval metrics and database persistence layer.
 - **Architectural Fixes Implemented**:
   - **Deterministic IDs**: `parse_service.py` migrated to `uuid.uuid5` for deterministic chunk IDs, solving re-ingestion instability.
   - **Vector Integrity**: Hardened embedding provider to block silent exceptions and retry throttled requests (5-attempt backoff). Qdrant payload schema updated with explicit index fields (`page_number`, `document_id`, `original_id`).
   - **Semantic Routing**: Replaced naive keyword flagging in `planner.py` with semantic centroid routing, cleanly splitting traffic ~50/50 (Fast vs Full path) without additional LLM latency.
   - **Format Support**: Implemented 1D string matching (`candidate_chunk_ids` via `MatchAny`) for pageless formats (DOCX, CSV, PPTX), achieving 100% recall on DOCX/CSV.
-- **Evaluation Status**: Final 77-query benchmark executed successfully with 0 dropped queries. True Blended Recall@5 is verified at **72.73%**.
-- **Conclusion**: The KRE core architecture is structurally sound, stable, and completely validated against the 77-query baseline.
+  - **OKF Infrastructure & Live Graph**: Resolved missing DynamoDB table provisioning (`okf_entities`, `okf_properties`, `okf_relations`) in AWS `ap-south-1`. Ingested 9 canonical documents with full Nova Micro Tier-3 extraction and System-2 relation graph: **1,023 Concept Nodes**, **2,154 Property Facts**, and **2,079 Relation Edges**.
+- **Definitive Baseline (AN3)**: Full 77-query benchmark executed with the live OKF Knowledge Graph enabled:
+  - **Recall@5**: **79.22% (61 / 77)** (gained +6.49% over OKF-absent baseline of 72.73%).
+  - **Recall@3**: **79.22% (61 / 77)**.
+  - **Real-Answer Faithfulness**: **99.59%**.
+  - **p95 Latency**: **3,467 ms** (< 4,000 ms SLA target).
+  - **LLM Activation Rate**: **50.65% Full Path / 49.35% Fast Path**.
+- **Conclusion**: The hybrid retrieval thesis is empirically validated. OKF graph expansion and property lookups directly resolved multi-hop synthesis queries on dense technical papers (doubled recall from 40% to 80% on `2507` and 70% to 100% on `2204`). The backend is 100% verified, clean, and ready for Phase 4 Frontend Integration.

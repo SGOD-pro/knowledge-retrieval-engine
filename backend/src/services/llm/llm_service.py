@@ -1,6 +1,5 @@
 import json
 import logging
-import re
 import time
 from typing import Any
 
@@ -26,12 +25,13 @@ def _strip_markdown_json(text: str) -> str:
         text = text[7:]
     elif text.startswith("```"):
         text = text[3:]
-    if text.endswith("```"):
-        text = text[:-3]
+    text = text.removesuffix("```")
     return text.strip()
 
 
-def call(query: str, compressed_context: str, provider: str | None = None) -> dict[str, Any]:
+def call(
+    query: str, compressed_context: str, provider: str | None = None
+) -> dict[str, Any]:
     """
     Call the LLM using the provided query and compressed context.
 
@@ -52,7 +52,8 @@ def call(query: str, compressed_context: str, provider: str | None = None) -> di
     if not compressed_context or not compressed_context.strip():
         latency_ms = (time.perf_counter() - start_time) * 1000.0
         logger.info(
-            "llm.skipped_no_context latency_ms=%.2f — returning static NOT_FOUND", latency_ms
+            "llm.skipped_no_context latency_ms=%.2f — returning static NOT_FOUND",
+            latency_ms,
         )
         return {
             "answer": NO_CONTEXT_MESSAGE,

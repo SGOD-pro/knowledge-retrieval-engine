@@ -1,17 +1,12 @@
-import os
 from config import settings
 
 
 class ConfigurationError(Exception):
     """Raised when environment or provider configuration rules are violated."""
 
-    pass
-
 
 class ProviderMismatchError(Exception):
     """Raised when query provider does not match corpus embedding provider."""
-
-    pass
 
 
 def get_active_provider() -> str:
@@ -23,10 +18,12 @@ def get_active_provider() -> str:
     provider = settings.MODEL_PROVIDER.lower()
 
     if environment == "prod" and provider == "dev":
-        raise ConfigurationError("MODEL_PROVIDER=dev is strictly prohibited in prod environment (Rule 29).")
+        raise ConfigurationError(
+            "MODEL_PROVIDER=dev is strictly prohibited in prod environment (Rule 29)."
+        )
 
     return provider
 
+
 def enforce_rate_limit(provider: str | None = None):
     """Placeholder helper to enforce API rate limits if needed."""
-    pass

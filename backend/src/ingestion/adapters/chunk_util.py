@@ -1,8 +1,11 @@
 import re
-from typing import List
+
 from schemas.models import Chunk
 
-def merge_and_split_chunks(chunks: List[Chunk], min_tokens: int = 100, max_tokens: int = 500) -> List[Chunk]:
+
+def merge_and_split_chunks(
+    chunks: list[Chunk], min_tokens: int = 100, max_tokens: int = 500
+) -> list[Chunk]:
     """
     Adjusts chunk sizes to ensure they are between min_tokens and max_tokens.
     - If a paragraph is smaller, merge it with the next one.
@@ -18,11 +21,14 @@ def merge_and_split_chunks(chunks: List[Chunk], min_tokens: int = 100, max_token
         word_count = len(chunk.text.split())
         if word_count > max_tokens:
             # Simple sentence splitting (handles basic punctuation)
-            sentences = re.split(r'(?<=[.!?])\s+', chunk.text)
+            sentences = re.split(r"(?<=[.!?])\s+", chunk.text)
             current_text = ""
             sub_index = 0
             for sentence in sentences:
-                if len((current_text + " " + sentence).split()) > max_tokens and current_text:
+                if (
+                    len((current_text + " " + sentence).split()) > max_tokens
+                    and current_text
+                ):
                     new_chunk = Chunk(
                         id=f"{chunk.id}:s{sub_index}",
                         document_id=chunk.document_id,
@@ -42,7 +48,7 @@ def merge_and_split_chunks(chunks: List[Chunk], min_tokens: int = 100, max_token
                     sub_index += 1
                 else:
                     current_text = (current_text + " " + sentence).strip()
-            
+
             if current_text:
                 new_chunk = Chunk(
                     id=f"{chunk.id}:s{sub_index}",
@@ -70,20 +76,20 @@ def merge_and_split_chunks(chunks: List[Chunk], min_tokens: int = 100, max_token
         if current_chunk is None:
             current_chunk = chunk
             continue
-        
+
         current_words = len(current_chunk.text.split())
-        
+
         if current_words < min_tokens:
             # Merge text
             merged_text = current_chunk.text + " " + chunk.text
-            
+
             # Create a new chunk that inherits properties from the first one
             current_chunk = Chunk(
                 id=current_chunk.id,  # keep the original id of the first piece
                 document_id=current_chunk.document_id,
                 source_format=current_chunk.source_format,
                 text=merged_text,
-                element_type="paragraph", # it's mixed now, default to paragraph
+                element_type="paragraph",  # it's mixed now, default to paragraph
                 page_number=current_chunk.page_number,
                 section_path=current_chunk.section_path,
                 bounding_box=current_chunk.bounding_box,

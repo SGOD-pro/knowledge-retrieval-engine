@@ -1,6 +1,6 @@
 import json
 import logging
-import os
+
 from config import settings
 
 try:
@@ -10,6 +10,7 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+
 class RedisCache:
     def __init__(self):
         self.client = None
@@ -17,6 +18,7 @@ class RedisCache:
         if not redis_url or "localhost" in redis_url:
             try:
                 from aws.infra import get_client
+
                 ec_client = get_client("elasticache")
                 response = ec_client.describe_cache_clusters(ShowCacheNodeInfo=True)
                 if response["CacheClusters"]:
@@ -27,22 +29,25 @@ class RedisCache:
                         host = cluster["ConfigurationEndpoint"]["Address"]
                         port = cluster["ConfigurationEndpoint"]["Port"]
                         redis_url = f"redis://{host}:{port}/0"
-                    elif "CacheNodes" in cluster and cluster["CacheNodes"]:
+                    elif cluster.get("CacheNodes"):
                         host = cluster["CacheNodes"][0]["Endpoint"]["Address"]
                         port = cluster["CacheNodes"][0]["Endpoint"]["Port"]
                         redis_url = f"redis://{host}:{port}/0"
             except Exception as e:
                 import logging
-                logging.getLogger(__name__).warning("Failed to fetch ElastiCache instance: %s", e)
-        
+
+                logging.getLogger(__name__).warning(
+                    "Failed to fetch ElastiCache instance: %s", e
+                )
+
         if redis_url and redis:
             try:
                 # Set short timeouts to fail-open quickly if Redis is unreachable
                 self.client = redis.Redis.from_url(
-                    redis_url, 
-                    socket_timeout=1.0, 
+                    redis_url,
+                    socket_timeout=1.0,
                     socket_connect_timeout=1.0,
-                    decode_responses=True
+                    decode_responses=True,
                 )
             except Exception as e:
                 logger.warning(f"Failed to initialize Redis client: {e}")
@@ -56,7 +61,7 @@ class RedisCache:
     def get_cache(self, key: str) -> dict | None:
         if not self.client:
             return None
-            
+
         try:
             cached_data = self.client.get(key)
             if cached_data:
@@ -69,11 +74,12 @@ class RedisCache:
     def set_cache(self, key: str, value: dict, ttl: int):
         if not self.client:
             return
-            
+
         try:
             self.client.setex(key, ttl, json.dumps(value))
         except Exception as e:
             logger.warning(f"Redis set_cache failed for key {key}: {e}")
+
 
 # Singleton instance
 cache = RedisCache()

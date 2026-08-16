@@ -1,1 +1,1 @@
-from . import concept_service
+"""Ingestion Lambda package."""

@@ -19,7 +19,6 @@ ENVIRONMENT values:
 """
 
 import logging
-import os
 
 import boto3
 from botocore.config import Config
@@ -29,20 +28,24 @@ from config import settings
 logger = logging.getLogger(__name__)
 
 # Services that run locally via FLOCI in dev mode
-_LOCAL_SERVICES = frozenset({
-    "dynamodb",
-    "s3",
-    "sqs",
-    "sns",
-    "rds",
-    "elasticache",
-})
+_LOCAL_SERVICES = frozenset(
+    {
+        "dynamodb",
+        "s3",
+        "sqs",
+        "sns",
+        "rds",
+        "elasticache",
+    }
+)
 
 # Services that always use the real AWS endpoint (profile=aws in dev)
-_CLOUD_SERVICES = frozenset({
-    "bedrock-runtime",
-    "lambda",
-})
+_CLOUD_SERVICES = frozenset(
+    {
+        "bedrock-runtime",
+        "lambda",
+    }
+)
 
 _FLOCI_ENDPOINT = "http://localhost:4566"
 _AWS_PROFILE = "aws"
@@ -62,19 +65,37 @@ def _build_client(service: str, region_name: str | None = None):
         # User requirement: lambda and bedrock always use profile=aws, region=ap-south-1
         # regardless of env (prod or dev).
         region = region_name or "ap-south-1"
-        logger.debug("aws.infra.client service=%s profile=%s region=%s", service, _AWS_PROFILE, region)
+        logger.debug(
+            "aws.infra.client service=%s profile=%s region=%s",
+            service,
+            _AWS_PROFILE,
+            region,
+        )
         session = boto3.Session(profile_name=_AWS_PROFILE, region_name=region)
         return session.client(service, config=_RETRY_CONFIG)
 
     if env == "dev":
         # Dev local services use local profile and endpoint
-        logger.debug("aws.infra.client service=%s profile=%s endpoint=%s", service, _LOCAL_PROFILE, _FLOCI_ENDPOINT)
+        logger.debug(
+            "aws.infra.client service=%s profile=%s endpoint=%s",
+            service,
+            _LOCAL_PROFILE,
+            _FLOCI_ENDPOINT,
+        )
         session = boto3.Session(profile_name=_LOCAL_PROFILE, region_name=_LOCAL_REGION)
-        return session.client(service, endpoint_url=_FLOCI_ENDPOINT, config=_RETRY_CONFIG)
+        return session.client(
+            service, endpoint_url=_FLOCI_ENDPOINT, config=_RETRY_CONFIG
+        )
     else:
         # Prod local services use aws profile and ap-south-1
         region = region_name or "ap-south-1"
-        logger.debug("aws.infra.client service=%s env=%s profile=%s region=%s", service, env, _AWS_PROFILE, region)
+        logger.debug(
+            "aws.infra.client service=%s env=%s profile=%s region=%s",
+            service,
+            env,
+            _AWS_PROFILE,
+            region,
+        )
         session = boto3.Session(profile_name=_AWS_PROFILE, region_name=region)
         return session.client(service, config=_RETRY_CONFIG)
 
@@ -83,16 +104,34 @@ def _build_resource(service: str):
     env = settings.ENVIRONMENT
 
     if service in _CLOUD_SERVICES:
-        logger.debug("aws.infra.resource service=%s profile=%s region=%s", service, _AWS_PROFILE, "ap-south-1")
+        logger.debug(
+            "aws.infra.resource service=%s profile=%s region=%s",
+            service,
+            _AWS_PROFILE,
+            "ap-south-1",
+        )
         session = boto3.Session(profile_name=_AWS_PROFILE, region_name="ap-south-1")
         return session.resource(service, config=_RETRY_CONFIG)
 
     if env == "dev":
-        logger.debug("aws.infra.resource service=%s profile=%s endpoint=%s", service, _LOCAL_PROFILE, _FLOCI_ENDPOINT)
+        logger.debug(
+            "aws.infra.resource service=%s profile=%s endpoint=%s",
+            service,
+            _LOCAL_PROFILE,
+            _FLOCI_ENDPOINT,
+        )
         session = boto3.Session(profile_name=_LOCAL_PROFILE, region_name=_LOCAL_REGION)
-        return session.resource(service, endpoint_url=_FLOCI_ENDPOINT, config=_RETRY_CONFIG)
+        return session.resource(
+            service, endpoint_url=_FLOCI_ENDPOINT, config=_RETRY_CONFIG
+        )
     else:
-        logger.debug("aws.infra.resource service=%s env=%s profile=%s region=%s", service, env, _AWS_PROFILE, "ap-south-1")
+        logger.debug(
+            "aws.infra.resource service=%s env=%s profile=%s region=%s",
+            service,
+            env,
+            _AWS_PROFILE,
+            "ap-south-1",
+        )
         session = boto3.Session(profile_name=_AWS_PROFILE, region_name="ap-south-1")
         return session.resource(service, config=_RETRY_CONFIG)
 
@@ -142,7 +181,7 @@ def setup_infrastructure():
             ],
             BillingMode="PAY_PER_REQUEST",
         )
-        dynamodb.get_waiter('table_exists').wait(TableName=table_name)
+        dynamodb.get_waiter("table_exists").wait(TableName=table_name)
         logger.info("aws.infra.dynamodb_created table=%s", table_name)
     except Exception as e:
         logger.error("aws.infra.dynamodb_check_failed table=%s error=%s", table_name, e)
@@ -165,7 +204,7 @@ def setup_infrastructure():
             ],
             BillingMode="PAY_PER_REQUEST",
         )
-        dynamodb.get_waiter('table_exists').wait(TableName="okf_entities")
+        dynamodb.get_waiter("table_exists").wait(TableName="okf_entities")
         logger.info("aws.infra.dynamodb_created table=okf_entities")
     except Exception as e:
         logger.error("aws.infra.dynamodb_check_failed table=okf_entities error=%s", e)
@@ -188,7 +227,7 @@ def setup_infrastructure():
             ],
             BillingMode="PAY_PER_REQUEST",
         )
-        dynamodb.get_waiter('table_exists').wait(TableName="okf_properties")
+        dynamodb.get_waiter("table_exists").wait(TableName="okf_properties")
         logger.info("aws.infra.dynamodb_created table=okf_properties")
     except Exception as e:
         logger.error("aws.infra.dynamodb_check_failed table=okf_properties error=%s", e)
@@ -211,7 +250,7 @@ def setup_infrastructure():
             ],
             BillingMode="PAY_PER_REQUEST",
         )
-        dynamodb.get_waiter('table_exists').wait(TableName="okf_relations")
+        dynamodb.get_waiter("table_exists").wait(TableName="okf_relations")
         logger.info("aws.infra.dynamodb_created table=okf_relations")
     except Exception as e:
         logger.error("aws.infra.dynamodb_check_failed table=okf_relations error=%s", e)
@@ -230,7 +269,10 @@ def setup_infrastructure():
             if region == "us-east-1":
                 s3.create_bucket(Bucket=bucket)
             else:
-                s3.create_bucket(Bucket=bucket, CreateBucketConfiguration={"LocationConstraint": region})
+                s3.create_bucket(
+                    Bucket=bucket,
+                    CreateBucketConfiguration={"LocationConstraint": region},
+                )
             logger.info("aws.infra.s3_created bucket=%s", bucket)
         else:
             logger.warning("aws.infra.s3_check_failed bucket=%s error=%s", bucket, e)

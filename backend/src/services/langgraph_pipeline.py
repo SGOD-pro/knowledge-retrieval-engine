@@ -1,20 +1,21 @@
 import logging
 import re
 import time
-from typing import TypedDict, Any
-from langgraph.graph import StateGraph, START, END
+from typing import Any, TypedDict
+
+from langgraph.graph import END, START, StateGraph
 
 from schemas.models import Chunk
-from services.retrieval.planner import planner, Plan
-from services.retrieval.bm25_retriever import BM25Retriever
-from services.retrieval.page_index_retriever import PageIndexRetriever
-from services.retrieval.vector_retriever import VectorRetriever
-from services.retrieval.okf_retriever import OKFRetriever
-from services.retrieval.graph_retriever import GraphRetriever
-from services.retrieval.reranker import rerank
-from services.retrieval.fidelity_check import check_fidelity, CoverageError
-from services.retrieval.compressor import compress_chunks
 from services.llm.llm_service import call as call_llm
+from services.retrieval.bm25_retriever import BM25Retriever
+from services.retrieval.compressor import compress_chunks
+from services.retrieval.fidelity_check import CoverageError, check_fidelity
+from services.retrieval.graph_retriever import GraphRetriever
+from services.retrieval.okf_retriever import OKFRetriever
+from services.retrieval.page_index_retriever import PageIndexRetriever
+from services.retrieval.planner import Plan, planner
+from services.retrieval.reranker import rerank
+from services.retrieval.vector_retriever import VectorRetriever
 
 logger = logging.getLogger(__name__)
 
@@ -30,27 +31,30 @@ class PipelineState(TypedDict):
     query_embedding: list[float] | None
     document_ids: list[str] | None
     plan: Plan | None
-    bm25_candidates: list[Chunk]      # preserved BM25 results for RRF
-    candidate_page_ids: list[int]     # pages narrowed by PageIndex
-    candidate_chunk_ids: list[str]    # chunk IDs without pages narrowed by PageIndex (DOCX, PPTX, CSV)
-    candidate_chunks: list[Chunk]     # vector results (also used for fast-path)
+    bm25_candidates: list[Chunk]  # preserved BM25 results for RRF
+    candidate_page_ids: list[int]  # pages narrowed by PageIndex
+    candidate_chunk_ids: list[
+        str
+    ]  # chunk IDs without pages narrowed by PageIndex (DOCX, PPTX, CSV)
+    candidate_chunks: list[Chunk]  # vector results (also used for fast-path)
     okf_properties: list[dict[str, Any]]
-    okf_seed_chunk_ids: list[str]     # chunk IDs from OKF lookup for BM25 boost
+    okf_seed_chunk_ids: list[str]  # chunk IDs from OKF lookup for BM25 boost
     graph_results: list[dict[str, Any]]
     top_chunks: list[Chunk]
     compressed_text: str
-    context_snippet: str              # first 500 chars of compressed_text for faithfulness judge
+    context_snippet: str  # first 500 chars of compressed_text for faithfulness judge
     final_answer: str
     confidence_score: float
     citations: list[str]
     error: str | None
-    stage_timings: dict[str, float]   # real per-stage measurements (Component 4)
+    stage_timings: dict[str, float]  # real per-stage measurements (Component 4)
     force_full_path: bool
 
 
 # ---------------------------------------------------------------------------
 # RRF merge (Component 1)
 # ---------------------------------------------------------------------------
+
 
 def _rrf_merge(bm25_chunks: list, vector_chunks: list, k: int = 60) -> list:
     """Reciprocal Rank Fusion. k=60 per the original RRF paper (Cormack et al. 2009).
@@ -70,9 +74,11 @@ def _rrf_merge(bm25_chunks: list, vector_chunks: list, k: int = 60) -> list:
 # Pipeline nodes
 # ---------------------------------------------------------------------------
 
+
 def route_query(state: PipelineState):
     t0 = time.perf_counter()
     from providers.embedding_provider import embed_text
+
     query_embedding = embed_text(state["query"])
     plan = planner.route(state["query"], query_embedding)
     latency_ms = (time.perf_counter() - t0) * 1000.0
@@ -88,6 +94,7 @@ def run_okf_router(state: PipelineState):
     """Pre-retrieval OKF lookup (Component 2). Returns okf_seed_chunk_ids for BM25
     soft boost. Failure is always silent — empty seed list = retrieval unchanged."""
     from services.retrieval.planner import extract_entities
+
     t0 = time.perf_counter()
     entities = extract_entities(state["query"])
     props, seed_ids = [], []
@@ -95,11 +102,17 @@ def run_okf_router(state: PipelineState):
         try:
             retriever = OKFRetriever()
             props = retriever.lookup(entities)
-            seed_ids = [p.get("source_chunk_id") for p in props if p.get("source_chunk_id")]
+            seed_ids = [
+                p.get("source_chunk_id") for p in props if p.get("source_chunk_id")
+            ]
         except Exception as e:
-            logger.warning("okf_router.failed entity_count=%d error=%s", len(entities), e)
+            logger.warning(
+                "okf_router.failed entity_count=%d error=%s", len(entities), e
+            )
     latency_ms = (time.perf_counter() - t0) * 1000.0
-    logger.info("okf_router.latency_ms=%.2f okf_router.seed_count=%d", latency_ms, len(seed_ids))
+    logger.info(
+        "okf_router.latency_ms=%.2f okf_router.seed_count=%d", latency_ms, len(seed_ids)
+    )
     existing = state.get("stage_timings", {})
     return {
         "okf_properties": props,
@@ -112,6 +125,7 @@ def run_bm25(state: PipelineState):
     """BM25 retrieval (Component 1 + 2). top_k=20 for union design.
     Soft-boosts OKF-matched chunks by OKF_BOOST before returning."""
     from db.database import CloudRepository
+
     t0 = time.perf_counter()
     repo = CloudRepository()
     all_chunks = repo.get_all_chunks(state.get("document_ids"))
@@ -129,8 +143,12 @@ def run_bm25(state: PipelineState):
     chunks = [c for c, _ in results]
     avg_score = sum(s for _, s in results) / max(1, len(results))
     latency_ms = (time.perf_counter() - t0) * 1000.0
-    logger.info("bm25.latency_ms=%.2f bm25.result_count=%d bm25.avg_score=%.4f",
-                latency_ms, len(chunks), avg_score)
+    logger.info(
+        "bm25.latency_ms=%.2f bm25.result_count=%d bm25.avg_score=%.4f",
+        latency_ms,
+        len(chunks),
+        avg_score,
+    )
     existing = state.get("stage_timings", {})
     return {
         "bm25_candidates": chunks,
@@ -144,11 +162,17 @@ def run_page_index(state: PipelineState):
     based on headings/footnotes retrieved by BM25."""
     t0 = time.perf_counter()
     retriever = PageIndexRetriever()
-    chunks, pages, c_ids = retriever.filter_and_rank(state["query"], state.get("bm25_candidates", []))
-    
+    chunks, pages, c_ids = retriever.filter_and_rank(
+        state["query"], state.get("bm25_candidates", [])
+    )
+
     avg_score = 1.0 if pages else 0.0
     latency_ms = (time.perf_counter() - t0) * 1000.0
-    logger.info("page_index.latency_ms=%.2f page_index.confidence_score=%.2f", latency_ms, avg_score)
+    logger.info(
+        "page_index.latency_ms=%.2f page_index.confidence_score=%.2f",
+        latency_ms,
+        avg_score,
+    )
     existing = state.get("stage_timings", {})
     return {
         "candidate_page_ids": pages,
@@ -156,9 +180,11 @@ def run_page_index(state: PipelineState):
         "stage_timings": {**existing, "page_index_ms": latency_ms},
     }
 
+
 def run_vector(state: PipelineState):
     """Vector retrieval (Component 1). Searches within PageIndex candidates."""
     from db.database import CloudRepository
+
     t0 = time.perf_counter()
     repo = CloudRepository()
     retriever = VectorRetriever(repository=repo)
@@ -179,8 +205,12 @@ def run_vector(state: PipelineState):
     vector_chunks = [c for c, _ in chunks]
     avg_sim = sum(s for _, s in chunks) / max(1, len(chunks)) if chunks else 0.0
     latency_ms = (time.perf_counter() - t0) * 1000.0
-    logger.info("vector.latency_ms=%.2f vector.result_count=%d vector.avg_sim=%.4f",
-                latency_ms, len(vector_chunks), avg_sim)
+    logger.info(
+        "vector.latency_ms=%.2f vector.result_count=%d vector.avg_sim=%.4f",
+        latency_ms,
+        len(vector_chunks),
+        avg_sim,
+    )
     existing = state.get("stage_timings", {})
 
     if is_fast_path:
@@ -198,6 +228,7 @@ def run_vector(state: PipelineState):
 
 def run_graph(state: PipelineState):
     from services.retrieval.planner import extract_entities
+
     t0 = time.perf_counter()
     entities = extract_entities(state["query"])
 
@@ -226,8 +257,12 @@ def run_reranker(state: PipelineState):
 
     top_chunks = rerank(state["query"], merged, top_k=6)
     latency_ms = (time.perf_counter() - t0) * 1000.0
-    logger.info("reranker.latency_ms=%.2f reranker.input_count=%d reranker.output_count=%d",
-                latency_ms, len(merged), len(top_chunks))
+    logger.info(
+        "reranker.latency_ms=%.2f reranker.input_count=%d reranker.output_count=%d",
+        latency_ms,
+        len(merged),
+        len(top_chunks),
+    )
     existing = state.get("stage_timings", {})
     return {
         "top_chunks": top_chunks,
@@ -240,11 +275,15 @@ def run_compressor(state: PipelineState):
     chunks = state.get("top_chunks", [])
     compressed = compress_chunks(state["query"], chunks)
     latency_ms = (time.perf_counter() - t0) * 1000.0
-    logger.info("compressor.latency_ms=%.2f compressor.output_len=%d", latency_ms, len(compressed))
+    logger.info(
+        "compressor.latency_ms=%.2f compressor.output_len=%d",
+        latency_ms,
+        len(compressed),
+    )
     existing = state.get("stage_timings", {})
     return {
         "compressed_text": compressed,
-        "context_snippet": compressed[:500],   # expose for LLM faithfulness judge
+        "context_snippet": compressed[:500],  # expose for LLM faithfulness judge
         "stage_timings": {**existing, "compressor_ms": latency_ms},
     }
 
@@ -281,14 +320,14 @@ def run_llm(state: PipelineState):
 
     t0 = time.perf_counter()
     compressed = state.get("compressed_text", "").strip()
-    
+
     # M1 / L2: Early exit if context is empty
     if not compressed:
         return {
             "final_answer": "NOT_FOUND",
             "citations": [],
             "confidence_score": 0.0,
-            "stage_timings": {**state.get("stage_timings", {}), "llm_ms": 0.0}
+            "stage_timings": {**state.get("stage_timings", {}), "llm_ms": 0.0},
         }
 
     response = call_llm(state["query"], compressed)
@@ -297,15 +336,17 @@ def run_llm(state: PipelineState):
     top_chunks = state.get("top_chunks", [])
     avg_reranker = (
         sum(getattr(c, "reranker_score", 0.0) for c in top_chunks) / len(top_chunks)
-        if top_chunks else 0.0
+        if top_chunks
+        else 0.0
     )
     confidence = avg_reranker
 
     latency_ms = (time.perf_counter() - t0) * 1000.0
     logger.info("llm.latency_ms=%.2f llm.confidence=%.4f", latency_ms, confidence)
     existing = state.get("stage_timings", {})
-    
+
     from services.retrieval.response_builder import build_citation
+
     return {
         "final_answer": response.get("answer", "NOT_FOUND"),
         "citations": [build_citation(c).to_dict() for c in top_chunks],
@@ -319,6 +360,7 @@ def end_fast_path(state: PipelineState):
     term overlap. Fidelity check runs on context (correct 2-arg signature). Real
     confidence score with explicit None checks (no falsy-zero override)."""
     from services.retrieval.response_builder import build_citation
+
     t0 = time.perf_counter()
 
     query = state["query"]
@@ -374,13 +416,23 @@ def end_fast_path(state: PipelineState):
         elif c.structural_weight is not None:
             reranker_scores.append(c.structural_weight)
         else:
-            reranker_scores.append(0.5)  # fallback only when both fields are genuinely absent
-    confidence = round(sum(reranker_scores) / len(reranker_scores), 4) if reranker_scores else 0.0
+            reranker_scores.append(
+                0.5
+            )  # fallback only when both fields are genuinely absent
+    confidence = (
+        round(sum(reranker_scores) / len(reranker_scores), 4)
+        if reranker_scores
+        else 0.0
+    )
     confidence = min(1.0, max(0.0, confidence))
 
     latency_ms = (time.perf_counter() - t0) * 1000.0
-    logger.info("fast_path.latency_ms=%.2f fast_path.confidence=%.4f fast_path.answer_len=%d",
-                latency_ms, confidence, len(answer))
+    logger.info(
+        "fast_path.latency_ms=%.2f fast_path.confidence=%.4f fast_path.answer_len=%d",
+        latency_ms,
+        confidence,
+        len(answer),
+    )
     existing = state.get("stage_timings", {})
     return {
         "final_answer": answer,
@@ -395,11 +447,12 @@ def end_fast_path(state: PipelineState):
 # Routing functions
 # ---------------------------------------------------------------------------
 
+
 def route_after_vector(state: PipelineState):
     plan = state["plan"]
     if plan.fast_path and not state.get("force_full_path", False):
         return "end_fast_path"
-    return "run_okf_router_post"   # OKF already ran pre-BM25; this routes to reranker or graph
+    return "run_okf_router_post"  # OKF already ran pre-BM25; this routes to reranker or graph
 
 
 def route_after_reranker_or_graph(state: PipelineState):
@@ -415,12 +468,10 @@ def route_after_okf_post(state: PipelineState):
     return "run_reranker"
 
 
-
-
-
 # ---------------------------------------------------------------------------
 # Dummy passthrough node — avoids duplicate conditional edge targets
 # ---------------------------------------------------------------------------
+
 
 def run_okf_post(state: PipelineState):
     """Passthrough: OKF already ran pre-BM25 (run_okf_router). This node exists
@@ -435,7 +486,7 @@ def run_okf_post(state: PipelineState):
 workflow = StateGraph(PipelineState)
 
 workflow.add_node("route_query", route_query)
-workflow.add_node("run_okf_router", run_okf_router)   # pre-BM25 OKF (Component 2)
+workflow.add_node("run_okf_router", run_okf_router)  # pre-BM25 OKF (Component 2)
 workflow.add_node("run_bm25", run_bm25)
 workflow.add_node("run_page_index", run_page_index)
 workflow.add_node("run_vector", run_vector)
@@ -460,7 +511,7 @@ workflow.add_conditional_edges(
     {
         "end_fast_path": "end_fast_path",
         "run_okf_router_post": "run_okf_router_post",
-    }
+    },
 )
 
 workflow.add_conditional_edges(
@@ -469,7 +520,7 @@ workflow.add_conditional_edges(
     {
         "run_graph": "run_graph",
         "run_reranker": "run_reranker",
-    }
+    },
 )
 
 workflow.add_edge("run_graph", "run_reranker")
@@ -486,8 +537,14 @@ app = workflow.compile()
 # Pipeline entry point
 # ---------------------------------------------------------------------------
 
+
 class Pipeline:
-    def run(self, query: str, document_ids: list[str] | None = None, force_full_path: bool = False):
+    def run(
+        self,
+        query: str,
+        document_ids: list[str] | None = None,
+        force_full_path: bool = False,
+    ):
         initial_state = {
             "query": query,
             "query_embedding": None,
@@ -519,7 +576,9 @@ class Pipeline:
                 self.citations = state.get("citations", [])
                 self.confidence_score = state.get("confidence_score", 0.0)
                 self.stage_timings = state.get("stage_timings", {})
-                self.context_snippet = state.get("context_snippet", "")  # for faithfulness judge
+                self.context_snippet = state.get(
+                    "context_snippet", ""
+                )  # for faithfulness judge
                 plan = state.get("plan")
                 self.fast_path = plan.fast_path if plan else False
                 self.stages = plan.stages if plan else []
@@ -528,12 +587,15 @@ class Pipeline:
                 class LLMInput:
                     def __init__(self, ctx):
                         self.context = ctx
+
                 self._llm_input = LLMInput(state.get("compressed_text", ""))
 
                 self.top_chunks = state.get("top_chunks", [])
                 self._reranker_avg = (
-                    sum(getattr(c, "reranker_score", 0.0) for c in self.top_chunks) / len(self.top_chunks)
-                    if self.top_chunks else 0.0
+                    sum(getattr(c, "reranker_score", 0.0) for c in self.top_chunks)
+                    / len(self.top_chunks)
+                    if self.top_chunks
+                    else 0.0
                 )
 
                 self._coverage = 1.0

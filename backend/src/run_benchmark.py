@@ -24,12 +24,13 @@ import time
 from pathlib import Path
 from typing import Any
 
-if sys.stdout.encoding.lower() != 'utf-8':
-    sys.stdout.reconfigure(encoding='utf-8')
+if sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout.reconfigure(encoding="utf-8")
 
 # ---------------------------------------------------------------------------
 # Page number extraction — exact match only, no tolerance
 # ---------------------------------------------------------------------------
+
 
 def _parse_page(citation: Any) -> int | None:
     """Extract page number from a citation dict. Exact match only.
@@ -88,7 +89,9 @@ def _expected_pages(ground_truth: dict) -> set[int]:
     return pages
 
 
-def _hits_at_k(retrieved_citations: list[dict], expected_pages: set[int], k: int) -> int:
+def _hits_at_k(
+    retrieved_citations: list[dict], expected_pages: set[int], k: int
+) -> int:
     """Return 1 if any of the top-k retrieved citations match an expected page, else 0."""
     for citation in retrieved_citations[:k]:
         p = _parse_page(citation)
@@ -103,11 +106,13 @@ def _hits_at_k(retrieved_citations: list[dict], expected_pages: set[int], k: int
 
 from src.services.langgraph_pipeline import pipeline
 
+
 def get_ngrams(text: str, n: int = 3) -> set[str]:
     text = text.lower().replace(" ", "")
     if len(text) < n:
         return set([text])
-    return set([text[i:i+n] for i in range(len(text)-n+1)])
+    return set([text[i : i + n] for i in range(len(text) - n + 1)])
+
 
 def _content_match(retrieved_text: str, expected_text: str) -> bool:
     """Return True if Jaccard similarity >= 0.8 or substring inclusion."""
@@ -117,32 +122,34 @@ def _content_match(retrieved_text: str, expected_text: str) -> bool:
     exp_grams = get_ngrams(expected_text)
     if not ret_grams or not exp_grams:
         return False
-    
+
     intersection = len(ret_grams.intersection(exp_grams))
     union = len(ret_grams.union(exp_grams))
     jaccard = intersection / union
-    
+
     # Substring check
     if expected_text.lower() in retrieved_text.lower():
         return True
     if retrieved_text.lower() in expected_text.lower() and len(retrieved_text) > 100:
         return True
-            
+
     return jaccard >= 0.8
 
 
-def _hits_at_k_dual(retrieved_chunks: list[Any], expected_pages: set[int], expected_text: str, k: int) -> int:
+def _hits_at_k_dual(
+    retrieved_chunks: list[Any], expected_pages: set[int], expected_text: str, k: int
+) -> int:
     """Return 1 if any of the top-k retrieved chunks match an expected page OR content."""
     for chunk in retrieved_chunks[:k]:
         # 1. Exact page match
         p = _parse_page(chunk.id)
         if p is not None and p in expected_pages:
             return 1
-        
+
         # 2. Content fallback match
         if expected_text and _content_match(chunk.text, expected_text):
             return 1
-            
+
     return 0
 
 
@@ -150,19 +157,21 @@ def _hits_at_k_dual(retrieved_chunks: list[Any], expected_pages: set[int], expec
 # Faithfulness judge (LLM-as-judge)
 # ---------------------------------------------------------------------------
 
+
 def _faithfulness_score(answer: str, context: str) -> float:
     """Simple entity-overlap faithfulness estimate.
     Fraction of words in the answer that appear in the context chunks.
     """
     import re
+
     if answer in ("NOT_FOUND", ""):
         return 1.0
-    
+
     # Extract words > 3 chars from answer
     answer_terms = set(w.lower() for w in re.findall(r"\w+", answer) if len(w) > 3)
     if not answer_terms:
         return 1.0
-        
+
     context_lower = context.lower()
     found = sum(1 for t in answer_terms if t in context_lower)
     return round(found / len(answer_terms), 4)
@@ -171,6 +180,7 @@ def _faithfulness_score(answer: str, context: str) -> float:
 # ---------------------------------------------------------------------------
 # Main benchmark loop
 # ---------------------------------------------------------------------------
+
 
 def run_benchmark(
     ground_truths_path: str,
@@ -186,7 +196,7 @@ def run_benchmark(
 
     total = len(ground_truths)
     print(f"Running benchmark: {total} queries using INTERNAL pipeline.run()")
-    print(f"Hit criterion: exact page match OR content similarity >= 0.8")
+    print("Hit criterion: exact page match OR content similarity >= 0.8")
     print("-" * 60)
 
     hits_at_5 = 0
@@ -206,7 +216,9 @@ def run_benchmark(
 
         if not expected_pages and not expected_text:
             parse_fail_count += 1
-            print(f"  [{i+1}/{total}] SKIP (no parseable expected page or text): {query[:60]}...")
+            print(
+                f"  [{i+1}/{total}] SKIP (no parseable expected page or text): {query[:60]}..."
+            )
             continue
 
         t0 = time.perf_counter()
@@ -233,11 +245,11 @@ def run_benchmark(
         h3 = _hits_at_k_dual(retrieved_chunks, expected_pages, expected_text, k=3)
         hits_at_5 += h5
         hits_at_3 += h3
-        
+
         # Build context from returned chunks
         context = " ".join([c.text for c in retrieved_chunks])
         faith = _faithfulness_score(answer, context)
-        
+
         if h5:
             faith_hits.append(faith)
         else:
@@ -245,14 +257,16 @@ def run_benchmark(
 
         hit_symbol = "✓" if h5 else "✗"
         path_label = "fast" if is_fast else "full"
-        print(f"  [{i+1}/{total}] {hit_symbol} R@5={h5} faith={faith:.2f} "
-              f"path={path_label} latency={elapsed_ms:.0f}ms | {query[:55]}...")
+        print(
+            f"  [{i+1}/{total}] {hit_symbol} R@5={h5} faith={faith:.2f} "
+            f"path={path_label} latency={elapsed_ms:.0f}ms | {query[:55]}..."
+        )
 
     # Compute scored queries (excluding parse failures and errors)
     scored = total - parse_fail_count - len(errors)
     recall_at_5 = hits_at_5 / scored if scored else 0.0
     recall_at_3 = hits_at_3 / scored if scored else 0.0
-    
+
     avg_faith_hits = sum(faith_hits) / len(faith_hits) if faith_hits else 0.0
     avg_faith_misses = sum(faith_misses) / len(faith_misses) if faith_misses else 0.0
     avg_latency_ms = sum(latencies_ms) / len(latencies_ms) if latencies_ms else 0.0

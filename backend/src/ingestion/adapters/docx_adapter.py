@@ -18,14 +18,18 @@ def parse(path: Path, document_id: str) -> list[Chunk]:
         if is_heading:
             level = style.removeprefix("heading").strip() or "1"
             section = section[: max(0, int(level) - 1)] + [text]
-        chunks.append(Chunk(
-            id=f"{document_id}:p:{index}", document_id=document_id,
-            source_format="docx", text=text,
-            element_type="heading" if is_heading else "paragraph",
-            section_path=tuple(section),
-            location_reference=f"Paragraph: {index + 1}",
-        ))
-        
+        chunks.append(
+            Chunk(
+                id=f"{document_id}:p:{index}",
+                document_id=document_id,
+                source_format="docx",
+                text=text,
+                element_type="heading" if is_heading else "paragraph",
+                section_path=tuple(section),
+                location_reference=f"Paragraph: {index + 1}",
+            )
+        )
+
     for index, table in enumerate(document.tables):
         md_lines = []
         for i, row in enumerate(table.rows):
@@ -35,13 +39,18 @@ def parse(path: Path, document_id: str) -> list[Chunk]:
                 md_lines.append("|" + "|".join(["---"] * len(row.cells)) + "|")
         text = "\n".join(md_lines)
         if text.strip():
-            chunks.append(Chunk(
-                id=f"{document_id}:t:{index}", document_id=document_id,
-                source_format="docx", text=text,
-                element_type="table",
-                section_path=(),
-                location_reference=f"Table: {index + 1}",
-            ))
-            
+            chunks.append(
+                Chunk(
+                    id=f"{document_id}:t:{index}",
+                    document_id=document_id,
+                    source_format="docx",
+                    text=text,
+                    element_type="table",
+                    section_path=(),
+                    location_reference=f"Table: {index + 1}",
+                )
+            )
+
     from .chunk_util import merge_and_split_chunks
+
     return merge_and_split_chunks(chunks)
