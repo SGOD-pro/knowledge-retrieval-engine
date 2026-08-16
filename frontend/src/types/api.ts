@@ -35,8 +35,8 @@ export interface Workspace {
 
 export interface CreateWorkspaceRequest {
   name: string
-  industry: string
-  description: string
+  industry?: string
+  description?: string
 }
 
 export interface DocumentItem {
@@ -45,7 +45,7 @@ export interface DocumentItem {
   format: "pdf" | "docx" | "csv" | "pptx" | string
   upload_date: string
   chunk_count: number
-  status: "Ready" | "Processing" | "Failed"
+  status: "Ready" | "Processing" | "Failed" | string
   size?: string
 }
 
@@ -60,7 +60,7 @@ export interface UploadedDocument {
   id: string
   filename: string
   format: string
-  status: "processing" | "uploaded" | "failed"
+  status: "processing" | "uploaded" | "failed" | string
 }
 
 export interface DocumentUploadResponse {
@@ -68,37 +68,61 @@ export interface DocumentUploadResponse {
 }
 
 export interface BoundingBox {
-  l: number
-  t: number
-  r: number
-  b: number
+  l?: number
+  t?: number
+  r?: number
+  b?: number
+  x?: number
+  y?: number
+  width?: number
+  height?: number
+  page_number?: number
 }
 
 export interface Citation {
   id: number
   chunk_id: string
   document_id: string
-  document_filename: string
-  source_format: string
-  text: string
-  page_number: number | null
-  bounding_box: BoundingBox | null
-  location_reference: string
+  document_filename?: string
+  source_format?: string
+  text?: string
+  snippet?: string
+  page_number?: number | null
+  bounding_box?: BoundingBox | null
+  location_reference?: string
 }
 
 export interface QueryRequest {
-  workspace_id: string
+  workspace_id?: string
   query: string
   document_ids?: string[]
+  provider?: string
+}
+
+export interface LatencyBreakdown {
+  route_query_ms?: number
+  vector_ms?: number
+  bm25_ms?: number
+  reranker_ms?: number
+  compressor_ms?: number
+  fidelity_ms?: number
+  llm_ms?: number
+  total_ms?: number
+  [key: string]: number | undefined
 }
 
 export interface QueryResponse {
   answer: string
   citations: Citation[]
-  retrieval_path: "full" | "fast" | "hybrid"
-  confidence: number
-  latency_ms: number
+  retrieval_path?: string | string[]
+  confidence?: number
+  confidence_score?: number
+  latency_ms?: number
+  latency_breakdown?: LatencyBreakdown
+  fast_path?: boolean
+  cached?: boolean
   faithfulness?: number
+  document_ids?: string[]
 }
 
 export interface ChatMessage {

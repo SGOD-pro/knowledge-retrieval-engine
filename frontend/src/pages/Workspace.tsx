@@ -12,6 +12,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Breadcrumb, BreadcrumbItem, BreadcrumbLink, BreadcrumbList, BreadcrumbSeparator } from "@/components/ui/breadcrumb"
 import { Form, FormControl, FormField, FormItem } from "@/components/ui/form"
+import { api } from "@/lib/api"
 
 const querySchema = z.object({
   query: z.string().min(1, "Query is required")
@@ -56,15 +57,31 @@ export function Workspace() {
     setIsQuerying(true)
 
     try {
-      const res = await fetch("/api/query", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query: queryText })
-      })
-      if (!res.ok) throw new Error("Query failed")
+      const data = await api.query({ query: queryText })
       
-      const data: QueryResponse = await res.json()
-      setMessages(prev => [...prev, { role: "agent", content: data.answer, responseData: data }])
+      const mappedResponse: QueryResponse = {
+        answer: data.answer,
+        citations: (data.citations || []).map((c: any) => ({
+          chunk_id: String(c.chunk_id || c.id || ""),
+          document_id: String(c.document_id || ""),
+          source_format: c.source_format || "pdf",
+          bounding_box: c.bounding_box,
+          location_reference: c.location_reference || (c.page_number ? `Page ${c.page_number}` : ""),
+          text_snippet: c.text || c.text_snippet || ""
+        })),
+        confidence_score: data.confidence || data.confidence_score || 0,
+        latency_breakdown: data.latency_breakdown || { total_ms: data.latency_ms || 0 },
+        fast_path: data.fast_path ?? false,
+        cached: data.cached ?? false,
+        document_ids: data.document_ids || [],
+        retrieval_path: Array.isArray(data.retrieval_path) 
+          ? data.retrieval_path 
+          : data.fast_path 
+          ? ["bm25", "vector"] 
+          : ["bm25", "vector", "reranker"]
+      }
+
+      setMessages(prev => [...prev, { role: "agent", content: mappedResponse.answer, responseData: mappedResponse }])
     } catch (e) {
       console.error(e)
       setMessages(prev => [...prev, { role: "agent", content: "Error communicating with backend." }])

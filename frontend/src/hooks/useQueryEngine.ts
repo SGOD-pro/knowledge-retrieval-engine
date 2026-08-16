@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { api } from '../lib/api';
 
 export interface Citation {
   id: string;
@@ -21,29 +22,32 @@ export function useQueryEngine() {
   const [loading, setLoading] = useState(false);
   const [response, setResponse] = useState<QueryResponse | null>(null);
 
-  const executeQuery = async (query: string) => {
+  const executeQuery = async (queryText: string) => {
     setLoading(true);
     try {
-      const res = await fetch('/api/query', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query })
-      });
-      
-      if (!res.ok) {
-        throw new Error('Query failed with status: ' + res.status);
-      }
-      
-      const data = await res.json();
-      
+      const data = await api.query({ query: queryText });
+
+      const mappedCitations: Citation[] = (data.citations || []).map((c: any, idx: number) => ({
+        id: String(c.id || idx + 1),
+        document_id: String(c.document_id || "doc_1"),
+        source_format: c.source_format || "pdf",
+        snippet: c.text || c.snippet || "",
+        location_reference: c.location_reference || (c.page_number ? `Page ${c.page_number}` : ""),
+        bounding_box: Array.isArray(c.bounding_box)
+          ? c.bounding_box
+          : c.bounding_box
+          ? [c.bounding_box.x, c.bounding_box.y, c.bounding_box.width, c.bounding_box.height]
+          : null
+      }));
+
       const mappedResponse: QueryResponse = {
         answer: data.answer || "No answer returned.",
-        citations: data.citations || [],
+        citations: mappedCitations,
         retrieval_path: data.fast_path ? ["BM25", "Vector"] : ["BM25", "Vector", "LLM"],
-        confidence: data.confidence_score || 0,
-        latency_ms: data.latency_breakdown?.total_ms || 0
+        confidence: data.confidence || data.confidence_score || 0,
+        latency_ms: data.latency_ms || data.latency_breakdown?.total_ms || 0
       };
-      
+
       setResponse(mappedResponse);
     } catch (err) {
       console.error("Failed to execute query:", err);

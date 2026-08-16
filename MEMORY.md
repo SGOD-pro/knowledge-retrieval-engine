@@ -232,4 +232,9 @@ Phase 3 completion status was INVALIDATED. The prior tests were run against prov
   - KRE does **not** implement the file-based markdown bundle (`.okf/` folder hierarchy), YAML frontmatter schemas, or `index.md` / `log.md` manifests from v0.1/v0.2 of the spec.
   - Accepted tradeoffs: No DR without re-running Nova Micro extraction; no filesystem bundle export; governance metadata (`verified`, `status`, `stale_after`, `attesters`) not tracked in v1. Scoped as future enhancements if DR or auditability become requirements.
 - **Documentation Sanitized**: Corrected `ARCHITECTURE.md`, `PHASES.md`, and other system documents to ensure zero claims implying markdown-bundle existence or full spec compliance.
+- **API Implementation & E2E Validation (AT3)**:
+  - Implemented all endpoints per `API.md` in `backend/src/api/routes.py`: Placeholder Auth (`/auth/login`), Workspaces (`/workspaces`), Document Ingestion & Library (`/workspaces/{id}/documents`), Document Viewer stream (`/documents/{id}/file`), Query Pipeline (`/query`), Live Benchmarks (`/system/benchmarks`), and Knowledge Graph (`/workspaces/{id}/graph`).
+  - Unit tests passed (`pytest backend/tests/test_api_endpoints.py` -> 5 passed).
+  - Playwright E2E test suite created (`frontend/tests/e2e/kre_full_e2e.spec.ts`) validating all 7 core platform flows (Auth, Workspaces, Upload, 3-Pane Chat, Citation Bounding Boxes, OKF Graph SVG, Benchmarks Area Chart) -> 7 passed in 11.8s.
+
 

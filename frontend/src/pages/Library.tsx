@@ -18,19 +18,24 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { Badge } from "@/components/ui/badge"
+import { api } from "@/lib/api"
 
 const MAX_FILE_SIZE = 50 * 1024 * 1024 // 50MB
 const ALLOWED_FORMATS = [".pdf", ".docx", ".xlsx", ".pptx", ".csv"]
 
 const formSchema = z.object({
-  file: z.any()
-    .refine((files) => files?.length === 1, "File is required.")
-    .refine((files) => files?.[0]?.size <= MAX_FILE_SIZE, "Max file size is 50MB.")
+  file: z
+    .custom<FileList>()
+    .refine((files) => files?.length === 1, "Please select a file to upload.")
+    .refine(
+      (files) => files?.[0]?.size <= MAX_FILE_SIZE,
+      "File size must be less than 50MB."
+    )
     .refine((files) => {
       if (!files?.[0]) return false
-      const name = files[0].name.toLowerCase()
-      return ALLOWED_FORMATS.some(ext => name.endsWith(ext))
-    }, `Only ${ALLOWED_FORMATS.join(", ")} formats are supported.`),
+      const ext = "." + files[0].name.split(".").pop()?.toLowerCase()
+      return ALLOWED_FORMATS.includes(ext)
+    }, "Unsupported format. Allowed: .pdf, .docx, .xlsx, .pptx, .csv"),
 })
 
 interface UploadedDocument {
@@ -54,20 +59,7 @@ export function Library() {
     setIsUploading(true)
 
     try {
-      const formData = new FormData()
-      formData.append("file", file)
-
-      // Proxy in vite.config.ts should route this to backend
-      const res = await fetch("/api/ingest", {
-        method: "POST",
-        body: formData,
-      })
-
-      if (!res.ok) {
-        throw new Error("Upload failed")
-      }
-
-      const data = await res.json()
+      const data = await api.ingestFile(file)
       toast.success("Document uploaded successfully")
       
       setDocuments(prev => [

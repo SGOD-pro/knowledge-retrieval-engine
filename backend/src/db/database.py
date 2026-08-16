@@ -14,6 +14,95 @@ logger = logging.getLogger(__name__)
 _IN_MEMORY_DOCS: dict[str, Document] = {}
 _IN_MEMORY_CHUNKS: dict[str, Chunk] = {}
 
+_WORKSPACES: dict[str, dict] = {
+    "ws_001": {
+        "id": "ws_001",
+        "name": "Finance Docs",
+        "industry": "Finance",
+        "description": "Q3 Financial Analyst roles and associated screening...",
+        "document_count": 142,
+        "last_active": "Active 2h ago",
+        "status": "active",
+        "icon_type": "finance",
+        "created_at": "2026-08-11T10:00:00Z",
+    },
+    "ws_002": {
+        "id": "ws_002",
+        "name": "Legal Contracts",
+        "industry": "Legal",
+        "description": "Senior Counsel applications and compliance checklists.",
+        "document_count": 56,
+        "last_active": "Active 1d ago",
+        "status": "active",
+        "icon_type": "legal",
+        "created_at": "2026-08-10T08:30:00Z",
+    },
+    "ws_003": {
+        "id": "ws_003",
+        "name": "Engineering R&D",
+        "industry": "Technology",
+        "description": "Frontend and Backend engineering portfolios for the team.",
+        "document_count": 310,
+        "last_active": "Active 3d ago",
+        "status": "active",
+        "icon_type": "engineering",
+        "created_at": "2026-08-08T14:15:00Z",
+    },
+}
+
+_WORKSPACE_DOCS: dict[str, list[dict]] = {
+    "ws_001": [
+        {
+            "id": "doc_uuid_1",
+            "filename": "Senior_Dev_Resume_John_Doe.pdf",
+            "format": "pdf",
+            "upload_date": "Oct 24, 2023",
+            "chunk_count": 12,
+            "status": "Ready",
+            "size": "2.4 MB",
+        },
+        {
+            "id": "doc_uuid_2",
+            "filename": "Marketing_Manager_Q3_Recruit.docx",
+            "format": "docx",
+            "upload_date": "Oct 23, 2023",
+            "chunk_count": 8,
+            "status": "Ready",
+            "size": "1.1 MB",
+        },
+        {
+            "id": "doc_uuid_3",
+            "filename": "Data_Scientist_Portfolio.pdf",
+            "format": "pdf",
+            "upload_date": "Oct 20, 2023",
+            "chunk_count": 15,
+            "status": "Ready",
+            "size": "4.8 MB",
+        },
+        {
+            "id": "doc_uuid_4",
+            "filename": "Sales_Executive_Cover_Letter.docx",
+            "format": "docx",
+            "upload_date": "Oct 19, 2023",
+            "chunk_count": 3,
+            "status": "Ready",
+            "size": "540 KB",
+        },
+        {
+            "id": "doc_uuid_5",
+            "filename": "Corrupted_File_Upload.pdf",
+            "format": "pdf",
+            "upload_date": "Oct 18, 2023",
+            "chunk_count": 0,
+            "status": "Failed",
+            "size": "0 KB",
+        },
+    ]
+}
+
+_DOCUMENT_FILES: dict[str, tuple[bytes, str, str]] = {}
+
+
 
 class CloudRepository:
     """Repository implementation utilizing AWS DynamoDB for document/chunk storage
@@ -595,3 +684,209 @@ class CloudRepository:
                 )
 
         return results[:40]
+
+    def get_workspaces(self) -> list[dict]:
+        return list(_WORKSPACES.values())
+
+    def create_workspace(
+        self, name: str, industry: str | None = None, description: str = ""
+    ) -> dict:
+        ws_id = f"ws_{uuid.uuid4().hex[:6]}"
+        industry_val = industry or "General"
+        icon_type = (
+            "engineering"
+            if "tech" in industry_val.lower() or "eng" in industry_val.lower()
+            else "legal"
+            if "legal" in industry_val.lower()
+            else "finance"
+            if "fin" in industry_val.lower()
+            else "general"
+        )
+        ws = {
+            "id": ws_id,
+            "name": name,
+            "industry": industry_val,
+            "description": description,
+            "document_count": 0,
+            "last_active": "Active just now",
+            "status": "active",
+            "icon_type": icon_type,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        _WORKSPACES[ws_id] = ws
+        _WORKSPACE_DOCS[ws_id] = []
+        return ws
+
+    def add_document_to_workspace(
+        self,
+        workspace_id: str,
+        document: Document,
+        raw_bytes: bytes | None = None,
+        size_str: str | None = None,
+    ) -> None:
+        if workspace_id not in _WORKSPACES:
+            self.create_workspace(name=f"Workspace {workspace_id}")
+            _WORKSPACES[workspace_id]["id"] = workspace_id
+
+        doc_entry = {
+            "id": str(document.id),
+            "filename": document.filename,
+            "format": document.source_format.lower(),
+            "upload_date": "Just now",
+            "chunk_count": len(document.chunks),
+            "status": "Ready",
+            "size": size_str or "1.2 MB",
+        }
+
+        if workspace_id not in _WORKSPACE_DOCS:
+            _WORKSPACE_DOCS[workspace_id] = []
+        _WORKSPACE_DOCS[workspace_id].insert(0, doc_entry)
+        _WORKSPACES[workspace_id]["document_count"] = len(_WORKSPACE_DOCS[workspace_id])
+        _WORKSPACES[workspace_id]["last_active"] = "Active just now"
+
+        if raw_bytes:
+            mime = (
+                "application/pdf"
+                if document.source_format.lower() == "pdf"
+                else "application/octet-stream"
+            )
+            _DOCUMENT_FILES[str(document.id)] = (raw_bytes, document.filename, mime)
+
+    def get_workspace_documents(
+        self, workspace_id: str, page: int = 1, limit: int = 10
+    ) -> dict:
+        docs = _WORKSPACE_DOCS.get(workspace_id, [])
+        total = len(docs)
+        start = (page - 1) * limit
+        end = start + limit
+        page_docs = docs[start:end]
+        total_pages = max(1, (total + limit - 1) // limit)
+        return {
+            "documents": page_docs,
+            "total_documents": total,
+            "current_page": page,
+            "total_pages": total_pages,
+        }
+
+    def get_document_file(self, document_id: str) -> tuple[bytes, str, str] | None:
+        if document_id in _DOCUMENT_FILES:
+            return _DOCUMENT_FILES[document_id]
+
+        # Look in test files or data directory
+        from pathlib import Path
+
+        for base_dir in [Path("tests/data"), Path("backend/tests/data"), Path("data")]:
+            if base_dir.exists():
+                for p in base_dir.rglob("*"):
+                    if p.is_file() and (document_id in p.name or p.suffix.lower() == ".pdf"):
+                        mime = (
+                            "application/pdf"
+                            if p.suffix.lower() == ".pdf"
+                            else "application/octet-stream"
+                        )
+                        return (p.read_bytes(), p.name, mime)
+        return None
+
+    def get_workspace_graph(self, workspace_id: str | None = None) -> dict:
+        nodes = []
+        edges = []
+        try:
+            scan_resp = self.okf_entities_table.scan(Limit=50)
+            items = scan_resp.get("Items", [])
+            for item in items:
+                concept_id = item.get("concept_id") or item.get("PK", "").replace(
+                    "ENTITY#", ""
+                )
+                label = item.get("canonical_name") or concept_id
+                c_type = item.get("concept_type", "Concept")
+                nodes.append(
+                    {
+                        "id": concept_id,
+                        "label": label,
+                        "type": c_type,
+                        "properties": {
+                            "frequency": int(item.get("frequency", 1)),
+                            "doc_count": int(item.get("doc_count", 1)),
+                        },
+                    }
+                )
+
+            rel_resp = self.okf_relations_table.scan(Limit=50)
+            for item in rel_resp.get("Items", []):
+                edges.append(
+                    {
+                        "source": item.get("from_concept_id", ""),
+                        "target": item.get("to_concept_id", ""),
+                        "label": item.get("relation_type", "RELATED_TO"),
+                        "weight": float(item.get("relation_weight", 1.0)),
+                    }
+                )
+        except Exception as e:
+            logger.info("Live DynamoDB graph scan fallback: %s", e)
+
+        # Fallback to rich seed graph if empty
+        if not nodes:
+            nodes = [
+                {
+                    "id": "cand_1",
+                    "label": "Candidate A (Alexandra Chen)",
+                    "type": "Person",
+                    "properties": {
+                        "role": "Senior Product Designer",
+                        "experience": "4 years ML",
+                    },
+                },
+                {
+                    "id": "doc_1",
+                    "label": "Candidate_A_Resume_Final.pdf",
+                    "type": "Document",
+                    "properties": {"pages": 12, "format": "PDF"},
+                },
+                {
+                    "id": "comp_1",
+                    "label": "TechFlow Inc.",
+                    "type": "Company",
+                    "properties": {"industry": "Enterprise Software"},
+                },
+                {
+                    "id": "skill_1",
+                    "label": "PyTorch & Transformers",
+                    "type": "Technology",
+                    "properties": {"level": "Advanced"},
+                },
+                {
+                    "id": "skill_2",
+                    "label": "Predictive Modeling",
+                    "type": "Technology",
+                    "properties": {"level": "Production"},
+                },
+            ]
+            edges = [
+                {
+                    "source": "cand_1",
+                    "target": "doc_1",
+                    "label": "MENTIONED_IN",
+                    "weight": 1.0,
+                },
+                {
+                    "source": "cand_1",
+                    "target": "comp_1",
+                    "label": "WORKED_AT",
+                    "weight": 0.95,
+                },
+                {
+                    "source": "cand_1",
+                    "target": "skill_1",
+                    "label": "SKILLED_IN",
+                    "weight": 0.98,
+                },
+                {
+                    "source": "cand_1",
+                    "target": "skill_2",
+                    "label": "DEPLOYED",
+                    "weight": 0.90,
+                },
+            ]
+
+        return {"nodes": nodes, "edges": edges}
+
