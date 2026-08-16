@@ -51,6 +51,13 @@ The system employs a **Hybrid Architecture** combining a unified core engine wit
 - **OKF Properties:** `okf_properties` table — stores typed properties linked to concepts.
 - **OKF Relations:** `okf_relations` table — stores adjacency entries for graph traversal.
 
+### OKF Implementation Scope (DynamoDB-Only)
+KRE's OKF implementation is purely **DynamoDB-backed**, inspired by Google's Open Knowledge Format vocabulary (concepts, properties, typed relations). It **does NOT implement** file-based markdown bundles, YAML frontmatter schemas, or `index.md` manifests from Google OKF v0.1 or v0.2.
+- **Storage:** Dedicated DynamoDB tables (`okf_entities`, `okf_properties`, `okf_relations`).
+- **Extraction:** Nova Micro extracts structured concepts, properties, and relations at ingestion time into DynamoDB.
+- **Tradeoffs:** No disaster recovery without re-running Nova Micro extraction; no filesystem bundle export; governance metadata (`verified`, `status`, `stale_after`, `type` hierarchy) is not tracked. This is a deliberate architectural scope decision for high-performance sub-10ms lookups.
+
+
 ### QdrantDB (Vector Search)
 - Collection `kre_chunks` with two named vectors, never merged:
   - `embedding_fast` (384-dim) for BGE-small embeddings.

@@ -35,6 +35,8 @@
 
 - Nova Micro (Bedrock) is ingestion-only. Zero query-time calls.
 
+- OKF implementation is strictly DynamoDB-only (`okf_entities`, `okf_properties`, `okf_relations`). KRE adopts Google's Open Knowledge Format vocabulary (concepts, properties, relations) but does NOT implement the file-based markdown bundle, YAML frontmatter schemas, or `index.md` manifests from v0.1 or v0.2 of the spec.
+
 ## Soft Boundaries
 
 - Max corpus: QdrantDB + DynamoDB don't have the 10k-page FAISS-recall-degradation ceiling from rev 1-3. Benchmark at 50k pages before setting a new number.
@@ -44,6 +46,7 @@
 - Max graph: 5,000 nodes, 50,000 edges.
 - Max file size: 500 pages per PDF, 200 slides per PPTX, 10,000 rows per XLSX sheet, 500 pages per DOCX.
 - Ingestion is executed via the canonical FastAPI `/ingest` API (synchronous HTTP multipart upload). The S3-event-driven async worker (`ingestion_lambda/main.py`) is intentionally deferred to v2 as a backlog scaling item for large bulk document drops.
+- **OKF Storage & Disaster Recovery**: Because OKF data is stored exclusively in DynamoDB without file-based markdown bundles, disaster recovery requires re-running Nova Micro ingestion extraction over the raw corpus. Governance metadata (`verified`, `status`, `stale_after`, hierarchical type taxonomy) is not tracked in v1. These are scoped future enhancements if DR or auditability become priorities, not currently broken behavior.
 - **Citation Semantics**: The API currently returns the *entire pool* of `top_chunks` that survived the Reranker as "citations" for a given response, provided the LLM's final answer passes the Fidelity Check (meaning the answer was successfully extracted from that context pool). It does *not* filter down to the actually-cited subset of chunks. This guarantees 100% grounded chunk IDs with correct locations (eliminating LLM hallucinated citations) but introduces a precision tradeoff where some returned citations may not have directly contributed to the generated answer.
 - **Fast-Path Routing Gate**: The fast-path routing decision (which bypasses the LLM and Reranker for simple factual lookups) relies entirely on a keyword-based flag system (checking for synthesis, comparison, temporal, and relationship tokens). This has a known structural limitation: synthesis queries phrased with vocabulary outside the current flag families will be silently misrouted to the fast-path. This is currently mitigated by a broad `synthesis_flag`, but the problem is not fully solved until a semantic/embedding-based routing signal is implemented.
 - **LLM Activation Rate Margin**: Our LLM activation metric is currently sitting at `0.5882` (10/17 queries), which mathematically satisfies the strict `< 0.60` target. However, this is a razor-thin margin achieved on a small benchmark sample (17 queries) that has already been extensively tuned against. Because this rate depends directly on the `synthesis_flag` mitigation (which has known structural keyword-evasion vulnerabilities), this target should not be considered robustly or permanently met until the semantic routing signal is implemented.
@@ -51,6 +54,8 @@
 - **Answer Completeness vs. Faithfulness & Recall**: Current evaluation metrics (`Recall@5` and `Faithfulness`) measure retrieval precision and groundedness/chunk-correctness, not multi-part answer completeness. A generated answer for a multi-part query (e.g., asking for "three architectural USPs" or "compare X against Y and Z") can retrieve the correct source chunk and generate a response that is 100% faithful (zero ungrounded fabrications) while still omitting one or more requested sub-elements if the model abbreviates or if list items were separated across chunk boundaries (e.g. `Q119`). Under current scoring criteria, such queries score as full successes (`Hit@5 = 1`, `Faithfulness = 1.0`). A multi-element completeness validation metric is scoped as a future v2 evaluation enhancement rather than a blocking baseline gate.
 
 ## Out of Scope v1
+- OKF file-based markdown bundles (`.okf/` folders, YAML frontmatter `.md` concept files, `index.md` / `log.md` manifests per Google OKF v0.1/v0.2).
+- OKF governance metadata tracking (`verified`, `status`, `stale_after`, `attesters`).
 - Image/chart description (Extraction logic exists in odl-parser-lambda but remains inert and out of scope for Phase 4 UI/client responses).
 - Formula rendering.
 - User authentication / multi-tenancy.

@@ -158,3 +158,18 @@ NetworkX: **rejected for production.** Implemented via dict-based adjacency list
 
 ## Storage Decision
 PostgreSQL/pgvector: **REMOVED.** All storage migrated to DynamoDB (metadata, OKF) + QdrantDB (vectors) + Redis (cache).
+
+## OKF Architecture & Spec Scope Decision (DynamoDB-Only)
+
+KRE's Open Knowledge Framework (OKF) implementation is **DynamoDB-only**. It is inspired by Google's Open Knowledge Format vocabulary (concepts, properties, typed relations) but **does NOT implement** the file-based markdown bundle, YAML frontmatter schema, or `index.md` manifest from either v0.1 or v0.2 of the Google OKF specification.
+
+This is a **deliberate architectural scope decision**, not an oversight or partial implementation.
+
+### Accepted Tradeoffs
+1. **Disaster Recovery:** No point-in-time disaster recovery of the knowledge graph without re-running Bedrock Nova Micro extraction over the raw corpus.
+2. **File Export / Human Inspection:** No human-inspectable filesystem bundle export (`.okf/` folder hierarchy or `.md` concept files).
+3. **Governance Metadata:** No governance metadata (such as `verified`, `status`, `stale_after`, `confidence`, or formal hierarchical type taxonomy) is currently persisted or tracked in DynamoDB.
+
+### Scoped Future Roadmap
+File-based markdown bundle serialization and governance schemas are categorized as scoped future enhancements if disaster recovery, offline audits, or human-curated knowledge editing become product priorities in later versions — not as a currently broken or missing component of the v1 system.
+

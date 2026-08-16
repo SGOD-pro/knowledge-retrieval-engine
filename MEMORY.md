@@ -222,3 +222,14 @@ Phase 3 completion status was INVALIDATED. The prior tests were run against prov
   - **p95 Latency**: **3,467 ms** (< 4,000 ms SLA target).
   - **LLM Activation Rate**: **50.65% Full Path / 49.35% Fast Path**.
 - **Conclusion**: The hybrid retrieval thesis is empirically validated. OKF graph expansion and property lookups directly resolved multi-hop synthesis queries on dense technical papers (doubled recall from 40% to 80% on `2507` and 70% to 100% on `2204`). The backend is 100% verified, clean, and ready for Phase 4 Frontend Integration.
+
+---
+
+## Session State — Phase AT: OKF Architecture & Scope Formalization (2026-08-16)
+
+- **OKF Architecture Scope Recorded**: Formalized explicit, permanent decision across `DECISION.md`, `BOUNDARIES.md`, and `ARCHITECTURE.md`.
+  - KRE's OKF implementation is strictly DynamoDB-only (`okf_entities`, `okf_properties`, `okf_relations`), drawing vocabulary (concepts, properties, typed relations) from Google's Open Knowledge Format.
+  - KRE does **not** implement the file-based markdown bundle (`.okf/` folder hierarchy), YAML frontmatter schemas, or `index.md` / `log.md` manifests from v0.1/v0.2 of the spec.
+  - Accepted tradeoffs: No DR without re-running Nova Micro extraction; no filesystem bundle export; governance metadata (`verified`, `status`, `stale_after`, `attesters`) not tracked in v1. Scoped as future enhancements if DR or auditability become requirements.
+- **Documentation Sanitized**: Corrected `ARCHITECTURE.md`, `PHASES.md`, and other system documents to ensure zero claims implying markdown-bundle existence or full spec compliance.
+

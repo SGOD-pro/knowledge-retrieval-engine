@@ -190,7 +190,7 @@ Prerequisite: Phase 5 exit criteria fully passed. BGE-small microservice scaffol
 
 Deliverables:
   - **OKF DynamoDB Schema**: `okf_entities` and `okf_properties` tables with strict typed schemas.
-  - **okf_builder.py rewrite**: Nova Micro extracts concepts/properties/relations from ALL document formats (PDF, CSV, Excel, DOCX, PPTX) at ingestion time. Stores to DynamoDB. Follows OKF v0.1 concept types (PRODUCT, PERSON, ORGANIZATION, METRIC, POLICY, PROCESS, DATE_PERIOD, LOCATION, etc.).
+  - **okf_builder.py rewrite**: Nova Micro extracts concepts/properties/relations from ALL document formats (PDF, CSV, Excel, DOCX, PPTX) at ingestion time. Stores directly to DynamoDB (drawing concept type vocabulary such as PRODUCT, PERSON, ORGANIZATION, METRIC, POLICY, PROCESS, DATE_PERIOD, LOCATION from OKF conventions, without file-based markdown bundle serialization).
   - **okf_retriever.py rewrite**: Pure DynamoDB lookup. Given query entities, retrieves typed properties and related concepts. Zero LLM calls.
   - **Knowledge Graph Traversal**: DynamoDB adjacency-based graph traversal. Relations stored as concept-to-concept links with relation_type and weight.
   - **Combined Retrieval Routing**: Pipeline merges OKF facts + vector chunks + BM25 hits + PageIndex structural scores. The compressor receives ALL of these signals and selects the exact relevant sections.
