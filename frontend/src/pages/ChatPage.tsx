@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from "react"
-import { useParams, useNavigate } from "react-router-dom"
+import { useParams } from "react-router-dom"
 import {
   Send,
   Paperclip,
@@ -10,7 +10,8 @@ import {
   FileSearch,
   PanelLeftOpen,
   Maximize,
-  Minimize
+  Minimize,
+  HelpCircle
 } from "lucide-react"
 import { useChatStore } from "../store/useChatStore"
 import { useWorkspaceStore } from "../store/useWorkspaceStore"
@@ -22,12 +23,12 @@ import { UploadPage } from "./UploadPage"
 import { ThemeToggle } from "../components/common/ThemeToggle"
 
 export function ChatPage() {
-  const navigate = useNavigate()
   const { workspaceId } = useParams<{ workspaceId: string }>()
   const { activeWorkspace, workspaces, setActiveWorkspace } = useWorkspaceStore()
   const {
     sessions,
     activeSessionId,
+    ensureSession,
     sendMessage,
     isQuerying,
     setActiveCitation,
@@ -42,25 +43,26 @@ export function ChatPage() {
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
 
-  // Sync route workspaceId with store & redirect to upload if 0 docs
+  const currentWsId = workspaceId || activeWorkspace?.id || ""
+
+  // Sync route workspaceId with store & ensure session
   useEffect(() => {
     if (workspaceId) {
       const match = workspaces.find((w) => w.id === workspaceId)
-      if (match) {
-        if (activeWorkspace?.id !== match.id) {
-          setActiveWorkspace(match)
-        }
-        if (match.document_count === 0) {
-          navigate(`/workspaces/${match.id}/upload`, { replace: true })
-        }
+      if (match && activeWorkspace?.id !== match.id) {
+        setActiveWorkspace(match)
       }
-    } else if (activeWorkspace && activeWorkspace.document_count === 0) {
-      navigate(`/workspaces/${activeWorkspace.id}/upload`, { replace: true })
     }
-  }, [workspaceId, activeWorkspace, workspaces, setActiveWorkspace, navigate])
+  }, [workspaceId, activeWorkspace?.id, workspaces, setActiveWorkspace])
 
-  const activeSession =
-    sessions.find((s) => s.id === activeSessionId) || sessions[0]
+  // Ensure an active session exists for this workspace
+  useEffect(() => {
+    if (currentWsId) {
+      ensureSession(currentWsId)
+    }
+  }, [currentWsId, ensureSession])
+
+  const activeSession = sessions.find((s) => s.id === activeSessionId) || sessions[0]
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" })
@@ -70,19 +72,19 @@ export function ChatPage() {
   useEffect(() => {
     if (textareaRef.current) {
       textareaRef.current.style.height = "auto"
-      textareaRef.current.style.height = `${Math.min(textareaRef.current.scrollHeight, 160)}px`
+      textareaRef.current.style.height = `${Math.min(textareaRef.current.scrollHeight, 140)}px`
     }
   }, [inputQuery])
 
-  const handleSend = async (e?: React.FormEvent) => {
+  const handleSend = async (e?: React.FormEvent, customText?: string) => {
     if (e) e.preventDefault()
-    if (!inputQuery.trim() || isQuerying) return
-    const q = inputQuery
+    const textToSend = customText || inputQuery
+    if (!textToSend.trim() || isQuerying) return
     setInputQuery("")
     if (textareaRef.current) {
       textareaRef.current.style.height = "auto"
     }
-    await sendMessage(workspaceId || activeWorkspace?.id || "ws_001", q)
+    await sendMessage(currentWsId, textToSend)
   }
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -132,22 +134,34 @@ export function ChatPage() {
     })
   }
 
+  // Find last AI message to show metrics
+  const lastAiMessage = activeSession?.messages
+    ?.slice()
+    .reverse()
+    .find((m) => m.sender === "assistant" && m.latency_ms)
+
+  const quickPrompts = [
+    "Summarize the key findings and executive summary across uploaded documents.",
+    "Extract all key entities, metrics, and dates mentioned in the documents.",
+    "What are the main technical concepts or topics discussed in this corpus?"
+  ]
+
   return (
-    <div className="h-screen w-full flex p-2 sm:p-2.5 gap-2 sm:gap-2.5 overflow-hidden bg-background text-foreground select-none">
+    <div className="h-screen w-screen flex p-2 sm:p-2.5 gap-2 sm:gap-2.5 overflow-hidden bg-background text-foreground select-none">
       {/* Pane 1: Collapsible Chat Sidebar */}
       {leftPaneOpen && <ChatSidebar />}
 
       {/* Pane 2: Center Chat Area */}
-      <div className="flex-1 flex flex-col h-full overflow-hidden bg-card border border-border/80 rounded-3xl shadow-xs relative transition-all">
-        {/* Top Header */}
+      <div className="flex-1 flex flex-col h-full min-w-0 min-h-0 overflow-hidden bg-card border border-border/80 rounded-3xl shadow-xs">
+        {/* Top Header (shrink-0) */}
         <div className="h-14 px-5 border-b border-border/60 flex items-center justify-between bg-card/40 shrink-0 z-10">
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-3 min-w-0">
             {/* Reopen Left Sidebar Button if collapsed */}
             {!leftPaneOpen && (
               <button
                 type="button"
                 onClick={() => setLeftPaneOpen(true)}
-                className="p-1.5 rounded-xl bg-card border border-border text-foreground hover:bg-accent text-xs font-semibold flex items-center gap-1.5 shadow-xs cursor-pointer"
+                className="p-1.5 rounded-xl bg-card border border-border text-foreground hover:bg-accent text-xs font-semibold flex items-center gap-1.5 shadow-xs cursor-pointer shrink-0"
                 title="Open Chat History"
               >
                 <PanelLeftOpen className="h-4 w-4 text-[#c96442]" />
@@ -155,29 +169,37 @@ export function ChatPage() {
               </button>
             )}
 
-            <h1 className="font-headline font-bold text-lg text-foreground truncate max-w-[280px] sm:max-w-md">
-              {activeSession?.title || "Data Scientist Pipeline"}
+            <h1 className="font-headline font-bold text-base sm:text-lg text-foreground truncate">
+              {activeSession?.title || "New Query Session"}
             </h1>
           </div>
 
-          <div className="flex items-center gap-3 sm:gap-4">
-            {/* KPI metrics */}
-            <div className="hidden sm:flex items-center gap-3 text-xs font-semibold">
-              <div className="flex items-center gap-1.5">
-                <span className="text-[10px] text-muted-foreground uppercase tracking-wider">
-                  Latency
-                </span>
-                <span className="font-bold text-foreground">1.2s</span>
+          <div className="flex items-center gap-3 sm:gap-4 shrink-0">
+            {/* Dynamic KPI metrics from real queries */}
+            {lastAiMessage && (
+              <div className="hidden sm:flex items-center gap-3 text-xs font-semibold">
+                {lastAiMessage.latency_ms && (
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-[10px] text-muted-foreground uppercase tracking-wider">
+                      Latency
+                    </span>
+                    <span className="font-bold text-foreground">
+                      {(lastAiMessage.latency_ms / 1000).toFixed(2)}s
+                    </span>
+                  </div>
+                )}
+                {lastAiMessage.faithfulness && (
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-[10px] text-muted-foreground uppercase tracking-wider">
+                      Faithfulness
+                    </span>
+                    <span className="font-bold text-[#006768] dark:text-[#6cd7d8]">
+                      {lastAiMessage.faithfulness}%
+                    </span>
+                  </div>
+                )}
               </div>
-              <div className="flex items-center gap-1.5">
-                <span className="text-[10px] text-muted-foreground uppercase tracking-wider">
-                  Faithfulness
-                </span>
-                <span className="font-bold text-[#006768] dark:text-[#6cd7d8]">
-                  98%
-                </span>
-              </div>
-            </div>
+            )}
 
             {/* Theme Toggle in Header if left sidebar is collapsed */}
             {!leftPaneOpen && <ThemeToggle />}
@@ -204,28 +226,50 @@ export function ChatPage() {
                 className="p-1.5 px-3 rounded-xl bg-card border border-border text-foreground hover:bg-accent text-xs font-semibold flex items-center gap-1.5 shadow-xs cursor-pointer"
               >
                 <FileSearch className="h-4 w-4 text-[#c96442]" />
-                <span>Open Document</span>
+                <span>Document Pane</span>
               </button>
             )}
           </div>
         </div>
 
-        {/* Messages Scroll Area with Bottom Padding for Floating Box */}
-        <div className="flex-1 overflow-y-auto p-5 sm:p-7 pb-36 space-y-5">
-          {activeSession?.messages.length === 0 ? (
-            <div className="h-full flex flex-col items-center justify-center text-center p-8 max-w-md mx-auto space-y-3">
+        {/* Scrollable Messages Area (flex-1 min-h-0) */}
+        <div className="flex-1 min-h-0 overflow-y-auto p-4 sm:p-6 space-y-5">
+          {(!activeSession?.messages || activeSession.messages.length === 0) ? (
+            <div className="h-full min-h-[300px] flex flex-col items-center justify-center text-center p-4 max-w-lg mx-auto space-y-4 my-auto">
               <div className="h-12 w-12 rounded-2xl bg-[#fdeae4] dark:bg-[#3d231b] text-[#c96442] flex items-center justify-center shadow-xs">
                 <Sparkles className="h-6 w-6" />
               </div>
-              <h3 className="font-headline text-2xl font-bold text-foreground">
-                Query {activeWorkspace?.name || "Workspace"}
-              </h3>
-              <p className="text-xs text-muted-foreground leading-relaxed">
-                Ask analytical questions across candidate resumes, legal portfolios, or technical docs with verifiable citations.
-              </p>
+              <div className="space-y-1.5">
+                <h3 className="font-headline text-xl sm:text-2xl font-bold text-foreground">
+                  Query {activeWorkspace?.name || "Workspace"}
+                </h3>
+                <p className="text-xs text-muted-foreground leading-relaxed max-w-sm">
+                  Ask grounded questions across your workspace corpus. KRE will retrieve matching chunks and provide verifiable citations.
+                </p>
+              </div>
+
+              {/* Suggested starter questions */}
+              <div className="w-full space-y-2 pt-2 text-left">
+                <div className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground px-1 flex items-center gap-1">
+                  <HelpCircle className="h-3 w-3 text-[#c96442]" />
+                  <span>Suggested queries</span>
+                </div>
+                <div className="space-y-1.5">
+                  {quickPrompts.map((prompt, idx) => (
+                    <button
+                      key={idx}
+                      type="button"
+                      onClick={() => handleSend(undefined, prompt)}
+                      className="w-full text-left p-2.5 rounded-xl border border-border/80 hover:border-[#c96442]/60 bg-muted/30 hover:bg-[#c96442]/5 text-xs text-foreground/90 hover:text-foreground transition-all cursor-pointer"
+                    >
+                      {prompt}
+                    </button>
+                  ))}
+                </div>
+              </div>
             </div>
           ) : (
-            activeSession?.messages.map((msg) => (
+            activeSession.messages.map((msg) => (
               <div
                 key={msg.id}
                 className={`flex flex-col ${
@@ -239,7 +283,7 @@ export function ChatPage() {
                   </div>
                 ) : (
                   /* Assistant Message */
-                  <div className="max-w-2xl space-y-2.5">
+                  <div className="max-w-2xl space-y-2.5 w-full">
                     {/* Bot Label */}
                     <div className="flex items-center gap-2">
                       <div className="h-5 w-5 rounded-md bg-[#c96442] text-white flex items-center justify-center text-[9px] font-bold shadow-xs">
@@ -248,23 +292,32 @@ export function ChatPage() {
                       <span className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground">
                         KRE AI
                       </span>
+                      {msg.timestamp && (
+                        <span className="text-[10px] text-muted-foreground">
+                          {msg.timestamp}
+                        </span>
+                      )}
                     </div>
 
                     {/* AI Response Text */}
-                    <div className="text-foreground text-sm font-sans leading-relaxed whitespace-pre-line">
+                    <div className="text-foreground text-sm font-sans leading-relaxed whitespace-pre-line bg-muted/20 p-4 rounded-2xl border border-border/60 shadow-xs">
                       {renderMessageContent(msg.text, msg.citations)}
                     </div>
 
                     {/* Retrieval Tag Chips */}
-                    <div className="flex items-center gap-2 pt-1.5">
-                      <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-[11px] font-medium bg-[#ede9de] dark:bg-[#242628] text-foreground/80">
-                        <Zap className="h-3 w-3 text-[#c96442]" />
-                        <span>{msg.retrieval_path || "Fast Match (1.2s)"}</span>
-                      </span>
-                      <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-[11px] font-medium bg-[#ede9de] dark:bg-[#242628] text-foreground/80">
-                        <Brain className="h-3 w-3 text-[#006768] dark:text-[#6cd7d8]" />
-                        <span>Reasoned Answer</span>
-                      </span>
+                    <div className="flex items-center gap-2 pt-0.5">
+                      {msg.retrieval_path && (
+                        <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-[11px] font-medium bg-[#ede9de] dark:bg-[#242628] text-foreground/80">
+                          <Zap className="h-3 w-3 text-[#c96442]" />
+                          <span>{msg.retrieval_path}</span>
+                        </span>
+                      )}
+                      {msg.confidence !== undefined && (
+                        <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-[11px] font-medium bg-[#ede9de] dark:bg-[#242628] text-foreground/80">
+                          <Brain className="h-3 w-3 text-[#006768] dark:text-[#6cd7d8]" />
+                          <span>Confidence {Math.round(msg.confidence * 100)}%</span>
+                        </span>
+                      )}
                     </div>
                   </div>
                 )}
@@ -276,22 +329,19 @@ export function ChatPage() {
           {isQuerying && (
             <div className="flex items-center gap-2 text-muted-foreground text-xs p-2">
               <Loader2 className="h-4 w-4 animate-spin text-[#c96442]" />
-              <span>Retrieving candidates & synthesising citations...</span>
+              <span>Retrieving relevant chunks & synthesizing response...</span>
             </div>
           )}
 
-          <div ref={messagesEndRef} />
+          <div ref={messagesEndRef} className="h-2" />
         </div>
 
-        {/* Smooth Bottom-to-Top Card Background Gradient Overlay */}
-        <div className="absolute bottom-0 left-0 right-0 h-32 bg-gradient-to-t from-card via-card/85 to-transparent pointer-events-none z-10" />
-
-        {/* Floating Chat Input Capsule with Auto-Adaptive Height & Zero Inner Outline */}
-        <div className="absolute bottom-3 left-4 right-4 sm:left-8 sm:right-8 flex flex-col items-center pointer-events-none z-20">
-          <div className="w-full max-w-3xl pointer-events-auto flex flex-col items-center space-y-1.5">
+        {/* Dedicated Chat Input Area (shrink-0, non-overlapping flex sibling) */}
+        <div className="shrink-0 p-3 sm:p-4 pt-2 border-t border-border/50 bg-card/90 backdrop-blur-sm flex flex-col items-center">
+          <div className="w-full max-w-3xl flex flex-col items-center space-y-1.5">
             <form
-              onSubmit={handleSend}
-              className="w-full relative flex items-end bg-[#ede9de] dark:bg-[#242628] rounded-3xl border border-[#ded8cd] dark:border-[#333537] shadow-lg shadow-black/5 dark:shadow-black/25 px-2 py-1.5 transition-all focus-within:border-[#c96442] dark:focus-within:border-[#c96442]"
+              onSubmit={(e) => handleSend(e)}
+              className="w-full relative flex items-end bg-[#ede9de] dark:bg-[#242628] rounded-3xl border border-[#ded8cd] dark:border-[#333537] shadow-sm px-2 py-1.5 transition-all focus-within:border-[#c96442] dark:focus-within:border-[#c96442]"
             >
               <button
                 type="button"
@@ -308,9 +358,9 @@ export function ChatPage() {
                 value={inputQuery}
                 onChange={(e) => setInputQuery(e.target.value)}
                 onKeyDown={handleKeyDown}
-                placeholder="Ask about this candidate..."
+                placeholder="Ask a question across workspace documents..."
                 disabled={isQuerying}
-                className="flex-1 bg-transparent border-0 outline-none focus:outline-none focus:ring-0 focus-visible:ring-0 focus-visible:outline-none shadow-none text-sm placeholder:text-muted-foreground/70 resize-none py-2 px-2.5 max-h-40 overflow-y-auto leading-relaxed text-foreground font-sans scrollbar-thin"
+                className="flex-1 bg-transparent border-0 outline-none focus:outline-none focus:ring-0 focus-visible:ring-0 focus-visible:outline-none shadow-none text-sm placeholder:text-muted-foreground/70 resize-none py-2 px-2.5 max-h-36 overflow-y-auto leading-relaxed text-foreground font-sans scrollbar-thin"
               />
 
               <Button

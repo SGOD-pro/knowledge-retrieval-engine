@@ -7,12 +7,16 @@ import { LibraryPage } from "./pages/LibraryPage"
 import { UploadPage } from "./pages/UploadPage"
 import { BenchmarksPage } from "./pages/BenchmarksPage"
 import { ChatPage } from "./pages/ChatPage"
+import { LandingPage } from "./pages/LandingPage"
 import { MainLayout } from "./components/layout/MainLayout"
 import { useWorkspaceStore } from "./store/useWorkspaceStore"
 
 function DynamicWorkspaceRedirect({ target }: { target: "chat" | "documents" | "upload" }) {
-  const { activeWorkspace } = useWorkspaceStore()
-  const wsId = activeWorkspace?.id || "ws_001"
+  const { activeWorkspace, workspaces } = useWorkspaceStore()
+  const wsId = activeWorkspace?.id || workspaces[0]?.id
+  if (!wsId) {
+    return <Navigate to="/workspaces" replace />
+  }
   return <Navigate to={`/workspaces/${wsId}/${target}`} replace />
 }
 
@@ -20,6 +24,10 @@ export function App() {
   return (
     <BrowserRouter>
       <Routes>
+        {/* Enterprise Landing Page Route */}
+        <Route path="/" element={<LandingPage />} />
+        <Route path="/landing" element={<LandingPage />} />
+
         {/* Auth Route */}
         <Route path="/login" element={<AuthPage />} />
 
@@ -29,7 +37,6 @@ export function App() {
 
         {/* Main 2-Panel App Layout */}
         <Route element={<MainLayout />}>
-          <Route path="/" element={<Navigate to="/workspaces" replace />} />
           <Route path="/workspaces" element={<WorkspacePage />} />
           <Route path="/workspaces/new" element={<CreateWorkspacePage />} />
 
@@ -50,7 +57,7 @@ export function App() {
             element={
               <div className="p-8 space-y-4">
                 <h1 className="font-headline text-3xl font-bold text-foreground">Settings</h1>
-                <p className="text-sm text-muted-foreground">Workspace configuration & API tokens.</p>
+                <p className="text-sm text-muted-foreground">Workspace configuration & API tokens. xxx</p>
               </div>
             }
           />

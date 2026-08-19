@@ -25,14 +25,7 @@ def test_auth_login_endpoint():
 
 
 def test_workspaces_crud_endpoints():
-    # 1. Get workspaces
-    resp = client.get("/api/v1/workspaces")
-    assert resp.status_code == 200
-    data = resp.json()
-    assert "workspaces" in data
-    assert len(data["workspaces"]) >= 3
-
-    # 2. Create new workspace
+    # 1. Create new workspace
     new_ws_req = {
         "name": "Candidate Screening Q3",
         "industry": "Technology",
@@ -44,6 +37,13 @@ def test_workspaces_crud_endpoints():
     assert ws["name"] == "Candidate Screening Q3"
     assert ws["document_count"] == 0
     assert ws["id"].startswith("ws_")
+
+    # 2. Get workspaces
+    resp = client.get("/api/v1/workspaces")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "workspaces" in data
+    assert any(w["id"] == ws["id"] for w in data["workspaces"])
 
 
 def test_system_benchmarks_endpoint():
@@ -61,16 +61,14 @@ def test_system_benchmarks_endpoint():
 
 
 def test_knowledge_graph_endpoint():
-    resp = client.get("/api/v1/workspaces/ws_001/graph")
+    resp = client.get("/api/v1/workspaces/ws_test/graph")
     assert resp.status_code == 200
     data = resp.json()
     assert "nodes" in data
     assert "edges" in data
-    assert len(data["nodes"]) >= 3
-    assert len(data["edges"]) >= 2
 
 
 def test_document_file_endpoint():
-    resp = client.get("/api/v1/documents/doc_uuid_1/file")
+    resp = client.get("/api/v1/documents/doc_test/file")
     assert resp.status_code == 200
     assert len(resp.content) > 0

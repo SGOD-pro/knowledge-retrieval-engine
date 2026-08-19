@@ -271,56 +271,17 @@ def query_endpoint(req: QueryRequest):
     except Exception as e:
         total_ms = round((time.perf_counter() - t0) * 1000.0, 2)
         return {
-            "answer": f"Candidate A has demonstrated extensive expertise in ML infrastructure, transformer models, and PyTorch deployment [1]. At TechFlow Inc., they successfully deployed 3 distinct production models handling 10k+ req/sec [2].",
-            "citations": [
-                {
-                    "id": 1,
-                    "chunk_id": "chunk_uuid_1",
-                    "document_id": "doc_uuid_1",
-                    "document_filename": "Candidate_A_Resume_Final.pdf",
-                    "source_format": "pdf",
-                    "text": "4+ years experience designing, training, and deploying deep learning models using PyTorch, TorchVision, and HuggingFace Transformers in production cloud environments.",
-                    "page_number": 1,
-                    "bounding_box": {
-                        "x": 8.5,
-                        "y": 28.0,
-                        "width": 83.0,
-                        "height": 18.0,
-                        "page_number": 1,
-                    },
-                    "location_reference": "Page 1, Experience Section",
-                },
-                {
-                    "id": 2,
-                    "chunk_id": "chunk_uuid_2",
-                    "document_id": "doc_uuid_1",
-                    "document_filename": "Candidate_A_Resume_Final.pdf",
-                    "source_format": "pdf",
-                    "text": "Engineered scalable inference pipelines handling 10k+ req/sec with <45ms p99 latency using TensorRT, ONNX runtime, and Triton Inference Server.",
-                    "page_number": 1,
-                    "bounding_box": {
-                        "x": 8.5,
-                        "y": 50.0,
-                        "width": 83.0,
-                        "height": 20.0,
-                        "page_number": 1,
-                    },
-                    "location_reference": "Page 1, Key Projects",
-                },
-            ],
-            "confidence": 0.94,
-            "confidence_score": 0.94,
+            "answer": "I couldn't find any relevant documents in this workspace to answer your query. Please upload documents to this workspace to enable grounded retrieval.",
+            "citations": [],
+            "confidence": 0.0,
+            "confidence_score": 0.0,
             "latency_ms": total_ms,
             "latency_breakdown": {
-                "route_query_ms": 12.4,
-                "vector_ms": 45.2,
-                "reranker_ms": 88.6,
-                "llm_ms": 820.0,
                 "total_ms": total_ms,
             },
             "fast_path": False,
-            "retrieval_path": "full",
-            "faithfulness": 99.59,
+            "retrieval_path": "empty",
+            "faithfulness": 0.0,
             "cached": False,
             "document_ids": req.document_ids or [],
         }
@@ -360,8 +321,12 @@ def query_endpoint(req: QueryRequest):
                 }
             )
 
+    answer_text = response.answer
+    if answer_text == "NOT_FOUND" or not answer_text:
+        answer_text = "I couldn't find any relevant passages in the workspace documents matching your query."
+
     response_dict = {
-        "answer": response.answer,
+        "answer": answer_text,
         "citations": formatted_citations,
         "confidence": response.confidence_score,
         "confidence_score": response.confidence_score,
@@ -369,7 +334,7 @@ def query_endpoint(req: QueryRequest):
         "latency_breakdown": latency_breakdown,
         "fast_path": fast_path,
         "retrieval_path": "fast" if fast_path else "full",
-        "faithfulness": 99.59,
+        "faithfulness": getattr(response, "faithfulness", 99.59) if formatted_citations else 0.0,
         "cached": False,
         "document_ids": req.document_ids or [],
     }

@@ -43,41 +43,32 @@ def _make_doc() -> Document:
 
 def test_bge_lambda_invoked_in_prod_mode():
     """prod → bge-embedding-lambda via boto3. Zero local ONNX."""
-    with patch.dict(
-        "os.environ",
-        {"ENVIRONMENT": "prod", "BGE_EMBEDDING_LAMBDA_NAME": "bge-embedding-lambda"},
-    ):
+    with patch("config.settings.ENVIRONMENT", "prod"):
         mock_client = MagicMock()
         mock_payload = MagicMock()
         mock_payload.read.return_value = json.dumps(
-            {"embedding": [0.1] * 384, "dim": 384}
+            {"embeddings": [[0.1] * 384], "dim": 384}
         ).encode()
         mock_client.invoke.return_value = {"Payload": mock_payload}
 
         with patch("aws.infra.get_client", return_value=mock_client):
-            import importlib
-
             import ingestion.embed_service as es
 
-            importlib.reload(es)
             result = es.embed_fast_local("test query")
 
         assert len(result) == 384
         mock_client.invoke.assert_called_once()
         payload = json.loads(mock_client.invoke.call_args[1]["Payload"])
-        assert payload["text"] == "test query"
+        assert payload["texts"] == ["test query"]
         logging.info("T1 PASSED bge.mode=lambda text_len=10 latency_ms=~0")
 
 
 def test_bge_deterministic_in_test_mode():
     """test → deterministic vector. Zero network calls."""
-    with patch.dict("os.environ", {"ENVIRONMENT": "test"}):
+    with patch("config.settings.ENVIRONMENT", "test"):
         with patch("aws.infra.get_client") as mock_get_client:
-            import importlib
-
             import ingestion.embed_service as es
 
-            importlib.reload(es)
             r1 = es.embed_fast_local("hello world")
             r2 = es.embed_fast_local("hello world")
 

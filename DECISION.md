@@ -21,10 +21,10 @@ The system adopts a **Hybrid Architecture**:
 
 ## Embedding Model — Dual Path
 
-Fast path: **BGE-small-en-v1.5 (Lambda / Local ONNX Fallback)**
+Fast path: **BGE-small-en-v1.5 (AWS Lambda)**
 - 384-dim normalized vectors.
-- Prod: invokes `bge-small-en-v1-5-lambda-prod` via boto3 (falling back to local ONNX if unprovisioned).
-- Dev/Test: runs local ONNX or deterministic vector.
+- Invokes `bge-microservice-stack-BGELambdaFunction-roIuowXCDxCe` via boto3.
+- Test: deterministic vector for offline test suites.
 
 Full path & Ingestion: **amazon.titan-embed-text-v2 (Bedrock)**
 - 1024-dim vectors via Bedrock API.
@@ -33,9 +33,9 @@ Full path & Ingestion: **amazon.titan-embed-text-v2 (Bedrock)**
 
 ## BGE-Small Microservice / Lambda
 
-- Deployed as a dedicated AWS Lambda function (`bge_microservice/main.py:lambda_handler`).
-- Model files: `bge-onnx/` (`model.onnx`, `tokenizer.json`).
-- Core backend delegates embedding to this Lambda or loads the ONNX weights locally as a fallback.
+- Deployed as a dedicated AWS Lambda function: `bge-microservice-stack-BGELambdaFunction-roIuowXCDxCe`.
+- Model files: `bge-onnx/` (`model.onnx`, `tokenizer.json`) hosted inside the Lambda runtime.
+- Core backend directly invokes this Lambda via AWS SDK boto3.
 
 ## Lambda Packaging Limits
 

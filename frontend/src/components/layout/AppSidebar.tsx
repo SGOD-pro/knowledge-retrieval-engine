@@ -14,18 +14,26 @@ import { useWorkspaceStore } from "../../store/useWorkspaceStore"
 
 export function AppSidebar() {
   const { user } = useAuthStore()
-  const { activeWorkspace } = useWorkspaceStore()
-  const currentWsId = activeWorkspace?.id || "ws_001"
+  const { activeWorkspace, workspaces } = useWorkspaceStore()
+  const currentWsId = activeWorkspace?.id || workspaces[0]?.id
 
   const mainNavItems = [
     { name: "Workspace", path: "/workspaces", icon: FolderKanban },
-    { name: "Library", path: `/workspaces/${currentWsId}/documents`, icon: FolderOpen },
+    {
+      name: "Library",
+      path: currentWsId ? `/workspaces/${currentWsId}/documents` : "/workspaces",
+      icon: FolderOpen
+    },
     { name: "Benchmarks", path: "/benchmarks", icon: BarChart3 },
     { name: "Settings", path: "/settings", icon: SlidersHorizontal }
   ]
 
   const bottomNavItems = [
-    { name: "Chat History", path: `/workspaces/${currentWsId}/chat`, icon: History },
+    {
+      name: "Chat History",
+      path: currentWsId ? `/workspaces/${currentWsId}/chat` : "/workspaces",
+      icon: History
+    },
     { name: "Archived", path: "/archived", icon: Archive }
   ]
 

@@ -1,6 +1,6 @@
 import { create } from "zustand"
 import type { Workspace, CreateWorkspaceRequest } from "../types/api"
-import { api, MOCK_WORKSPACES } from "../lib/api"
+import { api } from "../lib/api"
 
 interface WorkspaceState {
   workspaces: Workspace[]
@@ -15,8 +15,8 @@ interface WorkspaceState {
 }
 
 export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
-  workspaces: MOCK_WORKSPACES,
-  activeWorkspace: MOCK_WORKSPACES[0],
+  workspaces: [],
+  activeWorkspace: null,
   searchQuery: "",
   isLoading: false,
   error: null,
@@ -43,13 +43,12 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     set({ isLoading: true, error: null })
     try {
       const newWs = await api.createWorkspace(data)
-      const updated = [newWs, ...get().workspaces]
-      localStorage.setItem("kre_workspaces", JSON.stringify(updated))
-      set({
-        workspaces: updated,
+      // Add to Zustand state only after backend confirms creation
+      set((state) => ({
+        workspaces: [newWs, ...state.workspaces],
         activeWorkspace: newWs,
         isLoading: false
-      })
+      }))
       return newWs
     } catch (err: any) {
       set({ error: err.message, isLoading: false })

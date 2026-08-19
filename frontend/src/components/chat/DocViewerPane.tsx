@@ -1,15 +1,16 @@
-import React, { useState, useEffect, useRef } from "react"
+import { useEffect, useRef } from "react"
 import {
   X,
   ZoomIn,
   ZoomOut,
-  ChevronLeft,
-  ChevronRight,
   FileText,
   Network,
   Maximize2,
   Minimize2,
-  GripVertical
+  GripVertical,
+  BookOpen,
+  MapPin,
+  Quote
 } from "lucide-react"
 import { useChatStore } from "../../store/useChatStore"
 import { KnowledgeGraphPane } from "./KnowledgeGraphPane"
@@ -22,16 +23,10 @@ export function DocViewerPane() {
     setRightPaneOpen,
     zoomLevel,
     setZoomLevel,
-    currentPage,
-    setCurrentPage,
-    totalPages,
     docPaneWidth,
     setDocPaneWidth
   } = useChatStore()
 
-  const [highlightedId, setHighlightedId] = useState<number | null>(
-    activeCitation?.id || 1
-  )
   const isDraggingRef = useRef(false)
   const startXRef = useRef(0)
   const startWidthRef = useRef(docPaneWidth)
@@ -109,13 +104,14 @@ export function DocViewerPane() {
           <button
             type="button"
             onClick={() => setRightPaneMode("document")}
-            className={`pb-2.5 text-xs font-semibold tracking-wider uppercase transition-colors relative cursor-pointer ${
+            className={`pb-2.5 text-xs font-semibold tracking-wider uppercase transition-colors relative cursor-pointer flex items-center gap-1.5 ${
               rightPaneMode === "document"
                 ? "text-foreground font-bold"
                 : "text-muted-foreground hover:text-foreground"
             }`}
           >
-            <span>Page {currentPage} of {totalPages}</span>
+            <BookOpen className="h-3.5 w-3.5" />
+            <span>Document Reference</span>
             {rightPaneMode === "document" && (
               <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-[#c96442]" />
             )}
@@ -139,7 +135,7 @@ export function DocViewerPane() {
         </div>
 
         <div className="flex items-center gap-1 -mt-2">
-          {/* Maximize / Preset toggle */}
+          {/* Maximize toggle */}
           <button
             type="button"
             onClick={toggleMaximize}
@@ -170,11 +166,11 @@ export function DocViewerPane() {
       ) : (
         <>
           {/* Subheader: Document Name & Zoom */}
-          <div className="px-5 py-2 border-b border-border/40 flex items-center justify-between bg-card/60">
+          <div className="px-5 py-2.5 border-b border-border/40 flex items-center justify-between bg-card/60">
             <div className="flex items-center gap-2 text-xs font-medium text-foreground truncate max-w-[200px] sm:max-w-[260px]">
               <FileText className="h-3.5 w-3.5 text-[#c96442] shrink-0" />
               <span className="truncate">
-                {activeCitation?.document_filename || "Candidate_A_Resume_Final.pdf"}
+                {activeCitation?.document_filename || "No Citation Selected"}
               </span>
             </div>
 
@@ -202,131 +198,101 @@ export function DocViewerPane() {
           </div>
 
           {/* Document Content Canvas */}
-          <div className="flex-1 overflow-y-auto p-4 bg-muted/40 flex justify-center">
-            <div
-              style={{
-                transform: `scale(${zoomLevel / 100})`,
-                transformOrigin: "top center",
-                maxWidth: docPaneWidth >= 650 ? "580px" : "400px"
-              }}
-              className="w-full bg-[#ffffff] text-[#1c1c1a] rounded-xl shadow-md p-6 space-y-4 border border-[#dad9d4] relative transition-all"
-            >
-              {/* Candidate Header */}
-              <div className="border-b border-[#dad9d4] pb-3 text-left">
-                <h1 className="font-headline font-bold text-lg tracking-tight text-[#1c1c1a]">
-                  ALEXANDRA CHEN
-                </h1>
-                <p className="text-[10px] font-bold text-[#89726b] uppercase tracking-wider">
-                  Senior Product Designer & ML Specialist
-                </p>
-                <p className="text-[9px] text-[#56423c] mt-0.5">
-                  alexandra.chen@email.com | (123) 456-7890 | San Francisco, CA
-                </p>
-              </div>
-
-              {/* Professional Summary */}
-              <div className="text-left space-y-1">
-                <h3 className="text-[10px] font-bold text-[#1c1c1a] tracking-wider uppercase border-b border-[#dad9d4] pb-0.5">
-                  Professional Summary
-                </h3>
-                <p className="text-[9.5px] text-[#56423c] leading-relaxed">
-                  Innovative systems and product architect with 4+ years of specialized AI experience in machine learning pipelines, NLP retrieval architectures, and interactive multimodal UX workflows.
-                </p>
-              </div>
-
-              {/* Experience */}
-              <div className="text-left space-y-2">
-                <h3 className="text-[10px] font-bold text-[#1c1c1a] tracking-wider uppercase border-b border-[#dad9d4] pb-0.5">
-                  Experience
-                </h3>
-
-                {/* Citation Bounding Box 1 */}
-                <div
-                  id="citation-box-1"
-                  onClick={() => setHighlightedId(1)}
-                  className={`p-2 rounded-lg border-2 transition-all relative cursor-pointer ${
-                    highlightedId === 1 || activeCitation?.id === 1
-                      ? "border-[#c96442] bg-[#c96442]/10 ring-2 ring-[#c96442]/20"
-                      : "border-[#c96442]/40 hover:border-[#c96442]"
-                  }`}
-                >
-                  {/* Pin Tag 1 */}
-                  <span className="absolute -top-2.5 -right-2 h-5 w-5 rounded-full bg-[#c96442] text-white text-[10px] font-bold flex items-center justify-center shadow-xs">
-                    1
-                  </span>
-
-                  <div className="font-bold text-[10.5px] text-[#1c1c1a]">
-                    SENIOR PRODUCT DESIGNER | TechFlow Inc. (2019–Present)
+          <div className="flex-1 overflow-y-auto p-4 sm:p-6 bg-muted/30 flex justify-center">
+            {activeCitation ? (
+              <div
+                style={{
+                  transform: `scale(${zoomLevel / 100})`,
+                  transformOrigin: "top center",
+                  maxWidth: docPaneWidth >= 650 ? "580px" : "440px"
+                }}
+                className="w-full bg-card text-foreground rounded-2xl shadow-sm p-6 space-y-4 border border-border transition-all h-fit"
+              >
+                {/* Citation Header */}
+                <div className="border-b border-border/60 pb-3.5 flex items-start justify-between gap-2">
+                  <div className="space-y-1 min-w-0">
+                    <div className="flex items-center gap-2">
+                      <span className="h-5 w-5 rounded-full bg-[#c96442] text-white text-[10px] font-bold flex items-center justify-center shrink-0">
+                        {activeCitation.id}
+                      </span>
+                      <h2 className="font-headline font-bold text-sm text-foreground truncate">
+                        {activeCitation.document_filename}
+                      </h2>
+                    </div>
+                    <div className="flex items-center gap-2 text-[11px] text-muted-foreground pl-7">
+                      <span className="flex items-center gap-1">
+                        <MapPin className="h-3 w-3" />
+                        <span>{activeCitation.location_reference || `Page ${activeCitation.page_number || 1}`}</span>
+                      </span>
+                      {activeCitation.source_format && (
+                        <>
+                          <span>•</span>
+                          <span className="uppercase font-semibold text-[10px]">
+                            {activeCitation.source_format}
+                          </span>
+                        </>
+                      )}
+                    </div>
                   </div>
-                  <ul className="list-disc list-inside text-[9.5px] text-[#56423c] space-y-0.5 mt-1">
-                    <li>Led end-to-end ML integration and retrieval recommendation engines.</li>
-                    <li>Migrated recommendation engines and deployed production workflows.</li>
-                  </ul>
                 </div>
 
-                {/* Citation Bounding Box 2 */}
-                <div
-                  id="citation-box-2"
-                  onClick={() => setHighlightedId(2)}
-                  className={`p-2 rounded-lg border-2 transition-all relative cursor-pointer mt-3 ${
-                    highlightedId === 2 || activeCitation?.id === 2
-                      ? "border-[#c96442] bg-[#c96442]/10 ring-2 ring-[#c96442]/20"
-                      : "border-[#c96442]/40 hover:border-[#c96442]"
-                  }`}
-                >
-                  {/* Pin Tag 2 */}
-                  <span className="absolute -top-2.5 -right-2 h-5 w-5 rounded-full bg-[#c96442] text-white text-[10px] font-bold flex items-center justify-center shadow-xs">
-                    2
-                  </span>
-
-                  <div className="font-bold text-[10.5px] text-[#1c1c1a]">
-                    ML INFRASTRUCTURE & MODEL DEPLOYMENT
+                {/* Grounded Citation Extract */}
+                <div className="space-y-2">
+                  <div className="flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wider text-[#c96442]">
+                    <Quote className="h-3.5 w-3.5" />
+                    <span>Cited Content</span>
                   </div>
-                  <ul className="list-disc list-inside text-[9.5px] text-[#56423c] space-y-0.5 mt-1">
-                    <li>Successfully deployed three distinct predictive models into production environments.</li>
-                    <li>Serving over 10k requests/min with custom transformer architectures.</li>
-                    <li>Reduced overall inference latency by 22% via quantized models.</li>
-                  </ul>
+
+                  <div className="p-4 rounded-xl bg-[#c96442]/5 border-2 border-[#c96442]/30 text-xs sm:text-sm text-foreground leading-relaxed font-sans shadow-xs">
+                    {activeCitation.text}
+                  </div>
+                </div>
+
+                {/* Chunk Reference Metadata */}
+                <div className="pt-2 border-t border-border/50 text-[11px] text-muted-foreground space-y-1">
+                  {activeCitation.chunk_id && (
+                    <div className="flex items-center justify-between">
+                      <span className="font-semibold">Chunk ID:</span>
+                      <span className="font-mono text-[10px]">{activeCitation.chunk_id}</span>
+                    </div>
+                  )}
+                  {activeCitation.page_number && (
+                    <div className="flex items-center justify-between">
+                      <span className="font-semibold">Document Page:</span>
+                      <span>Page {activeCitation.page_number}</span>
+                    </div>
+                  )}
                 </div>
               </div>
-
-              {/* Education & Skills */}
-              <div className="text-left space-y-1.5 pt-1">
-                <h3 className="text-[10px] font-bold text-[#1c1c1a] tracking-wider uppercase border-b border-[#dad9d4] pb-0.5">
-                  Education & Skills
-                </h3>
-                <p className="text-[9.5px] text-[#56423c]">
-                  <strong className="text-[#1c1c1a]">M.S. Human-Computer Interaction & AI</strong> — Stanford University (2018)
-                </p>
-                <p className="text-[9.5px] text-[#56423c]">
-                  <strong className="text-[#1c1c1a]">Skills:</strong> PyTorch, LangGraph, RAG Retrieval, Transformer architectures, UI/UX Design Systems, TypeScript, React.
-                </p>
+            ) : (
+              /* Clean Empty State when no citation is clicked */
+              <div className="h-full flex flex-col items-center justify-center text-center p-6 max-w-xs mx-auto space-y-3">
+                <div className="h-12 w-12 rounded-2xl bg-muted text-muted-foreground flex items-center justify-center">
+                  <BookOpen className="h-6 w-6" />
+                </div>
+                <div className="space-y-1">
+                  <h4 className="font-headline font-bold text-sm text-foreground">
+                    No Citation Selected
+                  </h4>
+                  <p className="text-xs text-muted-foreground leading-relaxed">
+                    Click any citation number badge (e.g. [1], [2]) in an AI response to inspect the source passage here.
+                  </p>
+                </div>
               </div>
+            )}
+          </div>
+
+          {/* Bottom Navigation */}
+          {activeCitation && (
+            <div className="p-2.5 border-t border-border/60 bg-card flex items-center justify-between text-xs text-muted-foreground">
+              <span className="text-[11px] font-medium text-foreground">
+                Citation [{activeCitation.id}]
+              </span>
+              <span className="text-[11px]">
+                {activeCitation.location_reference || `Page ${activeCitation.page_number || 1}`}
+              </span>
             </div>
-          </div>
-
-          {/* Bottom Pagination controls */}
-          <div className="p-2.5 border-t border-border/60 bg-card flex items-center justify-between text-xs text-muted-foreground">
-            <button
-              type="button"
-              disabled={currentPage <= 1}
-              onClick={() => setCurrentPage(Math.max(1, currentPage - 1))}
-              className="flex items-center gap-1 hover:text-foreground disabled:opacity-40 cursor-pointer"
-            >
-              <ChevronLeft className="h-4 w-4" />
-              <span>Prev</span>
-            </button>
-            <span className="text-[11px] font-medium">Page {currentPage} of {totalPages}</span>
-            <button
-              type="button"
-              disabled={currentPage >= totalPages}
-              onClick={() => setCurrentPage(Math.min(totalPages, currentPage + 1))}
-              className="flex items-center gap-1 hover:text-foreground disabled:opacity-40 cursor-pointer"
-            >
-              <span>Next</span>
-              <ChevronRight className="h-4 w-4" />
-            </button>
-          </div>
+          )}
         </>
       )}
     </div>

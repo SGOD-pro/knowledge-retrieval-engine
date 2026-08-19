@@ -49,12 +49,14 @@ export function LibraryPage() {
         setActiveWorkspace(match)
       }
     }
-  }, [workspaceId, activeWorkspace?.id, workspaces, setActiveWorkspace])
+  }, [workspaceId, activeWorkspace, workspaces, setActiveWorkspace])
 
-  const currentWsId = workspaceId || activeWorkspace?.id || "ws_001"
+  const currentWsId = workspaceId || activeWorkspace?.id || ""
 
   useEffect(() => {
-    fetchDocuments(currentWsId, currentPage)
+    if (currentWsId) {
+      fetchDocuments(currentWsId, currentPage)
+    }
   }, [currentWsId, currentPage, fetchDocuments])
 
   const getFormatBadge = (format: string) => {
@@ -188,6 +190,16 @@ export function LibraryPage() {
                     </td>
                   </tr>
                 </>
+              ) : documents.length === 0 ? (
+                <tr>
+                  <td colSpan={5} className="py-16 text-center text-muted-foreground">
+                    <FileText className="h-10 w-10 mx-auto mb-3 opacity-30 text-muted-foreground" />
+                    <p className="text-sm font-semibold text-foreground">No documents uploaded yet</p>
+                    <p className="text-xs text-muted-foreground mt-1 max-w-sm mx-auto">
+                      Upload PDF, DOCX, or PPTX documents to this workspace to start indexing and testing the retrieval engine.
+                    </p>
+                  </td>
+                </tr>
               ) : (
                 documents.map((doc) => (
                   <tr

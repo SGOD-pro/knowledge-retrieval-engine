@@ -256,10 +256,10 @@
   --color-text-muted: var(--text-muted);
 
   /* Typography */
-  --font-headline: 'Literata', serif;
-  --font-serif: 'Literata', serif;
-  --font-body: 'Work Sans', sans-serif;
-  --font-sans: 'Work Sans', sans-serif;
+  --font-headline: 'Literata', Georgia, Cambria, 'Times New Roman', serif;
+  --font-serif: 'Literata', Georgia, Cambria, 'Times New Roman', serif;
+  --font-body: 'Inter', 'Work Sans', system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-sans: 'Inter', 'Work Sans', system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
 
   /* Custom Spacing & Radius */
   --radius-sm: 0.25rem;
@@ -272,6 +272,9 @@
 }
 
 @layer base {
+  html {
+    scroll-behavior: smooth;
+  }
   * {
     @apply border-border;
     scrollbar-width: thin;

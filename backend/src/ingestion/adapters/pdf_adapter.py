@@ -1,46 +1,156 @@
-import json
-import subprocess
-import tempfile
-from pathlib import Path
-from typing import Any
+"""PDF adapter — invokes the ODL Parser Lambda for extraction in prod,
+or falls back immediately to pypdf in dev/local environments.
+"""
 
+import base64
+import json
+import logging
+import uuid
+from pathlib import Path
+
+from config import settings
 from schemas.models import Chunk
 
+logger = logging.getLogger(__name__)
 
-def parse(
-    path: Path, document_id: str, executable: str = "opendataloader-pdf"
-) -> list[Chunk]:
-    """Run opendataloader-pdf in batch mode and normalize its JSON output.
 
-    Keeping the subprocess boundary here prevents parser-specific details from
-    leaking into the unified ingestion service.
+# ---------------------------------------------------------------------------
+# Lambda invocation path (prod / staging)
+# ---------------------------------------------------------------------------
+
+def _invoke_lambda(path: Path, document_id: str) -> list[dict] | None:
+    """Upload PDF to S3 then invoke the ODL Parser Lambda.
+
+    Returns the raw list of element dicts from the Lambda response, or None
+    if invocation fails (caller falls back to pypdf).
     """
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        subprocess.run(
-            [executable, "-q", "-f", "json", "-o", tmp_dir, str(path)],
-            check=True,
-            capture_output=True,
-            text=True,
+    # In test mode, skip lambda to avoid remote calls during unit tests
+    if settings.ENVIRONMENT == "test":
+        logger.debug("pdf_adapter.test_mode skipping lambda for local parsing")
+        return None
+
+    try:
+        from aws.infra import get_client
+        from botocore.exceptions import BotoCoreError, ClientError
+
+        s3 = get_client("s3")
+        lambda_client = get_client("lambda")
+
+        # Upload to S3 under a temp key scoped to the document_id
+        s3_key = f"tmp/pdf-extraction/{document_id}/{path.name}"
+        pdf_bytes = path.read_bytes()
+        s3.put_object(
+            Bucket=settings.S3_BUCKET_NAME,
+            Key=s3_key,
+            Body=pdf_bytes,
+            ContentType="application/pdf",
         )
-        json_file = Path(tmp_dir) / f"{path.stem}.json"
-        if not json_file.exists():
-            json_files = list(Path(tmp_dir).glob("*.json"))
-            if json_files:
-                json_file = json_files[0]
-            else:
-                return []
-        payload: Any = json.loads(json_file.read_text(encoding="utf-8"))
+        logger.info(
+            "pdf_adapter.s3_upload doc_id=%s bucket=%s key=%s",
+            document_id,
+            settings.S3_BUCKET_NAME,
+            s3_key,
+        )
 
-    items = (
-        payload
-        if isinstance(payload, list)
-        else (payload.get("kids") or payload.get("pages") or [])
-    )
+        # Invoke the extraction Lambda
+        payload = {
+            "s3_bucket": settings.S3_BUCKET_NAME,
+            "s3_key": s3_key,
+            "document_id": document_id,
+        }
+        response = lambda_client.invoke(
+            FunctionName=settings.ODL_PARSER_LAMBDA_NAME,
+            InvocationType="RequestResponse",
+            Payload=json.dumps(payload).encode("utf-8"),
+        )
+
+        result_raw = response["Payload"].read()
+        result = json.loads(result_raw)
+
+        # Lambda may return an error envelope
+        if "errorMessage" in result or result.get("error"):
+            logger.error(
+                "pdf_adapter.lambda_error doc_id=%s error=%s",
+                document_id,
+                result.get("errorMessage") or result.get("error"),
+            )
+            return None
+
+        chunks_raw = result.get("chunks") or result.get("kids") or result.get("pages") or []
+        logger.info(
+            "pdf_adapter.lambda_done doc_id=%s chunk_count=%d",
+            document_id,
+            len(chunks_raw),
+        )
+        return chunks_raw
+
+    except (ImportError, BotoCoreError, ClientError) as exc:
+        logger.warning(
+            "pdf_adapter.lambda_unavailable doc_id=%s reason=%s — falling back to pypdf",
+            document_id,
+            exc,
+        )
+        return None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "pdf_adapter.lambda_failed doc_id=%s error=%s — falling back to pypdf",
+            document_id,
+            exc,
+        )
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Fallback: pypdf plain-text extraction (dev mode)
+# ---------------------------------------------------------------------------
+
+def _extract_with_pypdf(path: Path, document_id: str) -> list[dict]:
+    """Extract text via pypdf. No bounding boxes, paragraph-level chunks."""
+    try:
+        from pypdf import PdfReader  # type: ignore[import]
+    except ImportError:
+        logger.error("pdf_adapter: pypdf not installed and Lambda unavailable — returning empty")
+        return []
+
+    try:
+        reader = PdfReader(str(path))
+        elements: list[dict] = []
+        for page_num, page in enumerate(reader.pages, start=1):
+            text = page.extract_text() or ""
+            # Split into rough paragraphs on blank lines
+            paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+            if not paragraphs and text.strip():
+                paragraphs = [text.strip()]
+            for para in paragraphs:
+                elements.append(
+                    {
+                        "content": para,
+                        "type": "paragraph",
+                        "page_number": page_num,
+                    }
+                )
+        logger.info(
+            "pdf_adapter.pypdf_done doc_id=%s pages=%d elements=%d",
+            document_id,
+            len(reader.pages),
+            len(elements),
+        )
+        return elements
+    except Exception as e:
+        logger.error("pdf_adapter.pypdf_error doc_id=%s error=%s", document_id, e)
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Chunk normaliser (shared by both paths)
+# ---------------------------------------------------------------------------
+
+def _normalize_elements(elements: list[dict], document_id: str) -> list[Chunk]:
     chunks: list[Chunk] = []
-
-    for index, element in enumerate(items):
+    for index, element in enumerate(elements):
         if not isinstance(element, dict):
             continue
+
         text = str(
             element.get("content") or element.get("source") or element.get("text") or ""
         ).strip()
@@ -91,3 +201,24 @@ def parse(
     from .chunk_util import merge_and_split_chunks
 
     return merge_and_split_chunks(chunks)
+
+
+# ---------------------------------------------------------------------------
+# Public entry point (called by format_router)
+# ---------------------------------------------------------------------------
+
+def parse(path: Path, document_id: str) -> list[Chunk]:
+    """Parse a PDF via Lambda (prod) or pypdf fallback (dev).
+
+    Lambda path: upload to S3 → invoke ODL_PARSER_LAMBDA_NAME → receive JSON.
+    Fallback path: pypdf text extraction (no bounding boxes).
+    """
+    elements = _invoke_lambda(path, document_id)
+
+    if elements is None:
+        logger.info(
+            "pdf_adapter.using_fallback doc_id=%s path=%s", document_id, path.name
+        )
+        elements = _extract_with_pypdf(path, document_id)
+
+    return _normalize_elements(elements, document_id)

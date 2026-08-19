@@ -12,7 +12,6 @@ import type {
   CreateWorkspaceRequest,
   DocumentLibraryResponse,
   DocumentUploadResponse,
-  UploadedDocument,
   QueryRequest,
   QueryResponse,
   BenchmarkResponse,
@@ -98,178 +97,57 @@ async function apiFetch<T>(
 
 // ── Mock Fallback Data (Dev Resilience) ──────────────────────────────────────
 
-export const MOCK_WORKSPACES: Workspace[] = [
-  {
-    id: "ws_001",
-    name: "Finance Docs",
-    industry: "Finance",
-    description: "Q3 Financial Analyst roles and associated screening...",
-    document_count: 142,
-    last_active: "Active 2h ago",
-    status: "active",
-    icon_type: "finance"
-  },
-  {
-    id: "ws_002",
-    name: "Legal Contracts",
-    industry: "Legal",
-    description: "Senior Counsel applications and compliance checklists.",
-    document_count: 56,
-    last_active: "Active 1d ago",
-    status: "active",
-    icon_type: "legal"
-  },
-  {
-    id: "ws_003",
-    name: "Engineering R&D",
-    industry: "Technology",
-    description: "Frontend and Backend engineering portfolios for th...",
-    document_count: 310,
-    last_active: "Active 3d ago",
-    status: "active",
-    icon_type: "engineering"
-  }
-]
+export const MOCK_WORKSPACES: Workspace[] = []
 
 export const MOCK_DOCUMENTS: DocumentLibraryResponse = {
-  documents: [
-    {
-      id: "doc_uuid_1",
-      filename: "Senior_Dev_Resume_John_Doe.pdf",
-      format: "pdf",
-      upload_date: "Oct 24, 2023",
-      chunk_count: 12,
-      status: "Ready",
-      size: "2.4 MB"
-    },
-    {
-      id: "doc_uuid_2",
-      filename: "Marketing_Manager_Q3_Recruit.docx",
-      format: "docx",
-      upload_date: "Oct 23, 2023",
-      chunk_count: 8,
-      status: "Processing",
-      size: "1.1 MB"
-    },
-    {
-      id: "doc_uuid_3",
-      filename: "Data_Scientist_Portfolio.pdf",
-      format: "pdf",
-      upload_date: "Oct 20, 2023",
-      chunk_count: 15,
-      status: "Ready",
-      size: "4.8 MB"
-    },
-    {
-      id: "doc_uuid_4",
-      filename: "Sales_Executive_Cover_Letter.docx",
-      format: "docx",
-      upload_date: "Oct 19, 2023",
-      chunk_count: 3,
-      status: "Ready",
-      size: "540 KB"
-    },
-    {
-      id: "doc_uuid_5",
-      filename: "Corrupted_File_Upload.pdf",
-      format: "pdf",
-      upload_date: "Oct 18, 2023",
-      chunk_count: 0,
-      status: "Failed",
-      size: "0 KB"
-    }
-  ],
-  total_documents: 142,
+  documents: [],
+  total_documents: 0,
   current_page: 1,
-  total_pages: 15
+  total_pages: 1
 }
 
 export const MOCK_BENCHMARKS: BenchmarkResponse = {
-  status: "PASSING ALL",
+  status: "ACTIVE",
   version: "v2.4.1",
   kpis: {
     p95_latency: {
-      value: 3.47,
+      value: 0,
       unit: "s",
       target: 4.0,
-      delta: "-0.53s vs SLA target",
+      delta: "Ready",
       status: "passing"
     },
     recall_5: {
-      value: 79.22,
+      value: 0,
       unit: "%",
       target: 75.0,
-      delta: "+4.22% vs baseline",
+      delta: "Ready",
       status: "passing"
     },
     faithfulness: {
-      value: 99.59,
+      value: 0,
       unit: "%",
       target: 80.0,
-      delta: "+19.59% vs baseline",
+      delta: "Ready",
       status: "passing"
     },
     llm_activation: {
-      value: 50.65,
+      value: 0,
       unit: "%",
       target: 60.0,
-      delta: "-9.35% under cap",
+      delta: "Ready",
       status: "passing"
     }
   },
   latency_chart: {
     target_line: 4.0,
-    data_points: [
-      { timestamp: "Mon", latency_ms: 1.2 },
-      { timestamp: "Tue", latency_ms: 1.4 },
-      { timestamp: "Wed", latency_ms: 1.8 },
-      { timestamp: "Thu", latency_ms: 2.3 },
-      { timestamp: "Fri", latency_ms: 2.9 },
-      { timestamp: "Sat", latency_ms: 3.47 },
-      { timestamp: "Sun", latency_ms: 2.1 }
-    ]
+    data_points: []
   }
 }
 
 export const MOCK_GRAPH: KnowledgeGraphResponse = {
-  nodes: [
-    {
-      id: "cand_1",
-      label: "Candidate A (Alexandra Chen)",
-      type: "Person",
-      properties: { role: "Senior Product Designer", experience: "4 years ML" }
-    },
-    {
-      id: "doc_1",
-      label: "Candidate_A_Resume_Final.pdf",
-      type: "Document",
-      properties: { pages: 12, format: "PDF" }
-    },
-    {
-      id: "comp_1",
-      label: "TechFlow Inc.",
-      type: "Company",
-      properties: { industry: "Enterprise Software" }
-    },
-    {
-      id: "skill_1",
-      label: "PyTorch & Transformers",
-      type: "Technology",
-      properties: { level: "Advanced" }
-    },
-    {
-      id: "skill_2",
-      label: "Predictive Modeling",
-      type: "Technology",
-      properties: { level: "Production" }
-    }
-  ],
-  edges: [
-    { source: "cand_1", target: "doc_1", label: "MENTIONED_IN", weight: 1.0 },
-    { source: "cand_1", target: "comp_1", label: "WORKED_AT", weight: 0.95 },
-    { source: "cand_1", target: "skill_1", label: "SKILLED_IN", weight: 0.98 },
-    { source: "cand_1", target: "skill_2", label: "DEPLOYED", weight: 0.90 }
-  ]
+  nodes: [],
+  edges: []
 }
 
 // ── Public Centralized API Functions ────────────────────────────────────────
@@ -314,75 +192,40 @@ export async function oauthLogin(provider: string): Promise<{ provider: string; 
 
 /** Workspaces CRUD */
 export async function getWorkspaces(): Promise<{ workspaces: Workspace[] }> {
-  try {
-    return await apiFetch<{ workspaces: Workspace[] }>("/api/v1/workspaces")
-  } catch (err) {
-    console.warn("Using mock workspaces:", err)
-    const saved = localStorage.getItem("kre_workspaces")
-    if (saved) {
-      try {
-        return { workspaces: JSON.parse(saved) }
-      } catch {
-        // ignore JSON parse error
-      }
-    }
-    return { workspaces: MOCK_WORKSPACES }
-  }
+  return apiFetch<{ workspaces: Workspace[] }>("/api/v1/workspaces")
 }
 
 export async function createWorkspace(data: CreateWorkspaceRequest): Promise<Workspace> {
-  try {
-    return await apiFetch<Workspace>("/api/v1/workspaces", {
-      method: "POST",
-      body: JSON.stringify(data)
-    })
-  } catch (err) {
-    console.warn("Using local workspace fallback:", err)
-    const newWs: Workspace = {
-      id: `ws_${Math.random().toString(36).substring(2, 8)}`,
-      name: data.name,
-      industry: data.industry || "General",
-      description: data.description || "Analytical workspace.",
-      document_count: 0,
-      last_active: "Active just now",
-      status: "active",
-      icon_type:
-        data.industry?.toLowerCase().includes("legal")
-          ? "legal"
-          : data.industry?.toLowerCase().includes("fin")
-          ? "finance"
-          : "engineering"
-    }
-    return newWs
-  }
+  return apiFetch<Workspace>("/api/v1/workspaces", {
+    method: "POST",
+    body: JSON.stringify(data)
+  })
 }
 
-/** Document Library & Upload */
+/** Document Library */
 export async function getDocuments(
   workspaceId: string,
   page = 1,
   limit = 10
 ): Promise<DocumentLibraryResponse> {
-  try {
-    return await apiFetch<DocumentLibraryResponse>(
-      `/api/v1/workspaces/${workspaceId}/documents?page=${page}&limit=${limit}`
-    )
-  } catch (err) {
-    console.warn("Using mock document library:", err)
-    return MOCK_DOCUMENTS
-  }
+  return apiFetch<DocumentLibraryResponse>(
+    `/api/v1/workspaces/${workspaceId}/documents?page=${page}&limit=${limit}`
+  )
 }
 
-export function uploadDocuments(
+/**
+ * Upload a single document with XHR so we can track per-file upload progress.
+ * Call this per-file in parallel from the store — do not batch files into one request.
+ */
+export function uploadSingleDocument(
   workspaceId: string,
-  files: File[],
+  file: File,
   onProgress?: (loaded: number, total: number) => void
 ): Promise<DocumentUploadResponse> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest()
     const formData = new FormData()
-
-    files.forEach((file) => formData.append("files", file))
+    formData.append("files", file)
 
     if (xhr.upload && onProgress) {
       xhr.upload.addEventListener("progress", (e) => {
@@ -400,25 +243,21 @@ export function uploadDocuments(
           reject(new ApiError("Failed to parse upload response", xhr.status))
         }
       } else {
-        // Dev fallback for offline/demo tests
-        const uploaded: UploadedDocument[] = files.map((f, idx) => ({
-          id: `doc_up_${Date.now()}_${idx}`,
-          filename: f.name,
-          format: f.name.split(".").pop() || "pdf",
-          status: "processing"
-        }))
-        resolve({ uploaded_documents: uploaded })
+        let errMsg = `Upload failed: ${xhr.status}`
+        try {
+          const body = JSON.parse(xhr.responseText)
+          if (body?.detail) errMsg = body.detail
+        } catch { /* ignore */ }
+        reject(new ApiError(errMsg, xhr.status))
       }
     })
 
     xhr.addEventListener("error", () => {
-      const uploaded: UploadedDocument[] = files.map((f, idx) => ({
-        id: `doc_up_${Date.now()}_${idx}`,
-        filename: f.name,
-        format: f.name.split(".").pop() || "pdf",
-        status: "processing"
-      }))
-      resolve({ uploaded_documents: uploaded })
+      reject(new ApiError("Network error during upload", 0))
+    })
+
+    xhr.addEventListener("abort", () => {
+      reject(new ApiError("Upload aborted", 0))
     })
 
     const url = `${API_BASE}/api/v1/workspaces/${workspaceId}/documents`
@@ -463,58 +302,16 @@ export async function query(req: QueryRequest): Promise<QueryResponse> {
       body: JSON.stringify(req)
     })
   } catch (err) {
-    console.warn("Using fallback query response:", err)
+    console.warn("Query error:", err)
     return {
-      answer: `Candidate A has demonstrated extensive applied expertise in machine learning and distributed systems [1]. At TechFlow Inc., they successfully deployed 3 distinct transformer architectures into high-throughput production environments [2].`,
-      citations: [
-        {
-          id: 1,
-          chunk_id: "chunk_uuid_1",
-          document_id: "doc_uuid_1",
-          document_filename: "Candidate_A_Resume_Final.pdf",
-          source_format: "pdf",
-          text: "4+ years experience designing, training, and deploying deep learning models using PyTorch, TorchVision, and HuggingFace Transformers in production cloud environments.",
-          page_number: 1,
-          bounding_box: {
-            x: 8.5,
-            y: 28.0,
-            width: 83.0,
-            height: 18.0,
-            page_number: 1
-          },
-          location_reference: "Page 1, Experience Section"
-        },
-        {
-          id: 2,
-          chunk_id: "chunk_uuid_2",
-          document_id: "doc_uuid_1",
-          document_filename: "Candidate_A_Resume_Final.pdf",
-          source_format: "pdf",
-          text: "Engineered scalable inference pipelines handling 10k+ req/sec with <45ms p99 latency using TensorRT, ONNX runtime, and Triton Inference Server.",
-          page_number: 1,
-          bounding_box: {
-            x: 8.5,
-            y: 50.0,
-            width: 83.0,
-            height: 20.0,
-            page_number: 1
-          },
-          location_reference: "Page 1, Key Projects"
-        }
-      ],
-      confidence: 0.94,
-      confidence_score: 0.94,
-      latency_ms: 1200,
-      latency_breakdown: {
-        route_query_ms: 12.4,
-        vector_ms: 45.2,
-        reranker_ms: 88.6,
-        llm_ms: 820.0,
-        total_ms: 1200
-      },
+      answer: "No relevant documents found in this workspace to answer your query. Please upload documents first.",
+      citations: [],
+      confidence: 0,
+      confidence_score: 0,
+      latency_ms: 0,
       fast_path: false,
-      retrieval_path: "full",
-      faithfulness: 99.59,
+      retrieval_path: "empty",
+      faithfulness: 0,
       cached: false,
       document_ids: req.document_ids || []
     }
@@ -555,7 +352,7 @@ export const api = {
   getDocuments,
   getDocument,
   getDocumentFileUrl,
-  uploadDocuments,
+  uploadSingleDocument,
   ingestFile,
   query,
   getBenchmarks,

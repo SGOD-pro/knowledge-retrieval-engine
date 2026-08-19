@@ -3,9 +3,11 @@ import { describe, it, expect, vi } from 'vitest'
 import { Workspace } from '../src/pages/Workspace'
 
 vi.mock("react-resizable-panels", () => ({
+  Group: ({ children }: any) => <div>{children}</div>,
   PanelGroup: ({ children }: any) => <div>{children}</div>,
   Panel: ({ children }: any) => <div>{children}</div>,
   PanelResizeHandle: () => <div />,
+  Separator: () => <div />
 }))
 
 const mockCitationResponse = {
@@ -49,6 +51,8 @@ describe('Workspace UI Tests', () => {
   it('test_api_query_success_renders_citations_and_badges', async () => {
     const mockFetch = vi.fn().mockResolvedValue({
       ok: true,
+      status: 200,
+      text: async () => JSON.stringify(mockCitationResponse),
       json: async () => mockCitationResponse
     })
     global.fetch = mockFetch

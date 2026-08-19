@@ -14,8 +14,7 @@ The system employs a **Hybrid Architecture** combining a unified core engine wit
    - Invoked synchronously via boto3 from `pdf_adapter.py` for complex PDF chunk extraction. In dev/local mode, can be imported directly or executed locally.
 3. **BGE EMBEDDING LAMBDA (`bge_microservice/`)**:
    - Dedicated AWS Lambda handler (`bge_microservice/main.py:lambda_handler`) hosting `BGE-small-en-v1.5` ONNX weights (`bge-onnx/model.onnx`).
-   - Invoked via boto3 (`bge-small-en-v1-5-lambda-prod`) by `embed_service.py` to keep heavy ONNX weights out of the core lambda bundle.
-   - **Automatic Fallback:** If the Lambda is unprovisioned or unreachable, `embed_service.py` gracefully falls back to local in-process ONNX execution (`bge-onnx/`).
+   - Invoked via boto3 (`bge-microservice-stack-BGELambdaFunction-roIuowXCDxCe`) by `embed_service.py` to keep heavy ONNX weights out of the core lambda bundle.
 4. **INGESTION PATH (Canonical vs. Deferred)**:
    - **Canonical v1 Ingestion Path:** Direct multipart upload via FastAPI `/ingest` (`api/routes.py` -> `ingestion_lambda/parse_service.py:ingest_document`). This is the sole active ingestion pipeline for v1, executing document parsing, format adapters, OKF extraction via Nova Micro, dual-column embeddings, and database persistence.
    - **S3-Event Worker (`backend/src/ingestion_lambda/main.py`):** **Intentionally deferred to v2 / Backlog**. The event-driven S3 handler is currently a stub. Direct HTTP upload completely covers all current frontend and API use cases; asynchronous S3 event-driven batch ingestion is reserved as a future scaling enhancement for bulk document drops without HTTP connection timeout constraints.

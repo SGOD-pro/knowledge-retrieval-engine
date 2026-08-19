@@ -8,10 +8,12 @@ import {
   FileText,
   CheckCircle2,
   RefreshCw,
-  AlertCircle
+  AlertCircle,
+  XCircle
 } from "lucide-react"
 import { useWorkspaceStore } from "../store/useWorkspaceStore"
 import { useDocumentStore } from "../store/useDocumentStore"
+import type { FileUploadState } from "../store/useDocumentStore"
 import { Button } from "../components/ui/button"
 import { Progress } from "../components/ui/progress"
 import {
@@ -32,7 +34,7 @@ export function UploadPage({
 }) {
   const { workspaceId } = useParams<{ workspaceId: string }>()
   const { activeWorkspace, workspaces, setActiveWorkspace } = useWorkspaceStore()
-  const { documents, fetchDocuments, uploadFiles, isUploading, uploadProgress } = useDocumentStore()
+  const { documents, fetchDocuments, uploadFiles, isUploading, fileUploads } = useDocumentStore()
   const [dragOver, setDragOver] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
@@ -46,27 +48,32 @@ export function UploadPage({
     }
   }, [workspaceId, activeWorkspace?.id, workspaces, setActiveWorkspace])
 
-  const currentWsId = workspaceId || activeWorkspace?.id || "ws_001"
+  const currentWsId = workspaceId || activeWorkspace?.id || ""
 
   useEffect(() => {
-    fetchDocuments(currentWsId)
+    if (currentWsId) {
+      fetchDocuments(currentWsId)
+    }
   }, [currentWsId, fetchDocuments])
 
   const handleFiles = async (files: FileList | null) => {
     if (!files || files.length === 0) return
     const fileArray = Array.from(files)
 
-    toast.info(`Uploading ${fileArray.length} document(s)...`)
+    toast.info(`Uploading ${fileArray.length} document${fileArray.length > 1 ? "s" : ""}...`)
     const success = await uploadFiles(currentWsId, fileArray)
 
     if (success) {
-      toast.success("Documents uploaded and queued for processing!")
+      toast.success("All documents uploaded and queued for processing!")
       await fetchDocuments(currentWsId)
       if (onClose) {
         onClose()
       }
     } else {
-      toast.error("Failed to upload files")
+      const failedCount = fileUploads.filter((f) => f.status === "error").length
+      if (failedCount > 0) {
+        toast.error(`${failedCount} file(s) failed to upload`)
+      }
     }
   }
 
@@ -111,6 +118,20 @@ export function UploadPage({
     )
   }
 
+  /** Render per-file upload status icon */
+  const getFileStatusIcon = (fu: FileUploadState) => {
+    if (fu.status === "done") {
+      return <CheckCircle2 className="h-4 w-4 text-[#006768] dark:text-[#6cd7d8] shrink-0" />
+    }
+    if (fu.status === "error") {
+      return <XCircle className="h-4 w-4 text-[#ba1a1a] dark:text-[#ffb4ab] shrink-0" />
+    }
+    if (fu.status === "uploading") {
+      return <Loader2 className="h-4 w-4 text-[#c96442] animate-spin shrink-0" />
+    }
+    return <RefreshCw className="h-4 w-4 text-muted-foreground/50 shrink-0" />
+  }
+
   return (
     <div
       className={
@@ -128,7 +149,7 @@ export function UploadPage({
           <span>|</span>
           <DropdownMenu>
             <DropdownMenuTrigger className="flex items-center gap-1 text-foreground hover:text-primary transition-colors cursor-pointer outline-none">
-              <span>{activeWorkspace?.name || "Workspace Alpha"}</span>
+              <span>{activeWorkspace?.name || "Select Workspace"}</span>
               <ChevronDown className="h-3.5 w-3.5 opacity-60" />
             </DropdownMenuTrigger>
             <DropdownMenuContent className="bg-popover border-border">
@@ -224,17 +245,60 @@ export function UploadPage({
             </span>
           ))}
         </div>
-
-        {/* Upload Progress Bar if active */}
-        {isUploading && (
-          <div className="w-full max-w-xs mt-5 space-y-2">
-            <Progress value={uploadProgress} className="h-1.5" />
-            <div className="text-[11px] text-muted-foreground">
-              Processing and vectorizing documents... {uploadProgress}%
-            </div>
-          </div>
-        )}
       </div>
+
+      {/* Per-File Upload Progress — shown while uploading */}
+      {isUploading && fileUploads.length > 0 && (
+        <div className="rounded-2xl border border-border/80 bg-card shadow-xs overflow-hidden max-w-2xl mx-auto divide-y divide-border/50">
+          <div className="px-4 py-3 flex items-center justify-between">
+            <h3 className="font-headline font-bold text-xs text-foreground">
+              Uploading {fileUploads.length} file{fileUploads.length > 1 ? "s" : ""}
+            </h3>
+            <span className="text-[11px] text-muted-foreground font-sans">
+              {fileUploads.filter((f) => f.status === "done").length}/{fileUploads.length} complete
+            </span>
+          </div>
+          {fileUploads.map((fu, idx) => (
+            <div key={`${fu.filename}-${idx}`} className="px-4 py-3 space-y-1.5">
+              <div className="flex items-center gap-2.5">
+                {getFileStatusIcon(fu)}
+                <span className="text-xs font-medium text-foreground truncate flex-1 min-w-0">
+                  {fu.filename}
+                </span>
+                <span
+                  className={`text-[11px] font-semibold shrink-0 ${
+                    fu.status === "done"
+                      ? "text-[#006768] dark:text-[#6cd7d8]"
+                      : fu.status === "error"
+                      ? "text-[#ba1a1a] dark:text-[#ffb4ab]"
+                      : "text-muted-foreground"
+                  }`}
+                >
+                  {fu.status === "done"
+                    ? "Done"
+                    : fu.status === "error"
+                    ? fu.error || "Failed"
+                    : fu.status === "uploading"
+                    ? `${fu.progress}%`
+                    : "Pending"}
+                </span>
+              </div>
+              {(fu.status === "uploading" || fu.status === "pending") && (
+                <Progress
+                  value={fu.progress}
+                  className="h-1"
+                />
+              )}
+              {fu.status === "done" && (
+                <Progress value={100} className="h-1 [&>div]:bg-[#006768]" />
+              )}
+              {fu.status === "error" && (
+                <Progress value={100} className="h-1 [&>div]:bg-[#ba1a1a]" />
+              )}
+            </div>
+          ))}
+        </div>
+      )}
 
       {/* Info Callout */}
       <div className="rounded-2xl border border-[#f7e4df] dark:border-[#2d2f31] bg-[#fff1ed] dark:bg-[#181a1c] p-4 flex items-start gap-3.5 shadow-xs max-w-2xl mx-auto">
@@ -252,47 +316,49 @@ export function UploadPage({
       </div>
 
       {/* Uploaded Documents List with Live Status */}
-      <div className="space-y-3 pt-2 max-w-2xl mx-auto">
-        <div className="flex items-center justify-between">
-          <h3 className="font-headline font-bold text-sm text-foreground flex items-center gap-2">
-            <span>Workspace Documents</span>
-            <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-[#ede9de] dark:bg-[#242628] text-muted-foreground">
-              {documents.length}
+      {documents.length > 0 && (
+        <div className="space-y-3 pt-2 max-w-2xl mx-auto">
+          <div className="flex items-center justify-between">
+            <h3 className="font-headline font-bold text-sm text-foreground flex items-center gap-2">
+              <span>Workspace Documents</span>
+              <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-[#ede9de] dark:bg-[#242628] text-muted-foreground">
+                {documents.length}
+              </span>
+            </h3>
+            <span className="text-[11px] text-muted-foreground font-sans">
+              Indexed for analytical retrieval
             </span>
-          </h3>
-          <span className="text-[11px] text-muted-foreground font-sans">
-            Indexed for analytical retrieval
-          </span>
-        </div>
+          </div>
 
-        <div className="rounded-2xl border border-border/80 bg-card overflow-hidden divide-y divide-border/50 shadow-xs">
-          {documents.slice(0, 6).map((doc) => (
-            <div
-              key={doc.id}
-              className="p-3.5 flex items-center justify-between gap-3 hover:bg-accent/40 transition-colors"
-            >
-              <div className="flex items-center gap-3 min-w-0">
-                <FileText className="h-4 w-4 text-[#c96442] shrink-0" />
-                <div className="min-w-0">
-                  <div className="text-xs font-semibold text-foreground truncate">
-                    {doc.filename}
-                  </div>
-                  <div className="text-[10px] text-muted-foreground flex items-center gap-2 mt-0.5">
-                    <span>{doc.upload_date}</span>
-                    <span>•</span>
-                    <span>{doc.chunk_count > 0 ? `${doc.chunk_count} chunks` : "Indexing"}</span>
+          <div className="rounded-2xl border border-border/80 bg-card overflow-hidden divide-y divide-border/50 shadow-xs">
+            {documents.slice(0, 6).map((doc) => (
+              <div
+                key={doc.id}
+                className="p-3.5 flex items-center justify-between gap-3 hover:bg-accent/40 transition-colors"
+              >
+                <div className="flex items-center gap-3 min-w-0">
+                  <FileText className="h-4 w-4 text-[#c96442] shrink-0" />
+                  <div className="min-w-0">
+                    <div className="text-xs font-semibold text-foreground truncate">
+                      {doc.filename}
+                    </div>
+                    <div className="text-[10px] text-muted-foreground flex items-center gap-2 mt-0.5">
+                      <span>{doc.upload_date}</span>
+                      <span>•</span>
+                      <span>{doc.chunk_count > 0 ? `${doc.chunk_count} chunks` : "Indexing"}</span>
+                    </div>
                   </div>
                 </div>
-              </div>
 
-              <div className="flex items-center gap-3 shrink-0">
-                {getFormatBadge(doc.format)}
-                {getStatusBadge(doc.status)}
+                <div className="flex items-center gap-3 shrink-0">
+                  {getFormatBadge(doc.format)}
+                  {getStatusBadge(doc.status)}
+                </div>
               </div>
-            </div>
-          ))}
+            ))}
+          </div>
         </div>
-      </div>
+      )}
     </div>
   )
 }

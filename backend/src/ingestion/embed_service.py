@@ -1,11 +1,10 @@
-"""Ingestion-time embedding service.
+"""Ingestion and query-time fast embedding service.
 
-Populates BOTH embedding columns at ingestion time for every chunk:
-- embedding_fast (384-dim): BGE-small-en-v1.5 ONNX.
-    prod  → call bge-embedding-lambda via boto3 (zero ONNX weight in query Lambda)
-    dev   → local ONNX inference from bge-onnx/ directory
-    test  → deterministic SHA-256 pseudo-embedding
-- embedding_full (1024-dim): API provider (Titan V2).
+Populates BOTH embedding columns:
+- embedding_fast (384-dim): BGE-small-en-v1.5 via AWS Lambda function.
+    Lambda Function: settings.BGE_EMBEDDING_LAMBDA_NAME (default: bge-microservice-stack-BGELambdaFunction-roIuowXCDxCe)
+    test mode: deterministic SHA-256 pseudo-embedding for fast offline tests.
+- embedding_full (1024-dim): API provider (Titan V2 / OpenRouter).
 
 Neither column is left null after ingestion.
 """
@@ -13,85 +12,73 @@ Neither column is left null after ingestion.
 import hashlib
 import json
 import logging
-import os
 import time
 from dataclasses import replace
-from pathlib import Path
 
-import numpy as np
-
+from config import settings
 from schemas.models import Chunk
 
 logger = logging.getLogger(__name__)
 
-from config import settings
 
 # ---------------------------------------------------------------------------
-# BGE Lambda (prod) — from config
+# Core Lambda Invocation
 # ---------------------------------------------------------------------------
 
-_BGE_LAMBDA_NAME = settings.BGE_EMBEDDING_LAMBDA_NAME
 
-# ---------------------------------------------------------------------------
-# Local ONNX (dev) — paths
-# ---------------------------------------------------------------------------
+def _call_bge_lambda_batch(texts: list[str]) -> list[list[float]]:
+    """Invoke the deployed BGE Lambda with a batch of texts."""
+    if not texts:
+        return []
 
-_BGE_MODEL_DIR = os.environ.get(
-    "BGE_SMALL_MODEL_DIR",
-    str(
-        Path(__file__).resolve().parent.parent.parent.parent
-        / "bge_microservice"
-        / "bge-onnx"
-    ),
-)
+    from aws.infra import get_client
 
-_BGE_ONNX_SESSION = None
-_BGE_TOKENIZER = None
+    client = get_client("lambda")
+    function_name = settings.BGE_EMBEDDING_LAMBDA_NAME
+    payload = json.dumps({"texts": texts})
 
+    try:
+        response = client.invoke(
+            FunctionName=function_name,
+            InvocationType="RequestResponse",
+            Payload=payload.encode("utf-8"),
+        )
+        response_payload = json.loads(response["Payload"].read())
 
-def _get_bge_session():
-    global _BGE_ONNX_SESSION
-    if _BGE_ONNX_SESSION is None:
-        import onnxruntime as ort
-
-        model_path = os.path.join(_BGE_MODEL_DIR, "model.onnx")
-        if os.path.exists(model_path):
-            _BGE_ONNX_SESSION = ort.InferenceSession(
-                model_path, providers=["CPUExecutionProvider"]
+        if "embeddings" in response_payload:
+            embeddings = response_payload["embeddings"]
+            logger.debug(
+                "bge.lambda_success count=%d dim=%s",
+                len(embeddings),
+                response_payload.get("dim", 384),
             )
-            logger.info("bge.local_session_loaded path=%s", model_path)
+            return embeddings
+        elif "embedding" in response_payload:
+            return [response_payload["embedding"]]
+        elif "error" in response_payload:
+            raise RuntimeError(f"Lambda returned an error: {response_payload['error']}")
         else:
-            logger.warning("bge.local_model_not_found path=%s", model_path)
-    return _BGE_ONNX_SESSION
+            raise RuntimeError(f"Unexpected response from BGE Lambda: {response_payload}")
+    except Exception as e:
+        logger.error("bge.lambda_failed func=%s error=%s", function_name, e)
+        raise
 
 
-def _get_bge_tokenizer():
-    global _BGE_TOKENIZER
-    if _BGE_TOKENIZER is None:
-        from tokenizers import Tokenizer
-
-        tokenizer_path = os.path.join(_BGE_MODEL_DIR, "tokenizer.json")
-        if os.path.exists(tokenizer_path):
-            _BGE_TOKENIZER = Tokenizer.from_file(tokenizer_path)
-            _BGE_TOKENIZER.enable_truncation(max_length=512)
-            _BGE_TOKENIZER.enable_padding(length=512)
-        else:
-            logger.warning("bge.local_tokenizer_not_found path=%s", tokenizer_path)
-    return _BGE_TOKENIZER
+def _call_bge_lambda(text: str) -> list[float]:
+    """Invoke the deployed BGE Lambda for a single text and return the 384-dim embedding."""
+    results = _call_bge_lambda_batch([text])
+    if not results:
+        raise RuntimeError("BGE Lambda returned empty embeddings list")
+    return results[0]
 
 
 # ---------------------------------------------------------------------------
-# embed_fast_local — routes by ENVIRONMENT
+# Public Embedding Functions
 # ---------------------------------------------------------------------------
 
 
 def embed_fast_local(text: str) -> list[float]:
-    """Generate a 384-dim embedding.
-
-    prod  → boto3 invoke bge-embedding-lambda
-    dev   → local ONNX
-    test  → deterministic fallback (no network, no file deps)
-    """
+    """Generate a 384-dim embedding via BGE Lambda (or deterministic fallback in test mode)."""
     environment = settings.ENVIRONMENT
     t0 = time.perf_counter()
 
@@ -103,149 +90,25 @@ def embed_fast_local(text: str) -> list[float]:
         )
         return vec
 
-    if environment == "prod":
-        vec = _call_bge_lambda(text)
-        logger.info(
-            "bge.mode=lambda latency_ms=%.2f", (time.perf_counter() - t0) * 1000
-        )
-        return vec
-
-    # dev — local ONNX
-    vec = _run_onnx(text)
+    vec = _call_bge_lambda(text)
     logger.info(
-        "bge.mode=local_onnx latency_ms=%.2f", (time.perf_counter() - t0) * 1000
+        "bge.mode=lambda latency_ms=%.2f", (time.perf_counter() - t0) * 1000
     )
     return vec
 
 
-def _call_bge_lambda(text: str) -> list[float]:
-    """Invoke the deployed BGE Lambda and return the 384-dim embedding."""
-    try:
-        from aws.infra import get_client
-
-        client = get_client("lambda")
-        response = client.invoke(
-            FunctionName=_BGE_LAMBDA_NAME,
-            InvocationType="RequestResponse",
-            Payload=json.dumps({"text": text}),
-        )
-        payload = json.loads(response["Payload"].read())
-        if "error" in payload:
-            raise RuntimeError(f"BGE Lambda error: {payload['error']}")
-        return payload["embedding"]
-    except Exception as e:
-        logger.warning("bge.lambda_failed error=%s — falling back to local ONNX", e)
-        return _run_onnx(text)
-
-
-def _call_bge_lambda_batch(texts: list[str]) -> list[list[float]]:
-    """Invoke the deployed BGE Lambda with a batch of texts."""
-    try:
-        from aws.infra import get_client
-
-        client = get_client("lambda")
-        response = client.invoke(
-            FunctionName=_BGE_LAMBDA_NAME,
-            InvocationType="RequestResponse",
-            Payload=json.dumps({"texts": texts}),
-        )
-        payload = json.loads(response["Payload"].read())
-        if "error" in payload:
-            raise RuntimeError(f"BGE Lambda batch error: {payload['error']}")
-        return payload["embeddings"]
-    except Exception as e:
-        logger.warning(
-            "bge.lambda_batch_failed error=%s — falling back to local ONNX", e
-        )
-        return [_run_onnx(t) for t in texts]
-
-
-def _run_onnx(text: str) -> list[float]:
-    """Local ONNX inference for dev mode."""
-    session = _get_bge_session()
-    tokenizer = _get_bge_tokenizer()
-
-    if session is None or tokenizer is None:
-        logger.warning("bge.local_onnx_unavailable falling back to deterministic")
-        return _deterministic_vector(text, 384)
-
-    encoded = tokenizer.encode(text)
-    input_ids = np.array([encoded.ids], dtype=np.int64)
-    attention_mask = np.array([encoded.attention_mask], dtype=np.int64)
-    token_type_ids = np.zeros_like(input_ids, dtype=np.int64)
-
-    outputs = session.run(
-        None,
-        {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "token_type_ids": token_type_ids,
-        },
-    )
-    token_embeddings = outputs[0]
-    mask_expanded = attention_mask[:, :, np.newaxis].astype(np.float32)
-    summed = np.sum(token_embeddings * mask_expanded, axis=1)
-    counted = np.clip(mask_expanded.sum(axis=1), a_min=1e-9, a_max=None)
-    pooled = (summed / counted).flatten()
-
-    norm = np.linalg.norm(pooled)
-    if norm > 0:
-        pooled = pooled / norm
-    return pooled.tolist()
-
-
-def _run_onnx_batch(texts: list[str], batch_size: int = 64) -> list[list[float]]:
-    """High-throughput batch ONNX inference using tokenizer.encode_batch."""
-    session = _get_bge_session()
-    tokenizer = _get_bge_tokenizer()
-
-    if session is None or tokenizer is None or not texts:
-        return [_deterministic_vector(t, 384) for t in texts]
-
-    results = []
-    for i in range(0, len(texts), batch_size):
-        sub_texts = texts[i : i + batch_size]
-        encoded_batch = tokenizer.encode_batch(sub_texts)
-
-        input_ids = np.array([e.ids for e in encoded_batch], dtype=np.int64)
-        attention_mask = np.array(
-            [e.attention_mask for e in encoded_batch], dtype=np.int64
-        )
-        token_type_ids = np.zeros_like(input_ids, dtype=np.int64)
-
-        outputs = session.run(
-            None,
-            {
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-                "token_type_ids": token_type_ids,
-            },
-        )
-        token_embeddings = outputs[0]
-        mask_expanded = attention_mask[:, :, np.newaxis].astype(np.float32)
-        summed = np.sum(token_embeddings * mask_expanded, axis=1)
-        counted = np.clip(mask_expanded.sum(axis=1), a_min=1e-9, a_max=None)
-        pooled = summed / counted
-
-        norms = np.linalg.norm(pooled, axis=1, keepdims=True)
-        norms[norms == 0] = 1e-9
-        normalized = (pooled / norms).tolist()
-        results.extend(normalized)
-
-    return results
-
-
 def embed_fast_batch(texts: list[str]) -> list[list[float]]:
-    """Batch fast embeddings — routes by ENVIRONMENT."""
+    """Batch fast embeddings via BGE Lambda (or deterministic fallback in test mode)."""
+    if not texts:
+        return []
+
     environment = settings.ENVIRONMENT
     t0 = time.perf_counter()
 
     if environment == "test":
         result = [_deterministic_vector(t, 384) for t in texts]
-    elif environment == "prod":
-        result = _call_bge_lambda_batch(texts)
     else:
-        result = _run_onnx_batch(texts)
+        result = _call_bge_lambda_batch(texts)
 
     logger.info(
         "bge.batch_embed count=%d env=%s latency_ms=%.2f",
@@ -266,12 +129,20 @@ def _deterministic_vector(text: str, dim: int) -> list[float]:
     return vector
 
 
+# ---------------------------------------------------------------------------
+# Dual Ingestion Embedding
+# ---------------------------------------------------------------------------
+
+
 def embed_chunks_dual(chunks: list[Chunk], provider: str | None = None) -> list[Chunk]:
     """Populate both embedding columns for all chunks at ingestion time.
 
-    - embedding_fast: BGE-small (384-dim). Prod=Lambda, dev=ONNX, test=deterministic.
-    - embedding_full: Titan V2 API (1024-dim).
+    - embedding_fast: BGE-small (384-dim) via AWS Lambda.
+    - embedding_full: Titan V2 API / OpenRouter (1024-dim).
     """
+    if not chunks:
+        return []
+
     texts = [c.text for c in chunks]
 
     t0 = time.perf_counter()

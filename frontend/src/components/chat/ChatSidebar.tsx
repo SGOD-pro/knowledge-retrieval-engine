@@ -32,22 +32,30 @@ export function ChatSidebar() {
 
   const [isSearching, setIsSearching] = useState(false)
 
+  const currentWsId = activeWorkspace?.id || ""
+
   const handleNewChat = () => {
-    const newId = createNewChat(activeWorkspace?.id || "ws_001")
+    const newId = createNewChat(currentWsId)
     setActiveSessionId(newId)
   }
 
-  const todaySessions = sessions.filter(
-    (s) =>
-      s.category === "Today" &&
-      s.title.toLowerCase().includes(searchFilter.toLowerCase())
+  const workspaceSessions = sessions.filter(
+    (s) => !currentWsId || s.workspaceId === currentWsId
   )
 
-  const previousSessions = sessions.filter(
-    (s) =>
-      s.category === "Previous 7 Days" &&
-      s.title.toLowerCase().includes(searchFilter.toLowerCase())
+  const filteredSessions = workspaceSessions.filter((s) =>
+    s.title.toLowerCase().includes(searchFilter.toLowerCase())
   )
+
+  const todaySessions = filteredSessions.filter((s) => s.category === "Today")
+  const previousSessions = filteredSessions.filter((s) => s.category !== "Today")
+
+  const userInitials = (user?.name || "KRE")
+    .split(" ")
+    .map((w) => w[0])
+    .join("")
+    .slice(0, 2)
+    .toUpperCase()
 
   return (
     <aside className="w-64 sm:w-72 shrink-0 bg-sidebar border border-border/80 rounded-3xl p-4 flex flex-col justify-between h-full select-none shadow-xs animate-in slide-in-from-left-2 duration-150">
@@ -55,15 +63,17 @@ export function ChatSidebar() {
       <div className="flex-1 flex flex-col overflow-hidden">
         {/* Workspace Title, Back button & Collapse button */}
         <div className="flex items-start justify-between mb-4">
-          <div className="space-y-0.5">
-            <h2 className="font-headline font-bold text-lg text-foreground flex items-center gap-2">
-              <span>{activeWorkspace?.name || "Workspace Alpha"}</span>
+          <div className="space-y-0.5 min-w-0 pr-1">
+            <h2 className="font-headline font-bold text-base sm:text-lg text-foreground truncate">
+              {activeWorkspace?.name || "Workspace"}
             </h2>
             <p className="text-[11px] text-muted-foreground font-sans">
-              Active Screening • 14 Candidates
+              {activeWorkspace?.document_count
+                ? `${activeWorkspace.document_count} Document${activeWorkspace.document_count > 1 ? "s" : ""}`
+                : "Active Corpus"}
             </p>
           </div>
-          <div className="flex items-center gap-1">
+          <div className="flex items-center gap-1 shrink-0">
             <button
               type="button"
               onClick={() => navigate("/workspaces")}
@@ -150,11 +160,11 @@ export function ChatSidebar() {
             </div>
           )}
 
-          {/* Previous 7 Days */}
+          {/* Previous */}
           {previousSessions.length > 0 && (
             <div className="space-y-1.5">
               <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider px-2">
-                Previous 7 Days
+                Previous Chats
               </span>
               <div className="space-y-1">
                 {previousSessions.map((session) => {
@@ -178,6 +188,12 @@ export function ChatSidebar() {
               </div>
             </div>
           )}
+
+          {filteredSessions.length === 0 && (
+            <div className="text-center p-4 text-xs text-muted-foreground font-sans">
+              No conversations yet.
+            </div>
+          )}
         </div>
       </div>
 
@@ -195,25 +211,22 @@ export function ChatSidebar() {
 
         {/* User Card & Theme Toggle */}
         <div className="flex items-center justify-between pt-0.5">
-          <div className="flex items-center gap-2.5">
-            <Avatar className="h-8 w-8 border border-border/70">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <Avatar className="h-8 w-8 border border-border/70 shrink-0">
               <AvatarImage
-                src={
-                  user?.avatar ||
-                  "https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=128&auto=format&fit=crop&q=80"
-                }
-                alt="Alexandra Chen"
+                src={user?.avatar || undefined}
+                alt={user?.name || "User"}
               />
               <AvatarFallback className="bg-primary/10 text-primary font-medium text-xs">
-                AC
+                {userInitials}
               </AvatarFallback>
             </Avatar>
-            <div className="space-y-0.5 leading-none">
-              <div className="font-semibold text-xs text-foreground">
-                {user?.name || "Alexandra Chen"}
+            <div className="space-y-0.5 leading-none min-w-0">
+              <div className="font-semibold text-xs text-foreground truncate">
+                {user?.name || "KRE Analyst"}
               </div>
-              <div className="text-[9px] font-bold text-muted-foreground uppercase tracking-wider">
-                {user?.role || "SENIOR DESIGNER"}
+              <div className="text-[9px] font-bold text-muted-foreground uppercase tracking-wider truncate">
+                {user?.role || "Analyst"}
               </div>
             </div>
           </div>

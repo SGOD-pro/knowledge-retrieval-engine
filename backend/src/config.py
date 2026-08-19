@@ -15,8 +15,8 @@ class Settings(BaseSettings):
     ODL_PARSER_LAMBDA_NAME: str = "odl-parser-lambda-prod"
     REDIS_URL: str = "redis://localhost:6379/0"
 
-    # BGE Embedding — dev uses local ONNX, prod invokes this Lambda
-    BGE_EMBEDDING_LAMBDA_NAME: str = "bge-small-en-v1-5-lambda-prod"
+    # BGE Embedding Lambda function
+    BGE_EMBEDDING_LAMBDA_NAME: str = "bge-microservice-stack-BGELambdaFunction-roIuowXCDxCe"
 
     # Qdrant Cloud — always prod, no LocalStack equivalent
     QDRANT_URL: str = "http://localhost:6333"
