@@ -8,8 +8,10 @@ import {
   Scale,
   Users2,
   Folder,
-  FileText
+  FileText,
+  Trash2
 } from "lucide-react"
+import { toast } from "sonner"
 import { useWorkspaceStore } from "../store/useWorkspaceStore"
 import { WorkspaceCardSkeleton } from "../components/common/ShimmerSkeleton"
 import { Input } from "../components/ui/input"
@@ -25,6 +27,7 @@ export function WorkspacePage() {
     setSearchQuery,
     setActiveWorkspace,
     fetchWorkspaces,
+    deleteWorkspace,
     isLoading
   } = useWorkspaceStore()
 
@@ -151,8 +154,32 @@ export function WorkspacePage() {
               className="h-64 rounded-2xl border border-border/80 bg-card hover:border-primary/50 transition-all p-6 flex flex-col justify-between shadow-xs hover:shadow-md cursor-pointer group"
             >
               <div className="space-y-4">
-                {/* Icon */}
-                {getWorkspaceIcon(ws)}
+                {/* Header with Icon and Hover-Triggered Delete Button */}
+                <div className="flex items-start justify-between">
+                  {getWorkspaceIcon(ws)}
+                  <button
+                    type="button"
+                    title="Delete Workspace"
+                    onClick={async (e) => {
+                      e.stopPropagation()
+                      if (
+                        window.confirm(
+                          `Are you sure you want to delete workspace "${ws.name}"? All associated documents and indexed data will be permanently removed.`
+                        )
+                      ) {
+                        const success = await deleteWorkspace(ws.id)
+                        if (success) {
+                          toast.success(`Workspace "${ws.name}" deleted`)
+                        } else {
+                          toast.error(`Failed to delete workspace "${ws.name}"`)
+                        }
+                      }
+                    }}
+                    className="opacity-0 group-hover:opacity-100 transition-opacity p-2 rounded-xl text-muted-foreground hover:text-destructive hover:bg-destructive/10 cursor-pointer"
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </button>
+                </div>
 
                 {/* Info */}
                 <div className="space-y-1.5">

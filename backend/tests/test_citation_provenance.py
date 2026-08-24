@@ -1,11 +1,37 @@
 from services.langgraph_pipeline import pipeline
 
 
-def test_citation_provenance_invariant():
+def test_citation_provenance_invariant(monkeypatch):
     """Invariant test verifying that every citation in response.citations
     strictly originates from a retrieved chunk in response.top_chunks.
     """
+    monkeypatch.setenv("ENVIRONMENT", "test")
     query = "How many parallel attention heads h are employed in the Multi-Head Attention mechanism of the base Transformer model?"
+
+    from db.database import CloudRepository
+    from schemas.models import Document, Chunk
+    from ingestion.embed_service import embed_fast_local, _deterministic_vector
+
+    repo = CloudRepository()
+    doc = Document(
+        id="transformer_doc_1",
+        filename="transformer_paper.pdf",
+        source_format="pdf",
+        chunks=(
+            Chunk(
+                id="transformer_doc_1:c1",
+                document_id="transformer_doc_1",
+                text="In the base Transformer model, h = 8 parallel attention layers or heads are employed.",
+                source_format="pdf",
+                page_number=4,
+                element_type="paragraph",
+                section_path="3.2.2 Multi-Head Attention",
+                embedding_fast=embed_fast_local(query),
+                embedding_full=_deterministic_vector(query, 1024),
+            ),
+        ),
+    )
+    repo.save(doc)
 
     # Run the pipeline
     response = pipeline.run(query)

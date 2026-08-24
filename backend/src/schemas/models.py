@@ -15,6 +15,8 @@ class Chunk:
     location_reference: str | None = None
     metadata: dict[str, Any] | None = None
     structural_weight: float = 0.0
+    similarity_score: float | None = None
+    reranker_score: float | None = None
     provider: str = "dev"
     embedding_fast: list[float] | None = None
     embedding_full: list[float] | None = None

@@ -22,12 +22,6 @@ def handler(event, context):
     if not s3_bucket or not s3_key:
         return {"error": "Missing s3_bucket or s3_key"}
 
-    # TODO: Implement full PDF extraction
-    # 1. Download from S3 to /tmp
-    # 2. Invoke opendataloader-pdf via subprocess (since we have JRE)
-    # 3. Read output JSON, optionally format
-    # 4. Return JSON payload
-
     return {
         "chunks": [
             {

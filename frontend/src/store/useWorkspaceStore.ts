@@ -12,6 +12,7 @@ interface WorkspaceState {
   setActiveWorkspace: (workspace: Workspace | null) => void
   fetchWorkspaces: () => Promise<void>
   createWorkspace: (data: CreateWorkspaceRequest) => Promise<Workspace | null>
+  deleteWorkspace: (workspaceId: string) => Promise<boolean>
 }
 
 export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
@@ -53,6 +54,27 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     } catch (err: any) {
       set({ error: err.message, isLoading: false })
       return null
+    }
+  },
+
+  deleteWorkspace: async (workspaceId: string) => {
+    try {
+      await api.deleteWorkspace(workspaceId)
+      set((state) => {
+        const nextWorkspaces = state.workspaces.filter((w) => w.id !== workspaceId)
+        const nextActive =
+          state.activeWorkspace?.id === workspaceId
+            ? nextWorkspaces[0] || null
+            : state.activeWorkspace
+        return {
+          workspaces: nextWorkspaces,
+          activeWorkspace: nextActive
+        }
+      })
+      return true
+    } catch (err: any) {
+      set({ error: err.message })
+      return false
     }
   }
 }))

@@ -59,6 +59,22 @@ export function LibraryPage() {
     }
   }, [currentWsId, currentPage, fetchDocuments])
 
+  // Polling: Auto-refresh library every 2.5s while any document is in processing state
+  useEffect(() => {
+    if (!currentWsId) return
+    const hasProcessing = documents.some((d) => {
+      const s = String(d.status || "").toLowerCase()
+      return s === "processing" || s === "indexing" || s === "pending"
+    })
+    if (!hasProcessing) return
+
+    const interval = setInterval(() => {
+      fetchDocuments(currentWsId, currentPage)
+    }, 2500)
+
+    return () => clearInterval(interval)
+  }, [currentWsId, currentPage, documents, fetchDocuments])
+
   const getFormatBadge = (format: string) => {
     const fmt = format.toUpperCase()
     if (fmt === "PDF") {
@@ -69,14 +85,15 @@ export function LibraryPage() {
       )
     }
     return (
-      <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-[#ede9de] dark:bg-[#282a2c] text-foreground/80 tracking-wider">
+      <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-[#ede9de] dark:bg-[#242628] text-foreground/80 tracking-wider">
         {fmt}
       </span>
     )
   }
 
   const getStatusBadge = (status: DocumentItem["status"]) => {
-    if (status === "Ready") {
+    const s = String(status || "").toLowerCase()
+    if (s === "ready") {
       return (
         <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-[#e2f3ee] dark:bg-[#1a3832] text-[#006768] dark:text-[#6cd7d8]">
           <CheckCircle2 className="h-3.5 w-3.5" />
@@ -84,7 +101,7 @@ export function LibraryPage() {
         </span>
       )
     }
-    if (status === "Processing") {
+    if (s === "processing" || s === "indexing" || s === "pending") {
       return (
         <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-[#ede9de] dark:bg-[#282a2c] text-foreground/80">
           <RefreshCw className="h-3.5 w-3.5 animate-spin" />

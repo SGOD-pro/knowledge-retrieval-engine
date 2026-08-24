@@ -2,12 +2,12 @@ from pathlib import Path
 
 import pytest
 from docx import Document as DocxDocument
-from ingestion_lambda.adapters.docx_adapter import parse as parse_docx
-from ingestion_lambda.adapters.pptx_adapter import parse as parse_pptx
-from ingestion_lambda.adapters.xlsx_adapter import parse as parse_xlsx
-from ingestion_lambda.format_router import route
-from ingestion_lambda.page_index_service import rank, score
-from ingestion_lambda.parse_service import parse_file
+from ingestion.adapters.docx_adapter import parse as parse_docx
+from ingestion.adapters.pptx_adapter import parse as parse_pptx
+from ingestion.adapters.xlsx_adapter import parse as parse_xlsx
+from ingestion.format_router import route
+from ingestion.page_index_service import rank, score
+from ingestion.parse_service import parse_file
 from openpyxl import Workbook
 from pptx import Presentation
 

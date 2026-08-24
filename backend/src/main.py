@@ -31,5 +31,4 @@ app.add_middleware(
 
 # Mount both with /api/v1 prefix (contract standard) and root prefix (direct access)
 app.include_router(router, prefix="/api/v1")
-# app.include_router(router, prefix="/v1")
-# app.include_router(router)
+app.include_router(router)

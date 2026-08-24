@@ -18,22 +18,26 @@ from schemas.models import Document
 logger = logging.getLogger(__name__)
 
 
-def generate_deterministic_doc_id(path: Path) -> str:
+def generate_deterministic_doc_id(path_or_name: Path | str) -> str:
     """Generate a deterministic UUID5 for a document based on its filename."""
-    return str(uuid.uuid5(uuid.NAMESPACE_DNS, path.name))
+    name = path_or_name.name if isinstance(path_or_name, Path) else path_or_name
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, name))
 
 
-def parse_file(path: Path, document_id: str | None = None) -> Document:
+def parse_file(
+    path: Path, document_id: str | None = None, filename: str | None = None
+) -> Document:
     """Parse a file to a Document with chunks. Does NOT embed or run OKF.
 
     Embedding and OKF are orchestrated by the ingestion route handler
     so they can be skipped in unit tests that only care about parsing.
     """
     t0 = time.perf_counter()
-    document_id = document_id or generate_deterministic_doc_id(path)
+    doc_filename = filename or path.name
+    document_id = document_id or generate_deterministic_doc_id(doc_filename)
     source_format, adapter = route(path)
     chunks = tuple(adapter(path, document_id))
-    doc = Document(document_id, path.name, source_format, chunks)
+    doc = Document(document_id, doc_filename, source_format, chunks)
     latency_ms = (time.perf_counter() - t0) * 1000.0
     logger.info(
         "parse_service.done doc_id=%s format=%s chunks=%d latency_ms=%.2f",
@@ -46,14 +50,17 @@ def parse_file(path: Path, document_id: str | None = None) -> Document:
 
 
 def ingest_document(
-    path: Path, document_id: str | None = None, provider: str = "dev"
+    path: Path,
+    document_id: str | None = None,
+    filename: str | None = None,
+    provider: str = "dev",
 ) -> Document:
     """Full ingestion pipeline: parse → embed → OKF → return Document with embeddings.
 
     Use this in the /ingest route handler.
     Use parse_file() directly in unit tests.
     """
-    doc = parse_file(path, document_id)
+    doc = parse_file(path, document_id=document_id, filename=filename)
     chunks_list = list(doc.chunks)
 
     # Embed both columns

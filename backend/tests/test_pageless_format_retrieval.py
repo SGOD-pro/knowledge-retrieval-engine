@@ -45,8 +45,9 @@ def test_pageless_chunks_preserved_in_page_index_narrowing():
     assert "docx_c1" in chunk_ids
 
 
-def test_vector_search_includes_pageless_chunks_when_pages_present():
+def test_vector_search_includes_pageless_chunks_when_pages_present(monkeypatch):
     """AE3: VectorRetriever must search both candidate_page_ids and candidate_chunk_ids (OR logic)."""
+    monkeypatch.setenv("ENVIRONMENT", "test")
     c_pdf = _make_chunk("pdf_c1", "PDF content on page 5", page_number=5, format="pdf")
     c_docx = _make_chunk(
         "docx_c1", "DOCX content without page number", page_number=None, format="docx"

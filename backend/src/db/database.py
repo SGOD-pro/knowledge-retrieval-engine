@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import time
 import uuid
 
@@ -10,6 +11,10 @@ from config import settings
 from schemas.models import Chunk, Document
 
 logger = logging.getLogger(__name__)
+
+
+def _is_test_env() -> bool:
+    return os.environ.get("ENVIRONMENT") == "test" or settings.ENVIRONMENT == "test"
 
 _IN_MEMORY_DOCS: dict[str, Document] = {}
 _IN_MEMORY_CHUNKS: dict[str, Chunk] = {}
@@ -164,7 +169,7 @@ class CloudRepository:
         for chunk in document.chunks:
             _IN_MEMORY_CHUNKS[str(chunk.id)] = chunk
 
-        if settings.ENVIRONMENT == "test":
+        if _is_test_env():
             return
 
         try:
@@ -279,7 +284,7 @@ class CloudRepository:
         )
 
     def get(self, document_id: str) -> Document | None:
-        if settings.ENVIRONMENT == "test":
+        if _is_test_env():
             return _IN_MEMORY_DOCS.get(document_id)
 
         from boto3.dynamodb.conditions import Key
@@ -311,21 +316,22 @@ class CloudRepository:
 
     def get_all_chunks(self, document_ids: list[str] | None = None) -> list[Chunk]:
         if _IN_MEMORY_CHUNKS:
-            if document_ids:
+            if document_ids is not None:
+                doc_id_set = set(document_ids)
                 return [
                     c
                     for c in _IN_MEMORY_CHUNKS.values()
-                    if str(c.document_id) in document_ids
+                    if str(c.document_id) in doc_id_set
                 ]
             return list(_IN_MEMORY_CHUNKS.values())
 
-        if settings.ENVIRONMENT == "test":
+        if _is_test_env():
             return []
 
         from boto3.dynamodb.conditions import Attr
 
         chunks = []
-        if document_ids:
+        if document_ids is not None:
             for d in document_ids:
                 doc = self.get(d)
                 if doc:
@@ -363,7 +369,7 @@ class CloudRepository:
         candidate_chunk_ids: list[str] | None = None,
         limit: int = 10,
     ) -> list[tuple[Chunk, float]]:
-        if settings.ENVIRONMENT == "test":
+        if _is_test_env():
             import numpy as np
 
             results = []
@@ -605,10 +611,84 @@ class CloudRepository:
     def get_workspaces(self) -> list[dict]:
         return list(_WORKSPACES.values())
 
+    def delete_workspace(self, workspace_id: str) -> bool:
+        if workspace_id not in _WORKSPACES and workspace_id not in _WORKSPACE_DOCS:
+            return False
+
+        docs = list(_WORKSPACE_DOCS.get(workspace_id, []))
+        doc_ids = [d.get("id") for d in docs if d.get("id")]
+
+        # 1. Delete workspace + its doc-list entries from _WORKSPACES/_WORKSPACE_DOCS
+        _WORKSPACES.pop(workspace_id, None)
+        _WORKSPACE_DOCS.pop(workspace_id, None)
+
+        for doc_id in doc_ids:
+            doc_id_str = str(doc_id)
+            _DOCUMENT_FILES.pop(doc_id_str, None)
+            _IN_MEMORY_DOCS.pop(doc_id_str, None)
+            chunks_to_remove = [
+                cid
+                for cid, c in _IN_MEMORY_CHUNKS.items()
+                if str(c.document_id) == doc_id_str
+            ]
+            for cid in chunks_to_remove:
+                _IN_MEMORY_CHUNKS.pop(cid, None)
+
+        if not _is_test_env():
+            # 2. For every document, delete its DynamoDB items (DOC# and CHUNK# rows in kre-table) via batch_writer
+            try:
+                for doc_id in doc_ids:
+                    doc_id_str = str(doc_id)
+                    resp = self.table.query(
+                        KeyConditionExpression="PK = :pk",
+                        ExpressionAttributeValues={":pk": f"DOC#{doc_id_str}"},
+                    )
+                    items = resp.get("Items", [])
+                    if items:
+                        with self.table.batch_writer() as batch:
+                            for it in items:
+                                batch.delete_item(Key={"PK": it["PK"], "SK": it["SK"]})
+            except Exception as e:
+                logger.error(
+                    "delete_workspace DynamoDB batch deletion failed for %s: %s",
+                    workspace_id,
+                    e,
+                )
+                raise RuntimeError(
+                    f"DynamoDB deletion failed for workspace {workspace_id}: {e}"
+                ) from e
+
+            # 3. Delete corresponding Qdrant points by document_id payload filter
+            try:
+                for doc_id in doc_ids:
+                    doc_id_str = str(doc_id)
+                    self.qclient.delete(
+                        collection_name=self.collection_name,
+                        points_selector=qmodels.FilterSelector(
+                            filter=qmodels.Filter(
+                                must=[
+                                    qmodels.FieldCondition(
+                                        key="document_id",
+                                        match=qmodels.MatchValue(value=doc_id_str),
+                                    )
+                                ]
+                            )
+                        ),
+                        wait=True,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "delete_workspace Qdrant deletion failed for %s: %s",
+                    workspace_id,
+                    e,
+                )
+
+        return True
+
     def create_workspace(
-        self, name: str, industry: str | None = None, description: str = ""
+        self, name: str, industry: str | None = None, description: str = "", workspace_id: str | None = None
     ) -> dict:
-        ws_id = f"ws_{uuid.uuid4().hex[:6]}"
+        ws_id = workspace_id or f"ws_{uuid.uuid4().hex[:6]}"
         industry_val = industry or "General"
         icon_type = (
             "engineering"
@@ -631,27 +711,29 @@ class CloudRepository:
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
         _WORKSPACES[ws_id] = ws
-        _WORKSPACE_DOCS[ws_id] = []
+        if ws_id not in _WORKSPACE_DOCS:
+            _WORKSPACE_DOCS[ws_id] = []
         return ws
 
-    def add_document_to_workspace(
+    def add_placeholder_document(
         self,
         workspace_id: str,
-        document: Document,
-        raw_bytes: bytes | None = None,
+        doc_id: str,
+        filename: str,
+        format_str: str,
         size_str: str | None = None,
-    ) -> None:
+        raw_bytes: bytes | None = None,
+    ) -> dict:
         if workspace_id not in _WORKSPACES:
-            self.create_workspace(name=f"Workspace {workspace_id}")
-            _WORKSPACES[workspace_id]["id"] = workspace_id
+            self.create_workspace(name=f"Workspace {workspace_id}", workspace_id=workspace_id)
 
         doc_entry = {
-            "id": str(document.id),
-            "filename": document.filename,
-            "format": document.source_format.lower(),
+            "id": str(doc_id),
+            "filename": filename,
+            "format": format_str.lower(),
             "upload_date": "Just now",
-            "chunk_count": len(document.chunks),
-            "status": "Ready",
+            "chunk_count": 0,
+            "status": "Processing",
             "size": size_str or "1.2 MB",
         }
 
@@ -664,10 +746,76 @@ class CloudRepository:
         if raw_bytes:
             mime = (
                 "application/pdf"
+                if format_str.lower() == "pdf"
+                else "application/octet-stream"
+            )
+            _DOCUMENT_FILES[str(doc_id)] = (raw_bytes, filename, mime)
+
+        return doc_entry
+
+    def update_document_status(
+        self,
+        workspace_id: str,
+        doc_id: str,
+        status: str,
+        chunk_count: int | None = None,
+        error: str | None = None,
+    ) -> None:
+        docs = _WORKSPACE_DOCS.get(workspace_id, [])
+        for d in docs:
+            if d.get("id") == str(doc_id):
+                d["status"] = status
+                if chunk_count is not None:
+                    d["chunk_count"] = chunk_count
+                if error:
+                    d["error"] = error
+                break
+
+    def add_document_to_workspace(
+        self,
+        workspace_id: str,
+        document: Document,
+        raw_bytes: bytes | None = None,
+        size_str: str | None = None,
+    ) -> None:
+        if workspace_id not in _WORKSPACES:
+            self.create_workspace(name=f"Workspace {workspace_id}", workspace_id=workspace_id)
+
+        doc_id_str = str(document.id)
+        existing_list = _WORKSPACE_DOCS.get(workspace_id, [])
+        existing = next((d for d in existing_list if d.get("id") == doc_id_str), None)
+
+        if existing is not None:
+            existing["filename"] = document.filename
+            existing["format"] = document.source_format.lower()
+            existing["chunk_count"] = len(document.chunks)
+            existing["status"] = "Ready"
+            if size_str:
+                existing["size"] = size_str
+        else:
+            doc_entry = {
+                "id": doc_id_str,
+                "filename": document.filename,
+                "format": document.source_format.lower(),
+                "upload_date": "Just now",
+                "chunk_count": len(document.chunks),
+                "status": "Ready",
+                "size": size_str or "1.2 MB",
+            }
+            if workspace_id not in _WORKSPACE_DOCS:
+                _WORKSPACE_DOCS[workspace_id] = []
+            _WORKSPACE_DOCS[workspace_id].insert(0, doc_entry)
+
+        _WORKSPACES[workspace_id]["document_count"] = len(_WORKSPACE_DOCS[workspace_id])
+        _WORKSPACES[workspace_id]["last_active"] = "Active just now"
+
+        if raw_bytes:
+            mime = (
+                "application/pdf"
                 if document.source_format.lower() == "pdf"
                 else "application/octet-stream"
             )
-            _DOCUMENT_FILES[str(document.id)] = (raw_bytes, document.filename, mime)
+            _DOCUMENT_FILES[doc_id_str] = (raw_bytes, document.filename, mime)
 
     def get_workspace_documents(
         self, workspace_id: str, page: int = 1, limit: int = 10

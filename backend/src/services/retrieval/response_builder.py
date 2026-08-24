@@ -35,6 +35,9 @@ class Citation:
     bounding_box: dict[str, float] | None
     location_reference: str | None
     text_snippet: str
+    text: str = ""
+    document_filename: str = ""
+    page_number: int | None = None
     # Presigned S3 URLs for images co-extracted with this chunk.
     # Generated fresh per query so they are never stale.
     image_urls: tuple[str, ...] = ()
@@ -64,16 +67,16 @@ class FastPathResponse:
 
 def build_citation(
     chunk: Chunk,
+    document_filename: str | None = None,
     image_bucket: str | None = None,
 ) -> Citation:
     """Build a citation enforcing Rule 20 (zero null location responses).
 
     Args:
-        chunk:        The source Chunk from the retrieval pipeline.
-        image_bucket: S3 bucket that holds the chunk's images.  Falls back to
-                      the ``S3_BUCKET_NAME`` env var then a dev default.
-                      Pass explicitly when the document carries its own bucket
-                      metadata.
+        chunk:             The source Chunk from the retrieval pipeline.
+        document_filename: Optional document filename to include in citation.
+        image_bucket:      S3 bucket that holds the chunk's images. Falls back to
+                           the ``S3_BUCKET_NAME`` env var then a dev default.
 
     Returns:
         A fully populated Citation with fresh presigned image URLs (if any).
@@ -100,8 +103,29 @@ def build_citation(
             else:
                 loc_ref = f"Section: {chunk.element_type}"
 
+    # Determine page number
+    page_num = chunk.page_number
+    if page_num is None and isinstance(bbox, dict) and "page_number" in bbox:
+        try:
+            page_num = int(bbox["page_number"])
+        except (ValueError, TypeError):
+            pass
+
+    # Resolve document filename
+    doc_fname = document_filename or getattr(chunk, "document_filename", "") or ""
+    if not doc_fname:
+        try:
+            from db.database import CloudRepository
+            doc = CloudRepository().get(str(chunk.document_id))
+            if doc and doc.filename:
+                doc_fname = doc.filename
+        except Exception:
+            pass
+    if not doc_fname:
+        doc_fname = f"Doc-{str(chunk.document_id)[:8]}"
+
     # Generate presigned URLs at query time — URLs expire, must be fresh per response.
-    # Security: no public ACLs, no bucket policy changes.  Presigned only.
+    # Security: no public ACLs, no bucket policy changes. Presigned only.
     image_urls: tuple[str, ...] = ()
     if chunk.image_s3_keys:
         bucket = image_bucket or _DEFAULT_IMAGE_BUCKET
@@ -117,9 +141,12 @@ def build_citation(
     return Citation(
         chunk_id=chunk.id,
         document_id=str(chunk.document_id),
+        document_filename=doc_fname,
         source_format=chunk.source_format,
+        page_number=page_num,
         bounding_box=bbox,
         location_reference=loc_ref,
+        text=chunk.text[:500],
         text_snippet=chunk.text[:200],
         image_urls=image_urls,
     )

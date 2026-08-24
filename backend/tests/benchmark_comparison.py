@@ -399,9 +399,9 @@ def ingest_all() -> list:
 
     PDFs → ODL Lambda (odl-parser-lambda-prod via boto3, env=prod).
     CSVs → row-level sentence chunking.
-    All others → parse_file from ingestion_lambda.parse_service.
+    All others → parse_file from ingestion.parse_service.
     """
-    from ingestion_lambda.parse_service import parse_file
+    from ingestion.parse_service import parse_file
 
     from config import settings
     from db.database import CloudRepository

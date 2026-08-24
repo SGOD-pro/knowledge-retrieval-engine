@@ -162,9 +162,14 @@ def run_page_index(state: PipelineState):
     based on headings/footnotes retrieved by BM25."""
     t0 = time.perf_counter()
     retriever = PageIndexRetriever()
-    chunks, pages, c_ids = retriever.filter_and_rank(
-        state["query"], state.get("bm25_candidates", [])
-    )
+    bm25_cands = state.get("bm25_candidates")
+    if bm25_cands:
+        chunks, pages, c_ids = retriever.filter_and_rank(
+            state["query"], bm25_cands
+        )
+    else:
+        # When BM25 is skipped (e.g. fast path), do not restrict page/chunk IDs
+        pages, c_ids = None, None
 
     avg_score = 1.0 if pages else 0.0
     latency_ms = (time.perf_counter() - t0) * 1000.0
@@ -202,7 +207,9 @@ def run_vector(state: PipelineState):
         top_k=10,
     )
 
-    vector_chunks = [c for c, _ in chunks]
+    from dataclasses import replace
+
+    vector_chunks = [replace(c, similarity_score=float(s)) for c, s in chunks]
     avg_sim = sum(s for _, s in chunks) / max(1, len(chunks)) if chunks else 0.0
     latency_ms = (time.perf_counter() - t0) * 1000.0
     logger.info(
@@ -407,23 +414,21 @@ def end_fast_path(state: PipelineState):
             logger.warning("fast_path.fidelity_failed reason=%s", e)
             answer = "NOT_FOUND"
 
-    # Real confidence — explicit None checks to avoid falsy-zero override (C3 fix)
-    reranker_scores = []
+    # Real confidence — computed from vector similarity / reranker scores
+    scores = []
     for c in top_chunks:
-        rs = getattr(c, "reranker_score", None)
-        if rs is not None:
-            reranker_scores.append(rs)
-        elif c.structural_weight is not None:
-            reranker_scores.append(c.structural_weight)
-        else:
-            reranker_scores.append(
-                0.5
-            )  # fallback only when both fields are genuinely absent
-    confidence = (
-        round(sum(reranker_scores) / len(reranker_scores), 4)
-        if reranker_scores
-        else 0.0
-    )
+        s = c.reranker_score if getattr(c, "reranker_score", None) is not None else getattr(c, "similarity_score", None)
+        if s is not None:
+            scores.append(float(s))
+    
+    if scores:
+        confidence = round(sum(scores) / len(scores), 4)
+    elif answer != "NOT_FOUND":
+        # Fallback for extractive match when vector similarity is unattached
+        confidence = round(len(selected) / 3.0 * 0.85, 4) if selected else 0.0
+    else:
+        confidence = 0.0
+
     confidence = min(1.0, max(0.0, confidence))
 
     latency_ms = (time.perf_counter() - t0) * 1000.0
@@ -592,7 +597,10 @@ class Pipeline:
 
                 self.top_chunks = state.get("top_chunks", [])
                 self._reranker_avg = (
-                    sum(getattr(c, "reranker_score", 0.0) for c in self.top_chunks)
+                    sum(
+                        (getattr(c, "reranker_score", 0.0) or 0.0)
+                        for c in self.top_chunks
+                    )
                     / len(self.top_chunks)
                     if self.top_chunks
                     else 0.0
