@@ -30,11 +30,13 @@ def test_workspace_deletion_and_isolation(monkeypatch):
                 source_format="pdf",
                 page_number=1,
                 element_type="paragraph",
-                section_path="1. Intro",
+                section_path=("1. Intro",),
                 embedding_fast=[0.9] * 384,
                 embedding_full=[0.9] * 1024,
+                workspace_id=ws_b,
             ),
         ),
+        workspace_id=ws_b,
     )
     repo.save(doc_b)
     repo.add_document_to_workspace(ws_b, doc_b, raw_bytes=b"fake b")
@@ -52,11 +54,13 @@ def test_workspace_deletion_and_isolation(monkeypatch):
                 source_format="pdf",
                 page_number=1,
                 element_type="paragraph",
-                section_path="1. Summary",
+                section_path=("1. Summary",),
                 embedding_fast=[-0.8] * 384,
                 embedding_full=[-0.8] * 1024,
+                workspace_id=ws_a,
             ),
         ),
+        workspace_id=ws_a,
     )
     repo.save(doc_a)
     repo.add_document_to_workspace(ws_a, doc_a, raw_bytes=b"fake a")

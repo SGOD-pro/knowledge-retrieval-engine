@@ -1,6 +1,7 @@
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import { describe, it, expect, vi } from 'vitest'
 import { Workspace } from '../src/pages/Workspace'
+import { api } from '../src/lib/api'
 
 vi.mock("react-resizable-panels", () => ({
   Group: ({ children }: any) => <div>{children}</div>,
@@ -10,7 +11,7 @@ vi.mock("react-resizable-panels", () => ({
   Separator: () => <div />
 }))
 
-const mockCitationResponse = {
+const mockCitationResponse: any = {
   answer: "This is a mocked answer from the agent.",
   citations: [
     {
@@ -49,13 +50,7 @@ describe('Workspace UI Tests', () => {
   })
 
   it('test_api_query_success_renders_citations_and_badges', async () => {
-    const mockFetch = vi.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      text: async () => JSON.stringify(mockCitationResponse),
-      json: async () => mockCitationResponse
-    })
-    global.fetch = mockFetch
+    vi.spyOn(api, 'query').mockResolvedValue(mockCitationResponse)
 
     render(<Workspace />)
     
@@ -63,12 +58,8 @@ describe('Workspace UI Tests', () => {
     const input = screen.getByPlaceholderText(/Ask the knowledge base/i)
     fireEvent.change(input, { target: { value: "Test query" } })
     
-    const sendButton = input.closest('form')?.querySelector('button[type="submit"]')
-    expect(sendButton).not.toBeDisabled()
-    
-    if (sendButton) {
-      fireEvent.click(sendButton)
-    }
+    const form = input.closest('form')
+    fireEvent.submit(form!)
 
     // Wait for response to render
     await waitFor(() => {

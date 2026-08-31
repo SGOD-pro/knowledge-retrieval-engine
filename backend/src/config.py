@@ -1,6 +1,17 @@
+from pathlib import Path
 from typing import Literal
 
 from pydantic_settings import BaseSettings
+
+_SRC_DIR = Path(__file__).resolve().parent
+_BACKEND_DIR = _SRC_DIR.parent
+_ROOT_DIR = _BACKEND_DIR.parent
+_ENV_FILES = (
+    str(_BACKEND_DIR / ".env"),
+    str(_ROOT_DIR / ".env"),
+    ".env",
+    "../.env",
+)
 
 
 class Settings(BaseSettings):
@@ -44,7 +55,7 @@ class Settings(BaseSettings):
     VECTOR_THRESHOLD: float = 0.3
     RERANKER_THRESHOLD: float = 0.2
 
-    model_config = {"env_file": (".env", "../.env"), "extra": "ignore"}
+    model_config = {"env_file": _ENV_FILES, "extra": "ignore"}
 
 
 settings = Settings()

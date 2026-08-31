@@ -34,13 +34,13 @@ def test_unauthenticated_request_returns_401_before_retrieval(monkeypatch):
     monkeypatch.setenv("AUTH_REQUIRED", "true")
 
     # Missing header
-    res_no_auth = client.post("/query", json={"query": "test query"})
+    res_no_auth = client.post("/query", json={"query": "test query", "workspace_id": "ws_default"})
     assert res_no_auth.status_code == 401
 
     # Invalid header token
     res_bad_auth = client.post(
         "/query",
-        json={"query": "test query"},
+        json={"query": "test query", "workspace_id": "ws_default"},
         headers={"Authorization": "Bearer invalid-secret"},
     )
     assert res_bad_auth.status_code == 401
@@ -55,6 +55,30 @@ def test_api_query_handles_not_found():
 def test_api_query_success_renders_citations(monkeypatch):
     # Mock pipeline execution for predictable endpoint test
     from services.langgraph_pipeline import pipeline
+    from db.database import CloudRepository
+    from schemas.models import Document, Chunk
+
+    repo = CloudRepository()
+    doc = Document(
+        id="doc-123",
+        filename="test.pdf",
+        source_format="pdf",
+        workspace_id="ws_default",
+        chunks=(
+            Chunk(
+                id="doc-123:c1",
+                document_id="doc-123",
+                text="Test chunk text",
+                source_format="pdf",
+                element_type="paragraph",
+                workspace_id="ws_default",
+                embedding_fast=[0.1] * 384,
+                embedding_full=[0.1] * 1024,
+            ),
+        ),
+    )
+    repo.save(doc)
+    repo.add_document_to_workspace("ws_default", doc)
 
     class MockPipelineResponse:
         answer = "This is a test answer from Phase 4."
@@ -72,10 +96,10 @@ def test_api_query_success_renders_citations(monkeypatch):
         top_chunks = []
 
     monkeypatch.setattr(
-        pipeline, "run", lambda query, doc_ids=None: MockPipelineResponse()
+        pipeline, "run", lambda query, document_ids=None, workspace_id="ws_default": MockPipelineResponse()
     )
 
-    response = client.post("/query", json={"query": "test query"})
+    response = client.post("/query", json={"query": "test query", "workspace_id": "ws_default"})
     assert response.status_code == 200
     data = response.json()
     assert data["answer"] == "This is a test answer from Phase 4."

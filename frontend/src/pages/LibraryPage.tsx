@@ -135,7 +135,7 @@ export function LibraryPage() {
                   key={ws.id}
                   onClick={() => {
                     setActiveWorkspace(ws)
-                    navigate(`/workspaces/${ws.id}/documents`)
+                    navigate(`/library/${ws.id}`)
                   }}
                   className="cursor-pointer"
                 >
@@ -222,7 +222,7 @@ export function LibraryPage() {
                   <tr
                     key={doc.id}
                     className="hover:bg-accent/40 transition-colors group cursor-pointer"
-                    onClick={() => navigate(`/workspaces/${currentWsId}/chat`)}
+                    onClick={() => navigate(`/library/${currentWsId}/document/${doc.id}`)}
                   >
                     {/* Filename */}
                     <td className="py-4 px-6 font-medium">

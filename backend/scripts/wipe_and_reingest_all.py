@@ -1,14 +1,17 @@
 import sys
 import time
 from pathlib import Path
+from dotenv import load_dotenv
 
-from qdrant_client.http import models as qmodels
-
-# Ensure src is on python path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+# Ensure src is on python path and env is loaded
+backend_dir = Path(__file__).resolve().parent.parent
+load_dotenv(backend_dir / ".env")
+sys.path.insert(0, str(backend_dir / "src"))
 
 if sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
+
+from qdrant_client.http import models as qmodels
 
 from aws.infra import setup_infrastructure
 from db.database import CloudRepository
@@ -63,6 +66,11 @@ try:
         field_name="original_id",
         field_schema=qmodels.PayloadSchemaType.KEYWORD,
     )
+    repo.qclient.create_payload_index(
+        collection_name=repo.collection_name,
+        field_name="workspace_id",
+        field_schema=qmodels.PayloadSchemaType.KEYWORD,
+    )
     print(
         "  - Created fresh Qdrant collection 'kre_chunks' with dual vectors (384, 1024) and payload indexes."
     )
@@ -103,6 +111,13 @@ for tbl_name, tbl in tables_to_clear:
 # 4. Ingest All Documents (Advance + Baseline) with Dual Embedding + OKF
 print("\n[4/5] Ingesting documents (Dual Embeddings + OKF Graph Extraction)...")
 
+DEFAULT_WORKSPACE_ID = "ws_001"
+try:
+    repo.create_workspace(name="Default Benchmark Workspace", workspace_id=DEFAULT_WORKSPACE_ID)
+    print(f"  - Created default workspace '{DEFAULT_WORKSPACE_ID}'")
+except Exception as e:
+    print(f"  - Workspace '{DEFAULT_WORKSPACE_ID}' status: {e}")
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 ADVANCE_DIR = BASE_DIR / "tests" / "data" / "advance"
 BASELINE_DIR = BASE_DIR / "tests" / "data"
@@ -132,10 +147,11 @@ for filepath in docs_to_ingest:
     t0 = time.perf_counter()
 
     try:
+        raw_bytes = filepath.read_bytes()
         # A. Parse into raw chunks
         source_format, adapter = route_adapter(filepath)
         doc_id = generate_deterministic_doc_id(filepath)
-        raw_chunks = adapter(filepath, doc_id)
+        raw_chunks = adapter(filepath, doc_id, workspace_id=DEFAULT_WORKSPACE_ID)
         parse_elapsed = time.perf_counter() - t0
         print(f"    1. Parsed {len(raw_chunks)} raw chunks in {parse_elapsed:.2f}s")
 
@@ -151,9 +167,11 @@ for filepath in docs_to_ingest:
             filename=filename,
             source_format=source_format,
             chunks=tuple(embedded_chunks),
+            workspace_id=DEFAULT_WORKSPACE_ID,
         )
         repo.save(doc)
-        print("    3. Saved to DynamoDB (kre-table) and Qdrant (kre_chunks).")
+        repo.add_document_to_workspace(DEFAULT_WORKSPACE_ID, doc, raw_bytes=raw_bytes)
+        print(f"    3. Saved to DynamoDB (kre-table), Qdrant (kre_chunks), and workspace {DEFAULT_WORKSPACE_ID}.")
 
         # D. Build OKF Knowledge Graph (Tier 1 regex + Tier 3 Nova Micro + System 2 edges)
         t_okf = time.perf_counter()

@@ -58,6 +58,15 @@ _resources: dict = {}
 _RETRY_CONFIG = Config(retries={"max_attempts": 3, "mode": "adaptive"})
 
 
+def _is_floci_available() -> bool:
+    import socket
+    try:
+        with socket.create_connection(("localhost", 4566), timeout=0.2):
+            return True
+    except OSError:
+        return False
+
+
 def _build_client(service: str, region_name: str | None = None):
     env = settings.ENVIRONMENT
 
@@ -74,7 +83,7 @@ def _build_client(service: str, region_name: str | None = None):
         session = boto3.Session(profile_name=_AWS_PROFILE, region_name=region)
         return session.client(service, config=_RETRY_CONFIG)
 
-    if env == "dev":
+    if env == "dev" and _is_floci_available():
         # Dev local services use local profile and endpoint
         logger.debug(
             "aws.infra.client service=%s profile=%s endpoint=%s",
@@ -87,7 +96,7 @@ def _build_client(service: str, region_name: str | None = None):
             service, endpoint_url=_FLOCI_ENDPOINT, config=_RETRY_CONFIG
         )
     else:
-        # Prod local services use aws profile and ap-south-1
+        # Real AWS local services use aws profile and ap-south-1
         region = region_name or "ap-south-1"
         logger.debug(
             "aws.infra.client service=%s env=%s profile=%s region=%s",
@@ -113,7 +122,7 @@ def _build_resource(service: str):
         session = boto3.Session(profile_name=_AWS_PROFILE, region_name="ap-south-1")
         return session.resource(service, config=_RETRY_CONFIG)
 
-    if env == "dev":
+    if env == "dev" and _is_floci_available():
         logger.debug(
             "aws.infra.resource service=%s profile=%s endpoint=%s",
             service,
@@ -178,6 +187,18 @@ def setup_infrastructure():
             AttributeDefinitions=[
                 {"AttributeName": "PK", "AttributeType": "S"},
                 {"AttributeName": "SK", "AttributeType": "S"},
+                {"AttributeName": "GSI1PK", "AttributeType": "S"},
+                {"AttributeName": "GSI1SK", "AttributeType": "S"},
+            ],
+            GlobalSecondaryIndexes=[
+                {
+                    "IndexName": "GSI1",
+                    "KeySchema": [
+                        {"AttributeName": "GSI1PK", "KeyType": "HASH"},
+                        {"AttributeName": "GSI1SK", "KeyType": "RANGE"},
+                    ],
+                    "Projection": {"ProjectionType": "ALL"},
+                }
             ],
             BillingMode="PAY_PER_REQUEST",
         )

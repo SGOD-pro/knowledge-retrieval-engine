@@ -6,13 +6,13 @@ import {
   Zap,
   Brain,
   Sparkles,
-  Loader2,
   FileSearch,
   PanelLeftOpen,
   Maximize,
   Minimize,
   HelpCircle
 } from "lucide-react"
+import { ThinkingOrb } from "thinking-orbs"
 import { useChatStore } from "../store/useChatStore"
 import { useWorkspaceStore } from "../store/useWorkspaceStore"
 import { ChatSidebar } from "../components/chat/ChatSidebar"
@@ -31,6 +31,7 @@ export function ChatPage() {
     ensureSession,
     sendMessage,
     isQuerying,
+    currentStage,
     setActiveCitation,
     rightPaneOpen,
     setRightPaneOpen,
@@ -325,11 +326,92 @@ export function ChatPage() {
             ))
           )}
 
-          {/* Typing / Querying indicator */}
+          {/* Real-time Streaming Processing Card with ThinkingOrb */}
           {isQuerying && (
-            <div className="flex items-center gap-2 text-muted-foreground text-xs p-2">
-              <Loader2 className="h-4 w-4 animate-spin text-[#c96442]" />
-              <span>Retrieving relevant chunks & synthesizing response...</span>
+            <div className="flex items-start gap-4 p-4 rounded-3xl bg-[#ede9de]/80 dark:bg-[#242628]/80 border border-border/80 shadow-xs max-w-xl animate-in fade-in-50 duration-200">
+              <div className="shrink-0 pt-0.5">
+                <ThinkingOrb
+                  state={currentStage?.state || "listening"}
+                  size={64}
+                />
+              </div>
+              <div className="space-y-1.5 min-w-0 flex-1">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">
+                    Retrieval Engine
+                  </span>
+                  {currentStage?.path && (
+                    <span
+                      className={`inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-bold rounded-full ${
+                        currentStage.path === "fast"
+                          ? "bg-[#c96442]/15 text-[#c96442]"
+                          : "bg-[#006768]/15 text-[#006768] dark:text-[#6cd7d8]"
+                      }`}
+                    >
+                      {currentStage.path === "fast" ? (
+                        <>
+                          <Zap className="h-2.5 w-2.5" />
+                          <span>⚡ Fast Match Path</span>
+                        </>
+                      ) : (
+                        <>
+                          <Brain className="h-2.5 w-2.5" />
+                          <span>🧠 Deep Multi-Hop Path</span>
+                        </>
+                      )}
+                    </span>
+                  )}
+                </div>
+                <p className="text-xs font-semibold text-foreground leading-snug animate-pulse">
+                  {currentStage?.label || "Analyzing query & planning route..."}
+                </p>
+                {/* Dynamic stage step tracker */}
+                <div className="flex items-center gap-1.5 pt-1 text-[10px] text-muted-foreground font-mono">
+                  <span
+                    className={`px-1.5 py-0.5 rounded-md ${
+                      currentStage?.stage === "listening" || currentStage?.stage === "routing"
+                        ? "bg-[#c96442]/20 text-[#c96442] font-bold"
+                        : "opacity-60"
+                    }`}
+                  >
+                    1. Plan
+                  </span>
+                  <span>→</span>
+                  <span
+                    className={`px-1.5 py-0.5 rounded-md ${
+                      currentStage?.stage === "searching"
+                        ? "bg-[#c96442]/20 text-[#c96442] font-bold"
+                        : "opacity-60"
+                    }`}
+                  >
+                    2. Vector
+                  </span>
+                  {currentStage?.path !== "fast" && (
+                    <>
+                      <span>→</span>
+                      <span
+                        className={`px-1.5 py-0.5 rounded-md ${
+                          currentStage?.stage === "graph"
+                            ? "bg-[#c96442]/20 text-[#c96442] font-bold"
+                            : "opacity-60"
+                        }`}
+                      >
+                        3. Graph
+                      </span>
+                    </>
+                  )}
+                  <span>→</span>
+                  <span
+                    className={`px-1.5 py-0.5 rounded-md ${
+                      currentStage?.stage === "synthesis"
+                        ? "bg-[#c96442]/20 text-[#c96442] font-bold"
+                        : "opacity-60"
+                    }`}
+                  >
+                    {currentStage?.path === "fast" ? "3. Match" : "4. Synthesize"}
+                  </span>
+                </div>
+              </div>
             </div>
           )}
 

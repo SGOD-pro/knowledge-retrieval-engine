@@ -10,8 +10,9 @@ def test_fast_path_confidence_varies_with_match_strength():
         source_format="pdf",
         page_number=1,
         element_type="paragraph",
-        section_path="Root",
+        section_path=("Root",),
         similarity_score=0.94,
+        workspace_id="ws_test",
     )
 
     weak_chunk = Chunk(
@@ -21,8 +22,9 @@ def test_fast_path_confidence_varies_with_match_strength():
         source_format="pdf",
         page_number=2,
         element_type="paragraph",
-        section_path="Root",
+        section_path=("Root",),
         similarity_score=0.42,
+        workspace_id="ws_test",
     )
 
     # State with strong match

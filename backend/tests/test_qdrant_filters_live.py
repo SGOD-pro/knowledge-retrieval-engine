@@ -37,8 +37,34 @@ def test_qdrant_multiformat_filter_scoping():
         },
     ]
 
+    from schemas.models import Document, Chunk
     repo = CloudRepository()
-    all_chunks = repo.get_all_chunks()
+    for item in test_queries:
+        chunk_text = f"{item['query']} sample detailed text containing {item['query']}"
+        chunk_full = embed_text(chunk_text, provider="dev")
+        doc = Document(
+            id=f"doc_{item['format']}",
+            filename=item["doc"],
+            source_format=item["format"].lower(),
+            workspace_id="ws_001",
+            chunks=(
+                Chunk(
+                    id=f"c_{item['format']}",
+                    document_id=f"doc_{item['format']}",
+                    text=chunk_text,
+                    source_format=item["format"].lower(),
+                    element_type="paragraph",
+                    page_number=1,
+                    workspace_id="ws_001",
+                    embedding_fast=[0.1] * 384,
+                    embedding_full=chunk_full,
+                ),
+            ),
+        )
+        repo.save(doc)
+        repo.add_document_to_workspace("ws_001", doc)
+
+    all_chunks = repo.get_all_chunks(workspace_id="ws_001")
     assert len(all_chunks) > 0, "No chunks loaded from repository"
 
     bm25 = BM25Retriever()
@@ -69,6 +95,7 @@ def test_qdrant_multiformat_filter_scoping():
             fast_path=False,
             candidate_page_ids=cand_pages,
             candidate_chunk_ids=cand_chunk_ids,
+            workspace_id="ws_001",
             top_k=10,
         )
         assert (

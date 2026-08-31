@@ -15,7 +15,9 @@ import type {
   QueryRequest,
   QueryResponse,
   BenchmarkResponse,
-  KnowledgeGraphResponse
+  KnowledgeGraphResponse,
+  ChatMessage,
+  ChatSession
 } from "../types/api"
 
 export const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://localhost:8001"
@@ -294,7 +296,86 @@ export function getDocumentFileUrl(documentId: string): string {
   return `${API_BASE}/api/v1/documents/${documentId}/file`
 }
 
-/** Query Retrieval Pipeline */
+export interface QueryStreamStageEvent {
+  type: "stage"
+  stage: string
+  state: "working" | "searching" | "solving" | "listening" | "connecting" | "weaving" | "composing" | "breathing" | "shaping"
+  label: string
+  progress?: number
+  path?: "fast" | "full"
+}
+
+/** Query Retrieval Pipeline with Real-time SSE Stage Streaming */
+export async function queryStream(
+  req: QueryRequest,
+  onProgress?: (event: QueryStreamStageEvent) => void
+): Promise<QueryResponse> {
+  try {
+    const token = localStorage.getItem("kre_token")
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json"
+    }
+    if (token) {
+      headers["Authorization"] = `Bearer ${token}`
+    }
+
+    const response = await fetch(`${API_BASE}/api/v1/query/stream`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(req)
+    })
+
+    if (!response.ok) {
+      return await query(req)
+    }
+
+    const reader = response.body?.getReader()
+    if (!reader) {
+      return await query(req)
+    }
+
+    const decoder = new TextDecoder()
+    let buffer = ""
+    let finalResult: QueryResponse | null = null
+
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split("\n\n")
+      buffer = lines.pop() || ""
+
+      for (const line of lines) {
+        const trimmed = line.trim()
+        if (!trimmed.startsWith("data: ")) continue
+        const dataStr = trimmed.substring(6)
+        if (dataStr === "[DONE]") break
+
+        try {
+          const parsed = JSON.parse(dataStr)
+          if (parsed.type === "stage" && onProgress) {
+            onProgress(parsed)
+          } else if (parsed.type === "result") {
+            finalResult = parsed.data
+          }
+        } catch (e) {
+          console.debug("SSE parse error:", e)
+        }
+      }
+    }
+
+    if (finalResult) {
+      return finalResult
+    }
+    return await query(req)
+  } catch (err) {
+    console.warn("queryStream error, falling back to query:", err)
+    return await query(req)
+  }
+}
+
+/** Query Retrieval Pipeline (Standard) */
 export async function query(req: QueryRequest): Promise<QueryResponse> {
   try {
     return await apiFetch<QueryResponse>("/api/v1/query", {
@@ -341,6 +422,44 @@ export async function getKnowledgeGraph(workspaceId?: string): Promise<Knowledge
   }
 }
 
+/** Chat Session Management */
+export async function getChatSessions(workspaceId: string): Promise<ChatSession[]> {
+  try {
+    return await apiFetch<ChatSession[]>(`/api/v1/workspaces/${workspaceId}/sessions`)
+  } catch (err) {
+    console.warn("Failed to get chat sessions:", err)
+    return []
+  }
+}
+
+export async function createChatSession(workspaceId: string, title: string = "New Query Session"): Promise<ChatSession> {
+  return await apiFetch<ChatSession>(`/api/v1/workspaces/${workspaceId}/sessions`, {
+    method: "POST",
+    body: JSON.stringify({ title })
+  })
+}
+
+export async function getChatSession(workspaceId: string, sessionId: string): Promise<ChatSession> {
+  return await apiFetch<ChatSession>(`/api/v1/workspaces/${workspaceId}/sessions/${sessionId}`)
+}
+
+export async function saveChatMessage(
+  workspaceId: string,
+  sessionId: string,
+  message: Partial<ChatMessage>
+): Promise<ChatMessage> {
+  return await apiFetch<ChatMessage>(`/api/v1/workspaces/${workspaceId}/sessions/${sessionId}/messages`, {
+    method: "POST",
+    body: JSON.stringify(message)
+  })
+}
+
+export async function deleteChatSession(workspaceId: string, sessionId: string): Promise<void> {
+  await apiFetch(`/api/v1/workspaces/${workspaceId}/sessions/${sessionId}`, {
+    method: "DELETE"
+  })
+}
+
 // ── Grouped Namespace Export ────────────────────────────────────────────────
 
 export const api = {
@@ -355,8 +474,14 @@ export const api = {
   uploadSingleDocument,
   ingestFile,
   query,
+  queryStream,
   getBenchmarks,
-  getKnowledgeGraph
+  getKnowledgeGraph,
+  getChatSessions,
+  createChatSession,
+  getChatSession,
+  saveChatMessage,
+  deleteChatSession
 }
 
 export default api

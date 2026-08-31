@@ -26,6 +26,7 @@ def _make_sample_chunk(
         embedding_fast=f_emb,
         embedding_full=full_emb,
         image_s3_keys=(),
+        workspace_id="ws_test",
     )
 
 
@@ -57,7 +58,13 @@ def test_cloud_repository_save_rejects_null_embeddings():
     """AE2: CloudRepository.save must raise ValueError if any chunk has null embeddings."""
     repo = CloudRepository()
     chunk_bad = _make_sample_chunk(f_emb=None, full_emb=None)
-    doc = Document("doc1", "test.docx", "docx", (chunk_bad,))
+    doc = Document(
+        id="doc1",
+        filename="test.docx",
+        source_format="docx",
+        chunks=(chunk_bad,),
+        workspace_id="ws_test",
+    )
 
     with pytest.raises((ValueError, RuntimeError), match="[Ii]ntegrity|embedding"):
         repo.save(doc)
@@ -70,7 +77,13 @@ def test_cloud_repository_save_rejects_zero_padded_embeddings():
     fake_full = [0.1] * 384 + [0.0] * 640
     fake_fast = [0.1] * 384
     chunk_bad = _make_sample_chunk(f_emb=fake_fast, full_emb=fake_full)
-    doc = Document("doc1", "test.docx", "docx", (chunk_bad,))
+    doc = Document(
+        id="doc1",
+        filename="test.docx",
+        source_format="docx",
+        chunks=(chunk_bad,),
+        workspace_id="ws_test",
+    )
 
     with pytest.raises(
         (ValueError, RuntimeError), match="[Ii]ntegrity|embedding|zero-padded"
@@ -84,7 +97,13 @@ def test_cloud_repository_save_rejects_dimension_mismatch():
     fake_fast = [0.1] * 1024
     fake_full = [0.1] * 384
     chunk_bad = _make_sample_chunk(f_emb=fake_fast, full_emb=fake_full)
-    doc = Document("doc1", "test.docx", "docx", (chunk_bad,))
+    doc = Document(
+        id="doc1",
+        filename="test.docx",
+        source_format="docx",
+        chunks=(chunk_bad,),
+        workspace_id="ws_test",
+    )
 
     with pytest.raises(
         (ValueError, RuntimeError), match="[Ii]ntegrity|embedding|dimension"

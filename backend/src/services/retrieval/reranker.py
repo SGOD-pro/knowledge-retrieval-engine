@@ -50,8 +50,8 @@ def rerank(
         post_count,
     )
 
-    # Take top_k
-    top_chunks = filtered[:top_k]
+    # Take top_k (fall back to candidates if all were filtered out by threshold)
+    top_chunks = filtered[:top_k] if filtered else candidates[:top_k]
 
     # Log latency and confidence score for this stage
     avg_score = (

@@ -25,16 +25,18 @@ def test_citation_provenance_invariant(monkeypatch):
                 source_format="pdf",
                 page_number=4,
                 element_type="paragraph",
-                section_path="3.2.2 Multi-Head Attention",
+                section_path=("3.2.2 Multi-Head Attention",),
                 embedding_fast=embed_fast_local(query),
                 embedding_full=_deterministic_vector(query, 1024),
+                workspace_id="ws_test",
             ),
         ),
+        workspace_id="ws_test",
     )
     repo.save(doc)
 
     # Run the pipeline
-    response = pipeline.run(query)
+    response = pipeline.run(query, workspace_id="ws_test")
 
     citations = response.citations
     assert len(citations) > 0, "No citations returned by pipeline"

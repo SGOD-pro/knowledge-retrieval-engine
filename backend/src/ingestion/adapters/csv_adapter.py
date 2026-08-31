@@ -14,7 +14,7 @@ from pathlib import Path
 from schemas.models import Chunk
 
 
-def parse(path: Path, document_id: str) -> list[Chunk]:
+def parse(path: Path, document_id: str, workspace_id: str = "") -> list[Chunk]:
     chunks: list[Chunk] = []
 
     # Try utf-8-sig first (handles BOM), fallback to latin-1
@@ -65,6 +65,7 @@ def parse(path: Path, document_id: str) -> list[Chunk]:
                 section_path=(path.name,),
                 location_reference=f"Row {row_idx}",
                 metadata={"row": row_idx, "headers": headers},
+                workspace_id=workspace_id,
             )
         )
 

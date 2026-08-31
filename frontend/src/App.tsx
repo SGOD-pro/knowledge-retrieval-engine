@@ -1,10 +1,11 @@
-import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom"
+import { BrowserRouter, Routes, Route, Navigate, useParams } from "react-router-dom"
 import { Toaster } from "sonner"
 import { AuthPage } from "./pages/AuthPage"
 import { WorkspacePage } from "./pages/WorkspacePage"
 import { CreateWorkspacePage } from "./pages/CreateWorkspacePage"
 import { LibraryPage } from "./pages/LibraryPage"
 import { UploadPage } from "./pages/UploadPage"
+import { DocumentViewerPage } from "./pages/DocumentViewerPage"
 import { BenchmarksPage } from "./pages/BenchmarksPage"
 import { ChatPage } from "./pages/ChatPage"
 import { LandingPage } from "./pages/LandingPage"
@@ -17,7 +18,23 @@ function DynamicWorkspaceRedirect({ target }: { target: "chat" | "documents" | "
   if (!wsId) {
     return <Navigate to="/workspaces" replace />
   }
+  if (target === "documents") {
+    return <Navigate to={`/library/${wsId}`} replace />
+  }
+  if (target === "upload") {
+    return <Navigate to={`/library/${wsId}/upload`} replace />
+  }
   return <Navigate to={`/workspaces/${wsId}/${target}`} replace />
+}
+
+function LegacyWorkspaceDocumentsRedirect() {
+  const { workspaceId } = useParams<{ workspaceId: string }>()
+  return <Navigate to={`/library/${workspaceId}`} replace />
+}
+
+function LegacyWorkspaceDocRedirect() {
+  const { workspaceId, documentId } = useParams<{ workspaceId: string; documentId: string }>()
+  return <Navigate to={`/library/${workspaceId}/document/${documentId}`} replace />
 }
 
 export function App() {
@@ -40,11 +57,17 @@ export function App() {
           <Route path="/workspaces" element={<WorkspacePage />} />
           <Route path="/workspaces/new" element={<CreateWorkspacePage />} />
 
-          {/* Slug-based Workspace Library & Upload */}
-          <Route path="/workspaces/:workspaceId/documents" element={<LibraryPage />} />
-          <Route path="/workspaces/:workspaceId/upload" element={<UploadPage />} />
-          
+          {/* Library & Document Viewer Routes */}
+          <Route path="/library/:workspaceId" element={<LibraryPage />} />
+          <Route path="/library/:workspaceId/upload" element={<UploadPage />} />
+          <Route path="/library/:workspaceId/document/:documentId" element={<DocumentViewerPage />} />
+          <Route path="/library/:workspaceId/doc/:documentId" element={<DocumentViewerPage />} />
+
           {/* Legacy & Shortcut redirects */}
+          <Route path="/workspaces/:workspaceId/documents" element={<LegacyWorkspaceDocumentsRedirect />} />
+          <Route path="/workspaces/:workspaceId/upload" element={<UploadPage />} />
+          <Route path="/workspaces/:workspaceId/document/:documentId" element={<LegacyWorkspaceDocRedirect />} />
+          <Route path="/workspaces/:workspaceId/doc/:documentId" element={<LegacyWorkspaceDocRedirect />} />
           <Route path="/library" element={<DynamicWorkspaceRedirect target="documents" />} />
           <Route path="/library/upload" element={<DynamicWorkspaceRedirect target="upload" />} />
 

@@ -6,9 +6,12 @@ import random
 import re
 import numpy as np
 from pathlib import Path
+from dotenv import load_dotenv
 
-# Ensure src is on python path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+# Ensure src is on python path and env is loaded
+backend_dir = Path(__file__).resolve().parent.parent
+load_dotenv(backend_dir / ".env")
+sys.path.insert(0, str(backend_dir / "src"))
 
 if sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
@@ -92,7 +95,7 @@ def main():
 
         t0 = time.perf_counter()
         try:
-            res = pipeline.run(query=query)
+            res = pipeline.run(query=query, workspace_id="ws_001")
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
             latencies.append(elapsed_ms)
 

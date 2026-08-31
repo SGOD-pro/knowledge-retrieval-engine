@@ -20,6 +20,7 @@ async def test_async_ingestion_endpoint_returns_fast_and_updates_status():
 
     def slow_ingest_document(path, *args, **kwargs):
         time.sleep(0.6)
+        ws = kwargs.get("workspace_id", ws_id)
         return Document(
             id="doc_async_test_123",
             filename="large_paper.pdf",
@@ -32,11 +33,13 @@ async def test_async_ingestion_endpoint_returns_fast_and_updates_status():
                     source_format="pdf",
                     page_number=1,
                     element_type="paragraph",
-                    section_path="Root",
+                    section_path=("Root",),
                     embedding_fast=[0.1] * 384,
                     embedding_full=[0.1] * 1024,
+                    workspace_id=ws,
                 ),
             ),
+            workspace_id=ws,
         )
 
     fake_file_content = b"%PDF-1.5 test document content"

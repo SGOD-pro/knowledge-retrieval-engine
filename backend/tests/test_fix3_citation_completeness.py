@@ -10,9 +10,10 @@ def test_citation_fields_completeness():
         source_format="pdf",
         page_number=1,
         element_type="paragraph",
-        section_path="1. Introduction",
+        section_path=("1. Introduction",),
         bounding_box={"x1": 0.1, "y1": 0.2, "x2": 0.8, "y2": 0.5, "page_number": 1},
         location_reference="Page 1",
+        workspace_id="ws_test",
     )
 
     cit = build_citation(chunk, document_filename="attention_paper.pdf")

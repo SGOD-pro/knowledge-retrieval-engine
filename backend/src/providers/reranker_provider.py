@@ -53,8 +53,11 @@ def _sigmoid(x: float) -> float:
 
 
 def nvidia_nim_reranker(query: str, documents: list[str]) -> list[float]:
-    invoke_url = "https://ai.api.nvidia.com/v1/retrieval/nvidia/llama-nemotron-rerank-1b-v2/reranking"
     api_key = settings.NVIDIA_API_KEY
+    if not api_key:
+        raise ValueError("NVIDIA_API_KEY is not configured")
+
+    invoke_url = "https://ai.api.nvidia.com/v1/retrieval/nvidia/llama-nemotron-rerank-1b-v2/reranking"
     logger.info("reranker.mode=nvidia_nim model=%s", _NVIDIA_RERANKER_MODEL)
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -103,6 +106,19 @@ def nvidia_nim_reranker(query: str, documents: list[str]) -> list[float]:
 
             return scores
 
+        except requests.exceptions.HTTPError as e:
+            # 4xx client errors (401, 404, 410, etc.) will not resolve with retries
+            if e.response is not None and 400 <= e.response.status_code < 500 and e.response.status_code != 429:
+                logger.error(f"Reranker permanent client error {e.response.status_code}: {e!s}")
+                raise
+            if attempt == max_retries - 1:
+                logger.error(f"Reranker failed after {max_retries} attempts: {e!s}")
+                raise
+            sleep_time = (base_backoff * (2**attempt)) + random.uniform(0, 1)
+            logger.warning(
+                f"Reranker request exception: {e!s}. Retrying in {sleep_time:.2f}s"
+            )
+            time.sleep(sleep_time)
         except requests.exceptions.RequestException as e:
             if attempt == max_retries - 1:
                 logger.error(f"Reranker failed after {max_retries} attempts: {e!s}")

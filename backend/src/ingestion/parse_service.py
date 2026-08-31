@@ -25,7 +25,10 @@ def generate_deterministic_doc_id(path_or_name: Path | str) -> str:
 
 
 def parse_file(
-    path: Path, document_id: str | None = None, filename: str | None = None
+    path: Path,
+    document_id: str | None = None,
+    filename: str | None = None,
+    workspace_id: str = "",
 ) -> Document:
     """Parse a file to a Document with chunks. Does NOT embed or run OKF.
 
@@ -36,8 +39,14 @@ def parse_file(
     doc_filename = filename or path.name
     document_id = document_id or generate_deterministic_doc_id(doc_filename)
     source_format, adapter = route(path)
-    chunks = tuple(adapter(path, document_id))
-    doc = Document(document_id, doc_filename, source_format, chunks)
+    chunks = tuple(adapter(path, document_id, workspace_id=workspace_id))
+    doc = Document(
+        id=document_id,
+        filename=doc_filename,
+        source_format=source_format,
+        chunks=chunks,
+        workspace_id=workspace_id,
+    )
     latency_ms = (time.perf_counter() - t0) * 1000.0
     logger.info(
         "parse_service.done doc_id=%s format=%s chunks=%d latency_ms=%.2f",
@@ -54,13 +63,16 @@ def ingest_document(
     document_id: str | None = None,
     filename: str | None = None,
     provider: str = "dev",
+    workspace_id: str = "",
 ) -> Document:
     """Full ingestion pipeline: parse → embed → OKF → return Document with embeddings.
 
     Use this in the /ingest route handler.
     Use parse_file() directly in unit tests.
     """
-    doc = parse_file(path, document_id=document_id, filename=filename)
+    doc = parse_file(
+        path, document_id=document_id, filename=filename, workspace_id=workspace_id
+    )
     chunks_list = list(doc.chunks)
 
     # Embed both columns
@@ -74,7 +86,13 @@ def ingest_document(
             doc.id,
             (time.perf_counter() - t0) * 1000,
         )
-        doc = Document(doc.id, doc.filename, doc.source_format, tuple(embedded))
+        doc = Document(
+            id=doc.id,
+            filename=doc.filename,
+            source_format=doc.source_format,
+            chunks=tuple(embedded),
+            workspace_id=doc.workspace_id,
+        )
     except Exception as e:
         logger.error("parse_service.embed_failed doc_id=%s error=%s", doc.id, e)
 

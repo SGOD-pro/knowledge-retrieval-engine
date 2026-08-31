@@ -5,7 +5,7 @@ from pptx import Presentation
 from schemas.models import Chunk
 
 
-def parse(path: Path, document_id: str) -> list[Chunk]:
+def parse(path: Path, document_id: str, workspace_id: str = "") -> list[Chunk]:
     presentation = Presentation(path)
     chunks: list[Chunk] = []
     for slide_number, slide in enumerate(presentation.slides, 1):
@@ -21,6 +21,7 @@ def parse(path: Path, document_id: str) -> list[Chunk]:
                         element_type="paragraph",
                         page_number=slide_number,
                         location_reference=f"Slide: {slide_number}, Shape: {shape_number}",
+                        workspace_id=workspace_id,
                     )
                 )
         if (
@@ -39,6 +40,7 @@ def parse(path: Path, document_id: str) -> list[Chunk]:
                         element_type="caption",
                         page_number=slide_number,
                         location_reference=f"Slide: {slide_number}, Speaker notes",
+                        workspace_id=workspace_id,
                     )
                 )
     return chunks

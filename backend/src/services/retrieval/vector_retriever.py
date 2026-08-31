@@ -30,6 +30,7 @@ class VectorRetriever:
         document_ids: list[str] | None = None,
         candidate_page_ids: list[int] | None = None,
         candidate_chunk_ids: list[str] | None = None,
+        workspace_id: str = "",
         top_k: int = 10,
     ) -> list[tuple[Chunk, float]]:
         """Execute vector search routed by retrieval path.
@@ -37,6 +38,9 @@ class VectorRetriever:
         fast_path=True  → embed locally via BGE-small ONNX, search embedding_fast.
         fast_path=False → embed via API provider, search embedding_full.
         """
+        if not workspace_id:
+            raise ValueError("workspace_id is required for vector search")
+
         start_time = time.perf_counter()
 
         if (
@@ -78,6 +82,7 @@ class VectorRetriever:
             document_ids=document_ids,
             candidate_page_ids=candidate_page_ids,
             candidate_chunk_ids=candidate_chunk_ids,
+            workspace_id=workspace_id,
             limit=top_k,
         )
 

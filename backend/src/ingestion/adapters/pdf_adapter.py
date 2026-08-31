@@ -30,11 +30,18 @@ def _invoke_lambda(path: Path, document_id: str) -> list[dict] | None:
         return None
 
     try:
+        import boto3
         from aws.infra import get_client
         from botocore.exceptions import BotoCoreError, ClientError
 
-        s3 = get_client("s3")
-        lambda_client = get_client("lambda")
+        # S3 upload must reach real AWS S3 where the cloud Lambda is executed
+        try:
+            session = boto3.Session(profile_name="aws")
+            s3 = session.client("s3")
+            lambda_client = session.client("lambda", region_name="ap-south-1")
+        except Exception:
+            s3 = get_client("s3")
+            lambda_client = get_client("lambda", region_name="ap-south-1")
 
         # Upload to S3 under a temp key scoped to the document_id
         s3_key = f"tmp/pdf-extraction/{document_id}/{path.name}"
@@ -76,7 +83,22 @@ def _invoke_lambda(path: Path, document_id: str) -> list[dict] | None:
             )
             return None
 
-        chunks_raw = result.get("chunks") or result.get("kids") or result.get("pages") or []
+        # Unpack ODL Parser envelope: {"results": [{"document_id": "...", "elements": {"kids": [...]}}]}
+        chunks_raw = []
+        if isinstance(result, dict):
+            if "results" in result and isinstance(result["results"], list) and result["results"]:
+                r0 = result["results"][0]
+                if isinstance(r0, dict):
+                    elements_obj = r0.get("elements", {})
+                    if isinstance(elements_obj, dict):
+                        chunks_raw = elements_obj.get("kids", [])
+                    elif isinstance(elements_obj, list):
+                        chunks_raw = elements_obj
+            if not chunks_raw:
+                chunks_raw = result.get("chunks") or result.get("kids") or result.get("pages") or []
+        elif isinstance(result, list):
+            chunks_raw = result
+
         logger.info(
             "pdf_adapter.lambda_done doc_id=%s chunk_count=%d",
             document_id,
@@ -145,7 +167,9 @@ def _extract_with_pypdf(path: Path, document_id: str) -> list[dict]:
 # Chunk normaliser (shared by both paths)
 # ---------------------------------------------------------------------------
 
-def _normalize_elements(elements: list[dict], document_id: str) -> list[Chunk]:
+def _normalize_elements(
+    elements: list[dict], document_id: str, workspace_id: str = ""
+) -> list[Chunk]:
     chunks: list[Chunk] = []
     for index, element in enumerate(elements):
         if not isinstance(element, dict):
@@ -180,6 +204,14 @@ def _normalize_elements(elements: list[dict], document_id: str) -> list[Chunk]:
             }
         elif isinstance(raw_box, dict):
             bounding_box = {k: float(v) for k, v in raw_box.items()}
+        else:
+            bounding_box = {
+                "x1": 0.0,
+                "y1": 0.0,
+                "x2": 1.0,
+                "y2": 1.0,
+                "page_number": page_number,
+            }
 
         element_type = str(
             element.get("type") or element.get("element_type") or "paragraph"
@@ -195,6 +227,7 @@ def _normalize_elements(elements: list[dict], document_id: str) -> list[Chunk]:
                 page_number=page_number,
                 bounding_box=bounding_box,
                 location_reference=f"Page: {page_number}",
+                workspace_id=workspace_id,
             )
         )
 
@@ -207,7 +240,7 @@ def _normalize_elements(elements: list[dict], document_id: str) -> list[Chunk]:
 # Public entry point (called by format_router)
 # ---------------------------------------------------------------------------
 
-def parse(path: Path, document_id: str) -> list[Chunk]:
+def parse(path: Path, document_id: str, workspace_id: str = "") -> list[Chunk]:
     """Parse a PDF via Lambda (prod) or pypdf fallback (dev).
 
     Lambda path: upload to S3 → invoke ODL_PARSER_LAMBDA_NAME → receive JSON.
@@ -221,4 +254,4 @@ def parse(path: Path, document_id: str) -> list[Chunk]:
         )
         elements = _extract_with_pypdf(path, document_id)
 
-    return _normalize_elements(elements, document_id)
+    return _normalize_elements(elements, document_id, workspace_id=workspace_id)

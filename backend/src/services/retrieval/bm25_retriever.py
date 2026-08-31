@@ -2,7 +2,7 @@ import logging
 import time
 from collections.abc import Sequence
 
-from rank_bm25 import BM25Okapi
+from rank_bm25 import BM25Plus
 
 from config import settings
 from schemas.models import Chunk
@@ -17,10 +17,10 @@ def _tokenize(text: str) -> list[str]:
 
 # Cache BM25 index keyed on chunk id tuple so repeated queries don't re-index.
 # Sequence[Chunk] is converted to a tuple of ids for the cache key.
-_BM25_CACHE: dict[tuple[str, ...], tuple[BM25Okapi, list[Chunk]]] = {}
+_BM25_CACHE: dict[tuple[str, ...], tuple[BM25Plus, list[Chunk]]] = {}
 
 
-def _get_bm25(chunks: Sequence[Chunk]) -> tuple[BM25Okapi, list[Chunk]]:
+def _get_bm25(chunks: Sequence[Chunk]) -> tuple[BM25Plus, list[Chunk]]:
     chunk_list = list(chunks)
     key = tuple(c.id for c in chunk_list)
     if key not in _BM25_CACHE:
@@ -28,7 +28,7 @@ def _get_bm25(chunks: Sequence[Chunk]) -> tuple[BM25Okapi, list[Chunk]]:
         if len(_BM25_CACHE) > 8:
             _BM25_CACHE.clear()
         corpus = [_tokenize(c.text) for c in chunk_list]
-        _BM25_CACHE[key] = (BM25Okapi(corpus), chunk_list)
+        _BM25_CACHE[key] = (BM25Plus(corpus), chunk_list)
     return _BM25_CACHE[key]
 
 

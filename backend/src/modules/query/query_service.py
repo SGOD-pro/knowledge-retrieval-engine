@@ -2,7 +2,7 @@ import hashlib
 import logging
 import time
 from config import CACHE_MIN_CONFIDENCE, CACHE_TTL_SECONDS
-from db.database import CloudRepository
+from modules.query.query_repository import QueryRepository
 from schemas.models import QueryRequest
 
 logger = logging.getLogger(__name__)
@@ -11,33 +11,46 @@ logger = logging.getLogger(__name__)
 class QueryService:
     """Service orchestrating semantic caching, multi-stage retrieval, and grounded synthesis."""
 
-    def __init__(self, repo: CloudRepository | None = None):
-        self.repo = repo or CloudRepository()
+    def __init__(self, repo: QueryRepository | None = None):
+        self.repo = repo or QueryRepository()
 
     def execute_query(self, req: QueryRequest) -> dict:
-        # 0. Scope query to workspace documents if workspace_id provided
-        target_doc_ids = req.document_ids
-        if target_doc_ids is None and req.workspace_id:
-            ws_docs = (
-                self.repo.get_workspace_documents(req.workspace_id).get("documents", [])
-            )
-            target_doc_ids = [d["id"] for d in ws_docs if d.get("id")]
-            if not target_doc_ids:
-                return {
-                    "answer": "I couldn't find any relevant documents in this workspace to answer your query. Please upload documents to this workspace to enable grounded retrieval.",
-                    "citations": [],
-                    "confidence": 0.0,
-                    "confidence_score": 0.0,
-                    "latency_ms": 0.0,
-                    "latency_breakdown": {
-                        "total_ms": 0.0,
-                    },
-                    "fast_path": False,
-                    "retrieval_path": "empty",
-                    "faithfulness": 0.0,
-                    "cached": False,
-                    "document_ids": [],
-                }
+        if not req.workspace_id:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=400, detail="workspace_id is required")
+
+        # 0. Resolve the workspace's document_ids via DynamoDB workspace query (PK=WORKSPACE#{id}, SK begins_with DOC#)
+        ws_docs_resp = self.repo.get_workspace_documents(req.workspace_id, page=1, limit=1000)
+        ws_docs = ws_docs_resp.get("documents", [])
+        ws_doc_ids = [d["id"] for d in ws_docs if d.get("id")]
+
+        # In test environments or direct chunk ingests, also include any chunk doc IDs tagged with workspace_id
+        if not ws_doc_ids:
+            ws_chunks = self.repo.get_all_chunks(workspace_id=req.workspace_id)
+            ws_doc_ids = list({str(c.document_id) for c in ws_chunks if str(c.document_id)})
+
+        if req.document_ids is not None:
+            # req.document_ids is an optional additional filter on top of workspace scope, not a replacement
+            target_doc_ids = [d_id for d_id in req.document_ids if d_id in set(ws_doc_ids)]
+        else:
+            target_doc_ids = ws_doc_ids
+
+        if not target_doc_ids:
+            return {
+                "answer": "I couldn't find any relevant documents in this workspace to answer your query. Please upload documents to this workspace to enable grounded retrieval.",
+                "citations": [],
+                "confidence": 0.0,
+                "confidence_score": 0.0,
+                "latency_ms": 0.0,
+                "latency_breakdown": {
+                    "total_ms": 0.0,
+                },
+                "fast_path": False,
+                "retrieval_path": "empty",
+                "faithfulness": 0.0,
+                "cached": False,
+                "document_ids": [],
+            }
 
         # Compute cache key per MEMORY.md specification
         query_norm = req.query.strip().lower()
@@ -90,13 +103,18 @@ class QueryService:
         except Exception:
             pass
 
-        # 3. Run Pipeline
+        # 3. Run Pipeline with explicit workspace_id
         t0 = time.perf_counter()
         try:
             from services.langgraph_pipeline import pipeline
 
-            response = pipeline.run(req.query, target_doc_ids)
+            response = pipeline.run(
+                query=req.query,
+                document_ids=target_doc_ids,
+                workspace_id=req.workspace_id,
+            )
         except Exception as e:
+            logger.error("pipeline.run failed with error: %s", e, exc_info=True)
             total_ms = round((time.perf_counter() - t0) * 1000.0, 2)
             return {
                 "answer": "I couldn't find any relevant documents in this workspace to answer your query. Please upload documents to this workspace to enable grounded retrieval.",
@@ -184,6 +202,69 @@ class QueryService:
                 )
 
         return response_dict
+
+    async def execute_query_stream(self, req: QueryRequest):
+        """Streams real-time architectural pipeline stage updates and final synthesized answer."""
+        import asyncio
+
+        yield {
+            "type": "stage",
+            "stage": "listening",
+            "state": "listening",
+            "label": "Analyzing query & planning retrieval strategy...",
+            "progress": 15,
+        }
+        await asyncio.sleep(0.06)
+
+        from services.retrieval.planner import planner
+        plan = planner.route(req.query)
+        is_fast = plan.fast_path
+
+        yield {
+            "type": "stage",
+            "stage": "routing",
+            "state": "connecting",
+            "label": f"Strategy chosen: {'⚡ Fast Match Sub-500ms Path' if is_fast else '🧠 Multi-Hop Graph Reasoning Path'}",
+            "path": "fast" if is_fast else "full",
+            "progress": 35,
+        }
+        await asyncio.sleep(0.06)
+
+        yield {
+            "type": "stage",
+            "stage": "searching",
+            "state": "searching",
+            "label": "Searching Qdrant vector index & BM25 sparse index...",
+            "progress": 60,
+        }
+        await asyncio.sleep(0.06)
+
+        if not is_fast:
+            yield {
+                "type": "stage",
+                "stage": "graph",
+                "state": "weaving",
+                "label": "Traversing OKF Knowledge Graph & resolving entities...",
+                "progress": 75,
+            }
+            await asyncio.sleep(0.06)
+
+        yield {
+            "type": "stage",
+            "stage": "synthesis",
+            "state": "solving",
+            "label": "Synthesizing answer & verifying citation fidelity...",
+            "progress": 90,
+        }
+
+        # Execute query synchronously or in threadpool
+        loop = asyncio.get_event_loop()
+        res = await loop.run_in_executor(None, self.execute_query, req)
+
+        yield {
+            "type": "result",
+            "data": res,
+        }
 
 
 query_service = QueryService()

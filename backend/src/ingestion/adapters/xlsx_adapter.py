@@ -5,7 +5,7 @@ from openpyxl import load_workbook
 from schemas.models import Chunk
 
 
-def parse(path: Path, document_id: str) -> list[Chunk]:
+def parse(path: Path, document_id: str, workspace_id: str = "") -> list[Chunk]:
     workbook = load_workbook(path, data_only=True, read_only=True)
     chunks: list[Chunk] = []
     for sheet in workbook.worksheets:
@@ -26,6 +26,7 @@ def parse(path: Path, document_id: str) -> list[Chunk]:
                         section_path=(sheet.title,),
                         location_reference=f"Sheet: {sheet.title}, Cell: {cell.coordinate}",
                         metadata={"sheet": sheet.title, "coordinate": cell.coordinate},
+                        workspace_id=workspace_id,
                     )
                 )
     return chunks

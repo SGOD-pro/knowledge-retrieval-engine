@@ -5,7 +5,7 @@ from docx import Document as DocxDocument
 from schemas.models import Chunk
 
 
-def parse(path: Path, document_id: str) -> list[Chunk]:
+def parse(path: Path, document_id: str, workspace_id: str = "") -> list[Chunk]:
     document = DocxDocument(path)
     chunks: list[Chunk] = []
     section: list[str] = []
@@ -27,6 +27,7 @@ def parse(path: Path, document_id: str) -> list[Chunk]:
                 element_type="heading" if is_heading else "paragraph",
                 section_path=tuple(section),
                 location_reference=f"Paragraph: {index + 1}",
+                workspace_id=workspace_id,
             )
         )
 
@@ -48,6 +49,7 @@ def parse(path: Path, document_id: str) -> list[Chunk]:
                     element_type="table",
                     section_path=(),
                     location_reference=f"Table: {index + 1}",
+                    workspace_id=workspace_id,
                 )
             )
 

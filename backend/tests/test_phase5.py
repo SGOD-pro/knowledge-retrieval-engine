@@ -21,11 +21,11 @@ def test_full_pipeline_p95_under_4000ms_prod(monkeypatch):
         fast_path = False
         top_chunks = []
 
-    monkeypatch.setattr(pipeline, "run", lambda query, doc_ids=None: FastMockResponse())
+    monkeypatch.setattr(pipeline, "run", lambda query, doc_ids=None, workspace_id="ws_default": FastMockResponse())
 
     for _ in range(20):
         t0 = time.perf_counter()
-        res = client.post("/query", json={"query": "test query", "provider": "prod"})
+        res = client.post("/query", json={"query": "test query", "workspace_id": "ws_default", "provider": "prod"})
         assert res.status_code == 200
         latencies.append((time.perf_counter() - t0) * 1000)
 
@@ -46,11 +46,11 @@ def test_full_pipeline_p95_under_4000ms_dev(monkeypatch):
         fast_path = False
         top_chunks = []
 
-    monkeypatch.setattr(pipeline, "run", lambda query, doc_ids=None: FastMockResponse())
+    monkeypatch.setattr(pipeline, "run", lambda query, doc_ids=None, workspace_id="ws_default": FastMockResponse())
 
     for _ in range(20):
         t0 = time.perf_counter()
-        res = client.post("/query", json={"query": "test query", "provider": "dev"})
+        res = client.post("/query", json={"query": "test query", "workspace_id": "ws_default", "provider": "dev"})
         assert res.status_code == 200
         latencies.append((time.perf_counter() - t0) * 1000)
 
@@ -89,11 +89,11 @@ def test_fast_path_cold_start_under_1500ms(monkeypatch):
         top_chunks = []
 
     monkeypatch.setattr(
-        pipeline, "run", lambda query, doc_ids=None: ColdStartMockResponse()
+        pipeline, "run", lambda query, doc_ids=None, workspace_id="ws_default": ColdStartMockResponse()
     )
 
     t0 = time.perf_counter()
-    res = client.post("/query", json={"query": "cold start query"})
+    res = client.post("/query", json={"query": "cold start query", "workspace_id": "ws_default"})
     assert res.status_code == 200
     cold_start_ms = (time.perf_counter() - t0) * 1000
     assert (

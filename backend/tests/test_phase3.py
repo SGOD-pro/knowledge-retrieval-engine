@@ -30,12 +30,21 @@ def _make_chunk(i: int = 0, text: str = "Revenue was $1.2M in Q3 2024.") -> Chun
         element_type="paragraph",
         page_number=1,
         structural_weight=0.5,
+        workspace_id="ws_test",
+        embedding_fast=[0.1] * 384,
+        embedding_full=[0.1] * 1024,
     )
 
 
 def _make_doc() -> Document:
     chunks = (_make_chunk(0), _make_chunk(1, "Refund rate was 3.2% in Q3."))
-    return Document("doc1", "test.pdf", "pdf", chunks)
+    return Document(
+        id="doc1",
+        filename="test.pdf",
+        source_format="pdf",
+        chunks=chunks,
+        workspace_id="ws_test",
+    )
 
 
 # ── T1: BGE Lambda routing ───────────────────────────────────────────────────
@@ -93,25 +102,12 @@ def test_okf_builder_stores_properties_to_dynamodb():
     mock_repo.table = MagicMock()
 
     with patch.dict("os.environ", {"ENVIRONMENT": "dev"}):
-        with patch("ingestion.okf_builder._get_repo", return_value=mock_repo):
-            with patch(
-                "ingestion.okf_builder._extract_tier3_with_tracking",
-                return_value=([], {"input_tokens": 0, "output_tokens": 0, "calls": 0}),
-            ):
-                with patch(
-                    "ingestion.normalize_service.cluster_entities", return_value={}
-                ):
-                    import importlib
-
-                    import ingestion.okf_builder as ob
-
-                    importlib.reload(ob)
-                    ob._get_repo = lambda: mock_repo
-                    ob._extract_tier3_with_tracking = lambda c: (
-                        [],
-                        {"input_tokens": 0, "output_tokens": 0, "calls": 0},
-                    )
-                    ob.build_okf(doc)
+        with patch("config.settings.ENVIRONMENT", "dev"):
+            with patch("db.database.CloudRepository", return_value=mock_repo):
+                with patch("ingestion.okf_builder._extract_tier3_smart", return_value=([], {"input_tokens": 0, "output_tokens": 0, "calls": 0})):
+                    with patch("ingestion.normalize_service.cluster_entities", return_value={"Revenue": "Revenue"}):
+                        import ingestion.okf_builder as ob
+                        ob.build_okf(doc)
 
     prop_calls = mock_repo.okf_properties_table.put_item.call_count
     logging.info("T2 PASSED okf_builder.property_writes=%d", prop_calls)
@@ -136,21 +132,13 @@ def test_okf_builder_tracks_token_usage():
     mock_repo.okf_properties_table = MagicMock()
     mock_repo.table = MagicMock()
 
-    import importlib
-
-    import ingestion.okf_builder as ob
-
-    importlib.reload(ob)
-
-    ob._get_repo = lambda: mock_repo
-    ob._extract_tier3_with_tracking = lambda c: (tier3_props, token_stats)
-
-    from ingestion import normalize_service
-
-    with patch.object(
-        normalize_service, "cluster_entities", return_value={"Revenue": "Revenue"}
-    ):
-        ob.build_okf(doc)
+    with patch.dict("os.environ", {"ENVIRONMENT": "dev"}):
+        with patch("config.settings.ENVIRONMENT", "dev"):
+            with patch("db.database.CloudRepository", return_value=mock_repo):
+                with patch("ingestion.okf_builder._extract_tier3_smart", return_value=(tier3_props, token_stats)):
+                    with patch("ingestion.normalize_service.cluster_entities", return_value={"Revenue": "Revenue"}):
+                        import ingestion.okf_builder as ob
+                        ob.build_okf(doc)
 
     mock_repo.table.update_item.assert_called_once()
     kw = mock_repo.table.update_item.call_args[1]
@@ -205,6 +193,12 @@ def test_full_path_llm_call_count_is_one():
     from fastapi.testclient import TestClient
 
     from main import app
+    from db.database import CloudRepository
+
+    repo = CloudRepository()
+    doc = _make_doc()
+    repo.save(doc)
+    repo.add_document_to_workspace("ws_test", doc)
 
     client = TestClient(app)
 
@@ -220,14 +214,15 @@ def test_full_path_llm_call_count_is_one():
         with patch("services.langgraph_pipeline.call_llm", side_effect=mock_llm):
             with patch("services.langgraph_pipeline.check_fidelity", return_value=1.0):
                 with patch(
-                    "services.langgraph_pipeline.rerank", return_value=[]
-                ):  # empty list → compressor gets nothing → still reaches LLM
+                    "services.langgraph_pipeline.rerank", return_value=[doc.chunks[0]]
+                ):
                     t0 = time.perf_counter()
                     resp = client.post(
                         "/query",
                         json={
                             "query": "Compare refund rates between Q1 and Q2",
                             "provider": "dev",
+                            "workspace_id": "ws_test",
                         },
                     )
                     latency_ms = (time.perf_counter() - t0) * 1000.0
@@ -314,7 +309,7 @@ def test_graph_retriever_bfs_max_hops():
 
 
 def test_nova_micro_zero_calls_at_query_time():
-    """concept_service must never be invoked during /query."""
+    """okf_builder must never be invoked during /query."""
     from fastapi.testclient import TestClient
 
     from main import app
@@ -323,9 +318,9 @@ def test_nova_micro_zero_calls_at_query_time():
 
     with patch.dict("os.environ", {"ENVIRONMENT": "test"}):
         with patch(
-            "ingestion.concept_service.extract_properties_nova_micro"
+            "ingestion.okf_builder.build_okf"
         ) as mock_nova:
-            resp = client.post("/query", json={"query": "What is the refund policy?"})
+            resp = client.post("/query", json={"query": "What is the refund policy?", "workspace_id": "ws_test"})
 
     assert resp.status_code == 200
     mock_nova.assert_not_called()

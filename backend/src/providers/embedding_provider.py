@@ -122,9 +122,25 @@ def embed_text(
 
 
 def _deterministic_vector(text: str, dim: int) -> list[float]:
-    """SHA-256-seeded pseudo-embedding for test/CI fallback."""
-    seed = hashlib.sha256(text.encode("utf-8")).digest()
-    vector = [(seed[i % len(seed)] / 127.5) - 1.0 for i in range(dim)]
+    """Word-hashed pseudo-embedding preserving semantic overlap for test/CI fallback."""
+    import re
+
+    _STOPWORDS = {
+        "what", "is", "the", "a", "an", "in", "on", "at", "to", "for",
+        "of", "and", "or", "with", "by", "from", "as", "are",
+    }
+    raw_words = re.findall(r"\w+", text.lower())
+    words = [w for w in raw_words if w not in _STOPWORDS and len(w) > 2]
+    if not words:
+        words = raw_words or [text]
+    vector = [0.0] * dim
+    for word in words:
+        seed = hashlib.sha256(word.encode("utf-8")).digest()
+        for i in range(dim):
+            vector[i] += (seed[i % len(seed)] / 127.5) - 1.0
+    norm = sum(x * x for x in vector) ** 0.5
+    if norm > 0:
+        vector = [x / norm for x in vector]
     return vector
 
 

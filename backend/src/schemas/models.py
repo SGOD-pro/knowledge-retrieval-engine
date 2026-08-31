@@ -23,6 +23,7 @@ class Chunk:
     # S3 keys for images extracted alongside this chunk (e.g. figures in a PDF).
     # Tuple (not list) to stay consistent with section_path and keep Chunk hashable.
     image_s3_keys: tuple[str, ...] = ()
+    workspace_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
@@ -37,6 +38,7 @@ class Document:
     filename: str
     source_format: str
     chunks: tuple[Chunk, ...]
+    workspace_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -44,6 +46,7 @@ class Document:
             "filename": self.filename,
             "source_format": self.source_format,
             "chunks": [chunk.to_dict() for chunk in self.chunks],
+            "workspace_id": self.workspace_id,
         }
 
 
@@ -89,6 +92,10 @@ class Workspace(BaseModel):
     status: str = "active"
     icon_type: str | None = "general"
     created_at: str | None = None
+
+    def __getitem__(self, item: str):
+        return getattr(self, item)
+
 
 
 # --- Document Models ---
@@ -142,7 +149,7 @@ class Citation(BaseModel):
 
 class QueryRequest(BaseModel):
     query: str
-    workspace_id: str | None = None
+    workspace_id: str
     document_ids: list[str] | None = None
     provider: str | None = None
 
@@ -198,4 +205,43 @@ class KnowledgeGraphEdge(BaseModel):
 class KnowledgeGraphResponse(BaseModel):
     nodes: list[KnowledgeGraphNode]
     edges: list[KnowledgeGraphEdge]
+
+
+# --- Chat Persistence Models ---
+class ChatMessageSchema(BaseModel):
+    id: str
+    sender: str  # "user" | "assistant"
+    text: str
+    timestamp: str
+    citations: list[dict[str, Any]] = Field(default_factory=list)
+    retrieval_path: str | None = None
+    confidence: float | None = None
+    latency_ms: float | None = None
+    faithfulness: float | None = None
+
+
+class ChatSessionSchema(BaseModel):
+    id: str
+    workspace_id: str
+    title: str
+    category: str = "Today"
+    updated_at: str
+    messages: list[ChatMessageSchema] = Field(default_factory=list)
+
+
+class CreateChatSessionRequest(BaseModel):
+    title: str | None = "New Query Session"
+
+
+class SaveChatMessageRequest(BaseModel):
+    id: str | None = None
+    sender: str  # "user" | "assistant"
+    text: str
+    timestamp: str | None = None
+    citations: list[dict[str, Any]] = Field(default_factory=list)
+    retrieval_path: str | None = None
+    confidence: float | None = None
+    latency_ms: float | None = None
+    faithfulness: float | None = None
+
 

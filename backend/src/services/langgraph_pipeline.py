@@ -28,6 +28,7 @@ OKF_BOOST = 2.0
 
 class PipelineState(TypedDict):
     query: str
+    workspace_id: str
     query_embedding: list[float] | None
     document_ids: list[str] | None
     plan: Plan | None
@@ -77,10 +78,17 @@ def _rrf_merge(bm25_chunks: list, vector_chunks: list, k: int = 60) -> list:
 
 def route_query(state: PipelineState):
     t0 = time.perf_counter()
-    from providers.embedding_provider import embed_text
 
-    query_embedding = embed_text(state["query"])
-    plan = planner.route(state["query"], query_embedding)
+    plan = planner.route(state["query"])
+    query_embedding = None
+    if not plan.fast_path and not state.get("force_full_path", False):
+        try:
+            from providers.embedding_provider import embed_text
+
+            query_embedding = embed_text(state["query"])
+        except Exception as e:
+            logger.warning("route_query: embedding generation failed: %s", e)
+
     latency_ms = (time.perf_counter() - t0) * 1000.0
     logger.info("route_query.latency_ms=%.2f fast_path=%s", latency_ms, plan.fast_path)
     return {
@@ -128,7 +136,10 @@ def run_bm25(state: PipelineState):
 
     t0 = time.perf_counter()
     repo = CloudRepository()
-    all_chunks = repo.get_all_chunks(state.get("document_ids"))
+    all_chunks = repo.get_all_chunks(
+        document_ids=state.get("document_ids"),
+        workspace_id=state.get("workspace_id", ""),
+    )
 
     retriever = BM25Retriever()
     results = retriever.search(state["query"], all_chunks, top_k=20)
@@ -204,6 +215,7 @@ def run_vector(state: PipelineState):
         document_ids=state.get("document_ids"),
         candidate_page_ids=state.get("candidate_page_ids"),
         candidate_chunk_ids=state.get("candidate_chunk_ids"),
+        workspace_id=state.get("workspace_id", ""),
         top_k=10,
     )
 
@@ -443,7 +455,11 @@ def end_fast_path(state: PipelineState):
         "final_answer": answer,
         "confidence_score": confidence,
         "top_chunks": top_chunks,
-        "citations": [build_citation(c).to_dict() for c in top_chunks],
+        "citations": (
+            [build_citation(c).to_dict() for c in top_chunks]
+            if answer != "NOT_FOUND"
+            else []
+        ),
         "stage_timings": {**existing, "fast_path_ms": latency_ms},
     }
 
@@ -548,10 +564,15 @@ class Pipeline:
         self,
         query: str,
         document_ids: list[str] | None = None,
+        workspace_id: str = "",
         force_full_path: bool = False,
     ):
+        if not workspace_id:
+            raise ValueError("workspace_id is required for pipeline execution")
+
         initial_state = {
             "query": query,
+            "workspace_id": workspace_id,
             "query_embedding": None,
             "document_ids": document_ids,
             "force_full_path": force_full_path,

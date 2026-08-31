@@ -42,6 +42,7 @@ def merge_and_split_chunks(
                         metadata=chunk.metadata,
                         structural_weight=chunk.structural_weight,
                         provider=chunk.provider,
+                        workspace_id=chunk.workspace_id,
                     )
                     split_chunks.append(new_chunk)
                     current_text = sentence
@@ -63,6 +64,7 @@ def merge_and_split_chunks(
                     metadata=chunk.metadata,
                     structural_weight=chunk.structural_weight,
                     provider=chunk.provider,
+                    workspace_id=chunk.workspace_id,
                 )
                 split_chunks.append(new_chunk)
         else:
@@ -78,8 +80,18 @@ def merge_and_split_chunks(
             continue
 
         current_words = len(current_chunk.text.split())
+        same_page = (
+            current_chunk.page_number is None and chunk.page_number is None
+        ) or (current_chunk.page_number == chunk.page_number)
+        same_section = current_chunk.section_path == chunk.section_path
 
-        if current_words < min_tokens:
+        if (
+            current_words < min_tokens
+            and same_page
+            and same_section
+            and current_chunk.element_type != "heading"
+            and chunk.element_type != "heading"
+        ):
             # Merge text
             merged_text = current_chunk.text + " " + chunk.text
 
@@ -97,6 +109,7 @@ def merge_and_split_chunks(
                 metadata=current_chunk.metadata,
                 structural_weight=current_chunk.structural_weight,
                 provider=current_chunk.provider,
+                workspace_id=current_chunk.workspace_id,
             )
         else:
             merged_chunks.append(current_chunk)

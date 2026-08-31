@@ -1,13 +1,13 @@
 from fastapi import HTTPException
-from db.database import CloudRepository
+from modules.workspaces.workspaces_repository import WorkspacesRepository
 from schemas.models import CreateWorkspaceRequest, Workspace
 
 
 class WorkspacesService:
     """Service handling workspace management, isolation, and scoped documents."""
 
-    def __init__(self, repo: CloudRepository | None = None):
-        self.repo = repo or CloudRepository()
+    def __init__(self, repo: WorkspacesRepository | None = None):
+        self.repo = repo or WorkspacesRepository()
 
     def get_workspaces(self) -> list[Workspace]:
         return self.repo.get_workspaces()

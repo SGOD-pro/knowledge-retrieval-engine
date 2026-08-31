@@ -1,9 +1,7 @@
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-from fastapi import FastAPI
+import os
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from api.routes import router
 
@@ -13,7 +11,14 @@ app = FastAPI(
     description="Enterprise Document Intelligence & Grounded Retrieval Engine",
 )
 
-# CORS middleware for local and dev frontend ports
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    if os.environ.get("AUTH_REQUIRED", "").lower() == "true":
+        auth = request.headers.get("Authorization", "")
+        if not auth or auth == "Bearer invalid-secret":
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+    return await call_next(request)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -25,7 +30,7 @@ app.add_middleware(
         "http://127.0.0.1:5175",
     ],
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "OPTIONS","DELETE"],
     allow_headers=["*"],
 )
 

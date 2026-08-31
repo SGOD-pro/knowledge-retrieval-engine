@@ -6,7 +6,9 @@ import {
   MessageSquare,
   Folder,
   ArrowLeft,
-  PanelLeftClose
+  PanelLeftClose,
+  Trash2,
+  Loader2
 } from "lucide-react"
 import { useChatStore } from "../../store/useChatStore"
 import { useWorkspaceStore } from "../../store/useWorkspaceStore"
@@ -25,6 +27,8 @@ export function ChatSidebar() {
     activeSessionId,
     setActiveSessionId,
     createNewChat,
+    deleteSession,
+    isLoadingSessions,
     searchFilter,
     setSearchFilter,
     setLeftPaneOpen
@@ -34,9 +38,13 @@ export function ChatSidebar() {
 
   const currentWsId = activeWorkspace?.id || ""
 
-  const handleNewChat = () => {
-    const newId = createNewChat(currentWsId)
-    setActiveSessionId(newId)
+  const handleNewChat = async () => {
+    await createNewChat(currentWsId)
+  }
+
+  const handleDeleteSession = async (e: React.MouseEvent, sessionId: string) => {
+    e.stopPropagation()
+    await deleteSession(currentWsId, sessionId)
   }
 
   const workspaceSessions = sessions.filter(
@@ -131,8 +139,15 @@ export function ChatSidebar() {
 
         {/* Chat History Lists */}
         <div className="flex-1 overflow-y-auto space-y-5 pr-1">
+          {isLoadingSessions && (
+            <div className="flex items-center justify-center py-6 text-muted-foreground gap-2 text-xs">
+              <Loader2 className="h-4 w-4 animate-spin text-[#c96442]" />
+              <span>Loading chats...</span>
+            </div>
+          )}
+
           {/* Today */}
-          {todaySessions.length > 0 && (
+          {!isLoadingSessions && todaySessions.length > 0 && (
             <div className="space-y-1.5">
               <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider px-2">
                 Today
@@ -141,19 +156,28 @@ export function ChatSidebar() {
                 {todaySessions.map((session) => {
                   const isActive = session.id === activeSessionId
                   return (
-                    <button
+                    <div
                       key={session.id}
-                      type="button"
-                      onClick={() => setActiveSessionId(session.id)}
-                      className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-xs text-left transition-all cursor-pointer ${
+                      onClick={() => setActiveSessionId(session.id, currentWsId)}
+                      className={`group w-full flex items-center justify-between px-3 py-2 rounded-xl text-xs text-left transition-all cursor-pointer ${
                         isActive
                           ? "bg-[#ede9de] dark:bg-[#282a2c] text-[#c96442] dark:text-[#ffb59d] font-bold shadow-xs"
                           : "text-sidebar-foreground/85 hover:bg-sidebar-accent/60 font-medium"
                       }`}
                     >
-                      <MessageSquare className="h-3.5 w-3.5 shrink-0" />
-                      <span className="truncate">{session.title}</span>
-                    </button>
+                      <div className="flex items-center gap-2.5 min-w-0 flex-1">
+                        <MessageSquare className="h-3.5 w-3.5 shrink-0" />
+                        <span className="truncate">{session.title}</span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={(e) => handleDeleteSession(e, session.id)}
+                        className="opacity-0 group-hover:opacity-100 p-1 hover:text-red-500 rounded-md transition-opacity"
+                        title="Delete Chat"
+                      >
+                        <Trash2 className="h-3 w-3" />
+                      </button>
+                    </div>
                   )
                 })}
               </div>
@@ -161,7 +185,7 @@ export function ChatSidebar() {
           )}
 
           {/* Previous */}
-          {previousSessions.length > 0 && (
+          {!isLoadingSessions && previousSessions.length > 0 && (
             <div className="space-y-1.5">
               <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider px-2">
                 Previous Chats
@@ -170,26 +194,35 @@ export function ChatSidebar() {
                 {previousSessions.map((session) => {
                   const isActive = session.id === activeSessionId
                   return (
-                    <button
+                    <div
                       key={session.id}
-                      type="button"
-                      onClick={() => setActiveSessionId(session.id)}
-                      className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-xs text-left transition-all cursor-pointer ${
+                      onClick={() => setActiveSessionId(session.id, currentWsId)}
+                      className={`group w-full flex items-center justify-between px-3 py-2 rounded-xl text-xs text-left transition-all cursor-pointer ${
                         isActive
                           ? "bg-[#ede9de] dark:bg-[#282a2c] text-[#c96442] dark:text-[#ffb59d] font-bold shadow-xs"
                           : "text-sidebar-foreground/85 hover:bg-sidebar-accent/60 font-medium"
                       }`}
                     >
-                      <Folder className="h-3.5 w-3.5 shrink-0 opacity-70" />
-                      <span className="truncate">{session.title}</span>
-                    </button>
+                      <div className="flex items-center gap-2.5 min-w-0 flex-1">
+                        <Folder className="h-3.5 w-3.5 shrink-0 opacity-70" />
+                        <span className="truncate">{session.title}</span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={(e) => handleDeleteSession(e, session.id)}
+                        className="opacity-0 group-hover:opacity-100 p-1 hover:text-red-500 rounded-md transition-opacity"
+                        title="Delete Chat"
+                      >
+                        <Trash2 className="h-3 w-3" />
+                      </button>
+                    </div>
                   )
                 })}
               </div>
             </div>
           )}
 
-          {filteredSessions.length === 0 && (
+          {!isLoadingSessions && filteredSessions.length === 0 && (
             <div className="text-center p-4 text-xs text-muted-foreground font-sans">
               No conversations yet.
             </div>

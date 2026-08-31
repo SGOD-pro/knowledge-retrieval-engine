@@ -23,6 +23,7 @@ def _make_chunk(cid: str, text: str, page_number: int | None, format: str = "doc
         embedding_fast=[0.1] * 384,
         embedding_full=[0.1] * 1024,
         image_s3_keys=(),
+        workspace_id="ws_test",
     )
 
 
@@ -59,7 +60,13 @@ def test_vector_search_includes_pageless_chunks_when_pages_present(monkeypatch):
     from schemas.models import Document
 
     repo = CloudRepository()
-    doc = Document("doc_test", "test.docx", "docx", (c_pdf, c_docx, c_irrelevant))
+    doc = Document(
+        id="doc_test",
+        filename="test.docx",
+        source_format="docx",
+        chunks=(c_pdf, c_docx, c_irrelevant),
+        workspace_id="ws_test",
+    )
     repo.save(doc)
 
     retriever = VectorRetriever(repository=repo)
@@ -70,6 +77,7 @@ def test_vector_search_includes_pageless_chunks_when_pages_present(monkeypatch):
         fast_path=False,
         candidate_page_ids=[5],
         candidate_chunk_ids=["docx_c1"],
+        workspace_id="ws_test",
         top_k=10,
     )
 

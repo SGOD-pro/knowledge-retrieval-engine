@@ -1,4 +1,4 @@
-import { NavLink } from "react-router-dom"
+import { NavLink, useLocation } from "react-router-dom"
 import {
   FolderKanban,
   FolderOpen,
@@ -13,28 +13,60 @@ import { useAuthStore } from "../../store/useAuthStore"
 import { useWorkspaceStore } from "../../store/useWorkspaceStore"
 
 export function AppSidebar() {
+  const location = useLocation()
   const { user } = useAuthStore()
   const { activeWorkspace, workspaces } = useWorkspaceStore()
   const currentWsId = activeWorkspace?.id || workspaces[0]?.id
 
+  const pathname = location.pathname
+
+  const isWorkspaceActive = pathname === "/workspaces" || pathname === "/workspaces/new"
+  const isLibraryActive = pathname.startsWith("/library") || pathname.includes("/documents")
+  const isBenchmarksActive = pathname.startsWith("/benchmarks")
+  const isSettingsActive = pathname.startsWith("/settings")
+  const isChatActive = pathname.includes("/chat")
+  const isArchivedActive = pathname.startsWith("/archived")
+
   const mainNavItems = [
-    { name: "Workspace", path: "/workspaces", icon: FolderKanban },
+    {
+      name: "Workspace",
+      path: "/workspaces",
+      icon: FolderKanban,
+      isActive: isWorkspaceActive
+    },
     {
       name: "Library",
-      path: currentWsId ? `/workspaces/${currentWsId}/documents` : "/workspaces",
-      icon: FolderOpen
+      path: currentWsId ? `/library/${currentWsId}` : "/library",
+      icon: FolderOpen,
+      isActive: isLibraryActive
     },
-    { name: "Benchmarks", path: "/benchmarks", icon: BarChart3 },
-    { name: "Settings", path: "/settings", icon: SlidersHorizontal }
+    {
+      name: "Benchmarks",
+      path: "/benchmarks",
+      icon: BarChart3,
+      isActive: isBenchmarksActive
+    },
+    {
+      name: "Settings",
+      path: "/settings",
+      icon: SlidersHorizontal,
+      isActive: isSettingsActive
+    }
   ]
 
   const bottomNavItems = [
     {
       name: "Chat History",
       path: currentWsId ? `/workspaces/${currentWsId}/chat` : "/workspaces",
-      icon: History
+      icon: History,
+      isActive: isChatActive
     },
-    { name: "Archived", path: "/archived", icon: Archive }
+    {
+      name: "Archived",
+      path: "/archived",
+      icon: Archive,
+      isActive: isArchivedActive
+    }
   ]
 
   return (
@@ -60,15 +92,13 @@ export function AppSidebar() {
         <nav className="mt-8 space-y-1.5">
           {mainNavItems.map((item) => (
             <NavLink
-              key={item.path}
+              key={item.name}
               to={item.path}
-              className={({ isActive }) =>
-                `flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-medium transition-all ${
-                  isActive
-                    ? "bg-[#ede9de] dark:bg-[#282a2c] text-[#c96442] dark:text-[#ffb59d] font-semibold shadow-xs"
-                    : "text-sidebar-foreground/80 hover:bg-sidebar-accent/60 hover:text-foreground"
-                }`
-              }
+              className={`flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-medium transition-all ${
+                item.isActive
+                  ? "bg-[#ede9de] dark:bg-[#282a2c] text-[#c96442] dark:text-[#ffb59d] font-semibold shadow-xs"
+                  : "text-sidebar-foreground/80 hover:bg-sidebar-accent/60 hover:text-foreground"
+              }`}
             >
               <item.icon className="h-4 w-4" />
               <span>{item.name}</span>
@@ -84,13 +114,11 @@ export function AppSidebar() {
             <NavLink
               key={item.name}
               to={item.path}
-              className={({ isActive }) =>
-                `flex items-center gap-3 px-3.5 py-2 rounded-xl text-sm font-medium transition-all ${
-                  isActive
-                    ? "text-primary font-semibold bg-[#ede9de]/50 dark:bg-[#282a2c]/50"
-                    : "text-sidebar-foreground/75 hover:bg-sidebar-accent/60 hover:text-foreground"
-                }`
-              }
+              className={`flex items-center gap-3 px-3.5 py-2 rounded-xl text-sm font-medium transition-all ${
+                item.isActive
+                  ? "text-primary font-semibold bg-[#ede9de]/50 dark:bg-[#282a2c]/50"
+                  : "text-sidebar-foreground/75 hover:bg-sidebar-accent/60 hover:text-foreground"
+              }`}
             >
               <item.icon className="h-4 w-4 opacity-80" />
               <span>{item.name}</span>

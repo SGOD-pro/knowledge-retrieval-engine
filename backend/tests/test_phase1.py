@@ -60,8 +60,22 @@ def test_pptx_speaker_notes_are_caption(tmp_path: Path):
 
 
 def test_pageindex_prioritizes_heading_over_footnote():
-    heading = Chunk("h", "d", "pdf", "refund policy", "heading")
-    footnote = Chunk("f", "d", "pdf", "refund policy", "footnote")
+    heading = Chunk(
+        id="h",
+        document_id="d",
+        source_format="pdf",
+        text="refund policy",
+        element_type="heading",
+        workspace_id="ws_test",
+    )
+    footnote = Chunk(
+        id="f",
+        document_id="d",
+        source_format="pdf",
+        text="refund policy",
+        element_type="footnote",
+        workspace_id="ws_test",
+    )
     assert score(heading, "refund policy") / score(footnote, "refund policy") >= 2
     assert rank([footnote, heading], "refund policy")[0] == heading
 
