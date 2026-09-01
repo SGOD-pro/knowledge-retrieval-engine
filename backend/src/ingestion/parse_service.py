@@ -18,10 +18,20 @@ from schemas.models import Document
 logger = logging.getLogger(__name__)
 
 
-def generate_deterministic_doc_id(path_or_name: Path | str) -> str:
-    """Generate a deterministic UUID5 for a document based on its filename."""
+def generate_deterministic_doc_id(
+    path_or_name: Path | str,
+    workspace_id: str = "",
+) -> str:
+    """Generate a deterministic UUID5 for a document.
+
+    Seed is ``f"{workspace_id}::{filename}"`` when workspace_id is provided,
+    which guarantees isolation between workspaces that upload a file with the
+    same name.  When workspace_id is omitted (legacy / migration fallback)
+    the seed is the bare filename — identical to the previous behaviour.
+    """
     name = path_or_name.name if isinstance(path_or_name, Path) else path_or_name
-    return str(uuid.uuid5(uuid.NAMESPACE_DNS, name))
+    seed = f"{workspace_id}::{name}" if workspace_id else name
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, seed))
 
 
 def parse_file(
@@ -37,7 +47,9 @@ def parse_file(
     """
     t0 = time.perf_counter()
     doc_filename = filename or path.name
-    document_id = document_id or generate_deterministic_doc_id(doc_filename)
+    document_id = document_id or generate_deterministic_doc_id(
+        doc_filename, workspace_id=workspace_id
+    )
     source_format, adapter = route(path)
     chunks = tuple(adapter(path, document_id, workspace_id=workspace_id))
     doc = Document(

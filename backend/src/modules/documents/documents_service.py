@@ -7,7 +7,7 @@ from fastapi import BackgroundTasks, HTTPException, Response, UploadFile
 from config import settings
 from modules.documents.documents_repository import DocumentsRepository
 from ingestion.format_router import SUPPORTED_FORMATS
-from ingestion.parse_service import ingest_document
+from ingestion.parse_service import ingest_document, generate_deterministic_doc_id
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +52,27 @@ class DocumentsService:
             import api.routes as _api_routes
 
             ingest_fn = getattr(_api_routes, "ingest_document", ingest_document)
+
+            # Re-ingestion guard: if the workspace-scoped doc_id already has a
+            # persisted document (same workspace + same filename → same ID), skip
+            # the expensive parse/embed/OKF pipeline and just update status to Ready.
+            # To force re-ingestion, the caller must delete the document first.
+            existing = self.repo.get(doc_id)
+            if existing is not None:
+                self.repo.update_document_status(
+                    workspace_id=workspace_id,
+                    doc_id=doc_id,
+                    status="Ready",
+                    chunk_count=len(existing.chunks),
+                )
+                logger.info(
+                    "background_ingest.skipped_duplicate ws=%s doc_id=%s filename=%s",
+                    workspace_id,
+                    doc_id,
+                    filename,
+                )
+                return
+
             document = ingest_fn(
                 temp_path,
                 document_id=doc_id,
@@ -119,7 +140,7 @@ class DocumentsService:
             size_str = (
                 f"{size_kb / 1024.0:.1f} MB" if size_kb >= 1024 else f"{size_kb:.0f} KB"
             )
-            doc_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, filename))
+            doc_id = generate_deterministic_doc_id(filename, workspace_id=workspace_id)
 
             with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temporary:
                 temporary.write(content)

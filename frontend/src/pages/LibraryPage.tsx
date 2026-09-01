@@ -9,7 +9,8 @@ import {
   AlertCircle,
   ChevronLeft,
   ChevronRight,
-  ChevronDown
+  ChevronDown,
+  MessageSquare
 } from "lucide-react"
 import { useWorkspaceStore } from "../store/useWorkspaceStore"
 import { useDocumentStore } from "../store/useDocumentStore"
@@ -166,13 +167,24 @@ export function LibraryPage() {
           </p>
         </div>
 
-        <Button
-          onClick={() => setUploadModalOpen(true)}
-          className="h-10 px-5 bg-[#ede9de] dark:bg-[#282a2c] hover:bg-[#e2ded2] dark:hover:bg-[#343638] text-foreground font-semibold rounded-xl text-xs flex items-center gap-2 border border-border/60 shadow-xs cursor-pointer transition-colors"
-        >
-          <FileUp className="h-4 w-4 text-[#c96442]" />
-          <span>Upload Files</span>
-        </Button>
+        <div className="flex items-center gap-3">
+          {documents.length > 0 && (
+            <Button
+              onClick={() => navigate(`/workspaces/${currentWsId}/chat`)}
+              className="h-10 px-4 bg-[#c96442] hover:bg-[#b05730] text-white font-semibold rounded-xl text-xs flex items-center gap-2 shadow-xs cursor-pointer transition-colors"
+            >
+              <MessageSquare className="h-4 w-4" />
+              <span>Go to Chat</span>
+            </Button>
+          )}
+          <Button
+            onClick={() => setUploadModalOpen(true)}
+            className="h-10 px-5 bg-[#ede9de] dark:bg-[#282a2c] hover:bg-[#e2ded2] dark:hover:bg-[#343638] text-foreground font-semibold rounded-xl text-xs flex items-center gap-2 border border-border/60 shadow-xs cursor-pointer transition-colors"
+          >
+            <FileUp className="h-4 w-4 text-[#c96442]" />
+            <span>Upload Files</span>
+          </Button>
+        </div>
       </div>
 
       {/* Documents Table */}

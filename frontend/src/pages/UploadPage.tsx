@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from "react"
-import { useParams } from "react-router-dom"
+import { useParams, useNavigate } from "react-router-dom"
 import {
   UploadCloud,
   Info,
@@ -9,7 +9,8 @@ import {
   CheckCircle2,
   RefreshCw,
   AlertCircle,
-  XCircle
+  XCircle,
+  MessageSquare
 } from "lucide-react"
 import { useWorkspaceStore } from "../store/useWorkspaceStore"
 import { useDocumentStore } from "../store/useDocumentStore"
@@ -33,8 +34,9 @@ export function UploadPage({
   isModal?: boolean
 }) {
   const { workspaceId } = useParams<{ workspaceId: string }>()
-  const { activeWorkspace, workspaces, setActiveWorkspace } = useWorkspaceStore()
+  const { activeWorkspace, workspaces, setActiveWorkspace, fetchWorkspaces } = useWorkspaceStore()
   const { documents, fetchDocuments, uploadFiles, isUploading, fileUploads } = useDocumentStore()
+  const navigate = useNavigate()
   const [dragOver, setDragOver] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
@@ -65,7 +67,8 @@ export function UploadPage({
 
     if (success) {
       toast.success("All documents uploaded and queued for processing!")
-      await fetchDocuments(currentWsId)
+      // Refresh both documents AND workspace list so doc_count updates on workspace card
+      await Promise.all([fetchDocuments(currentWsId), fetchWorkspaces()])
       if (onClose) {
         onClose()
       }
@@ -318,16 +321,29 @@ export function UploadPage({
       {/* Uploaded Documents List with Live Status */}
       {documents.length > 0 && (
         <div className="space-y-3 pt-2 max-w-2xl mx-auto">
-          <div className="flex items-center justify-between">
+          <div className="flex items-center justify-between gap-3">
             <h3 className="font-headline font-bold text-sm text-foreground flex items-center gap-2">
               <span>Workspace Documents</span>
               <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-[#ede9de] dark:bg-[#242628] text-muted-foreground">
                 {documents.length}
               </span>
             </h3>
-            <span className="text-[11px] text-muted-foreground font-sans">
-              Indexed for analytical retrieval
-            </span>
+            <div className="flex items-center gap-3">
+              <span className="hidden sm:inline text-[11px] text-muted-foreground font-sans">
+                Indexed for analytical retrieval
+              </span>
+              {currentWsId && (
+                <Button
+                  type="button"
+                  size="sm"
+                  onClick={() => navigate(`/workspaces/${currentWsId}/chat`)}
+                  className="h-8 px-3.5 bg-[#c96442] hover:bg-[#b05730] text-white font-medium rounded-xl text-xs shadow-xs flex items-center gap-1.5 cursor-pointer transition-colors"
+                >
+                  <MessageSquare className="h-3.5 w-3.5" />
+                  <span>Go to Chat</span>
+                </Button>
+              )}
+            </div>
           </div>
 
           <div className="rounded-2xl border border-border/80 bg-card overflow-hidden divide-y divide-border/50 shadow-xs">
@@ -357,6 +373,21 @@ export function UploadPage({
               </div>
             ))}
           </div>
+        </div>
+      )}
+
+      {/* Chat CTA — shown when there are documents ready to query */}
+      {documents.length > 0 && currentWsId && (
+        <div className="max-w-2xl mx-auto pt-1">
+          <button
+            type="button"
+            id="go-to-chat-btn"
+            onClick={() => navigate(`/workspaces/${currentWsId}/chat`)}
+            className="w-full flex items-center justify-center gap-2.5 h-11 rounded-2xl bg-gradient-to-r from-[#c96442] to-[#e07a55] hover:from-[#b05730] hover:to-[#c96442] text-white font-semibold text-sm shadow-md hover:shadow-lg transition-all duration-200 cursor-pointer group"
+          >
+            <MessageSquare className="h-4 w-4 group-hover:scale-110 transition-transform" />
+            <span>Start Chatting with Your Documents</span>
+          </button>
         </div>
       )}
     </div>

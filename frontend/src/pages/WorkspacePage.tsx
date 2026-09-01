@@ -34,8 +34,12 @@ export function WorkspacePage() {
   const [createModalOpen, setCreateModalOpen] = useState(false)
 
   useEffect(() => {
-    fetchWorkspaces()
-  }, [fetchWorkspaces])
+    // Only fetch if store is empty — Zustand keeps the list in memory between
+    // page navigations, so we do NOT need to re-fetch on every mount.
+    if (workspaces.length === 0) {
+      fetchWorkspaces()
+    }
+  }, [workspaces.length, fetchWorkspaces])
 
   const filteredWorkspaces = workspaces.filter((ws) =>
     ws.name.toLowerCase().includes(searchQuery.toLowerCase()) ||

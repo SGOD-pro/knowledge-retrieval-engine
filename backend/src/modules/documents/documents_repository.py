@@ -199,29 +199,46 @@ class DocumentsRepository:
 
         from boto3.dynamodb.conditions import Key
 
-        try:
-            response = self.table.query(
-                KeyConditionExpression=Key("PK").eq(f"DOC#{document_id}")
-            )
-            items = response.get("Items", [])
-            if not items:
+        def _fetch(did: str) -> Document | None:
+            try:
+                response = self.table.query(
+                    KeyConditionExpression=Key("PK").eq(f"DOC#{did}")
+                )
+                items = response.get("Items", [])
+                if not items:
+                    return None
+
+                doc_item = next(
+                    (item for item in items if item["SK"].startswith("DOC#")), None
+                )
+                if not doc_item:
+                    return None
+
+                chunk_items = [item for item in items if item["SK"].startswith("CHUNK#")]
+                chunks = [self._parse_chunk(row) for row in chunk_items]
+                return Document(
+                    id=str(doc_item["id"]),
+                    filename=doc_item["filename"],
+                    source_format=doc_item["source_format"],
+                    chunks=tuple(chunks),
+                    workspace_id=doc_item.get("workspace_id", ""),
+                )
+            except Exception:
                 return None
 
-            doc_item = next((item for item in items if item["SK"].startswith("DOC#")), None)
-            if not doc_item:
-                return None
+        # Primary: try exactly the supplied ID (workspace-scoped uuid5 for new docs).
+        doc = _fetch(document_id)
+        if doc is not None:
+            return doc
 
-            chunk_items = [item for item in items if item["SK"].startswith("CHUNK#")]
-            chunks = [self._parse_chunk(row) for row in chunk_items]
-            return Document(
-                id=str(doc_item["id"]),
-                filename=doc_item["filename"],
-                source_format=doc_item["source_format"],
-                chunks=tuple(chunks),
-                workspace_id=doc_item.get("workspace_id", ""),
-            )
-        except Exception:
-            return None
+        # Transition-window fallback: if the supplied ID was produced by the old
+        # bare-filename seed (pre-fix legacy record), it will already be found above.
+        # If the caller passes a workspace-scoped ID that doesn't exist yet (because
+        # the doc was ingested before the fix), we cannot reverse-engineer the filename,
+        # so we can't automatically try the legacy ID here.
+        # This fallback is intentionally a no-op placeholder; remove once corpus is
+        # fully re-ingested under the new scheme.
+        return None
 
     def get_all_chunks(
         self,
@@ -310,6 +327,12 @@ class DocumentsRepository:
         if workspace_id not in _WORKSPACE_DOCS:
             _WORKSPACE_DOCS[workspace_id] = []
         _WORKSPACE_DOCS[workspace_id].insert(0, doc_entry)
+
+        # Immediately update the in-memory workspace doc_count so the
+        # workspace card reflects the upload before background ingestion completes.
+        if workspace_id in _WORKSPACES:
+            _WORKSPACES[workspace_id]["document_count"] = len(_WORKSPACE_DOCS[workspace_id])
+            _WORKSPACES[workspace_id]["last_active"] = "Active just now"
 
         if not _is_test_env():
             try:

@@ -150,7 +150,7 @@ for filepath in docs_to_ingest:
         raw_bytes = filepath.read_bytes()
         # A. Parse into raw chunks
         source_format, adapter = route_adapter(filepath)
-        doc_id = generate_deterministic_doc_id(filepath)
+        doc_id = generate_deterministic_doc_id(filepath, workspace_id=DEFAULT_WORKSPACE_ID)
         raw_chunks = adapter(filepath, doc_id, workspace_id=DEFAULT_WORKSPACE_ID)
         parse_elapsed = time.perf_counter() - t0
         print(f"    1. Parsed {len(raw_chunks)} raw chunks in {parse_elapsed:.2f}s")
