@@ -25,6 +25,7 @@ dependencies = [
     "qdrant-client>=1.9.0",
     "scikit-learn>=1.9.0",
     "pypdf>=4.0.0",
+    "xlrd>=2.0.2",
 ]
 
 [build-system]

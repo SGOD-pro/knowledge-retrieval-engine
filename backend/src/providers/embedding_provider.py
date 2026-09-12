@@ -152,29 +152,13 @@ def embed_batch(
     if provider == "test" or (provider is None and settings.ENVIRONMENT == "test"):
         return [_deterministic_vector(t, FULL_EMBEDDING_DIM) for t in texts]
 
+    import random
     import time
+    from concurrent.futures import ThreadPoolExecutor
 
-    res = []
-    for t in texts:
-        last_err = None
-        for attempt in range(max_retries):
-            try:
-                res.append(embed_text(t, provider=provider))
-                time.sleep(0.05)
-                break
-            except Exception as e:
-                last_err = e
-                wait = (2**attempt) * 0.5
-                logger.warning(
-                    "embed_batch: retry %d/%d for text after %.2fs error=%s",
-                    attempt + 1,
-                    max_retries,
-                    wait,
-                    e,
-                )
-                time.sleep(wait)
-        else:
-            raise RuntimeError(
-                f"Failed to embed text after {max_retries} attempts: {last_err}"
-            )
-    return res
+    def _embed_single(text: str) -> list[float]:
+        time.sleep(random.uniform(0.02, 0.06))
+        return embed_text(text, provider=provider)
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        return list(executor.map(_embed_single, texts))

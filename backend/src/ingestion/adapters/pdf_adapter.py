@@ -24,9 +24,9 @@ def _invoke_lambda(path: Path, document_id: str) -> list[dict] | None:
     Returns the raw list of element dicts from the Lambda response, or None
     if invocation fails (caller falls back to pypdf).
     """
-    # In test mode, skip lambda to avoid remote calls during unit tests
-    if settings.ENVIRONMENT == "test":
-        logger.debug("pdf_adapter.test_mode skipping lambda for local parsing")
+    # In dev/test mode, skip lambda to avoid remote calls during local workflows
+    if settings.ENVIRONMENT in ("test", "dev"):
+        logger.debug("pdf_adapter.dev_mode skipping lambda for local parsing")
         return None
 
     try:
@@ -35,9 +35,11 @@ def _invoke_lambda(path: Path, document_id: str) -> list[dict] | None:
         from botocore.exceptions import BotoCoreError, ClientError
 
         # S3 upload must reach real AWS S3 where the cloud Lambda is executed
+        from botocore.config import Config
+        s3_cfg = Config(connect_timeout=10, read_timeout=25, retries={"max_attempts": 2})
         try:
             session = boto3.Session(profile_name="aws")
-            s3 = session.client("s3")
+            s3 = session.client("s3", region_name="us-east-1", config=s3_cfg)
             lambda_client = session.client("lambda", region_name="ap-south-1")
         except Exception:
             s3 = get_client("s3")

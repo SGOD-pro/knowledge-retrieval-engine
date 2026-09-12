@@ -36,6 +36,9 @@ def parse(path: Path, document_id: str, workspace_id: str = "") -> list[Chunk]:
             headers = [field.strip().replace("\n", " ") for field in row]
             continue  # Skip the header row itself — it is not a data chunk
 
+        if len(chunks) >= 500:
+            break
+
         # Build a natural-language sentence from all non-empty (header, value) pairs
         parts = []
         for col_idx, value in enumerate(row):

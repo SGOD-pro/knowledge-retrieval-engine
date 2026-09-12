@@ -6,11 +6,12 @@ from ingestion.adapters import (
     docx_adapter,
     pdf_adapter,
     pptx_adapter,
+    xls_adapter,
     xlsx_adapter,
 )
 from schemas.models import Chunk
 
-SUPPORTED_FORMATS = {".pdf", ".docx", ".xlsx", ".pptx", ".csv"}
+SUPPORTED_FORMATS = {".pdf", ".docx", ".xlsx", ".xls", ".pptx", ".csv"}
 Adapter = Callable[[Path, str], list[Chunk]]
 
 
@@ -20,6 +21,7 @@ def route(path: Path) -> tuple[str, Adapter]:
         ".pdf": ("pdf", pdf_adapter.parse),
         ".docx": ("docx", docx_adapter.parse),
         ".xlsx": ("xlsx", xlsx_adapter.parse),
+        ".xls": ("xls", xls_adapter.parse),
         ".pptx": ("pptx", pptx_adapter.parse),
         ".csv": ("csv", csv_adapter.parse),
     }
