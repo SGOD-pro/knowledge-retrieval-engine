@@ -27,6 +27,8 @@ import logging
 import time
 from decimal import Decimal
 
+from modules.graph.okf_key import canon_key as _canon_key
+
 logger = logging.getLogger(__name__)
 
 # Approximate tokens per character (conservative — real average is ~4 chars/token)
@@ -408,8 +410,13 @@ def _put_edge(
 
 
 def _concept_key(name: str) -> str:
-    """Canonical concept ID — uppercase stripped."""
-    return name.strip().upper().replace(" ", "_")
+    """Canonical concept ID — delegates to the shared canon_key utility.
+
+    Keeping the private name so all existing call sites in this module
+    require no change.  Do NOT re-implement the logic here; change
+    modules.graph.okf_key.canon_key if the key format ever evolves.
+    """
+    return _canon_key(name)
 
 
 def _get_repo():

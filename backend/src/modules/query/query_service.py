@@ -47,7 +47,9 @@ class QueryService:
                 },
                 "fast_path": False,
                 "retrieval_path": "empty",
-                "faithfulness": 0.0,
+                "faithfulness": None,
+                "citation_utilization_rate": None,
+                "token_usage": {"input_tokens": 0, "output_tokens": 0},
                 "cached": False,
                 "document_ids": [],
             }
@@ -127,7 +129,9 @@ class QueryService:
                 },
                 "fast_path": False,
                 "retrieval_path": "empty",
-                "faithfulness": 0.0,
+                "faithfulness": None,
+                "citation_utilization_rate": None,
+                "token_usage": {"input_tokens": 0, "output_tokens": 0},
                 "cached": False,
                 "document_ids": target_doc_ids or [],
             }
@@ -171,6 +175,22 @@ class QueryService:
         if answer_text == "NOT_FOUND" or not answer_text:
             answer_text = "I couldn't find any relevant passages in the workspace documents matching your query."
 
+        faithfulness = getattr(response, "faithfulness", None)
+        if response.answer == "NOT_FOUND" or not response.answer:
+            faithfulness = None
+
+        citation_util = getattr(response, "citation_utilization_rate", None)
+        usage = getattr(response, "usage", {"input_tokens": 0, "output_tokens": 0})
+
+        logger.info(
+            "query.cost_tracking path=%s input_tokens=%d output_tokens=%d total_tokens=%d latency_ms=%.2f",
+            "fast" if fast_path else "full",
+            usage.get("input_tokens", 0),
+            usage.get("output_tokens", 0),
+            usage.get("input_tokens", 0) + usage.get("output_tokens", 0),
+            total_ms,
+        )
+
         response_dict = {
             "answer": answer_text,
             "citations": formatted_citations,
@@ -180,7 +200,9 @@ class QueryService:
             "latency_breakdown": latency_breakdown,
             "fast_path": fast_path,
             "retrieval_path": "fast" if fast_path else "full",
-            "faithfulness": getattr(response, "faithfulness", 99.59) if formatted_citations else 0.0,
+            "faithfulness": faithfulness,
+            "citation_utilization_rate": citation_util,
+            "token_usage": usage,
             "cached": False,
             "document_ids": req.document_ids or [],
         }

@@ -126,6 +126,17 @@ def compute_complexity(query: str) -> tuple[float, dict[str, bool | int]]:
             "effect",
             "role of",
             "meaning",
+            # Mechanism / definitional queries (catches misspellings via prefix match)
+            "what is",
+            "what are",
+            "how does",
+            "how do",
+            "how is",
+            "how are",
+            "mechanism",
+            "define",
+            "definition",
+            "overview of",
         ]
     )
 
@@ -169,6 +180,26 @@ class Planner:
                     "vector",
                     "okf",
                     "graph",
+                    "reranker",
+                    "fidelity_check",
+                    "compressor",
+                    "llm",
+                ],
+                complexity_score=score,
+            )
+
+        # Rule 3 — SYNTHESIS PATH (early-return override)
+        # Mirrors Rule 2: definitional / mechanistic queries need full LLM synthesis;
+        # centroid distance is unreliable for typo-heavy or short "what is X" queries.
+        if flags["synthesis_flag"]:
+            return Plan(
+                fast_path=False,
+                use_graph=False,
+                stages=[
+                    "bm25",
+                    "page_index",
+                    "vector",
+                    "okf",
                     "reranker",
                     "fidelity_check",
                     "compressor",

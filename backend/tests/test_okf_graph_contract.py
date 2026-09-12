@@ -91,3 +91,99 @@ def test_get_workspace_graph_data_contract():
     assert edge_2["target"] == "chunk_202", f"Expected 'chunk_202', got '{edge_2['target']}'"
     assert edge_2["label"] == "SEMANTICALLY_RELATED", f"Expected 'SEMANTICALLY_RELATED', got '{edge_2['label']}'"
     assert pytest.approx(edge_2["weight"], rel=1e-3) == 0.895
+
+
+# ---------------------------------------------------------------------------
+# Task 1 regression — entity key canonicalization round-trip
+# ---------------------------------------------------------------------------
+
+
+def test_canon_key_write_read_round_trip():
+    """The key produced by the write path (okf_builder._concept_key / canon_key)
+    must equal the key used by the read path (graph_repository.get_okf_properties).
+
+    Before the fix the writer produced MULTI_HEAD_ATTENTION while the reader
+    queried multi_head_attention — an exact-match miss on every real entity.
+    """
+    from modules.graph.okf_key import canon_key
+    # Representative names; both space and hyphen are normalized to underscore
+    cases = [
+        ("Multi-Head Attention", "MULTI_HEAD_ATTENTION"),
+        ("layer normalization", "LAYER_NORMALIZATION"),
+        ("BERT", "BERT"),
+        ("Scaled Dot-Product Attention", "SCALED_DOT_PRODUCT_ATTENTION"),
+        ("GPT-4", "GPT_4"),
+    ]
+    for raw, expected in cases:
+        result = canon_key(raw)
+        assert result == expected, (
+            f"canon_key({raw!r}) = {result!r}, expected {expected!r}"
+        )
+
+
+def _extract_pk_from_conditions(conditions_obj) -> str:
+    """Pull the PK string from a boto3 ConditionBase (Key('PK').eq(...)) object."""
+    # boto3 ConditionBase.get_expression() returns:
+    #   {'format': '{0} {operator} {1}', 'operator': '=', 'values': (Key, 'ENTITY#...')}
+    try:
+        expr = conditions_obj.get_expression()
+        return str(expr["values"][-1])
+    except Exception:
+        return str(conditions_obj)
+
+
+def test_get_okf_properties_uses_upper_snake_pk():
+    """get_okf_properties must query ENTITY#{UPPER_SNAKE} not ENTITY#{lower}."""
+    from unittest.mock import MagicMock
+    import modules.documents.documents_repository as dr_mod
+
+    repo = GraphRepository.__new__(GraphRepository)
+    repo.okf_entities_table = MagicMock()
+    repo.okf_properties_table = MagicMock()
+    repo.okf_relations_table = MagicMock()
+    repo.okf_properties_table.query.return_value = {"Items": []}
+
+    original = getattr(dr_mod, "_is_test_env", None)
+    dr_mod._is_test_env = lambda: False
+    try:
+        repo.get_okf_properties(["Multi-Head Attention"])
+    finally:
+        if original is not None:
+            dr_mod._is_test_env = original
+
+    call_args = repo.okf_properties_table.query.call_args
+    assert call_args is not None, "okf_properties_table.query was never called"
+    ke = call_args.kwargs.get("KeyConditionExpression")
+    pk_value = _extract_pk_from_conditions(ke)
+    assert pk_value == "ENTITY#MULTI_HEAD_ATTENTION", (
+        f"Expected 'ENTITY#MULTI_HEAD_ATTENTION', got {pk_value!r}"
+    )
+
+
+def test_expand_graph_uses_upper_snake_pk():
+    """expand_graph must query ENTITY#{UPPER_SNAKE} not ENTITY#{lower}."""
+    from unittest.mock import MagicMock
+    import modules.documents.documents_repository as dr_mod
+
+    repo = GraphRepository.__new__(GraphRepository)
+    repo.okf_entities_table = MagicMock()
+    repo.okf_properties_table = MagicMock()
+    repo.okf_relations_table = MagicMock()
+    repo.okf_relations_table.query.return_value = {"Items": []}
+
+    original = getattr(dr_mod, "_is_test_env", None)
+    dr_mod._is_test_env = lambda: False
+    try:
+        repo.expand_graph(["layer normalization"], max_hops=1)
+    finally:
+        if original is not None:
+            dr_mod._is_test_env = original
+
+    call_args = repo.okf_relations_table.query.call_args
+    assert call_args is not None, "okf_relations_table.query was never called"
+    ke = call_args.kwargs.get("KeyConditionExpression")
+    pk_value = _extract_pk_from_conditions(ke)
+    assert pk_value == "ENTITY#LAYER_NORMALIZATION", (
+        f"Expected 'ENTITY#LAYER_NORMALIZATION', got {pk_value!r}"
+    )
+

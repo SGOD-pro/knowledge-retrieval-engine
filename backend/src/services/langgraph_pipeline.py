@@ -78,16 +78,10 @@ def _rrf_merge(bm25_chunks: list, vector_chunks: list, k: int = 60) -> list:
 
 def route_query(state: PipelineState):
     t0 = time.perf_counter()
+    from providers.embedding_provider import embed_text
 
-    plan = planner.route(state["query"])
-    query_embedding = None
-    if not plan.fast_path and not state.get("force_full_path", False):
-        try:
-            from providers.embedding_provider import embed_text
-
-            query_embedding = embed_text(state["query"])
-        except Exception as e:
-            logger.warning("route_query: embedding generation failed: %s", e)
+    query_embedding = embed_text(state["query"])
+    plan = planner.route(state["query"], query_embedding)
 
     latency_ms = (time.perf_counter() - t0) * 1000.0
     logger.info("route_query.latency_ms=%.2f fast_path=%s", latency_ms, plan.fast_path)
@@ -346,6 +340,9 @@ def run_llm(state: PipelineState):
             "final_answer": "NOT_FOUND",
             "citations": [],
             "confidence_score": 0.0,
+            "faithfulness": None,
+            "citation_utilization_rate": None,
+            "usage": {"input_tokens": 0, "output_tokens": 0},
             "stage_timings": {**state.get("stage_timings", {}), "llm_ms": 0.0},
         }
 
@@ -354,7 +351,7 @@ def run_llm(state: PipelineState):
     # Real confidence score — avg reranker score
     top_chunks = state.get("top_chunks", [])
     avg_reranker = (
-        sum(getattr(c, "reranker_score", 0.0) for c in top_chunks) / len(top_chunks)
+        sum((getattr(c, "reranker_score", 0.0) or 0.0) for c in top_chunks) / len(top_chunks)
         if top_chunks
         else 0.0
     )
@@ -365,11 +362,27 @@ def run_llm(state: PipelineState):
     existing = state.get("stage_timings", {})
 
     from services.retrieval.response_builder import build_citation
+    from services.evaluation.benchmark_scorer import compute_faithfulness
+
+    ans = response.get("answer", "NOT_FOUND")
+    usage = response.get("usage", {"input_tokens": 0, "output_tokens": 0})
+
+    if ans == "NOT_FOUND" or not top_chunks:
+        citation_utilization_rate = None
+        faithfulness = None
+    else:
+        contributed = [c for c in top_chunks if f"[{c.id}]" in compressed]
+        citation_utilization_rate = round(len(contributed) / len(top_chunks), 4)
+        context_for_faith = " ".join(c.text for c in top_chunks)
+        faithfulness = compute_faithfulness(ans, context_for_faith)
 
     return {
-        "final_answer": response.get("answer", "NOT_FOUND"),
+        "final_answer": ans,
         "citations": [build_citation(c).to_dict() for c in top_chunks],
         "confidence_score": confidence,
+        "faithfulness": faithfulness,
+        "citation_utilization_rate": citation_utilization_rate,
+        "usage": usage,
         "stage_timings": {**existing, "llm_ms": latency_ms},
     }
 
@@ -379,6 +392,7 @@ def end_fast_path(state: PipelineState):
     term overlap. Fidelity check runs on context (correct 2-arg signature). Real
     confidence score with explicit None checks (no falsy-zero override)."""
     from services.retrieval.response_builder import build_citation
+    from services.evaluation.benchmark_scorer import compute_faithfulness
 
     t0 = time.perf_counter()
 
@@ -390,28 +404,64 @@ def end_fast_path(state: PipelineState):
         return {
             "final_answer": "NOT_FOUND",
             "confidence_score": 0.0,
+            "faithfulness": None,
+            "citation_utilization_rate": None,
+            "usage": {"input_tokens": 0, "output_tokens": 0},
             "top_chunks": [],
             "citations": [],
             "stage_timings": {**state.get("stage_timings", {}), "fast_path_ms": 0.0},
         }
 
-    # Score each sentence by query term overlap (no LLM — Rule 1)
+    # Score each sentence/tabular unit by query term overlap (no LLM — Rule 1)
     query_terms = set(re.findall(r"\w+", query.lower()))
-    scored: list[tuple[int, str]] = []
+    scored: list[tuple[float, str, str]] = []
     for chunk in top_chunks:
+        # Headings inform retrieval ranking but are not standalone answer content
+        if chunk.element_type in ("heading", "title"):
+            continue
+
+        # Tabular rows and cells: evaluate whole chunk text without sentence splitting
+        if chunk.source_format in ("csv", "xlsx") or chunk.element_type in ("table_row", "cell", "table"):
+            unit = chunk.text.strip()
+            if unit:
+                terms = set(re.findall(r"\w+", unit.lower()))
+                matches = sum(
+                    1 for qt in query_terms
+                    if any(qt == t or (len(qt) > 3 and qt.rstrip("s") == t.rstrip("s")) for t in terms)
+                )
+                if matches > 0:
+                    rec = matches / max(1, len(query_terms))
+                    prec = matches / max(1, len(terms))
+                    f1 = (2 * prec * rec) / (prec + rec)
+                    scored.append((f1, unit, chunk.id))
+            continue
+
         for sentence in re.split(r"(?<=[.!?])\s+", chunk.text.strip()):
             if not sentence.strip():
                 continue
+            words = sentence.split()
+            if len(words) < 6:
+                continue  # skip fragments too short to be informative
             terms = set(re.findall(r"\w+", sentence.lower()))
-            scored.append((len(query_terms & terms), sentence))
+            matches = sum(
+                1 for qt in query_terms
+                if any(qt == t or (len(qt) > 3 and qt.rstrip("s") == t.rstrip("s")) for t in terms)
+            )
+            if matches > 0:
+                rec = matches / max(1, len(query_terms))
+                prec = matches / max(1, len(terms))
+                f1 = (2 * prec * rec) / (prec + rec)
+                scored.append((f1, sentence, chunk.id))
     scored.sort(key=lambda x: x[0], reverse=True)
 
     seen: set[str] = set()
     selected: list[str] = []
-    for _, sentence in scored:
+    contributing_chunk_ids: set[str] = set()
+    for _, sentence, chunk_id in scored:
         if sentence not in seen:
             selected.append(sentence)
             seen.add(sentence)
+            contributing_chunk_ids.add(chunk_id)
         if len(selected) == 3:
             break
 
@@ -443,6 +493,14 @@ def end_fast_path(state: PipelineState):
 
     confidence = min(1.0, max(0.0, confidence))
 
+    if answer == "NOT_FOUND" or not top_chunks:
+        fast_path_utilization = None
+        faithfulness = None
+    else:
+        fast_path_utilization = round(len(contributing_chunk_ids) / len(top_chunks), 4)
+        context_for_faith = " ".join(c.text for c in top_chunks)
+        faithfulness = compute_faithfulness(answer, context_for_faith)
+
     latency_ms = (time.perf_counter() - t0) * 1000.0
     logger.info(
         "fast_path.latency_ms=%.2f fast_path.confidence=%.4f fast_path.answer_len=%d",
@@ -454,6 +512,9 @@ def end_fast_path(state: PipelineState):
     return {
         "final_answer": answer,
         "confidence_score": confidence,
+        "faithfulness": faithfulness,
+        "citation_utilization_rate": fast_path_utilization,
+        "usage": {"input_tokens": 0, "output_tokens": 0},
         "top_chunks": top_chunks,
         "citations": (
             [build_citation(c).to_dict() for c in top_chunks]
@@ -605,6 +666,9 @@ class Pipeline:
                 self.context_snippet = state.get(
                     "context_snippet", ""
                 )  # for faithfulness judge
+                self.faithfulness = state.get("faithfulness", None)
+                self.citation_utilization_rate = state.get("citation_utilization_rate", None)
+                self.usage = state.get("usage", {"input_tokens": 0, "output_tokens": 0})
                 plan = state.get("plan")
                 self.fast_path = plan.fast_path if plan else False
                 self.stages = plan.stages if plan else []

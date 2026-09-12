@@ -280,21 +280,24 @@ class DocumentsRepository:
                 return chunks
             except Exception as e:
                 logger.warning("DynamoDB GSI1 query failed for workspace %s: %s", workspace_id, e)
-                # Fallback: scan workspace document items
-                docs_resp = self.table.query(
-                    KeyConditionExpression=Key("PK").eq(f"WORKSPACE#{workspace_id}")
-                    & Key("SK").begins_with("DOC#")
+                from boto3.dynamodb.conditions import Attr
+
+                resp = self.table.scan(
+                    FilterExpression=Attr("workspace_id").eq(workspace_id)
+                    & Attr("SK").begins_with("CHUNK#")
                 )
-                ws_doc_ids = [it["id"] for it in docs_resp.get("Items", []) if it.get("id")]
+                items = resp.get("Items", [])
+                while "LastEvaluatedKey" in resp:
+                    resp = self.table.scan(
+                        FilterExpression=Attr("workspace_id").eq(workspace_id)
+                        & Attr("SK").begins_with("CHUNK#"),
+                        ExclusiveStartKey=resp["LastEvaluatedKey"],
+                    )
+                    items.extend(resp.get("Items", []))
+                chunks = [self._parse_chunk(row) for row in items]
                 if document_ids is not None:
-                    target_ids = [d for d in ws_doc_ids if d in set(document_ids)]
-                else:
-                    target_ids = ws_doc_ids
-                chunks = []
-                for d in target_ids:
-                    doc = self.get(d)
-                    if doc:
-                        chunks.extend(doc.chunks)
+                    doc_id_set = set(document_ids)
+                    chunks = [c for c in chunks if str(c.document_id) in doc_id_set]
                 return chunks
         elif document_ids is not None:
             chunks = []

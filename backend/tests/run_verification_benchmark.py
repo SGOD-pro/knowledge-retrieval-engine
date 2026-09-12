@@ -21,42 +21,9 @@ from services.langgraph_pipeline import pipeline
 from run_benchmark import _parse_page
 
 
-def _tokenize(text: str) -> list[str]:
-    return [w.lower() for w in re.findall(r"\w+", text) if len(w) > 2]
+from services.evaluation.benchmark_scorer import content_match as _content_match
+from services.evaluation.benchmark_scorer import compute_faithfulness as _faithfulness_score
 
-
-def _content_match(chunk_text: str, expected_answer: str) -> bool:
-    if not expected_answer or not chunk_text:
-        return False
-    expected_tokens = set(_tokenize(expected_answer))
-    if not expected_tokens:
-        return False
-    chunk_tokens = set(_tokenize(chunk_text))
-    overlap = len(expected_tokens & chunk_tokens)
-    jaccard = overlap / len(expected_tokens)
-
-    # Check key numbers / percentages
-    exp_nums = set(re.findall(r"\b\d+(?:\.\d+)?%?\b", expected_answer))
-    if exp_nums:
-        chunk_nums = set(re.findall(r"\b\d+(?:\.\d+)?%?\b", chunk_text))
-        num_overlap = len(exp_nums & chunk_nums) / len(exp_nums)
-        if num_overlap >= 0.5 and jaccard >= 0.25:
-            return True
-
-    return jaccard >= 0.40
-
-
-def _faithfulness_score(answer: str, context: str) -> float:
-    if answer in ("NOT_FOUND", ""):
-        return 1.0
-
-    answer_terms = set(w.lower() for w in re.findall(r"\w+", answer) if len(w) > 3)
-    if not answer_terms:
-        return 1.0
-
-    context_lower = context.lower()
-    found = sum(1 for t in answer_terms if t in context_lower)
-    return found / len(answer_terms)
 
 
 def main():
@@ -158,19 +125,17 @@ def main():
             hits_at_3 += h3
 
             # Faithfulness
-            if ans == "NOT_FOUND":
+            faith = _faithfulness_score(ans, context_text)
+            if ans == "NOT_FOUND" or not ans:
                 not_found_count += 1
-                faith = 1.0
-            else:
-                faith = _faithfulness_score(ans, context_text)
+            elif faith is not None:
                 real_faith_scores.append(faith)
-
-            faith_scores.append(faith)
 
             symbol = "✓" if h5 == 1 else "✗"
             path_str = "FAST" if fast_path else "FULL"
+            faith_str = f"{faith:.2f}" if faith is not None else "N/A"
             print(
-                f"[{i:02d}/{sample_size}] {symbol} {qid:<6} R@5={h5} Faith={faith:.2f} Path={path_str:<4} Latency={elapsed_ms:5.0f}ms | {doc_filename:<35} | {query[:45]}..."
+                f"[{i:02d}/{sample_size}] {symbol} {qid:<6} R@5={h5} Faith={faith_str} Path={path_str:<4} Latency={elapsed_ms:5.0f}ms | {doc_filename:<35} | {query[:45]}..."
             )
 
             results.append(
@@ -212,8 +177,8 @@ def main():
     avg_latency = np.mean(latencies) if latencies else 0.0
     p95_latency = np.percentile(latencies, 95) if latencies else 0.0
     median_latency = np.median(latencies) if latencies else 0.0
-    avg_faith = np.mean(faith_scores) if faith_scores else 0.0
     avg_real_faith = np.mean(real_faith_scores) if real_faith_scores else 0.0
+    abstention_rate = not_found_count / sample_size
 
     print("\n" + "=" * 85)
     print("=== CANONICAL 60-QUERY VERIFICATION BENCHMARK SUMMARY ===")
@@ -238,9 +203,8 @@ def main():
         f"Real-Answer Faithfulness:          {avg_real_faith:.4f} (on {len(real_faith_scores)} answers)"
     )
     print(
-        f"NOT_FOUND Abstentions:             {not_found_count}/{sample_size} ({not_found_count/sample_size*100:.1f}%)"
+        f"NOT_FOUND Abstentions:             {not_found_count}/{sample_size} ({abstention_rate*100:.1f}%)"
     )
-    print(f"Blended Faithfulness:              {avg_faith:.4f}")
     print("=" * 85)
 
     # Save output JSON
@@ -261,7 +225,7 @@ def main():
                     "p95_latency_ms": p95_latency,
                     "real_answer_faithfulness": avg_real_faith,
                     "not_found_count": not_found_count,
-                    "blended_faithfulness": avg_faith,
+                    "abstention_rate": abstention_rate,
                 },
                 "queries": results,
             },

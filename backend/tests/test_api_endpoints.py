@@ -50,14 +50,14 @@ def test_system_benchmarks_endpoint():
     resp = client.get("/api/v1/system/benchmarks")
     assert resp.status_code == 200
     data = resp.json()
-    assert data["status"] == "PASSING ALL"
+    assert "status" in data
     assert data["version"] == "v2.4.1"
     kpis = data["kpis"]
-    assert kpis["p95_latency"]["value"] == 3.47
-    assert kpis["recall_5"]["value"] == 79.22
-    assert kpis["faithfulness"]["value"] == 99.59
-    assert kpis["llm_activation"]["value"] == 50.65
-    assert len(data["latency_chart"]["data_points"]) >= 7
+    assert "p95_latency" in kpis
+    assert "recall_5" in kpis
+    assert "faithfulness" in kpis
+    assert "llm_activation" in kpis
+    assert data["status"] in ("UNVERIFIED", "PASSING ALL", "FAILING")
 
 
 def test_knowledge_graph_endpoint():

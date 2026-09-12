@@ -26,7 +26,7 @@ def _get_bm25(chunks: Sequence[Chunk]) -> tuple[BM25Plus, list[Chunk]]:
     if key not in _BM25_CACHE:
         # Keep cache bounded
         if len(_BM25_CACHE) > 8:
-            _BM25_CACHE.clear()
+            _BM25_CACHE.pop(next(iter(_BM25_CACHE)))
         corpus = [_tokenize(c.text) for c in chunk_list]
         _BM25_CACHE[key] = (BM25Plus(corpus), chunk_list)
     return _BM25_CACHE[key]

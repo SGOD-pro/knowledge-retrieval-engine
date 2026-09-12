@@ -1,5 +1,6 @@
 import logging
 from config import settings
+from modules.graph.okf_key import canon_key
 
 logger = logging.getLogger(__name__)
 
@@ -99,11 +100,72 @@ class GraphRepository:
         results = []
         for entity in entities:
             try:
+                pk = f"ENTITY#{canon_key(entity)}"
                 resp = self.okf_properties_table.query(
-                    KeyConditionExpression=Key("PK").eq(f"ENTITY#{entity.lower()}")
+                    KeyConditionExpression=Key("PK").eq(pk)
                 )
                 results.extend(resp.get("Items", []))
             except Exception as e:
                 logger.debug("OKF property lookup failed for %s: %s", entity, e)
         return results
+
+    def expand_graph(
+        self, start_entities: list[str], max_hops: int = 2
+    ) -> list[dict[str, Any]]:
+        """Multi-hop graph traversal over okf_relations table.
+        Rule 13: MAX_NODES=40, MAX_HOPS=2 default.
+        """
+        if not start_entities:
+            return []
+        from modules.documents.documents_repository import _is_test_env
+
+        if _is_test_env():
+            return []
+
+        from boto3.dynamodb.conditions import Key
+
+        visited_nodes: set[str] = set()
+        frontier = list(start_entities)
+        results: list[dict[str, Any]] = []
+
+        for hop in range(max_hops):
+            next_frontier: list[str] = []
+            for entity in frontier:
+                cleaned = canon_key(entity)
+                if cleaned in visited_nodes:
+                    continue
+                visited_nodes.add(cleaned)
+
+                try:
+                    resp = self.okf_relations_table.query(
+                        KeyConditionExpression=Key("PK").eq(f"ENTITY#{cleaned}")
+                    )
+                    for item in resp.get("Items", []):
+                        raw_to = item.get("to_id") or item.get("to_concept_id") or ""
+                        target = _clean_id(raw_to) if raw_to else ""
+                        rel_type = item.get("rel_type") or item.get("relation_type") or "RELATED_TO"
+                        weight = float(item.get("score") or item.get("relation_weight") or 1.0)
+                        edge = {
+                            "from": cleaned,
+                            "to": target,
+                            "relation": rel_type,
+                            "weight": weight,
+                            "hop": hop + 1,
+                        }
+                        results.append(edge)
+                        if target and target.lower() not in visited_nodes and len(visited_nodes) < 40:
+                            next_frontier.append(target)
+                        if len(visited_nodes) >= 40:
+                            break
+                except Exception as e:
+                    logger.debug("Graph expansion failed for %s: %s", entity, e)
+
+                if len(visited_nodes) >= 40:
+                    break
+            frontier = next_frontier
+            if not frontier or len(visited_nodes) >= 40:
+                break
+
+        return results
+
 

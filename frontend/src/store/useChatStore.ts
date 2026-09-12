@@ -283,7 +283,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         retrieval_path: response.retrieval_path === "fast" ? "Fast Match" : "Full Pipeline",
         confidence: response.confidence_score || response.confidence,
         latency_ms: response.latency_ms,
-        faithfulness: response.faithfulness || 98
+        faithfulness: response.faithfulness ?? null
       }
 
       set((state) => ({

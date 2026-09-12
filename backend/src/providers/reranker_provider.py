@@ -152,7 +152,13 @@ def rerank_documents(
     logger.warning(
         "reranker.mode=jaccard_fallback reason=nvidia_nim_failed — check NVIDIA_API_KEY"
     )
-    query_words = set(query.lower().split())
+    _STOPWORDS = {
+        "what", "is", "the", "a", "an", "in", "on", "at", "to", "for",
+        "of", "and", "or", "with", "by", "from", "as", "are", "how",
+        "why", "which", "who", "where", "when", "does", "do", "did",
+    }
+    raw_query_words = set(query.lower().split())
+    query_words = {w for w in raw_query_words if w not in _STOPWORDS and len(w) > 2} or raw_query_words
     if not query_words:
         return [0.0] * len(documents)
 
@@ -163,7 +169,8 @@ def rerank_documents(
             scores.append(0.0)
             continue
         intersection = len(query_words.intersection(doc_words))
-        union = len(query_words.union(doc_words))
-        scores.append(float(intersection) / float(union))
+        # Containment score: fraction of meaningful query terms found in document
+        coverage = float(intersection) / float(len(query_words))
+        scores.append(coverage)
 
     return scores

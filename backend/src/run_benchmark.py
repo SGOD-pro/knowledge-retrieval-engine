@@ -114,26 +114,12 @@ def get_ngrams(text: str, n: int = 3) -> set[str]:
     return set([text[i : i + n] for i in range(len(text) - n + 1)])
 
 
+from services.evaluation.benchmark_scorer import content_match, compute_faithfulness
+
+
 def _content_match(retrieved_text: str, expected_text: str) -> bool:
-    """Return True if Jaccard similarity >= 0.8 or substring inclusion."""
-    if not retrieved_text or not expected_text:
-        return False
-    ret_grams = get_ngrams(retrieved_text)
-    exp_grams = get_ngrams(expected_text)
-    if not ret_grams or not exp_grams:
-        return False
-
-    intersection = len(ret_grams.intersection(exp_grams))
-    union = len(ret_grams.union(exp_grams))
-    jaccard = intersection / union
-
-    # Substring check
-    if expected_text.lower() in retrieved_text.lower():
-        return True
-    if retrieved_text.lower() in expected_text.lower() and len(retrieved_text) > 100:
-        return True
-
-    return jaccard >= 0.8
+    """Canonical content match from services.evaluation.benchmark_scorer."""
+    return content_match(retrieved_text, expected_text)
 
 
 def _hits_at_k_dual(
@@ -147,34 +133,15 @@ def _hits_at_k_dual(
             return 1
 
         # 2. Content fallback match
-        if expected_text and _content_match(chunk.text, expected_text):
+        if expected_text and content_match(getattr(chunk, "text", ""), expected_text):
             return 1
 
     return 0
 
 
-# ---------------------------------------------------------------------------
-# Faithfulness judge (LLM-as-judge)
-# ---------------------------------------------------------------------------
-
-
-def _faithfulness_score(answer: str, context: str) -> float:
-    """Simple entity-overlap faithfulness estimate.
-    Fraction of words in the answer that appear in the context chunks.
-    """
-    import re
-
-    if answer in ("NOT_FOUND", ""):
-        return 1.0
-
-    # Extract words > 3 chars from answer
-    answer_terms = set(w.lower() for w in re.findall(r"\w+", answer) if len(w) > 3)
-    if not answer_terms:
-        return 1.0
-
-    context_lower = context.lower()
-    found = sum(1 for t in answer_terms if t in context_lower)
-    return round(found / len(answer_terms), 4)
+def _faithfulness_score(answer: str, context: str) -> float | None:
+    """Canonical faithfulness estimate from services.evaluation.benchmark_scorer."""
+    return compute_faithfulness(answer, context)
 
 
 # ---------------------------------------------------------------------------
@@ -250,15 +217,17 @@ def run_benchmark(
         context = " ".join([c.text for c in retrieved_chunks])
         faith = _faithfulness_score(answer, context)
 
-        if h5:
-            faith_hits.append(faith)
-        else:
-            faith_misses.append(faith)
+        if faith is not None:
+            if h5:
+                faith_hits.append(faith)
+            else:
+                faith_misses.append(faith)
 
         hit_symbol = "✓" if h5 else "✗"
         path_label = "fast" if is_fast else "full"
+        faith_str = f"{faith:.2f}" if faith is not None else "N/A"
         print(
-            f"  [{i+1}/{total}] {hit_symbol} R@5={h5} faith={faith:.2f} "
+            f"  [{i+1}/{total}] {hit_symbol} R@5={h5} faith={faith_str} "
             f"path={path_label} latency={elapsed_ms:.0f}ms | {query[:55]}..."
         )
 
@@ -267,10 +236,13 @@ def run_benchmark(
     recall_at_5 = hits_at_5 / scored if scored else 0.0
     recall_at_3 = hits_at_3 / scored if scored else 0.0
 
+    all_real_faith = faith_hits + faith_misses
+    avg_real_faith = sum(all_real_faith) / len(all_real_faith) if all_real_faith else 0.0
     avg_faith_hits = sum(faith_hits) / len(faith_hits) if faith_hits else 0.0
     avg_faith_misses = sum(faith_misses) / len(faith_misses) if faith_misses else 0.0
     avg_latency_ms = sum(latencies_ms) / len(latencies_ms) if latencies_ms else 0.0
     llm_activation_rate = 1.0 - (fast_path_count / scored) if scored else 0.0
+    abstention_rate = not_found_count / scored if scored else 0.0
 
     summary = {
         "total_queries": total,
@@ -279,8 +251,10 @@ def run_benchmark(
         "api_errors": len(errors),
         "recall_at_5": recall_at_5,
         "recall_at_3": recall_at_3,
+        "real_answer_faithfulness": avg_real_faith,
         "avg_faithfulness_on_hits": avg_faith_hits,
         "avg_faithfulness_on_misses": avg_faith_misses,
+        "abstention_rate": abstention_rate,
         "avg_latency_ms": avg_latency_ms,
         "llm_activation_rate": llm_activation_rate,
         "fast_path_count": fast_path_count,

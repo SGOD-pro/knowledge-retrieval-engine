@@ -160,7 +160,9 @@ class QueryResponse(BaseModel):
     retrieval_path: str = "full"
     confidence: float = 0.0
     latency_ms: float = 0.0
-    faithfulness: float | None = 99.59
+    faithfulness: float | None = None
+    citation_utilization_rate: float | None = None
+    token_usage: dict[str, Any] | None = None
     cached: bool = False
     document_ids: list[str] = Field(default_factory=list)
     latency_breakdown: dict[str, Any] | None = None
