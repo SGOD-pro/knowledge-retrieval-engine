@@ -119,6 +119,7 @@ def compute_complexity(query: str) -> tuple[float, dict[str, bool | int]]:
             "explain",
             "describe",
             "summarize",
+            "summary",
             "outline",
             "connection",
             "influence",
@@ -126,7 +127,7 @@ def compute_complexity(query: str) -> tuple[float, dict[str, bool | int]]:
             "effect",
             "role of",
             "meaning",
-            # Mechanism / definitional queries (catches misspellings via prefix match)
+            # Mechanism / definitional queries
             "what is",
             "what are",
             "how does",
@@ -137,6 +138,62 @@ def compute_complexity(query: str) -> tuple[float, dict[str, bool | int]]:
             "define",
             "definition",
             "overview of",
+        ]
+    )
+    # Aggregation: queries that need to list/enumerate multiple items from a corpus
+    aggregation_flag = any(
+        k in q_lower
+        for k in [
+            "list all",
+            "list the",
+            "enumerate",
+            "all the",
+            "all models",
+            "all variables",
+            "all countries",
+            "all districts",
+            "all categories",
+            "all outcomes",
+            "all areas",
+            "focus areas",
+            "mentioned in",
+        ]
+    )
+    # Numeric: queries specifically asking for precise numbers, counts, or values
+    numeric_flag = any(
+        k in q_lower
+        for k in [
+            "how many",
+            "what was the",
+            "what is the value",
+            "variable code",
+            "net income",
+            "total",
+            "ratio",
+            "percentage",
+            "accuracy",
+            "surveyed",
+            "households",
+            "top-1",
+            "top-3",
+            "top-5",
+        ]
+    )
+    # Format-specific: queries that reference a specific named file, table, or section
+    format_flag = any(
+        k in q_lower
+        for k in [
+            "in the csv",
+            "in the excel",
+            "in the spreadsheet",
+            "in the xls",
+            "in table",
+            "in figure",
+            "in note",
+            "in sec-form",
+            "form 10-q",
+            "factsheet",
+            "variable_code",
         ]
     )
 
@@ -159,6 +216,9 @@ def compute_complexity(query: str) -> tuple[float, dict[str, bool | int]]:
         "negation_flag": negation_flag,
         "relationship_flag": relationship_flag,
         "synthesis_flag": synthesis_flag,
+        "aggregation_flag": aggregation_flag,
+        "numeric_flag": numeric_flag,
+        "format_flag": format_flag,
     }
     return min(score, 1.0), flags
 
@@ -208,6 +268,44 @@ class Planner:
                 complexity_score=score,
             )
 
+        # Rule 3b — AGGREGATION PATH: list/enumerate queries need LLM to gather
+        # multiple items from multiple chunks; extractive fast-path cannot do this.
+        if flags["aggregation_flag"]:
+            return Plan(
+                fast_path=False,
+                use_graph=False,
+                stages=[
+                    "bm25",
+                    "page_index",
+                    "vector",
+                    "okf",
+                    "reranker",
+                    "fidelity_check",
+                    "compressor",
+                    "llm",
+                ],
+                complexity_score=score,
+            )
+
+        # Rule 3c — NUMERIC / FORMAT PATH: questions asking for specific numbers,
+        # table values, or named file data require LLM extraction from context.
+        if flags["numeric_flag"] or flags["format_flag"]:
+            return Plan(
+                fast_path=False,
+                use_graph=False,
+                stages=[
+                    "bm25",
+                    "page_index",
+                    "vector",
+                    "okf",
+                    "reranker",
+                    "fidelity_check",
+                    "compressor",
+                    "llm",
+                ],
+                complexity_score=score,
+            )
+
         fast_path = False
         if query_embedding is not None:
             import numpy as np
@@ -217,8 +315,16 @@ class Planner:
             q_emb = np.array(query_embedding)
             sim_simple = np.dot(q_emb, CENTROID_SIMPLE)
             sim_synth = np.dot(q_emb, CENTROID_SYNTHESIS)
-            # If similarity to simple is greater, use fast path
-            fast_path = sim_simple > sim_synth
+            # If similarity to simple is greater, tentatively use fast path
+            # but still override for data-extraction queries.
+            centroid_suggests_fast = sim_simple > sim_synth
+            # Block fast path for aggregation/numeric/format even if centroid says simple
+            hard_block = (
+                flags["aggregation_flag"]
+                or flags["numeric_flag"]
+                or flags["format_flag"]
+            )
+            fast_path = centroid_suggests_fast and not hard_block
         else:
             # Fallback if embedding fails
             fast_path = not (
@@ -227,6 +333,9 @@ class Planner:
                 or flags["negation_flag"]
                 or flags["relationship_flag"]
                 or flags["synthesis_flag"]
+                or flags["aggregation_flag"]
+                or flags["numeric_flag"]
+                or flags["format_flag"]
             )
 
         if fast_path:

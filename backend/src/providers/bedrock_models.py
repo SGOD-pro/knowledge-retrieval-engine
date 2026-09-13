@@ -10,7 +10,7 @@ def get_embedding_model() -> str:
 
 
 def get_reranker_model() -> str:
-    return settings.NVIDIA_RERANKER_MODEL
+    return settings.PROD_RERANKER_MODEL
 
 
 def get_concept_model() -> str:

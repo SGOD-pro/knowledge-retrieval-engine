@@ -7,10 +7,10 @@ from providers.llm_provider import generate_completion
 
 logger = logging.getLogger(__name__)
 
-# Simple regex-based token counter estimate (1 token ~ 4 chars for rough limits)
-# For strict 1200 token limits, we enforce a character limit of 1200 * 4 = 4800 characters
-# The compressor should already be limiting this, but we enforce it here.
-MAX_CONTEXT_CHARS = 4800
+# Simple token estimate: 1 token ~ 4 chars. Target 2000 tokens of context.
+# The compressor limits this, but we enforce a hard cap here as a safety net.
+# Raised from 4800 to 8000 to prevent evidence truncation on large documents.
+MAX_CONTEXT_CHARS = 8000
 
 # Static fallback message used when no relevant context chunks are found.
 # ZERO LLM call — saves cost and avoids hallucination.
@@ -69,19 +69,19 @@ def call(
         compressed_context = compressed_context[:MAX_CONTEXT_CHARS]
 
     # -----------------------------------------------------------------------
-    # Ruthless hallucination guardrail — LLM MUST say NOT_FOUND if context
-    # does not contain the answer. No inferring, no guessing.
+    # Grounded synthesis prompt — allows partial answers, blocks hallucination
     # -----------------------------------------------------------------------
     system_prompt = (
-        "You are a document Q&A system. You ONLY answer using the provided context.\n\n"
-        "STRICT RULES — follow exactly:\n"
+        "You are a document Q&A assistant. Answer questions ONLY using the provided context.\n\n"
+        "INSTRUCTIONS:\n"
         "1. Read the context carefully.\n"
-        "2. If the answer IS clearly stated in the context, provide a concise factual answer.\n"
-        "3. If the answer is NOT in the context, respond with EXACTLY: NOT_FOUND\n"
-        "4. NEVER infer, guess, extrapolate, or use any external knowledge.\n"
-        "5. NEVER say 'I don't know' — only NOT_FOUND.\n"
-        "6. NEVER make up chunk IDs — only cite IDs that appear in the context.\n\n"
-        "Return a JSON object with this exact schema:\n"
+        "2. If the answer is clearly stated in the context, provide a concise factual answer.\n"
+        "3. If the context contains PARTIAL information, provide what you can find and note what is missing.\n"
+        "4. If the answer is truly NOT in the context at all, respond with exactly: NOT_FOUND\n"
+        "5. NEVER infer, guess, or use knowledge outside the provided context.\n"
+        "6. NEVER say 'I don't know' — only NOT_FOUND when no relevant information exists.\n"
+        "7. Cite only chunk IDs that appear in the [chunk_id] format in the context.\n\n"
+        "Return ONLY valid JSON with this exact schema (no markdown code blocks):\n"
         '{"answer": "<your answer or NOT_FOUND>", "citations": ["chunk_id_1", "chunk_id_2"]}'
     )
 
@@ -99,8 +99,18 @@ def call(
     try:
         parsed_response = json.loads(cleaned_json)
     except json.JSONDecodeError:
-        logger.error("LLM returned invalid JSON: %s", raw_response)
-        parsed_response = {"answer": NOT_FOUND_STATIC, "citations": []}
+        # Attempt to extract a plain-text answer before falling back to NOT_FOUND.
+        # Some model responses return unstructured text instead of JSON.
+        stripped = cleaned_json.strip()
+        if stripped and stripped.upper() != "NOT_FOUND" and len(stripped) > 10:
+            logger.warning(
+                "LLM returned non-JSON text (len=%d). Wrapping as plain answer.",
+                len(stripped),
+            )
+            parsed_response = {"answer": stripped, "citations": []}
+        else:
+            logger.error("LLM returned invalid JSON and no recoverable text: %s", raw_response[:200])
+            parsed_response = {"answer": NOT_FOUND_STATIC, "citations": []}
 
     # Enforce Rule 15 programmatically
     for forbidden_key in ["confidence", "certainty", "score"]:
