@@ -48,6 +48,15 @@ def _call_bge_lambda_batch(texts: list[str], batch_size: int = 16) -> list[list[
                 Payload=payload.encode("utf-8"),
             )
             response_payload = json.loads(response["Payload"].read())
+            if isinstance(response_payload, dict) and "body" in response_payload:
+                body = response_payload["body"]
+                if isinstance(body, str):
+                    try:
+                        response_payload = json.loads(body)
+                    except Exception:
+                        pass
+                elif isinstance(body, dict):
+                    response_payload = body
 
             if "embeddings" in response_payload:
                 embeddings = response_payload["embeddings"]

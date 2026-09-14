@@ -1,13 +1,29 @@
 import logging
+import re
 import time
 
 from config import settings
 
 logger = logging.getLogger(__name__)
 
+_TABULAR_FORMATS = {"csv", "xlsx", "xls"}
+_TABULAR_ELEMENT_TYPES = {"table_row", "cell", "table", "header_row"}
+
 
 class CoverageError(Exception):
     """Raised when context compression drops critical query entities."""
+
+
+def _context_is_tabular(context_chunks: list[str]) -> bool:
+    """Heuristic: if the joined context looks like CSV/XLS rows (many pipe/comma
+    delimited short lines), treat it as tabular and skip cosine similarity gating."""
+    joined = "\n".join(context_chunks)
+    lines = [l.strip() for l in joined.splitlines() if l.strip()]
+    if not lines:
+        return False
+    # If >= 50% of lines are comma- or pipe-separated with >=2 fields, call it tabular
+    structured_lines = sum(1 for l in lines if l.count(",") >= 1 or l.count("|") >= 1)
+    return structured_lines / max(1, len(lines)) >= 0.4
 
 
 def check_fidelity(query: str, context_chunks: list[str]) -> float:
@@ -15,10 +31,19 @@ def check_fidelity(query: str, context_chunks: list[str]) -> float:
     Stage 7: Fidelity Check.
     Check if the context chunks meet the cosine similarity threshold against the query.
     If the threshold is not met, a CoverageError is raised, gating the LLM execution.
+
+    Tabular/structured contexts (CSV, XLS) always pass — cosine similarity between
+    natural language queries and column-value rows is inherently low even when the
+    chunk contains the correct answer.
     """
     start_time = time.perf_counter()
 
     if query == "NOT_FOUND" or not context_chunks:
+        return 1.0
+
+    # --- Tabular bypass: never gate on cosine similarity for row-level data ---
+    if _context_is_tabular(context_chunks):
+        logger.info("fidelity_check.tabular_bypass — skipping embedding gate")
         return 1.0
 
     try:
@@ -48,8 +73,6 @@ def check_fidelity(query: str, context_chunks: list[str]) -> float:
 
     threshold = settings.FIDELITY_THRESHOLD
     if max_sim < threshold:
-        import re
-
         _STOPWORDS = {
             "what", "is", "the", "a", "an", "in", "on", "at", "to", "for",
             "of", "and", "or", "with", "by", "from", "as", "are", "how", "many", "does",

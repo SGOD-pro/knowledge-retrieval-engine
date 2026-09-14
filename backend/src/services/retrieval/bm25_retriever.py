@@ -10,9 +10,11 @@ from schemas.models import Chunk
 logger = logging.getLogger(__name__)
 
 
+import re
+
 def _tokenize(text: str) -> list[str]:
-    """Lowercase whitespace tokenization."""
-    return text.lower().split()
+    """Lowercase alphanumeric word tokenization (strips punctuation)."""
+    return re.findall(r"\w+", text.lower())
 
 
 # Cache BM25 index keyed on chunk id tuple so repeated queries don't re-index.

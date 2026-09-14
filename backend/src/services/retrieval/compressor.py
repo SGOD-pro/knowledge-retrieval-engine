@@ -11,14 +11,31 @@ def compress_chunks(query: str, chunks: list[Chunk]) -> str:
     Stage 8: Compression
     Extracts relevant snippets from chunks to minimize token count.
     Pure Python logic.
+
+    For structured/tabular chunks (CSV, XLS/XLSX, table rows/cells), ALL rows
+    are included without query-word filtering.  Natural-language query terms
+    rarely appear verbatim inside column-value rows, so paragraph-level
+    filtering silently drops the evidence and causes false refusals.
     """
     start_time = time.perf_counter()
+
+    _TABULAR_FORMATS = {"csv", "xlsx", "xls"}
+    _TABULAR_ELEMENT_TYPES = {"table_row", "cell", "table", "header_row"}
 
     query_words = set(w.lower() for w in query.split() if len(w) > 3)
     compressed_text = []
 
     for c in chunks:
-        # Simple extraction logic: Keep paragraphs containing query words
+        # --- Tabular chunks: include every row, no query-word filtering ---
+        if (
+            getattr(c, "source_format", "") in _TABULAR_FORMATS
+            or getattr(c, "element_type", "") in _TABULAR_ELEMENT_TYPES
+        ):
+            if c.text.strip():
+                compressed_text.append(f"[{c.id}] {c.text.strip()}")
+            continue
+
+        # --- Prose/PDF chunks: keep paragraphs containing query words ---
         paragraphs = [p for p in c.text.split("\n") if p.strip()]
         kept_paragraphs = []
         for p in paragraphs:
