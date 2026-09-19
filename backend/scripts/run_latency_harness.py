@@ -66,7 +66,7 @@ def run_latency_harness(
     workspace_id: str = "ws_fresh_benchmark",
     num_runs: int = 200,
     fast_query: str = "According to the uploaded SEC filing, what is Apple's Commission File Number?",
-    full_query: str = "Summarize Apple quarterly financial results across all product segments",
+    full_query: str = "In the uploaded SEC filing, how many common shares were outstanding as of July 17, 2026?",
 ) -> dict[str, Any]:
     service = QueryService()
 
