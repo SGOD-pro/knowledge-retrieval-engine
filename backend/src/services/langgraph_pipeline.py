@@ -70,6 +70,12 @@ class PipelineState(TypedDict):
     usage: dict[str, int]
     faithfulness: float | None
     citation_utilization_rate: float | None
+    planned_path: str
+    executed_path: str
+    candidate_page_scopes: list[tuple[str, int]] | None
+    graph_chunks: list[Chunk]
+    retrieval_candidates: dict[str, list[str]]
+    reranker_mode: str
 
 
 # ---------------------------------------------------------------------------
@@ -77,8 +83,15 @@ class PipelineState(TypedDict):
 # ---------------------------------------------------------------------------
 
 
-def _rrf_merge(bm25_chunks: list, vector_chunks: list, k: int = 60) -> list:
-    """Reciprocal Rank Fusion. k=60 per the original RRF paper (Cormack et al. 2009).
+def _rrf_merge(
+    bm25_chunks: list,
+    vector_chunks: list,
+    graph_chunks: list | None = None,
+    k: int = 60,
+    graph_weight: float = 1.2,
+) -> list:
+    """Reciprocal Rank Fusion with graph evidence signal.
+    k=60 per Cormack et al. 2009.
     Returns deduplicated list of Chunk objects ordered by descending RRF score."""
     scores: dict[str, float] = {}
     by_id: dict[str, object] = {}
@@ -88,6 +101,10 @@ def _rrf_merge(bm25_chunks: list, vector_chunks: list, k: int = 60) -> list:
     for rank, chunk in enumerate(vector_chunks):
         scores[chunk.id] = scores.get(chunk.id, 0.0) + 1.0 / (k + rank + 1)
         by_id[chunk.id] = chunk
+    if graph_chunks:
+        for rank, chunk in enumerate(graph_chunks):
+            scores[chunk.id] = scores.get(chunk.id, 0.0) + (graph_weight / (k + rank + 1))
+            by_id[chunk.id] = chunk
     return [by_id[cid] for cid in sorted(scores, key=scores.__getitem__, reverse=True)]
 
 
@@ -98,16 +115,29 @@ def _rrf_merge(bm25_chunks: list, vector_chunks: list, k: int = 60) -> list:
 
 def route_query(state: PipelineState):
     t0 = time.perf_counter()
-    from providers.embedding_provider import embed_text
+    from services.retrieval.planner import planner
 
-    query_embedding = embed_text(state["query"])
-    plan = planner.route(state["query"], query_embedding)
+    # 1. Route query deterministically without remote embedding calls
+    plan = planner.route(state["query"])
+    if state.get("force_full_path", False):
+        from dataclasses import replace
+        plan = replace(plan, fast_path=False)
+
+    # 2. Re-use existing query_embedding if provided by query_service;
+    # only embed via Titan if full path is chosen and embedding not yet computed
+    query_embedding = state.get("query_embedding")
+    if not plan.fast_path and query_embedding is None:
+        from providers.embedding_provider import embed_text
+        query_embedding = embed_text(state["query"])
 
     latency_ms = (time.perf_counter() - t0) * 1000.0
-    logger.info("route_query.latency_ms=%.2f fast_path=%s", latency_ms, plan.fast_path)
+    planned = "fast" if plan.fast_path else "full"
+    logger.info("route_query.latency_ms=%.2f fast_path=%s planned=%s", latency_ms, plan.fast_path, planned)
     return {
         "query_embedding": query_embedding,
         "plan": plan,
+        "planned_path": planned,
+        "executed_path": planned,
         "stage_timings": {"route_query_ms": latency_ms},
     }
 
@@ -189,7 +219,7 @@ def run_bm25(state: PipelineState):
 
 def run_page_index(state: PipelineState):
     """PageIndex narrowing (Component 1 / Rule 5). Narrows candidate pages
-    based on headings/footnotes retrieved by BM25."""
+    based on headings/footnotes retrieved by BM25 with document-scoped constraints."""
     t0 = time.perf_counter()
     retriever = PageIndexRetriever()
     bm25_cands = state.get("bm25_candidates")
@@ -197,9 +227,17 @@ def run_page_index(state: PipelineState):
         chunks, pages, c_ids = retriever.filter_and_rank(
             state["query"], bm25_cands, top_k=20
         )
+        page_scopes = [
+            (str(c.document_id), c.page_number)
+            for c in chunks
+            if c.page_number is not None and getattr(c, "document_id", None)
+        ]
+        # Include all selected chunk IDs
+        all_selected_ids = [str(c.id) for c in chunks]
+        c_ids = list(set((c_ids or []) + all_selected_ids))
     else:
         # When BM25 is skipped (e.g. fast path), do not restrict page/chunk IDs
-        pages, c_ids = None, None
+        pages, c_ids, page_scopes = None, None, None
 
     avg_score = 1.0 if pages else 0.0
     latency_ms = (time.perf_counter() - t0) * 1000.0
@@ -212,12 +250,13 @@ def run_page_index(state: PipelineState):
     return {
         "candidate_page_ids": pages,
         "candidate_chunk_ids": c_ids,
+        "candidate_page_scopes": page_scopes,
         "stage_timings": {**existing, "page_index_ms": latency_ms},
     }
 
 
 def run_vector(state: PipelineState):
-    """Vector retrieval (Component 1). Searches within PageIndex candidates."""
+    """Vector retrieval (Component 1). Searches within document-scoped PageIndex candidates."""
     t0 = time.perf_counter()
     repo = _get_repo()
     retriever = VectorRetriever(repository=repo)
@@ -232,8 +271,9 @@ def run_vector(state: PipelineState):
         document_ids=state.get("document_ids"),
         candidate_page_ids=state.get("candidate_page_ids"),
         candidate_chunk_ids=state.get("candidate_chunk_ids"),
+        candidate_page_scopes=state.get("candidate_page_scopes"),
         workspace_id=state.get("workspace_id", ""),
-        top_k=10,
+        top_k=40 if not is_fast_path else 10,
     )
 
     from dataclasses import replace
@@ -263,6 +303,7 @@ def run_vector(state: PipelineState):
 
 
 def run_graph(state: PipelineState):
+    """Graph traversal with provenance-backed source chunk extraction."""
     from services.retrieval.planner import extract_entities
 
     t0 = time.perf_counter()
@@ -270,38 +311,94 @@ def run_graph(state: PipelineState):
 
     retriever = GraphRetriever()
     results = retriever.expand(entities)
+
+    # Convert graph traversal outputs to provenance-backed chunk IDs
+    graph_chunks = []
+    repo = _get_repo()
+    ws_id = state.get("workspace_id", "")
+    chunk_ids_to_fetch = set()
+
+    for item in results:
+        c_id = item.get("source_chunk_id") or item.get("chunk_id")
+        if c_id:
+            chunk_ids_to_fetch.add(str(c_id))
+
+    if entities and repo:
+        try:
+            okf_props = repo.get_okf_properties(entities)
+            for p in okf_props:
+                sc = p.get("source_chunk_id")
+                if sc:
+                    chunk_ids_to_fetch.add(str(sc))
+        except Exception:
+            pass
+
+    if chunk_ids_to_fetch and repo:
+        try:
+            all_ws_chunks = repo.get_all_chunks(workspace_id=ws_id)
+            ws_by_id = {str(c.id): c for c in all_ws_chunks}
+            for cid in chunk_ids_to_fetch:
+                if cid in ws_by_id:
+                    graph_chunks.append(ws_by_id[cid])
+        except Exception as e:
+            logger.debug("graph_chunk_fetch_failed error=%s", e)
+
     latency_ms = (time.perf_counter() - t0) * 1000.0
-    logger.info("graph.latency_ms=%.2f graph.result_count=%d", latency_ms, len(results))
+    logger.info(
+        "graph.latency_ms=%.2f graph.result_count=%d graph.chunk_count=%d",
+        latency_ms,
+        len(results),
+        len(graph_chunks),
+    )
     existing = state.get("stage_timings", {})
     return {
         "graph_results": results,
+        "graph_chunks": graph_chunks,
         "stage_timings": {**existing, "graph_ms": latency_ms},
     }
 
 
 def run_reranker(state: PipelineState):
-    """RRF merge of bm25_candidates + candidate_chunks (vector), then neural rerank
-    (Component 1). Both retrieval lists searched the full corpus independently."""
+    """RRF merge of bm25_candidates + candidate_chunks (vector) + graph_chunks, then neural rerank.
+    Tracks raw retrieval candidates per stage for honest evaluation."""
     t0 = time.perf_counter()
     bm25 = state.get("bm25_candidates", [])
     vector = state.get("candidate_chunks", [])
+    graph = state.get("graph_chunks", [])
 
-    merged = _rrf_merge(bm25, vector, k=60)
+    merged = _rrf_merge(bm25, vector, graph_chunks=graph, k=60, graph_weight=1.2)
     if not merged:
         logger.warning("run_reranker: no chunks to rerank — returning empty")
-        return {"top_chunks": []}
+        return {"top_chunks": [], "retrieval_candidates": {}, "reranker_mode": "remote_success"}
+
+    from providers.reranker_provider import _is_circuit_open
+    circuit_open = _is_circuit_open()
+    reranker_mode = "circuit_open_lexical_fallback" if circuit_open else "remote_success"
 
     top_chunks = rerank(state["query"], merged, top_k=6)
     latency_ms = (time.perf_counter() - t0) * 1000.0
     logger.info(
-        "reranker.latency_ms=%.2f reranker.input_count=%d reranker.output_count=%d",
+        "reranker.latency_ms=%.2f reranker.input_count=%d reranker.output_count=%d mode=%s",
         latency_ms,
         len(merged),
         len(top_chunks),
+        reranker_mode,
     )
     existing = state.get("stage_timings", {})
+
+    retrieval_candidates = {
+        "bm25": [str(c.id) for c in bm25],
+        "vector": [str(c.id) for c in vector],
+        "graph": [str(c.id) for c in graph],
+        "rrf": [str(c.id) for c in merged],
+        "reranked": [str(c.id) for c in top_chunks],
+    }
+
     return {
         "top_chunks": top_chunks,
+        "retrieval_candidates": retrieval_candidates,
+        "reranker_mode": reranker_mode,
+        "executed_path": "full",
         "stage_timings": {**existing, "reranker_ms": latency_ms},
     }
 
@@ -362,6 +459,7 @@ def run_deterministic_math(state: PipelineState):
         "citation_utilization_rate": 1.0,
         "usage": {"input_tokens": 0, "output_tokens": 0},
         "execution_result": res,
+        "executed_path": "deterministic_math",
         "stage_timings": {**existing, "deterministic_math_ms": latency_ms},
     }
 
@@ -439,6 +537,7 @@ def run_llm(state: PipelineState):
             "faithfulness": None,
             "citation_utilization_rate": None,
             "usage": {"input_tokens": 0, "output_tokens": 0},
+            "executed_path": "full",
             "stage_timings": {**state.get("stage_timings", {}), "llm_ms": 0.0},
         }
 
@@ -469,8 +568,9 @@ def run_llm(state: PipelineState):
     else:
         contributed = [c for c in top_chunks if f"[{c.id}]" in compressed]
         citation_utilization_rate = round(len(contributed) / len(top_chunks), 4)
-        context_for_faith = " ".join(c.text for c in top_chunks)
-        faithfulness = compute_faithfulness(ans, context_for_faith)
+        faithfulness = compute_faithfulness(ans, compressed)
+    cands = dict(state.get("retrieval_candidates", {}))
+    cands["llm_citations"] = [str(getattr(c, "id", "")) for c in top_chunks]
 
     return {
         "final_answer": ans,
@@ -479,6 +579,8 @@ def run_llm(state: PipelineState):
         "faithfulness": faithfulness,
         "citation_utilization_rate": citation_utilization_rate,
         "usage": usage,
+        "executed_path": "full",
+        "retrieval_candidates": cands,
         "stage_timings": {**existing, "llm_ms": latency_ms},
     }
 
@@ -544,6 +646,7 @@ def end_fast_path(state: PipelineState):
             "usage": {"input_tokens": 0, "output_tokens": 0},
             "top_chunks": top_chunks,
             "citations": [citation],
+            "executed_path": "fast",
             "stage_timings": {**existing, "fast_path_ms": latency_ms},
         }
 
@@ -593,6 +696,7 @@ def end_fast_path(state: PipelineState):
             "usage": {"input_tokens": 0, "output_tokens": 0},
             "top_chunks": top_chunks,
             "citations": citations,
+            "executed_path": "fast",
             "stage_timings": {**existing, "fast_path_ms": latency_ms},
         }
 
@@ -605,6 +709,7 @@ def end_fast_path(state: PipelineState):
         "usage": {"input_tokens": 0, "output_tokens": 0},
         "top_chunks": [],
         "citations": [],
+        "executed_path": "fast",
         "stage_timings": {**state.get("stage_timings", {}), "fast_path_ms": latency_ms},
     }
 
@@ -637,21 +742,27 @@ def run_verified_extraction(state: PipelineState):
 
 
 def route_after_vector(state: PipelineState):
-    if state.get("force_full_path", False):
-        return "run_okf_router_post"
-    return "run_verified_extraction"
+    plan = state["plan"]
+    if plan and plan.fast_path:
+        return "run_verified_extraction"
+    return "run_okf_router_post"
 
 
 def route_after_extraction(state: PipelineState):
+    """If verified extraction succeeded, end fast-path.
+    If high-confidence top chunk exists (similarity >= 0.40), end fast-path via extractive fallback.
+    Otherwise escalate to full path."""
     if state.get("verified_answer") and state.get("verified_chunk"):
         return "end_fast_path"
-    plan = state.get("plan")
-    if plan and plan.fast_path:
-        return "end_fast_path"
-    logger.info(
-        "route_after_extraction: fast-path unverified for query='%s' — escalating to full generation path",
-        state["query"][:50],
-    )
+
+    candidates = state.get("candidate_chunks", [])
+    if candidates:
+        top_c = candidates[0]
+        top_sim = getattr(top_c, "similarity_score", 0.0) or 0.0
+        if top_sim >= 0.40:
+            return "end_fast_path"
+
+    # Escalate to full generation path
     return "run_okf_router_post"
 
 
@@ -661,9 +772,8 @@ def route_after_reranker_or_graph(state: PipelineState):
 
 
 def route_after_okf_post(state: PipelineState):
-    """Decide whether to run graph expansion for relationship queries."""
     plan = state["plan"]
-    if plan.use_graph:
+    if plan and plan.use_graph:
         return "run_graph"
     return "run_reranker"
 
@@ -764,6 +874,8 @@ class Pipeline:
         document_ids: list[str] | None = None,
         workspace_id: str = "",
         force_full_path: bool = False,
+        query_embedding: list[float] | None = None,
+        benchmark_mode: bool = False,
     ):
         if not workspace_id:
             raise ValueError("workspace_id is required for pipeline execution")
@@ -771,18 +883,24 @@ class Pipeline:
         initial_state = {
             "query": query,
             "workspace_id": workspace_id,
-            "query_embedding": None,
+            "query_embedding": query_embedding,
             "document_ids": document_ids,
             "force_full_path": force_full_path,
             "plan": None,
+            "planned_path": "full",
+            "executed_path": "full",
             "bm25_candidates": [],
             "candidate_page_ids": [],
             "candidate_chunk_ids": [],
+            "candidate_page_scopes": [],
             "candidate_chunks": [],
             "okf_properties": [],
             "okf_seed_chunk_ids": [],
             "graph_results": [],
+            "graph_chunks": [],
             "top_chunks": [],
+            "retrieval_candidates": {},
+            "reranker_mode": "remote_success",
             "compressed_text": "",
             "context_snippet": "",
             "final_answer": "",
@@ -816,6 +934,10 @@ class Pipeline:
                 plan = state.get("plan")
                 self.fast_path = plan.fast_path if plan else False
                 self.stages = plan.stages if plan else []
+                self.planned_path = state.get("planned_path", "fast" if self.fast_path else "full")
+                self.executed_path = state.get("executed_path", "fast" if self.fast_path else "full")
+                self.reranker_mode = state.get("reranker_mode", "remote_success")
+                self.retrieval_candidates = state.get("retrieval_candidates", {})
 
                 # Expose internal state for tests
                 class LLMInput:

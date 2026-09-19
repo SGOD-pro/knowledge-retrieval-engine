@@ -17,14 +17,15 @@ _CHUNK_CACHE: dict[str, tuple[float, list[Chunk]]] = {}  # key -> (expiry_timest
 _CHUNK_CACHE_TTL = 300.0  # 5 minutes
 
 
-def get_cached_chunks(workspace_id: str, loader_fn) -> list[Chunk]:
-    """Return cached chunks for a workspace, refreshing from loader_fn if expired."""
+def get_cached_chunks(workspace_id: str, loader_fn, corpus_version: str = "") -> list[Chunk]:
+    """Return cached chunks for a workspace and corpus version, refreshing from loader_fn if expired."""
+    key = f"{workspace_id}::{corpus_version}" if corpus_version else workspace_id
     now = time.monotonic()
-    cached = _CHUNK_CACHE.get(workspace_id)
+    cached = _CHUNK_CACHE.get(key)
     if cached and cached[0] > now:
         return cached[1]
     chunks = loader_fn()
-    _CHUNK_CACHE[workspace_id] = (now + _CHUNK_CACHE_TTL, chunks)
+    _CHUNK_CACHE[key] = (now + _CHUNK_CACHE_TTL, chunks)
     if len(_CHUNK_CACHE) > 10:
         oldest_key = min(_CHUNK_CACHE, key=lambda k: _CHUNK_CACHE[k][0])
         del _CHUNK_CACHE[oldest_key]
@@ -32,9 +33,11 @@ def get_cached_chunks(workspace_id: str, loader_fn) -> list[Chunk]:
 
 
 def invalidate_chunk_cache(workspace_id: str | None = None):
-    """Invalidate chunk cache for a workspace, or all if None."""
+    """Invalidate chunk cache for a workspace (prefix match), or all if None."""
     if workspace_id:
-        _CHUNK_CACHE.pop(workspace_id, None)
+        to_del = [k for k in _CHUNK_CACHE if k == workspace_id or k.startswith(f"{workspace_id}::")]
+        for k in to_del:
+            _CHUNK_CACHE.pop(k, None)
     else:
         _CHUNK_CACHE.clear()
 

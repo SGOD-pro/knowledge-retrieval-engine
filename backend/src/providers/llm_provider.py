@@ -21,6 +21,20 @@ logger = logging.getLogger(__name__)
 # Hard constraint: max tokens to LLM (Rule 4)
 _MAX_TOKENS = 1200
 
+_llm_counter = {"generation_calls": 0, "input_tokens": 0, "output_tokens": 0}
+
+
+def reset_llm_counter() -> None:
+    """Reset the LLM generation call counter."""
+    _llm_counter["generation_calls"] = 0
+    _llm_counter["input_tokens"] = 0
+    _llm_counter["output_tokens"] = 0
+
+
+def get_llm_counter() -> dict:
+    """Return a copy of the current LLM generation counter."""
+    return dict(_llm_counter)
+
 
 def generate_completion(
     system_prompt: str,
@@ -33,6 +47,7 @@ def generate_completion(
     Returns:
         (text, usage) where usage = {"input_tokens": N, "output_tokens": M}
     """
+    _llm_counter["generation_calls"] += 1
     try:
         from aws.infra import get_client
 

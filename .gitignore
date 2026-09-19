@@ -1,5 +1,22 @@
 .aws-sam
 /odl/*.json
-
 /bge-onix/model.onnx
-__pycache__
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+backend/.venv/
+
+# Environment files and credentials
+.env
+.env.*
+!.env.example
+backend/.env
+backend/.env.*
+!backend/.env.example
+
+# Benchmark outputs, reports and dumps
+tmp/
+backend/tmp/
+backend/reports/
+*.log

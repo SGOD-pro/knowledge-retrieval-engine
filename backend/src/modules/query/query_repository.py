@@ -46,6 +46,7 @@ class QueryRepository:
         document_ids: list[str] | None = None,
         candidate_page_ids: list[int] | None = None,
         candidate_chunk_ids: list[str] | None = None,
+        candidate_page_scopes: list[tuple[str, int]] | None = None,
         workspace_id: str = "",
         limit: int = 10,
     ) -> list[tuple[Chunk, float]]:
@@ -57,13 +58,19 @@ class QueryRepository:
             q_vec = np.array(query_embedding)
             has_page_constraint = candidate_page_ids is not None and len(candidate_page_ids) > 0
             has_chunk_constraint = candidate_chunk_ids is not None and len(candidate_chunk_ids) > 0
+            has_scope_constraint = candidate_page_scopes is not None and len(candidate_page_scopes) > 0
 
             for chunk in _IN_MEMORY_CHUNKS.values():
                 if getattr(chunk, "workspace_id", "") != workspace_id:
                     continue
                 if document_ids and str(chunk.document_id) not in document_ids:
                     continue
-                if has_page_constraint or has_chunk_constraint:
+                if has_scope_constraint:
+                    scope_match = (str(chunk.document_id), chunk.page_number) in candidate_page_scopes
+                    chunk_match = has_chunk_constraint and str(chunk.id) in candidate_chunk_ids
+                    if not (scope_match or chunk_match):
+                        continue
+                elif has_page_constraint or has_chunk_constraint:
                     page_match = has_page_constraint and chunk.page_number in candidate_page_ids
                     chunk_match = has_chunk_constraint and str(chunk.id) in candidate_chunk_ids
                     if not (page_match or chunk_match):
@@ -73,8 +80,9 @@ class QueryRepository:
                     c_arr = np.array(c_vec)
                     norm_q = np.linalg.norm(q_vec)
                     norm_c = np.linalg.norm(c_arr)
-                    score = float(np.dot(q_vec, c_arr) / ((norm_q * norm_c) + 1e-9))
-                    results.append((chunk, score))
+                    sim = float(np.dot(q_vec, c_arr) / (norm_q * norm_c)) if (norm_q * norm_c) > 0 else 0.0
+                    results.append((chunk, sim))
+
             results.sort(key=lambda x: x[1], reverse=True)
             return results[:limit]
 
@@ -93,7 +101,17 @@ class QueryRepository:
                 )
             )
         should_filters = []
-        if candidate_page_ids:
+        if candidate_page_scopes:
+            for s_doc, s_page in candidate_page_scopes:
+                should_filters.append(
+                    qmodels.Filter(
+                        must=[
+                            qmodels.FieldCondition(key="document_id", match=qmodels.MatchValue(value=s_doc)),
+                            qmodels.FieldCondition(key="page_number", match=qmodels.MatchValue(value=s_page)),
+                        ]
+                    )
+                )
+        elif candidate_page_ids:
             should_filters.append(
                 qmodels.FieldCondition(
                     key="page_number", match=qmodels.MatchAny(any=candidate_page_ids)

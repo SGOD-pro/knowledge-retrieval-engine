@@ -66,55 +66,74 @@ class QueryService:
         raw_key = (query_norm + doc_scope_hash).encode("utf-8")
         cache_key = f"query:{hashlib.sha256(raw_key).hexdigest()}"
 
-        # 1. Check Exact Match Cache (Layer 2)
-        try:
-            from db.redis_cache import cache
+        # 1. Check Exact Match Cache (Layer 2) — bypassed in benchmark_mode or cache=False
+        use_cache = req.cache and not getattr(req, "benchmark_mode", False)
+        if use_cache:
+            try:
+                from db.redis_cache import cache
 
-            cached_response = cache.get_cache(cache_key)
-            if cached_response:
-                cached_response["cached"] = True
-                return cached_response
-        except Exception:
-            pass
+                cached_response = cache.get_cache(cache_key)
+                if cached_response:
+                    cached_response["cached"] = True
+                    return cached_response
+            except Exception:
+                pass
 
-        # 2. Check Semantic Cache (Layer 1)
+        # 2. Check Semantic Cache (Layer 1) — bypassed in benchmark_mode or cache=False
         query_embedding = None
-        try:
-            from services.retrieval.planner import planner
+        if use_cache:
+            try:
+                from services.retrieval.planner import planner
 
-            plan = planner.route(req.query)
+                plan = planner.route(req.query)
+                is_full = (not plan.fast_path) or getattr(req, "force_full_path", False)
 
-            if not plan.fast_path:
-                from providers.embedding_provider import embed_text
-                from providers.provider_client import get_active_provider
+                if is_full:
+                    from providers.embedding_provider import embed_text
+                    from providers.provider_client import get_active_provider
 
-                provider = req.provider or get_active_provider()
+                    provider = req.provider or get_active_provider()
 
-                query_embedding = embed_text(req.query, provider=provider)
-                semantic_key = self.repo.check_semantic_cache(
-                    query_embedding, doc_scope_hash, provider
-                )
+                    query_embedding = embed_text(req.query, provider=provider)
+                    semantic_key = self.repo.check_semantic_cache(
+                        query_embedding, doc_scope_hash, provider
+                    )
 
-                if semantic_key:
-                    from db.redis_cache import cache
+                    if semantic_key:
+                        from db.redis_cache import cache
 
-                    cached_response = cache.get_cache(semantic_key)
-                    if cached_response:
-                        cached_response["cached"] = True
-                        return cached_response
-        except Exception:
-            pass
+                        cached_response = cache.get_cache(semantic_key)
+                        if cached_response:
+                            cached_response["cached"] = True
+                            return cached_response
+            except Exception:
+                pass
 
-        # 3. Run Pipeline with explicit workspace_id
+        # 3. Run Pipeline with explicit workspace_id and shared query_embedding
         t0 = time.perf_counter()
         try:
             from services.langgraph_pipeline import pipeline
+            import inspect
 
-            response = pipeline.run(
-                query=req.query,
-                document_ids=target_doc_ids,
-                workspace_id=req.workspace_id,
+            sig = inspect.signature(pipeline.run)
+            params = sig.parameters
+            accepts_var_kwargs = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
             )
+
+            kwargs = {
+                "query": req.query,
+                "document_ids": target_doc_ids,
+                "workspace_id": req.workspace_id,
+            }
+            if accepts_var_kwargs or "force_full_path" in params:
+                kwargs["force_full_path"] = getattr(req, "force_full_path", False)
+            if accepts_var_kwargs or "query_embedding" in params:
+                kwargs["query_embedding"] = query_embedding
+            if accepts_var_kwargs or "benchmark_mode" in params:
+                kwargs["benchmark_mode"] = getattr(req, "benchmark_mode", False)
+
+            response = pipeline.run(**kwargs)
         except Exception as e:
             logger.error("pipeline.run failed with error: %s", e, exc_info=True)
             total_ms = round((time.perf_counter() - t0) * 1000.0, 2)
@@ -129,11 +148,15 @@ class QueryService:
                 },
                 "fast_path": False,
                 "retrieval_path": "empty",
+                "planned_path": "full",
+                "executed_path": "empty",
                 "faithfulness": None,
                 "citation_utilization_rate": None,
                 "token_usage": {"input_tokens": 0, "output_tokens": 0},
                 "cached": False,
                 "document_ids": target_doc_ids or [],
+                "retrieval_candidates": {},
+                "reranker_mode": "remote_success",
             }
 
         t1 = time.perf_counter()
@@ -182,6 +205,11 @@ class QueryService:
         citation_util = getattr(response, "citation_utilization_rate", None)
         usage = getattr(response, "usage", {"input_tokens": 0, "output_tokens": 0})
 
+        planned_path = getattr(response, "planned_path", "fast" if fast_path else "full")
+        executed_path = getattr(response, "executed_path", "fast" if fast_path else "full")
+        retrieval_candidates = getattr(response, "retrieval_candidates", {})
+        reranker_mode = getattr(response, "reranker_mode", "remote_success")
+
         logger.info(
             "query.cost_tracking path=%s input_tokens=%d output_tokens=%d total_tokens=%d latency_ms=%.2f",
             "fast" if fast_path else "full",
@@ -199,17 +227,22 @@ class QueryService:
             "latency_ms": total_ms,
             "latency_breakdown": latency_breakdown,
             "fast_path": fast_path,
-            "retrieval_path": "fast" if fast_path else "full",
+            "retrieval_path": executed_path,
+            "planned_path": planned_path,
+            "executed_path": executed_path,
             "faithfulness": faithfulness,
             "citation_utilization_rate": citation_util,
             "token_usage": usage,
             "cached": False,
             "document_ids": req.document_ids or [],
+            "retrieval_candidates": retrieval_candidates,
+            "reranker_mode": reranker_mode,
         }
 
-        # 4. Write Cache (ONLY if conditions are met)
+        # 4. Write Cache (ONLY if cache enabled and not in benchmark_mode)
         if (
-            response.confidence_score >= CACHE_MIN_CONFIDENCE
+            use_cache
+            and response.confidence_score >= CACHE_MIN_CONFIDENCE
             and response.answer != "NOT_FOUND"
         ):
             from db.redis_cache import cache

@@ -51,7 +51,7 @@ def compress_chunks(query: str, chunks: list[Chunk]) -> str:
         kept_paragraphs = []
         for p in paragraphs:
             p_lower = p.lower()
-            if any(w in p_lower for w in query_words) or len(paragraphs) == 1:
+            if any(w in p_lower for w in query_words) or (not query_words and len(paragraphs) == 1):
                 kept_paragraphs.append(p)
 
         if kept_paragraphs:
@@ -59,26 +59,47 @@ def compress_chunks(query: str, chunks: list[Chunk]) -> str:
 
     final_text = "\n\n".join(compressed_text)
 
-    from services.retrieval.planner import extract_entities
-
-    entities = extract_entities(query)
-    final_text_lower = final_text.lower()
-    missing_entities = False
-    if final_text:
-        for e in entities:
-            if e.lower() not in final_text_lower:
-                missing_entities = True
+    # If compression dropped everything (no query word matched paragraphs),
+    # fallback to the top chunks preserving evidence boundaries within budget.
+    if not final_text and chunks:
+        # Keep up to 3 top chunks within token budget (~1500 tokens / 6000 chars)
+        budget_chars = 6000
+        fallback_parts = []
+        cur_len = 0
+        for c in chunks:
+            part = f"[{c.id}] {c.text.strip()}"
+            if cur_len + len(part) > budget_chars:
                 break
-
-    # If compression dropped everything (e.g. no query word matched exactly),
-    # OR if it dropped critical query entities, fallback to just sending the raw text.
-    if missing_entities or (not final_text and chunks):
-        final_text = "\n\n".join(f"[{c.id}] {c.text}" for c in chunks)
+            fallback_parts.append(part)
+            cur_len += len(part)
+        final_text = "\n\n".join(fallback_parts)
 
     latency_ms = (time.perf_counter() - start_time) * 1000.0
-    # Compression doesn't score confidence natively, but we must log it
     logger.info(
         "compressor.latency_ms=%.2f compressor.confidence_score=1.00", latency_ms
     )
 
     return final_text
+
+
+class Compressor:
+    """Wrapper class providing object-oriented interface for token compression."""
+
+    def compress(
+        self,
+        chunks: list[Chunk],
+        query: str = "",
+        max_tokens: int = 1200,
+    ) -> str:
+        q_words = set(query.lower().split()) if query else set()
+        sorted_chunks = sorted(
+            chunks,
+            key=lambda c: sum(1 for w in q_words if w in c.text.lower()),
+            reverse=True,
+        )
+        text = compress_chunks(query, sorted_chunks)
+        char_limit = max_tokens * 4
+        if len(text) > char_limit:
+            text = text[:char_limit].rsplit("\n", 1)[0]
+        return text
+

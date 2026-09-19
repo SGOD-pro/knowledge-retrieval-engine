@@ -1,0 +1,525 @@
+#!/usr/bin/env python3
+"""Canonical 60-Question RAG Benchmark Runner (Q136-Q195).
+
+Strictly evaluates the canonical 60-question evaluation suite against ws_fresh_benchmark.
+Enforces:
+  1. Clean worktree check (git status --porcelain).
+  2. Corpus completeness and SHA-256 hash tracking.
+  3. Live provider validation (fails if any provider is mocked).
+  4. Bypasses exact and semantic cache on every query (benchmark_mode=True).
+  5. Clears in-process BM25 cache once at start of cold benchmark.
+  6. Evaluates raw candidate chunk IDs prior to generation for Grounded Recall@5,
+     Precision@3, MRR@5, and nDCG@5 against structured relevance ground truth.
+  7. Tightened grading for premise correction, arithmetic, and JSON compliance.
+  8. Writes immutable reports to backend/reports/<commit_sha>/<timestamp>/manifest.json.
+  9. Strict 9-variable equality comparison with baseline artifact.
+"""
+
+import argparse
+import hashlib
+import json
+import logging
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import time
+from typing import Any
+import unittest.mock
+
+# Ensure backend/src is in sys.path
+SCRIPT_DIR = Path(__file__).resolve().parent
+BACKEND_DIR = SCRIPT_DIR.parent
+SRC_DIR = BACKEND_DIR / "src"
+ROOT_DIR = BACKEND_DIR.parent
+
+sys.path.insert(0, str(SRC_DIR))
+sys.path.insert(0, str(BACKEND_DIR))
+
+from modules.query.query_service import QueryService
+from modules.query.query_repository import QueryRepository
+from schemas.models import QueryRequest
+from services.evaluation.benchmark_scorer import (
+    compute_retrieval_metrics,
+    grade_premise_correction,
+    grade_arithmetic_answer,
+    grade_json_schema,
+    validate_citations,
+    content_match,
+    compute_answer_relevancy,
+    compute_faithfulness,
+)
+from services.evaluation.benchmark_comparator import (
+    compare_manifests,
+    NOT_COMPARABLE_MESSAGE,
+)
+from services.retrieval.bm25_retriever import invalidate_chunk_cache
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("canonical_60_benchmark")
+
+
+def verify_clean_worktree():
+    """Verify that git working tree has no uncommitted tracked or unstaged changes."""
+    try:
+        res = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=str(ROOT_DIR),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        lines = [
+            line for line in res.stdout.strip().split("\n")
+            if line and not line.strip().startswith("??")  # ignore untracked if any
+        ]
+        if lines:
+            raise RuntimeError(
+                f"Worktree is not clean. Uncommitted changes detected:\n" + "\n".join(lines)
+            )
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"Failed to check git status: {e}")
+
+
+def get_current_commit_sha() -> str:
+    """Get HEAD commit SHA."""
+    try:
+        res = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(ROOT_DIR),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return res.stdout.strip()
+    except Exception:
+        return "unknown_commit"
+
+
+def verify_live_providers():
+    """Verify that no remote providers or generation functions are mocked."""
+    from providers import llm_provider, embedding_provider, reranker_provider
+
+    targets = [
+        ("llm_provider.generate_completion", llm_provider.generate_completion),
+        ("embedding_provider.embed_text", embedding_provider.embed_text),
+        ("reranker_provider.rerank_documents", reranker_provider.rerank_documents),
+    ]
+    for name, target in targets:
+        if isinstance(target, (unittest.mock.Mock, unittest.mock.MagicMock)):
+            raise RuntimeError(f"Mocked provider detected for {name}. Benchmark runner requires live providers.")
+        if hasattr(target, "assert_called") or hasattr(target, "return_value"):
+            if isinstance(target.return_value, (unittest.mock.Mock, unittest.mock.MagicMock)):
+                raise RuntimeError(f"Mocked return value detected for {name}. Benchmark runner requires live providers.")
+
+
+def compute_file_sha256(filepath: Path) -> str:
+    h = hashlib.sha256()
+    with open(filepath, "rb") as f:
+        while chunk := f.read(65536):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def compute_corpus_manifest_hash(documents_meta: list[dict]) -> tuple[str, dict[str, str]]:
+    """Compute combined SHA-256 hash across all corpus documents in data/."""
+    file_hashes = {}
+    combined_hash = hashlib.sha256()
+
+    for doc in sorted(documents_meta, key=lambda x: x["filename"]):
+        fname = doc["filename"]
+        matches = list(ROOT_DIR.glob(f"data/**/{fname}"))
+        if not matches:
+            matches = list(ROOT_DIR.glob(f"**/{fname}"))
+        if not matches:
+            raise FileNotFoundError(f"Corpus document '{fname}' not found in workspace.")
+        fpath = matches[0]
+        fhash = compute_file_sha256(fpath)
+        file_hashes[fname] = fhash
+        combined_hash.update(f"{fname}:{fhash}".encode("utf-8"))
+
+    return combined_hash.hexdigest(), file_hashes
+
+
+def resolve_ground_truth_chunk_ids(
+    questions: list[dict],
+    all_chunks: list[Any],
+    doc_id_map: dict[str, str],
+) -> dict[str, set[str]]:
+    """Resolves structured ground truth chunk IDs per question.
+
+    Uses document_id and page/row locators from question metadata and evaluation_hint.
+    """
+    # Build lookup index by (document_id, page_number) and (document_id, row)
+    doc_filename_to_id = {fname: did for did, fname in doc_id_map.items()}
+    ground_truth = {}
+
+    for q in questions:
+        qid = q["id"]
+        expected_docs = q.get("expected_source_docs", [])
+        if not expected_docs:
+            ground_truth[qid] = set()
+            continue
+
+        target_doc_ids = {doc_filename_to_id[fn] for fn in expected_docs if fn in doc_filename_to_id}
+        hint = q.get("evaluation_hint", "").lower()
+        expected_ans = (q.get("expected_answer") or "").lower()
+
+        # Extract target page numbers from hint (e.g. "page 1", "pages 1-2")
+        target_pages = set()
+        for p_match in re.finditer(r"\bpage[s]?\s+(\d+)(?:\s*-\s*(\d+))?", hint):
+            start_p = int(p_match.group(1))
+            end_p = int(p_match.group(2)) if p_match.group(2) else start_p
+            for p in range(start_p, end_p + 1):
+                target_pages.add(p)
+
+        # Extract target row numbers from hint (e.g. "row 10")
+        target_rows = set()
+        for r_match in re.finditer(r"\brow\s+(\d+)", hint):
+            target_rows.add(int(r_match.group(1)))
+
+        matched_ids = set()
+        for c in all_chunks:
+            if c.document_id not in target_doc_ids:
+                continue
+
+            # Check page locator if specified
+            if target_pages:
+                if c.page_number in target_pages:
+                    matched_ids.add(c.id)
+                    continue
+
+            # Check row locator if specified
+            if target_rows and c.metadata and "row" in c.metadata:
+                if c.metadata["row"] in target_rows:
+                    matched_ids.add(c.id)
+                    continue
+
+            # If no page or row in hint, check token overlap with expected answer in the chunk
+            if expected_ans and content_match(c.text, expected_ans):
+                matched_ids.add(c.id)
+
+        # If strict locators found matches, use them; otherwise fallback to any chunk from target docs that contains hint tokens
+        if not matched_ids:
+            for c in all_chunks:
+                if c.document_id in target_doc_ids and (
+                    expected_ans and content_match(c.text, expected_ans)
+                ):
+                    matched_ids.add(c.id)
+
+        # If still empty, include all chunks for the target doc (weakest fallback)
+        if not matched_ids:
+            for c in all_chunks:
+                if c.document_id in target_doc_ids:
+                    matched_ids.add(c.id)
+
+        ground_truth[qid] = matched_ids
+
+    return ground_truth
+
+
+def run_benchmark(
+    workspace_id: str = "ws_fresh_benchmark",
+    benchmark_type: str = "cold",
+    baseline_path: str | None = None,
+    allow_dirty: bool = False,
+    test_path: str = "data/test.json",
+) -> dict[str, Any]:
+    """Execute canonical benchmark run."""
+    if not allow_dirty:
+        verify_clean_worktree()
+
+    verify_live_providers()
+
+    test_file = ROOT_DIR / test_path
+    if not test_file.exists():
+        raise FileNotFoundError(f"Test suite file not found: {test_file}")
+
+    suite_sha256 = compute_file_sha256(test_file)
+
+    with open(test_file, "r", encoding="utf-8") as f:
+        test_data = json.load(f)
+
+    questions = test_data["questions"]
+    documents_meta = test_data.get("documents", [])
+
+    corpus_manifest_sha256, file_hashes = compute_corpus_manifest_hash(documents_meta)
+    commit_sha = get_current_commit_sha()
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+
+    # Invalidate in-process cache for cold benchmark
+    if benchmark_type == "cold":
+        invalidate_chunk_cache()
+
+    repo = QueryRepository()
+    all_ws_chunks = repo.get_all_chunks(workspace_id=workspace_id)
+    if not all_ws_chunks:
+        raise RuntimeError(f"No chunks found in workspace '{workspace_id}'. Workspace must be ingested prior to running benchmark.")
+
+    doc_id_map = {d["doc_id"]: d["filename"] for d in documents_meta}
+    structured_ground_truth = resolve_ground_truth_chunk_ids(questions, all_ws_chunks, doc_id_map)
+
+    service = QueryService(repo=repo)
+
+    logger.info(
+        "Starting canonical 60-question benchmark (commit=%s, workspace=%s, type=%s, suite_hash=%s)",
+        commit_sha[:8],
+        workspace_id,
+        benchmark_type,
+        suite_sha256[:8],
+    )
+
+    query_results = []
+    total_q = len(questions)
+
+    refusal_total = 0
+    refusal_correct = 0
+
+    all_recalls = []
+    all_precisions = []
+    all_mrrs = []
+    all_ndcgs = []
+    all_latencies = []
+    llm_call_count = 0
+
+    for idx, q in enumerate(questions, 1):
+        qid = q["id"]
+        category = q.get("category", "")
+        q_text = q["question"]
+        expected_ans = q.get("expected_answer")
+        is_hallucination = q.get("hallucination_check", False)
+
+        req = QueryRequest(
+            query=q_text,
+            workspace_id=workspace_id,
+            cache=False,
+            benchmark_mode=True,
+        )
+
+        t_start = time.perf_counter()
+        resp = service.execute_query(req)
+        query_latency_ms = (time.perf_counter() - t_start) * 1000.0
+        all_latencies.append(query_latency_ms)
+
+        # Assert response was NOT cached
+        assert not resp.get("cached", False), f"Query {qid} returned cached response in benchmark_mode"
+
+        ans_text = resp.get("answer", "")
+        candidates = resp.get("retrieval_candidates", {})
+        reranked_ids = candidates.get("reranked", [])
+        top_citations = resp.get("citations", [])
+
+        # Evaluate retrieval metrics against resolved structured ground truth
+        rel_ids = structured_ground_truth.get(qid, set())
+        ret_metrics = compute_retrieval_metrics(reranked_ids, rel_ids)
+
+        all_recalls.append(ret_metrics["recall_at_5"])
+        all_precisions.append(ret_metrics["precision_at_3"])
+        all_mrrs.append(ret_metrics["mrr_at_5"])
+        all_ndcgs.append(ret_metrics["ndcg_at_5"])
+
+        # Evaluate answer correctness
+        is_correct = False
+        is_refusal = False
+
+        refusal_indicators = [
+            "couldn't find any relevant",
+            "not found",
+            "does not contain",
+            "not mentioned",
+            "no information",
+            "cannot find",
+        ]
+        ans_is_refusal = any(ind in ans_text.lower() for ind in refusal_indicators)
+
+        if is_hallucination and expected_ans is None:
+            refusal_total += 1
+            if ans_is_refusal:
+                refusal_correct += 1
+                is_correct = True
+                is_refusal = True
+        elif category == "HALLUCINATION_PREMISE":
+            refusal_total += 1
+            is_correct = grade_premise_correction(ans_text, expected_ans or "")
+            if is_correct:
+                refusal_correct += 1
+        elif category == "NUMERIC" and expected_ans:
+            # Check if expected answer contains a specific float/int
+            raw_nums = re.findall(r"[-+]?\b\d[\d,]*(?:\.\d+)?\b", expected_ans)
+            if raw_nums:
+                target_val = float(raw_nums[0].replace(",", ""))
+                is_correct = grade_arithmetic_answer(ans_text, target_val)
+            else:
+                is_correct = content_match(ans_text, expected_ans)
+        elif category == "EDGE_ADVERSARIAL" and "json" in q_text.lower():
+            is_correct = grade_json_schema(ans_text, required_keys=["answer"])
+        else:
+            if expected_ans:
+                relevancy = compute_answer_relevancy(ans_text, expected_ans)
+                c_match = content_match(ans_text, expected_ans)
+                is_correct = c_match and relevancy >= 0.40
+
+        # Check citations validity
+        context_ids = set(candidates.get("context", [c.get("chunk_id") for c in top_citations]))
+        cit_val = validate_citations(top_citations, context_chunk_ids=context_ids if context_ids else None)
+
+        executed_path = resp.get("executed_path", "full")
+        if executed_path == "full":
+            llm_call_count += 1
+
+        res_entry = {
+            "id": qid,
+            "category": category,
+            "question": q_text,
+            "expected_answer": expected_ans,
+            "answer": ans_text,
+            "is_correct": is_correct,
+            "is_refusal": is_refusal,
+            "executed_path": executed_path,
+            "planned_path": resp.get("planned_path", "full"),
+            "reranker_mode": resp.get("reranker_mode", "remote_success"),
+            "retrieval_metrics": ret_metrics,
+            "citation_validity": cit_val,
+            "latency_ms": round(query_latency_ms, 2),
+            "citations": top_citations,
+        }
+        query_results.append(res_entry)
+
+        logger.info(
+            "[%02d/%02d] %s (%s): %s | Path=%s | Reranker=%s | Latency=%.1fms",
+            idx,
+            total_q,
+            qid,
+            category,
+            "PASS" if is_correct else "FAIL",
+            executed_path,
+            resp.get("reranker_mode", "remote_success"),
+            query_latency_ms,
+        )
+
+    # Compute aggregate metrics
+    overall_acc = round(sum(1 for r in query_results if r["is_correct"]) / total_q, 4)
+    refusal_acc = round(refusal_correct / max(1, refusal_total), 4) if refusal_total > 0 else 1.0
+    avg_recall_5 = round(sum(all_recalls) / total_q, 4)
+    avg_precision_3 = round(sum(all_precisions) / total_q, 4)
+    avg_mrr_5 = round(sum(all_mrrs) / total_q, 4)
+    avg_ndcg_5 = round(sum(all_ndcgs) / total_q, 4)
+    llm_act_rate = round(llm_call_count / total_q, 4)
+
+    from providers.bedrock_models import get_embedding_model, get_llm_model
+
+    manifest = {
+        "commit_sha": commit_sha,
+        "baseline_commit_sha": commit_sha,  # Set self as baseline commit if creating initial baseline
+        "timestamp": timestamp,
+        "workspace_id": workspace_id,
+        "benchmark_type": benchmark_type,
+        "runner_version": "2.1.0",
+        "scorer_version": "2.1.0",
+        "test_suite_name": test_data.get("test_suite_name", "canonical_60"),
+        "test_suite_sha256": suite_sha256,
+        "corpus_manifest_sha256": corpus_manifest_sha256,
+        "corpus_file_hashes": file_hashes,
+        "embedding_model": get_embedding_model(),
+        "llm_model": get_llm_model(),
+        "reranker_policy": "openrouter:cross-encoder/ms-marco-MiniLM-L-6-v2",
+        "cache_mode": "bypass_exact_and_semantic",
+        "total_questions": total_q,
+        "metrics": {
+            "overall_accuracy": overall_acc,
+            "refusal_accuracy": refusal_acc,
+            "grounded_recall_at_5": avg_recall_5,
+            "precision_at_3": avg_precision_3,
+            "mrr_at_5": avg_mrr_5,
+            "ndcg_at_5": avg_ndcg_5,
+            "llm_activation_rate": llm_act_rate,
+        },
+        "query_latency_distribution_ms": {
+            "min": round(min(all_latencies), 2),
+            "max": round(max(all_latencies), 2),
+            "mean": round(sum(all_latencies) / len(all_latencies), 2),
+            "note": "Latency targets (<400ms fast / <4000ms full) are verified via dedicated backend/scripts/run_latency_harness.py (200 runs)",
+        },
+    }
+
+    # Write report files to immutable directory
+    report_dir = BACKEND_DIR / "reports" / commit_sha / timestamp
+    report_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest_path = report_dir / "manifest.json"
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+
+    details_path = report_dir / "query_details.json"
+    with open(details_path, "w", encoding="utf-8") as f:
+        json.dump(query_results, f, indent=2)
+
+    summary_md_path = report_dir / "summary.md"
+    summary_md = f"""# Canonical 60-Question Benchmark Report
+
+- **Commit SHA**: `{commit_sha}`
+- **Timestamp**: `{timestamp}`
+- **Workspace**: `{workspace_id}`
+- **Benchmark Type**: `{benchmark_type}`
+- **Test Suite SHA-256**: `{suite_sha256}`
+- **Corpus Manifest SHA-256**: `{corpus_manifest_sha256}`
+
+## Quality & Accuracy Metrics
+
+| Metric | Measured | Target | Status |
+| :--- | :--- | :--- | :--- |
+| **Overall Accuracy** | {overall_acc * 100:.1f}% | > 80.0% | {'PASS' if overall_acc >= 0.80 else 'FAIL'} |
+| **Refusal Accuracy** | {refusal_acc * 100:.1f}% | > 85.0% | {'PASS' if refusal_acc >= 0.85 else 'FAIL'} |
+| **Grounded Recall@5** | {avg_recall_5 * 100:.1f}% | > 85.0% | {'PASS' if avg_recall_5 >= 0.85 else 'FAIL'} |
+| **Precision@3** | {avg_precision_3 * 100:.1f}% | > 60.0% | {'PASS' if avg_precision_3 >= 0.60 else 'FAIL'} |
+| **MRR@5** | {avg_mrr_5:.4f} | > 0.7500 | {'PASS' if avg_mrr_5 >= 0.75 else 'FAIL'} |
+| **nDCG@5** | {avg_ndcg_5:.4f} | > 0.7500 | {'PASS' if avg_ndcg_5 >= 0.75 else 'FAIL'} |
+| **LLM Activation Rate** | {llm_act_rate * 100:.1f}% | < 60.0% | {'PASS' if llm_act_rate <= 0.60 else 'FAIL'} |
+
+> **Note on Latency**: Single 60-query pass provides directional latency only. Formal p95 warm/cold validation is performed via `backend/scripts/run_latency_harness.py`.
+"""
+    with open(summary_md_path, "w", encoding="utf-8") as f:
+        f.write(summary_md)
+
+    logger.info("Saved benchmark report to %s", report_dir)
+
+    # Baseline comparison if baseline path provided
+    if baseline_path:
+        b_path = Path(baseline_path)
+        if not b_path.exists():
+            logger.warning("Baseline manifest not found at %s", baseline_path)
+        else:
+            with open(b_path, "r", encoding="utf-8") as f:
+                baseline_manifest = json.load(f)
+            manifest["baseline_commit_sha"] = baseline_manifest.get("commit_sha")
+            cmp_res = compare_manifests(manifest, baseline_manifest)
+            logger.info("=== Comparison Result against %s ===", baseline_path)
+            logger.info("Status: %s", cmp_res["status"])
+            if not cmp_res["comparable"]:
+                for mismatch in cmp_res.get("mismatches", []):
+                    logger.warning("  Mismatch: %s", mismatch)
+            else:
+                for k, v in cmp_res.get("deltas", {}).items():
+                    logger.info("  %s: %+.4f", k, v)
+
+    return manifest
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run Canonical 60-Question Evaluation Benchmark.")
+    parser.add_argument("--workspace-id", default="ws_fresh_benchmark", help="Workspace ID to benchmark")
+    parser.add_argument("--benchmark-type", choices=["cold", "warm"], default="cold", help="Cold or warm run")
+    parser.add_argument("--baseline-path", default=None, help="Path to baseline manifest.json for comparison")
+    parser.add_argument("--allow-dirty", action="store_true", help="Allow uncommitted worktree changes during development")
+    parser.add_argument("--test-path", default="data/test.json", help="Path to test.json evaluation suite")
+
+    args = parser.parse_args()
+    res = run_benchmark(
+        workspace_id=args.workspace_id,
+        benchmark_type=args.benchmark_type,
+        baseline_path=args.baseline_path,
+        allow_dirty=args.allow_dirty,
+        test_path=args.test_path,
+    )
+    print(json.dumps(res["metrics"], indent=2))

@@ -1,3 +1,4 @@
+import json
 import math
 import re
 from typing import Any
@@ -175,3 +176,223 @@ def compute_context_precision(answer: str, context: str) -> float:
 
     overlap = len(ans_tokens & ctx_tokens)
     return round(overlap / len(ans_tokens), 4)
+
+
+def compute_retrieval_metrics(
+    retrieved_chunk_ids: list[str],
+    relevant_chunk_ids: set[str],
+    k_recall: int = 5,
+    k_precision: int = 3,
+    k_mrr: int = 5,
+    k_ndcg: int = 5,
+) -> dict[str, float]:
+    """
+    Computes rigorous retrieval metrics from raw candidate chunk IDs against
+    resolved structured ground-truth chunk IDs:
+      - recall_at_5: fraction of relevant chunks retrieved in top-5
+      - precision_at_3: fraction of top-3 retrieved chunks that are relevant
+      - mrr_at_5: reciprocal rank of the first relevant chunk within top-5 (0 if none)
+      - ndcg_at_5: normalized discounted cumulative gain at rank 5
+    """
+    if not relevant_chunk_ids:
+        # If question has no relevant chunks (e.g. absent/refusal), retrieval of 0 chunks is perfect
+        return {
+            "recall_at_5": 1.0 if not retrieved_chunk_ids else 0.0,
+            "precision_at_3": 1.0 if not retrieved_chunk_ids else 0.0,
+            "mrr_at_5": 1.0 if not retrieved_chunk_ids else 0.0,
+            "ndcg_at_5": 1.0 if not retrieved_chunk_ids else 0.0,
+        }
+
+    # Recall@k
+    top_recall = retrieved_chunk_ids[:k_recall]
+    recall_hits = sum(1 for cid in top_recall if cid in relevant_chunk_ids)
+    recall = round(recall_hits / min(len(relevant_chunk_ids), k_recall), 4)
+
+    # Precision@k
+    top_prec = retrieved_chunk_ids[:k_precision]
+    prec_hits = sum(1 for cid in top_prec if cid in relevant_chunk_ids)
+    precision = round(prec_hits / k_precision, 4) if k_precision > 0 else 0.0
+
+    # MRR@k
+    top_mrr = retrieved_chunk_ids[:k_mrr]
+    mrr = 0.0
+    for rank, cid in enumerate(top_mrr, 1):
+        if cid in relevant_chunk_ids:
+            mrr = round(1.0 / rank, 4)
+            break
+
+    # nDCG@k
+    top_ndcg = retrieved_chunk_ids[:k_ndcg]
+    dcg = 0.0
+    for rank, cid in enumerate(top_ndcg, 1):
+        if cid in relevant_chunk_ids:
+            dcg += 1.0 / math.log2(rank + 1)
+    idcg = sum(
+        1.0 / math.log2(rank + 1)
+        for rank in range(1, min(len(relevant_chunk_ids), k_ndcg) + 1)
+    )
+    ndcg = round(dcg / idcg, 4) if idcg > 0 else 0.0
+
+    return {
+        "recall_at_5": recall,
+        "precision_at_3": precision,
+        "mrr_at_5": mrr,
+        "ndcg_at_5": ndcg,
+    }
+
+
+def grade_premise_correction(
+    answer: str,
+    expected_answer: str,
+    key_correction_terms: list[str] | None = None,
+) -> bool:
+    """
+    Grades premise correction questions.
+    Requirements:
+      1. Must NOT simply say 'no', 'incorrect', 'actually', or refuse with 'NOT_FOUND'.
+      2. Must actively correct the false premise by stating the correct attribute/entity/number.
+      3. If key_correction_terms are provided, all must be present in the answer.
+      4. If expected_answer is provided, content_match or key terms must match.
+    """
+    if not answer or answer.strip() in ("NOT_FOUND", ""):
+        return False
+
+    ans_clean = answer.strip().lower()
+    # Reject lazy generic dismissals
+    generic_dismissals = [
+        "no",
+        "incorrect",
+        "that is incorrect",
+        "this is false",
+        "actually no",
+        "false premise",
+        "i cannot find",
+        "not mentioned",
+    ]
+    if ans_clean in generic_dismissals or len(tokenize(ans_clean)) < 3:
+        return False
+
+    if key_correction_terms:
+        for term in key_correction_terms:
+            if term.lower() not in ans_clean:
+                return False
+        return True
+
+    if expected_answer:
+        return content_match(answer, expected_answer)
+
+    return True
+
+
+def grade_arithmetic_answer(
+    answer: str,
+    expected_value: float,
+    tolerance: float = 0.01,
+    expected_unit: str | None = None,
+) -> bool:
+    """
+    Grades arithmetic/numeric calculation answers.
+    Validates:
+      - Presence of numeric value matching expected_value within tolerance.
+      - Correct sign.
+      - Presence of expected_unit if specified.
+    """
+    if not answer or answer.strip() in ("NOT_FOUND", ""):
+        return False
+
+    raw_nums = re.findall(r"[-+]?\b\d[\d,]*(?:\.\d+)?\b", answer)
+    found_match = False
+    for num_str in raw_nums:
+        clean_num = num_str.replace(",", "")
+        try:
+            val = float(clean_num)
+            if abs(val - expected_value) <= max(tolerance, abs(expected_value) * tolerance):
+                found_match = True
+                break
+        except ValueError:
+            continue
+
+    if not found_match:
+        return False
+
+    if expected_unit:
+        if expected_unit.lower() not in answer.lower():
+            return False
+
+    return True
+
+
+def grade_json_schema(answer: str, required_keys: list[str]) -> bool:
+    """
+    Grades format compliance for JSON responses.
+    Parses answer string (or markdown-fenced json) and ensures all required_keys exist.
+    """
+    if not answer:
+        return False
+
+    clean_text = answer.strip()
+    if clean_text.startswith("```json"):
+        clean_text = clean_text[7:]
+    elif clean_text.startswith("```"):
+        clean_text = clean_text[3:]
+    if clean_text.endswith("```"):
+        clean_text = clean_text[:-3]
+    clean_text = clean_text.strip()
+
+    try:
+        data = json.loads(clean_text)
+        if not isinstance(data, dict):
+            return False
+        for k in required_keys:
+            if k not in data:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def validate_citations(
+    citations: list[dict],
+    context_chunk_ids: list[str] | set[str] | None = None,
+) -> dict[str, Any]:
+    """
+    Validates that citations:
+      1. Have non-empty document_filename and chunk_id.
+      2. If context_chunk_ids provided, chunk_id MUST exist in the retrieved context.
+      3. Have valid page_number (> 0) or non-empty location_reference.
+    """
+    if not citations:
+        return {"valid": True, "citation_count": 0, "errors": []}
+
+    context_set = set(context_chunk_ids) if context_chunk_ids is not None else None
+    errors = []
+    valid_count = 0
+
+    for idx, c in enumerate(citations):
+        cid = str(c.get("chunk_id", ""))
+        doc_file = c.get("document_filename", "")
+        loc_ref = c.get("location_reference", "")
+        page_num = c.get("page_number")
+
+        if not cid:
+            errors.append(f"Citation {idx}: missing chunk_id")
+            continue
+        if context_set is not None and cid not in context_set:
+            errors.append(f"Citation {idx}: chunk_id {cid} not in context chunk IDs")
+            continue
+        if not doc_file:
+            errors.append(f"Citation {idx}: missing document_filename")
+            continue
+        if page_num is None and not loc_ref:
+            errors.append(f"Citation {idx}: missing page_number and location_reference")
+            continue
+
+        valid_count += 1
+
+    return {
+        "valid": len(errors) == 0,
+        "citation_count": len(citations),
+        "valid_count": valid_count,
+        "errors": errors,
+    }
+

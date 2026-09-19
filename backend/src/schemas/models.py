@@ -152,12 +152,17 @@ class QueryRequest(BaseModel):
     workspace_id: str
     document_ids: list[str] | None = None
     provider: str | None = None
+    cache: bool = True
+    benchmark_mode: bool = False
+    force_full_path: bool = False
 
 
 class QueryResponse(BaseModel):
     answer: str
     citations: list[dict[str, Any]] = Field(default_factory=list)
     retrieval_path: str = "full"
+    planned_path: str = "full"
+    executed_path: str = "full"
     confidence: float = 0.0
     latency_ms: float = 0.0
     faithfulness: float | None = None
@@ -166,6 +171,8 @@ class QueryResponse(BaseModel):
     cached: bool = False
     document_ids: list[str] = Field(default_factory=list)
     latency_breakdown: dict[str, Any] | None = None
+    retrieval_candidates: dict[str, list[str]] = Field(default_factory=dict)
+    reranker_mode: str = "remote_success"
 
 
 # --- System Benchmark Models ---

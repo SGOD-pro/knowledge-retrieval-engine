@@ -1,3 +1,4 @@
+raise RuntimeError("Obsolete runner. Use backend/scripts/run_canonical_60_benchmark.py")
 """Baseline Benchmark: Traditional RAG vs OKF vs PageIndex vs KRE
 
 Run ONCE. Results saved to backend/tmp/baseline_comparison.json.

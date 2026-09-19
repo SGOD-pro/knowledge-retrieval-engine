@@ -259,29 +259,22 @@ class TestCaseA:
 # -----------------------------------------------------------------------
 
 class TestCaseF:
-    """Verify embed_text is called for every query (centroid routing requires it)."""
+    """Verify route_query routes before remote embedding to preserve Rule 19."""
 
-    def test_embed_called_unconditionally(self):
-        """The current route_query must call embed_text before planner.route
-        so centroid routing works. This is a structural assertion."""
+    def test_routing_precedes_remote_embedding(self):
+        """route_query must choose path via planner.route without unconditional embed_text
+        so fast-path queries make zero remote embedding calls (Rule 19)."""
         import inspect
         from services.langgraph_pipeline import route_query
 
         source = inspect.getsource(route_query)
-        # embed_text must be called before planner.route
         embed_pos = source.find("embed_text")
         route_pos = source.find("planner.route")
-        assert embed_pos != -1, "embed_text not found in route_query source"
         assert route_pos != -1, "planner.route not found in route_query source"
-        assert embed_pos < route_pos, (
-            "embed_text must be called before planner.route for centroid routing"
-        )
-
-        # query_embedding must be passed to planner.route
-        assert "planner.route(state[\"query\"], query_embedding)" in source or \
-               "planner.route(state['query'], query_embedding)" in source, (
-            "query_embedding not passed to planner.route — centroid routing is broken"
-        )
+        if embed_pos != -1:
+            assert route_pos < embed_pos, (
+                "planner.route must be called before embed_text to avoid remote embedding on fast path (Rule 19)"
+            )
 
 # -----------------------------------------------------------------------
 # Case H: Faithfulness fallback (unit-level)

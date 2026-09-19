@@ -291,13 +291,67 @@ class DeterministicExecutor:
                         except Exception:
                             pass
 
-            # Strategy 2: Line-by-line search in chunk text
+            # Strategy 2: Tabular Grid Parsing (Markdown pipes or CSV commas)
+            raw_lines = [l.strip() for l in txt.splitlines() if l.strip()]
+            if len(raw_lines) >= 2:
+                delim = "|" if "|" in raw_lines[0] else ("," if "," in raw_lines[0] else None)
+                if delim:
+                    header_line = raw_lines[0]
+                    headers = [h.strip().strip("|").strip() for h in header_line.split(delim) if h.strip()]
+                    query_stop = {"what", "is", "the", "difference", "between", "sum", "of", "and", "in", "for", "across"}
+                    query_words = [w.lower() for w in re.findall(r"\b\w+\b", query) if w.lower() not in query_stop]
+
+                    target_col_idx = None
+                    for idx, h in enumerate(headers):
+                        h_lower = h.lower()
+                        if any(kw in h_lower for kw in keywords):
+                            target_col_idx = idx
+                            break
+                    if target_col_idx is None:
+                        for idx, h in enumerate(headers):
+                            h_lower = h.lower()
+                            if any(qw in h_lower for qw in query_words):
+                                target_col_idx = idx
+                                break
+
+                    data_rows = raw_lines[1:]
+                    if data_rows and not any(c.isalnum() for c in data_rows[0]):
+                        data_rows = data_rows[1:]
+
+                    for r in data_rows:
+                        cells = [c.strip().strip("|").strip() for c in r.split(delim)]
+                        cells = [c for c in cells if c or delim == ","]
+                        if not cells:
+                            continue
+                        r_lower = r.lower()
+                        if any(kw in r_lower for kw in keywords):
+                            val_str = None
+                            if target_col_idx is not None and target_col_idx < len(cells):
+                                val_str = cells[target_col_idx]
+                            else:
+                                for cell in cells:
+                                    if re.search(r"\b\d+(?:\.\d+)?\b", cell):
+                                        val_str = cell
+                                        break
+                            if val_str:
+                                try:
+                                    dec_val = parse_decimal_value(val_str)
+                                    return Operand(
+                                        raw_value=val_str,
+                                        normalized_value=dec_val,
+                                        source_citation=citation,
+                                        binding_confidence=0.95,
+                                    )
+                                except Exception:
+                                    pass
+
+            # Strategy 3: Line-by-line search in chunk text
             lines = txt.splitlines()
             for line in lines:
                 line_lower = line.lower()
                 matches_line = term_clean in line_lower or all(kw in line_lower for kw in keywords)
                 if matches_line:
-                    num_matches = re.findall(r"[-+]?\$?\s*[\d,]+(?:\.\d+)?(?:\s*[MBk%]|\s+million|\s+billion)?", line)
+                    num_matches = re.findall(r"(?<![A-Za-z0-9_])[-+]?\$?\s*[\d,]+(?:\.\d+)?(?:\s*[MBk%]|\s+million|\s+billion)?", line)
                     filtered = []
                     for nm in num_matches:
                         clean_nm = nm.strip().replace("$", "").replace(",", "")
@@ -445,5 +499,32 @@ class DeterministicExecutor:
             op_from = self._extract_operand_from_chunks(term_from, chunks, query)
             if op_sub and op_from:
                 return self.execute(ExecutionOperator.DIFFERENCE, [op_from, op_sub])
+
+        # 5. Sum of concept/column across entities
+        sum_across_m = re.search(
+            r"(?:.*?\b(?:calculate|find|compute|what\s+is)\s+)?(?:the\s+)?sum\s+of\s+([^,;]+?)\s+across\s+([^,;]+?)\s+and\s+(.+?)(?:\s+in|\s+for|\s*\?|\.|$)",
+            query,
+            re.IGNORECASE,
+        )
+        if sum_across_m:
+            concept = sum_across_m.group(1).strip()
+            ent1 = sum_across_m.group(2).strip()
+            ent2 = sum_across_m.group(3).strip()
+            op1 = self._extract_operand_from_chunks(f"{concept} {ent1}", chunks, query)
+            op2 = self._extract_operand_from_chunks(f"{concept} {ent2}", chunks, query)
+            if op1 and op2:
+                return self.execute(ExecutionOperator.SUM, [op1, op2])
+
+        sum_and_m = re.search(
+            r"(?:.*?\b(?:calculate|find|compute|what\s+is)\s+)?(?:the\s+)?sum\s+of\s+([^,;]+?)\s+and\s+(.+?)(?:\s+in|\s+for|\s*\?|\.|$)",
+            query,
+            re.IGNORECASE,
+        )
+        if sum_and_m:
+            term1, term2 = sum_and_m.group(1).strip(), sum_and_m.group(2).strip()
+            op1 = self._extract_operand_from_chunks(term1, chunks, query)
+            op2 = self._extract_operand_from_chunks(term2, chunks, query)
+            if op1 and op2:
+                return self.execute(ExecutionOperator.SUM, [op1, op2])
 
         return None

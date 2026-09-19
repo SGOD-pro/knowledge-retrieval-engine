@@ -1,3 +1,4 @@
+raise RuntimeError("Obsolete runner. Use backend/scripts/run_canonical_60_benchmark.py")
 import os
 import sys
 import json

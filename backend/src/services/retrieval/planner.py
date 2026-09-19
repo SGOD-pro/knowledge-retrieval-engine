@@ -103,7 +103,21 @@ def compute_complexity(query: str) -> tuple[float, dict[str, bool | int]]:
     temporal_flag = any(re.search(rf"\b{w}\b", q_lower) for w in temporal_words)
     comparison_flag = any(
         k in q_lower
-        for k in ["vs", "compare", "difference", "higher", "lower", "better", "than"]
+        for k in [
+            "vs",
+            "compare",
+            "difference",
+            "higher",
+            "lower",
+            "better",
+            "than",
+            "calculate",
+            "minus",
+            "subtract",
+            "plus",
+            "divide",
+            "sum of",
+        ]
     )
     negation_flag = any(
         k in q_lower for k in ["not", "except", "without", "other than"]

@@ -30,6 +30,7 @@ class VectorRetriever:
         document_ids: list[str] | None = None,
         candidate_page_ids: list[int] | None = None,
         candidate_chunk_ids: list[str] | None = None,
+        candidate_page_scopes: list[tuple[str, int]] | None = None,
         workspace_id: str = "",
         top_k: int = 10,
     ) -> list[tuple[Chunk, float]]:
@@ -64,16 +65,16 @@ class VectorRetriever:
             query_embedding = embed_fast_local(query)
             embedding_column = "embedding_fast"
         else:
-            # API embedding — through provider layer (Rule 28)
-            from providers.embedding_provider import embed_text
-            from providers.provider_client import get_active_provider
+            if not query_embedding:
+                from providers.embedding_provider import embed_text
+                from providers.provider_client import get_active_provider
 
-            active_provider = get_active_provider()
-            query_embedding = (
-                query_embedding
-                if query_embedding is not None
-                else embed_text(query, provider=active_provider)
-            )
+                active_provider = get_active_provider()
+                query_embedding = (
+                    self.repository.generate_query_embedding(query)
+                    if hasattr(self.repository, "generate_query_embedding")
+                    else embed_text(query, provider=active_provider)
+                )
             embedding_column = "embedding_full"
 
         results = self.repository.search_vector(
@@ -82,6 +83,7 @@ class VectorRetriever:
             document_ids=document_ids,
             candidate_page_ids=candidate_page_ids,
             candidate_chunk_ids=candidate_chunk_ids,
+            candidate_page_scopes=candidate_page_scopes,
             workspace_id=workspace_id,
             limit=top_k,
         )
