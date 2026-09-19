@@ -12,6 +12,33 @@ logger = logging.getLogger(__name__)
 
 import re
 
+# Workspace-level chunk cache with TTL to avoid repeated DynamoDB full scans
+_CHUNK_CACHE: dict[str, tuple[float, list[Chunk]]] = {}  # key -> (expiry_timestamp, chunks)
+_CHUNK_CACHE_TTL = 300.0  # 5 minutes
+
+
+def get_cached_chunks(workspace_id: str, loader_fn) -> list[Chunk]:
+    """Return cached chunks for a workspace, refreshing from loader_fn if expired."""
+    now = time.monotonic()
+    cached = _CHUNK_CACHE.get(workspace_id)
+    if cached and cached[0] > now:
+        return cached[1]
+    chunks = loader_fn()
+    _CHUNK_CACHE[workspace_id] = (now + _CHUNK_CACHE_TTL, chunks)
+    if len(_CHUNK_CACHE) > 10:
+        oldest_key = min(_CHUNK_CACHE, key=lambda k: _CHUNK_CACHE[k][0])
+        del _CHUNK_CACHE[oldest_key]
+    return chunks
+
+
+def invalidate_chunk_cache(workspace_id: str | None = None):
+    """Invalidate chunk cache for a workspace, or all if None."""
+    if workspace_id:
+        _CHUNK_CACHE.pop(workspace_id, None)
+    else:
+        _CHUNK_CACHE.clear()
+
+
 def _tokenize(text: str) -> list[str]:
     """Lowercase alphanumeric word tokenization (strips punctuation)."""
     return re.findall(r"\w+", text.lower())

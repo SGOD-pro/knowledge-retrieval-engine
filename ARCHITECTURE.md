@@ -38,7 +38,7 @@ The system employs a **Hybrid Architecture** combining a unified core engine wit
 |-------------------|-----------------------------------------|----------------------------------|
 | Fast Path Embed   | BGE-small-en-v1.5 (Local ONNX Fallback) | BGE-small-en-v1.5 (Lambda / ONNX)|
 | Full Path Embed   | amazon.titan-embed-text-v2 (Bedrock)    | amazon.titan-embed-text-v2 (Bedrock) |
-| Reranker          | nvidia/llama-nemotron-rerank-1b-v2 (NVIDIA NIM) | nvidia/llama-nemotron-rerank-1b-v2 (NVIDIA NIM) |
+| Reranker          | nvidia/llama-nemotron-rerank-vl-1b-v2:free (OpenRouter) | nvidia/llama-nemotron-rerank-vl-1b-v2:free (OpenRouter) |
 | OKF extraction    | amazon.nova-micro-v1 (Bedrock)          | amazon.nova-micro-v1 (Bedrock) |
 | Query LLM         | amazon.nova-lite-v1 (Bedrock)           | amazon.nova-lite-v1 (Bedrock) |
 

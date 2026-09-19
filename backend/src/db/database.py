@@ -26,6 +26,8 @@ from modules.chat.chat_repository import (
     _SESSION_MESSAGES,
 )
 
+import threading
+
 logger = logging.getLogger(__name__)
 
 
@@ -39,14 +41,38 @@ class CloudRepository(
     """Unified Facade Repository inheriting all domain repositories:
     WorkspacesRepository, DocumentsRepository, QueryRepository, GraphRepository, ChatRepository.
     Preserves 100% backward compatibility for all test suites and external scripts.
+    Implements a thread-safe singleton pattern to avoid redundant client/connection instantiation.
     """
+    _instance: "CloudRepository | None" = None
+    _lock: threading.Lock = threading.Lock()
+
+    def __new__(cls, dsn: str | None = None, *args, **kwargs):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    instance = super().__new__(cls)
+                    instance._initialized = False
+                    cls._instance = instance
+        return cls._instance
 
     def __init__(self, dsn: str | None = None):
-        WorkspacesRepository.__init__(self)
-        DocumentsRepository.__init__(self)
-        QueryRepository.__init__(self)
-        GraphRepository.__init__(self)
-        ChatRepository.__init__(self)
+        if getattr(self, "_initialized", False):
+            return
+        with self._lock:
+            if getattr(self, "_initialized", False):
+                return
+            WorkspacesRepository.__init__(self)
+            DocumentsRepository.__init__(self)
+            QueryRepository.__init__(self)
+            GraphRepository.__init__(self)
+            ChatRepository.__init__(self)
+            self._initialized = True
+
+    @classmethod
+    def reset_instance(cls) -> None:
+        """Reset singleton instance (used in test fixtures)."""
+        with cls._lock:
+            cls._instance = None
 
     def initialize(self) -> None:
         try:

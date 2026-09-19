@@ -14,39 +14,18 @@ class Plan:
 
 
 def extract_entities(query: str) -> list[str]:
-    # Simple capitalization / noun phrase entity extraction without external NER
+    # Hybrid entity extraction: capitalization-based + quoted terms + known patterns
     # R2: match consecutive capitalized tokens (TitleCase or ALLCAPS), separated by spaces or hyphens
     pattern = r"\b(?:[A-Z][a-zA-Z0-9]*)(?:(?:-|\s+)(?:[A-Z][a-zA-Z0-9]*))*\b"
     matches = re.findall(pattern, query)
 
     stop_words = {
-        "What",
-        "How",
-        "Why",
-        "Who",
-        "When",
-        "Where",
-        "Which",
-        "Is",
-        "Are",
-        "Do",
-        "Does",
-        "Can",
-        "Could",
-        "Should",
-        "Would",
-        "The",
-        "A",
-        "An",
-        "In",
-        "On",
-        "At",
-        "To",
-        "For",
-        "Of",
-        "With",
-        "By",
+        "What", "How", "Why", "Who", "When", "Where", "Which",
+        "Is", "Are", "Do", "Does", "Can", "Could", "Should", "Would",
+        "The", "A", "An", "In", "On", "At", "To", "For", "Of", "With", "By",
+        "According", "Answer", "List", "Tell", "Give", "Find", "Show",
     }
+    stop_words_lower = {w.lower() for w in stop_words}
 
     entities = []
     for span in matches:
@@ -61,6 +40,37 @@ def extract_entities(query: str) -> list[str]:
             merged = " ".join(filtered_parts)
             if merged not in entities:
                 entities.append(merged)
+
+    # Fallback for lowercase queries or queries with quoted terms / filenames
+    if not entities:
+        # Extract quoted strings
+        quoted = re.findall(r'["\']([^"\']+)["\']', query)
+        for q_term in quoted:
+            clean = q_term.strip()
+            if clean and clean.lower() not in stop_words_lower and clean not in entities:
+                entities.append(clean)
+
+        # Look for filenames (e.g. survay.csv, 2412.20875v1.pdf)
+        filenames = re.findall(r'\b[\w.-]+\.(?:csv|xls|xlsx|pdf|json|txt|md|doc|docx|pptx)\b', query, re.IGNORECASE)
+        for fname in filenames:
+            if fname not in entities:
+                entities.append(fname)
+
+        if not entities:
+            # Multi-word nouns or capitalized technical tokens fallback
+            words = re.findall(r'\b\w+\b', query)
+            _extended_stops = stop_words_lower | {
+                "what", "how", "why", "who", "when", "where", "which",
+                "is", "are", "was", "were", "do", "does", "did", "has", "have", "had",
+                "the", "a", "an", "in", "on", "at", "to", "for", "of", "with", "by",
+                "and", "or", "but", "not", "from", "as", "if", "than", "that", "this",
+                "be", "been", "being", "it", "its", "about", "between", "through",
+                "many", "much", "some", "any", "all", "each", "every", "summarize",
+            }
+            content_words = [w for w in words if w.lower() not in _extended_stops and len(w) > 2]
+            for w in content_words:
+                if w not in entities and not w.isdigit():
+                    entities.append(w)
 
     return entities
 

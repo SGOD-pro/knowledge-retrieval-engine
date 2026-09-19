@@ -38,16 +38,10 @@ class Settings(BaseSettings):
     PROD_EMBEDDING_MODEL: str = "amazon.titan-embed-text-v2:0"
     PROD_CONCEPT_MODEL: str = "apac.amazon.nova-micro-v1:0"
 
-    # NVIDIA NIM Reranker — DEPRECATED (410 Gone). Kept for legacy config compat.
-    NVIDIA_RERANKER_MODEL: str = "nvidia/llama-nemotron-rerank-1b-v2"
-    NVIDIA_API_KEY: str = ""
-
-    # OpenRouter Reranker
+    # OpenRouter Reranker — sole reranker provider in all environments.
+    # Fallback: BM25Plus lexical scoring when circuit breaker is tripped.
     OPENROUTER_API_KEY: str = ""
     OPENROUTER_RERANKER_MODEL: str = "nvidia/llama-nemotron-rerank-vl-1b-v2:free"
-
-    # Primary Reranker model
-    PROD_RERANKER_MODEL: str = "nvidia/llama-nemotron-rerank-vl-1b-v2:free"
 
     # MODEL_PROVIDER: controls which Bedrock profile is used at query time
     MODEL_PROVIDER: str = "prod"

@@ -10,7 +10,8 @@ def get_embedding_model() -> str:
 
 
 def get_reranker_model() -> str:
-    return settings.PROD_RERANKER_MODEL
+    # Reranker is OpenRouter-only (all environments). PROD_RERANKER_MODEL is removed.
+    return settings.OPENROUTER_RERANKER_MODEL
 
 
 def get_concept_model() -> str:

@@ -2,8 +2,10 @@
 
 Model Provider Matrix:
   - Primary:  OpenRouter Rerank API (nvidia/llama-nemotron-rerank-vl-1b-v2:free)
-  - Fallback: Term coverage / lexical scoring (deterministic, no API call)
-  - Legacy:   Bedrock Cohere / NVIDIA NIM direct (deprecated)
+  - Fallback: BM25Plus lexical scoring (deterministic, no API call)
+
+NVIDIA NIM direct and Bedrock Cohere are fully removed (NIM returned 410 Gone).
+This is the accepted architectural decision recorded in BOUNDARIES.md.
 
 Rule 6: Reranker runs before compression. Always.
 Rule 27: No GPU packages (torch, transformers, faiss) — onnxruntime allowed only in BGE microservice.
@@ -63,15 +65,24 @@ def _wait_for_rate_limit():
 # Circuit breaker state
 _circuit_breaker_tripped = False
 _circuit_breaker_reset_time = 0.0
+_circuit_breaker_half_open_interval = 300.0  # Probe request allowed every 5 minutes
+_circuit_breaker_last_probe = 0.0
 _circuit_breaker_lock = threading.Lock()
 
 
 def _is_circuit_open() -> bool:
-    global _circuit_breaker_tripped, _circuit_breaker_reset_time
+    global _circuit_breaker_tripped, _circuit_breaker_reset_time, _circuit_breaker_last_probe
     with _circuit_breaker_lock:
         if _circuit_breaker_tripped:
-            if time.time() > _circuit_breaker_reset_time:
+            now = time.time()
+            if now > _circuit_breaker_reset_time:
                 _circuit_breaker_tripped = False
+                logger.info("reranker.circuit_breaker_reset — full cooldown elapsed")
+                return False
+            # Half-open: allow one probe request every 5 minutes
+            if now - _circuit_breaker_last_probe >= _circuit_breaker_half_open_interval:
+                _circuit_breaker_last_probe = now
+                logger.info("reranker.circuit_breaker_half_open — allowing probe request")
                 return False
             return True
         return False
@@ -264,6 +275,11 @@ def rerank_documents(
         try:
             scores = _openrouter_reranker(query, documents)
             latency_ms = (time.perf_counter() - t0) * 1000.0
+            with _circuit_breaker_lock:
+                global _circuit_breaker_tripped
+                if _circuit_breaker_tripped:
+                    _circuit_breaker_tripped = False
+                    logger.info("reranker.circuit_breaker_closed — probe succeeded, service recovered")
             logger.info(
                 "reranker.openrouter.latency_ms=%.2f doc_count=%d avg_score=%.4f",
                 latency_ms,

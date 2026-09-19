@@ -29,7 +29,7 @@
 
 - Document text sent to API providers: still only compressed context to the LLM provider. Raw chunk text IS sent to the embedding and reranker providers during retrieval for the full path.
 
-- OpenRouter free-tier models: DEV AND STAGING ONLY. Never the sole path in a production deployment. (Note: NVIDIA NIM is a first-class production provider alongside Bedrock). CI blocks deploy to prod stage if MODEL_PROVIDER=dev is set in prod environment config.
+- **Reranker provider: OpenRouter only (all environments).** `nvidia/llama-nemotron-rerank-vl-1b-v2:free` via the OpenRouter Rerank API is the sole reranker provider for dev, staging, and production. NVIDIA NIM direct is fully removed — it returned HTTP 410 Gone and is no longer a supported provider. Bedrock Cohere is also removed. This is an intentional cost tradeoff accepted with the following rationale: (a) NIM endpoint is gone; (b) the OpenRouter free-tier model is the same underlying Nemotron Rerank weights; (c) the circuit-breaker + BM25Plus fallback provides resilience when the free daily quota exhausts. `RERANKER_THRESHOLD` is deliberately set to `0.05` for OpenRouter score distribution, which is lower than NIM's original tuning value — OpenRouter scores tend to be compressed toward the lower end of [0,1] and a threshold of 0.20 (NIM-inherited) would drop valid chunks.
 
 - No user query or answer stored to persistent log unless admin enables via explicit config flag. Off by default.
 

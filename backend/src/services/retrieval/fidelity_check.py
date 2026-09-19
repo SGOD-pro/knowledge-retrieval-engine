@@ -15,25 +15,43 @@ class CoverageError(Exception):
 
 
 def _context_is_tabular(context_chunks: list[str]) -> bool:
-    """Heuristic: if the joined context looks like CSV/XLS rows (many pipe/comma
-    delimited short lines), treat it as tabular and skip cosine similarity gating."""
+    """Heuristic: if the joined context looks like structured tabular data
+    (many pipe/comma delimited short lines with multiple fields or key-value rows),
+    treat it as tabular and skip cosine similarity gating.
+
+    Requires BOTH high structured-line ratio AND multi-field consistency
+    to avoid false-positiving on standard prose with commas.
+    """
     joined = "\n".join(context_chunks)
     lines = [l.strip() for l in joined.splitlines() if l.strip()]
     if not lines:
         return False
-    # If >= 50% of lines are comma- or pipe-separated with >=2 fields, call it tabular
-    structured_lines = sum(1 for l in lines if l.count(",") >= 1 or l.count("|") >= 1)
-    return structured_lines / max(1, len(lines)) >= 0.4
+
+    structured_count = 0
+    for l in lines:
+        pipe_count = l.count("|")
+        comma_count = l.count(",")
+        colon_count = l.count(":")
+        # Multi-column table row (at least 3 columns) or multiple Key: Value pairs
+        if pipe_count >= 2 or comma_count >= 2 or (colon_count >= 2 and len(l) < 200):
+            structured_count += 1
+
+    ratio = structured_count / max(1, len(lines))
+    return ratio >= 0.5
 
 
-def check_fidelity(query: str, context_chunks: list[str]) -> float:
+def check_fidelity(
+    query: str,
+    context_chunks: list[str],
+    query_embedding: list[float] | None = None,
+) -> float:
     """
     Stage 7: Fidelity Check.
     Check if the context chunks meet the cosine similarity threshold against the query.
     If the threshold is not met, a CoverageError is raised, gating the LLM execution.
 
-    Tabular/structured contexts (CSV, XLS) always pass — cosine similarity between
-    natural language queries and column-value rows is inherently low even when the
+    Tabular/structured contexts (CSV, XLS) pass via tabular bypass — cosine similarity
+    between natural language queries and column-value rows is inherently low even when the
     chunk contains the correct answer.
     """
     start_time = time.perf_counter()
@@ -41,7 +59,7 @@ def check_fidelity(query: str, context_chunks: list[str]) -> float:
     if query == "NOT_FOUND" or not context_chunks:
         return 1.0
 
-    # --- Tabular bypass: never gate on cosine similarity for row-level data ---
+    # --- Tabular bypass: never gate on cosine similarity for structured data ---
     if _context_is_tabular(context_chunks):
         logger.info("fidelity_check.tabular_bypass — skipping embedding gate")
         return 1.0
@@ -51,7 +69,13 @@ def check_fidelity(query: str, context_chunks: list[str]) -> float:
 
         from ingestion.embed_service import embed_fast_local
 
-        query_emb = embed_fast_local(query)
+        if query_embedding is not None and len(query_embedding) == 384:
+            query_emb = np.array(query_embedding, dtype=np.float32)
+            q_norm = np.linalg.norm(query_emb)
+            if q_norm > 0:
+                query_emb = query_emb / q_norm
+        else:
+            query_emb = embed_fast_local(query)
 
         max_sim = 0.0
         for chunk_text in context_chunks:

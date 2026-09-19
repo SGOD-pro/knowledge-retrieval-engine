@@ -22,7 +22,18 @@ def compress_chunks(query: str, chunks: list[Chunk]) -> str:
     _TABULAR_FORMATS = {"csv", "xlsx", "xls"}
     _TABULAR_ELEMENT_TYPES = {"table_row", "cell", "table", "header_row"}
 
-    query_words = set(w.lower() for w in query.split() if len(w) > 3)
+    _COMPRESSION_STOPWORDS = {
+        "what", "when", "where", "which", "who", "how", "does", "did",
+        "is", "are", "was", "were", "the", "this", "that", "with",
+        "from", "into", "for", "and", "but", "not", "you", "all",
+        "can", "had", "her", "his", "has", "have", "will", "been",
+    }
+    query_words = set(
+        w.lower().strip(".,!?:;\"'()[]{}")
+        for w in query.split()
+        if w.lower().strip(".,!?:;\"'()[]{}") not in _COMPRESSION_STOPWORDS
+        and len(w.strip(".,!?:;\"'()[]{}")) > 1
+    )
     compressed_text = []
 
     for c in chunks:

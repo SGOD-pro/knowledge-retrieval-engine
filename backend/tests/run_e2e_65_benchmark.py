@@ -20,7 +20,16 @@ logging.basicConfig(level=logging.WARNING)
 from schemas.models import QueryRequest
 from modules.query.query_service import query_service
 from db.database import CloudRepository
-from services.evaluation.benchmark_scorer import compute_faithfulness, content_match, tokenize
+from services.evaluation.benchmark_scorer import (
+    compute_faithfulness,
+    content_match,
+    tokenize,
+    compute_answer_relevancy,
+    compute_ndcg_at_k,
+    compute_precision_at_k,
+    compute_context_recall,
+    compute_context_precision,
+)
 
 WORKSPACE_ID = "ws_fresh_benchmark"
 TEST_JSON_PATH = backend_dir.parent / "data" / "test.json"
@@ -276,6 +285,9 @@ def main():
             recall_at_3 = 1 if len(citations) == 0 else 0
             mrr = 1.0 if len(citations) == 0 else 0.0
 
+        ndcg_5 = compute_ndcg_at_k(top_5_files, expected_docs, k=5) if expected_docs else 0.0
+        precision_3 = compute_precision_at_k(top_3_files, expected_docs, k=3) if expected_docs else 0.0
+
         is_correct, reason = evaluate_answer_correctness(answer, q)
 
         is_hallucinated = False
@@ -285,6 +297,12 @@ def main():
 
         context_text = " ".join(c.get("text", "") for c in citations)
         faith = compute_faithfulness(answer, context_text)
+        answer_relevancy = compute_answer_relevancy(answer, q.get("expected_answer", "")) if q.get("expected_answer") else None
+
+        from services.retrieval.planner import extract_entities
+        q_entities = extract_entities(query_text)
+        ctx_recall = compute_context_recall(q_entities, context_text)
+        ctx_precision = compute_context_precision(answer, context_text)
 
         quality_audit = assess_quality(q, answer, citations, is_correct, reason)
 
@@ -321,6 +339,11 @@ def main():
             "recall_at_5": recall_at_5,
             "recall_at_3": recall_at_3,
             "mrr": round(mrr, 4),
+            "ndcg_5": round(ndcg_5, 4),
+            "precision_3": round(precision_3, 4),
+            "answer_relevancy": round(answer_relevancy, 4) if answer_relevancy is not None else None,
+            "context_recall": round(ctx_recall, 4),
+            "context_precision": round(ctx_precision, 4),
             "faithfulness": faith,
             "is_hallucinated": is_hallucinated,
             "fast_path": fast_path,
@@ -371,6 +394,18 @@ def main():
     fast_count = sum(1 for r in results if r["fast_path"])
     full_count = total_q - fast_count
 
+    # New quality metrics
+    grounded_ndcg = [r["ndcg_5"] for r in results if r["expected_source_docs"]]
+    avg_ndcg = sum(grounded_ndcg) / len(grounded_ndcg) if grounded_ndcg else 0.0
+    grounded_prec = [r["precision_3"] for r in results if r["expected_source_docs"]]
+    avg_prec = sum(grounded_prec) / len(grounded_prec) if grounded_prec else 0.0
+    relevancy_scores = [r["answer_relevancy"] for r in results if r["answer_relevancy"] is not None]
+    avg_relevancy = sum(relevancy_scores) / len(relevancy_scores) if relevancy_scores else 0.0
+    ctx_recalls = [r["context_recall"] for r in results]
+    avg_ctx_recall = sum(ctx_recalls) / len(ctx_recalls) if ctx_recalls else 0.0
+    ctx_precs = [r["context_precision"] for r in results if r["context_precision"] is not None]
+    avg_ctx_prec = sum(ctx_precs) / len(ctx_precs) if ctx_precs else 0.0
+
     print("\n" + "=" * 80)
     print("                      TRUE BENCHMARK REPORT (65 RANDOM E2E RUN)       ")
     print("=" * 80)
@@ -379,6 +414,11 @@ def main():
     print(f"Recall@5 (Grounded):        {recall5:.2f}%")
     print(f"Recall@3 (Grounded):        {recall3:.2f}%")
     print(f"MRR@5:                      {mrr_avg:.4f}")
+    print(f"nDCG@5 (Grounded):          {avg_ndcg:.4f}")
+    print(f"Precision@3 (Grounded):     {avg_prec:.4f}")
+    print(f"Answer Relevancy:           {avg_relevancy:.4f}")
+    print(f"Context Recall:             {avg_ctx_recall:.4f}")
+    print(f"Context Precision:          {avg_ctx_prec:.4f}")
     print(f"Refusal Accuracy:           {refusal_acc:.2f}% ({sum(1 for r in refusal_q if r['correct'])}/{len(refusal_q)})")
     print(f"Hallucination Rate:         {hallucination_rate:.2f}%")
     print(f"Fast-Path Routing:          {fast_count}/{total_q} ({(fast_count/total_q)*100:.1f}%)")

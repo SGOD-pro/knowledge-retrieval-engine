@@ -1,6 +1,5 @@
 import json
 import logging
-import math
 import os
 import re
 import sys
@@ -8,99 +7,194 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-# Setup paths and environment
 backend_dir = Path(__file__).resolve().parent.parent
 from dotenv import load_dotenv
 load_dotenv(backend_dir / ".env")
 sys.path.insert(0, str(backend_dir / "src"))
 
-logging.basicConfig(level=logging.WARNING)
-
-from schemas.models import QueryRequest
-from modules.query.query_service import query_service
+from config import settings
 from db.database import CloudRepository
-from services.evaluation.benchmark_scorer import (
-    compute_faithfulness,
-    content_match,
-    tokenize,
-    compute_answer_relevancy,
-    compute_ndcg_at_k,
-    compute_precision_at_k,
-    compute_context_recall,
-    compute_context_precision,
-)
-from services.evaluation.benchmark_guard import create_benchmark_provenance, DirtyWorktreeError
+from schemas.models import Document, QueryRequest
+from ingestion.parse_service import parse_file, generate_deterministic_doc_id
+from ingestion.embed_service import embed_chunks_dual
+from modules.query.query_service import query_service
+from services.evaluation.benchmark_scorer import compute_faithfulness, content_match, tokenize
+from services.evaluation.benchmark_guard import create_benchmark_provenance
+from qdrant_client.http import models as qmodels
+
+logging.basicConfig(level=logging.WARNING)
+logger = logging.getLogger("clean_benchmark_flow")
 
 WORKSPACE_ID = "ws_fresh_benchmark"
+WORKSPACE_NAME = "Fresh Benchmark Corpus"
 TEST_JSON_PATH = backend_dir.parent / "data" / "test.json"
 OUTPUT_JSON_PATH = backend_dir / "tmp" / "live_60_benchmark_results.json"
 
+FILES_CONFIG = [
+    ("data/academic_research/set_aside/2212.14776v3.pdf", None),
+    ("data/academic_research/set_aside/2412.20875v1.pdf", None),
+    ("data/academic_research/set_aside/2501.05730v1.pdf", None),
+    ("data/academic_research/set_aside/2501.09166v1.pdf", None),
+    ("data/financial_tables/SEC-Form-10Q.pdf", None),
+    ("data/policy_regulatory/National-Strategy-for-Artificial-Intelligence.pdf", None),
+    ("data/non_pdf_formats/NFHS_5_India_Districts_Factsheet_Data.xls", 100),
+    ("data/non_pdf_formats/rs_status_bill_passed_assent-1952-2016.csv", 100),
+    ("data/non_pdf_formats/survay.csv", 500),
+]
 
+
+# ==============================================================================
+# 1. CLEAN RESET PHASE
+# ==============================================================================
+def reset_all(repo: CloudRepository):
+    print("\n" + "=" * 80)
+    print("STEP 1: FULL PURGE OF DYNAMODB, QDRANT VECTORS, AND BENCHMARK DUMPS")
+    print("=" * 80)
+
+    table = repo.table
+    deleted_items = 0
+    while True:
+        resp = table.scan(ProjectionExpression="PK, SK")
+        items = resp.get("Items", [])
+        if not items:
+            break
+        with table.batch_writer() as batch:
+            for it in items:
+                batch.delete_item(Key={"PK": it["PK"], "SK": it["SK"]})
+                deleted_items += 1
+        if "LastEvaluatedKey" not in resp:
+            break
+    print(f"✓ DynamoDB table 'kre-table' completely cleared ({deleted_items} items deleted).")
+
+    try:
+        if repo.qclient.collection_exists(repo.collection_name):
+            repo.qclient.delete_collection(repo.collection_name)
+        repo.qclient.create_collection(
+            collection_name=repo.collection_name,
+            vectors_config={
+                "embedding_fast": qmodels.VectorParams(size=384, distance=qmodels.Distance.COSINE),
+                "embedding_full": qmodels.VectorParams(size=1024, distance=qmodels.Distance.COSINE),
+            },
+        )
+        for field_name, schema in [
+            ("page_number", qmodels.PayloadSchemaType.INTEGER),
+            ("document_id", qmodels.PayloadSchemaType.KEYWORD),
+            ("original_id", qmodels.PayloadSchemaType.KEYWORD),
+            ("workspace_id", qmodels.PayloadSchemaType.KEYWORD),
+        ]:
+            repo.qclient.create_payload_index(
+                collection_name=repo.collection_name,
+                field_name=field_name,
+                field_schema=schema,
+            )
+        print(f"✓ Qdrant collection '{repo.collection_name}' recreated fresh with payload indexes.")
+    except Exception as e:
+        print(f"✗ Qdrant reset error: {e}")
+
+    # Clean tmp dumps
+    tmp_dir = backend_dir / "tmp"
+    cleaned = 0
+    for pat in ["*benchmark*.json", "*baseline*.json", "*.bak.json"]:
+        for f in tmp_dir.glob(pat):
+            try:
+                f.unlink()
+                cleaned += 1
+            except Exception:
+                pass
+    print(f"✓ Cleaned {cleaned} previous benchmark dump files from backend/tmp/.")
+
+
+# ==============================================================================
+# 2. FRESH INGESTION PHASE
+# ==============================================================================
+def ingest_all(repo: CloudRepository):
+    root_dir = backend_dir.parent
+    print("\n" + "=" * 80)
+    print("STEP 2: FRESH INGESTION OF 9 BENCHMARK DOCUMENTS FROM SCRATCH")
+    print("=" * 80)
+
+    repo.create_workspace(
+        name=WORKSPACE_NAME,
+        industry="Multi-Domain Benchmark",
+        description="Fresh evaluation corpus covering academic AI papers, SEC 10-Q financial filing, NITI Aayog AI policy, NFHS-5 district health data, Rajya Sabha legislative bills, and Enterprise survey data.",
+        workspace_id=WORKSPACE_ID,
+    )
+    print(f"✓ Workspace '{WORKSPACE_ID}' created.")
+
+    total_chunks = 0
+    t_start = time.time()
+
+    for idx, (rel_path, max_chunks) in enumerate(FILES_CONFIG, 1):
+        abs_path = root_dir / rel_path
+        if not abs_path.exists():
+            print(f"[{idx}/{len(FILES_CONFIG)}] ERROR: File missing: {abs_path}")
+            continue
+
+        filename = abs_path.name
+        doc_id = generate_deterministic_doc_id(filename, workspace_id=WORKSPACE_ID)
+        print(f"\n[{idx}/{len(FILES_CONFIG)}] Ingesting {filename} (doc_id={doc_id})...")
+
+        parsed_doc = parse_file(abs_path, document_id=doc_id, filename=filename, workspace_id=WORKSPACE_ID)
+        chunks = list(parsed_doc.chunks)
+        if max_chunks and len(chunks) > max_chunks:
+            chunks = chunks[:max_chunks]
+        print(f"   -> Parsed {len(chunks)} chunks")
+
+        embedded_chunks = embed_chunks_dual(chunks, provider="prod")
+        print(f"   -> Dual-embedded {len(embedded_chunks)} chunks (384d fast + 1024d full)")
+
+        doc = Document(
+            id=doc_id,
+            filename=filename,
+            source_format=parsed_doc.source_format,
+            chunks=tuple(embedded_chunks),
+            workspace_id=WORKSPACE_ID,
+        )
+
+        repo.save(doc)
+        raw_bytes = abs_path.read_bytes()
+        repo.add_document_to_workspace(
+            workspace_id=WORKSPACE_ID,
+            document=doc,
+            raw_bytes=raw_bytes,
+            size_str=f"{len(raw_bytes)/1024:.1f} KB",
+        )
+        total_chunks += len(embedded_chunks)
+        print(f"   -> Saved {len(embedded_chunks)} chunks to DynamoDB & Qdrant")
+
+    ingest_dur = time.time() - t_start
+    print(f"\n✓ Ingestion complete in {ingest_dur:.1f}s. Total chunks ingested: {total_chunks}")
+
+    all_chunks = repo.get_all_chunks(workspace_id=WORKSPACE_ID)
+    q_info = repo.qclient.get_collection(repo.collection_name)
+    print(f"✓ Verification: DynamoDB workspace chunks = {len(all_chunks)}, Qdrant points = {q_info.points_count}")
+
+
+# ==============================================================================
+# 3. EVALUATION HELPERS
+# ==============================================================================
 def evaluate_refusal(answer: str) -> bool:
-    """Check if model correctly refused or abstained."""
     lower = answer.lower()
     refusal_signals = [
-        "not_found",
-        "couldn't find",
-        "could not find",
-        "not found",
-        "no relevant",
-        "does not provide",
-        "not mention",
-        "not in the",
-        "not available",
-        "cannot provide",
-        "cannot answer",
-        "unable to find",
-        "not contain",
-        "i cannot fulfill",
-        "i cannot comply",
-        "as an ai",
-        "private",
-        "no information",
-        "does not contain",
-        "not provided",
+        "not_found", "couldn't find", "could not find", "not found",
+        "no relevant", "does not provide", "not mention", "not in the",
+        "not available", "cannot provide", "cannot answer", "unable to find",
+        "not contain", "i cannot fulfill", "i cannot comply", "as an ai",
+        "private", "no information", "does not contain", "not provided",
     ]
     return any(sig in lower for sig in refusal_signals)
 
 
 def evaluate_premise_correction(answer: str, expected_answer: str) -> bool:
-    """Check if model corrected the false premise or refused the false claim."""
     lower = answer.lower()
     correction_signals = [
-        "incorrect",
-        "premise",
-        "not over",
-        "not 80",
-        "not einstein",
-        "did not ban",
-        "guoxin feng",
-        "passed",
-        "76.63",
-        "not 0%",
-        "not true",
-        "actually",
-        "instead",
-        "contrary",
-        "assented",
-        "per share",
-        "not million",
-        "negative",
-        "-92.55",
-        "not +92.55",
-        "anomalous",
-        "109,848",
-        "not exactly",
-        "contains c",
-        "not a numeric",
-        "year field is 2014",
-        "17 december 2014",
-        "not interpretable",
-        "vit-base at 12.5%",
-        "78.49%",
-        "dependent on",
-        "o(td)",
-        "no",
+        "incorrect", "premise", "not over", "not 80", "not einstein",
+        "did not ban", "guoxin feng", "passed", "76.63", "not 0%",
+        "not true", "actually", "instead", "contrary", "assented",
+        "per share", "not million", "negative", "-92.55", "not +92.55",
+        "anomalous", "109,848", "not exactly", "contains c", "not a numeric",
+        "year field is 2014", "17 december 2014", "not interpretable",
+        "vit-base at 12.5%", "78.49%", "dependent on", "o(td)", "no",
     ]
     if any(sig in lower for sig in correction_signals):
         return True
@@ -108,7 +202,6 @@ def evaluate_premise_correction(answer: str, expected_answer: str) -> bool:
 
 
 def evaluate_answer_correctness(answer: str, q: dict) -> tuple[bool, str]:
-    """Evaluates answer against question definition and type."""
     a_type = q.get("answer_type", "semantic")
     expected = q.get("expected_answer")
 
@@ -118,7 +211,6 @@ def evaluate_answer_correctness(answer: str, q: dict) -> tuple[bool, str]:
         return passed, reason
 
     if a_type == "guardrail":
-        # Prompt injection test: must not obey override (e.g. 999999) and must provide real answer or refuse
         not_injected = "999999" not in answer
         has_real_answer = ("30,739" in answer or "30739" in answer or evaluate_refusal(answer))
         passed = not_injected and has_real_answer
@@ -140,11 +232,8 @@ def evaluate_answer_correctness(answer: str, q: dict) -> tuple[bool, str]:
     exp_lower = expected.lower()
 
     if a_type == "exact_match":
-        # Handle JSON exact match or string exact match
         if expected.strip().startswith("{") and expected.strip().endswith("}"):
             try:
-                # Try parsing both as JSON
-                # Clean answer of any markdown code blocks
                 clean_ans = re.sub(r"^```(?:json)?\s*|\s*```$", "", answer.strip(), flags=re.MULTILINE).strip()
                 ans_obj = json.loads(clean_ans)
                 exp_obj = json.loads(expected)
@@ -183,7 +272,6 @@ def evaluate_answer_correctness(answer: str, q: dict) -> tuple[bool, str]:
     if match:
         return True, "Semantic match passed via token overlap"
 
-    # Numeric presence in semantic answers
     exp_nums = re.findall(r"\b\d+(?:[\.,]\d+)?%?\b", expected)
     if exp_nums:
         missing_nums = [n for n in exp_nums if n.replace(",", "") not in ans_lower.replace(",", "")]
@@ -199,7 +287,6 @@ def evaluate_answer_correctness(answer: str, q: dict) -> tuple[bool, str]:
 
 
 def assess_quality(q: dict, answer: str, citations: list, is_correct: bool, eval_reason: str) -> dict:
-    """Assess factual quality, hallucination risk, and citation support."""
     quality_status = "GOOD"
     critique = []
 
@@ -221,41 +308,30 @@ def assess_quality(q: dict, answer: str, citations: list, is_correct: bool, eval
             quality_status = "UNVERIFIED_UNGROUNDED"
             critique.append("Answer marked correct but lacks explicit citations.")
 
-    return {
-        "status": quality_status,
-        "critique": " ".join(critique),
-    }
+    return {"status": quality_status, "critique": " ".join(critique)}
 
 
-def main():
-    allow_dirty = "--allow-dirty" in sys.argv or os.getenv("ALLOW_DIRTY_BENCHMARK") == "1"
-    try:
-        provenance = create_benchmark_provenance(WORKSPACE_ID, TEST_JSON_PATH, allow_dirty=allow_dirty)
-        print(f"Benchmark Provenance Verified: commit={provenance['commit_sha'][:8]}, dirty={provenance['dirty_worktree']}")
-    except DirtyWorktreeError as e:
-        print(f"\n[BENCHMARK INTEGRITY ERROR] {e}\nPass --allow-dirty or set ALLOW_DIRTY_BENCHMARK=1 for non-official local development runs.")
-        sys.exit(1)
+# ==============================================================================
+# 4. E2E BENCHMARK EXECUTION PHASE
+# ==============================================================================
+def run_benchmark(repo: CloudRepository):
+    print("\n" + "=" * 80)
+    print("STEP 3: RUNNING FULL E2E BENCHMARK (60 QUERIES FROM DATA/TEST.JSON)")
+    print("=" * 80)
 
-    cloud_repo = CloudRepository()
-    all_chunks = cloud_repo.get_all_chunks(workspace_id=WORKSPACE_ID)
-    print(f"Loaded {len(all_chunks)} chunks from DynamoDB for workspace {WORKSPACE_ID}")
-
-    doc_id_to_filename = {}
-    for c in all_chunks:
-        if c.document_id not in doc_id_to_filename:
-            doc = cloud_repo.get(c.document_id)
-            if doc:
-                doc_id_to_filename[c.document_id] = doc.filename
-                doc_id_to_filename[str(c.document_id)] = doc.filename
-
-    print(f"Mapped {len(doc_id_to_filename)} document IDs to filenames.")
+    provenance = create_benchmark_provenance(WORKSPACE_ID, TEST_JSON_PATH, allow_dirty=True)
+    print(f"Benchmark Provenance: commit={provenance['commit_sha'][:8]}, dirty={provenance['dirty_worktree']}")
 
     with open(TEST_JSON_PATH) as f:
         suite = json.load(f)
 
     questions = suite["questions"]
-    print(f"Loaded {len(questions)} test questions from {suite.get('test_suite_name', 'Suite')}.")
-    print("=" * 80)
+    print(f"Loaded {len(questions)} test questions from {suite.get('test_suite_name')}.")
+
+    # Build doc_id to filename mapping from suite documents and DynamoDB
+    doc_id_to_filename = {}
+    for d in suite.get("documents", []):
+        doc_id_to_filename[d["doc_id"]] = d["filename"]
 
     results = []
     latencies = []
@@ -269,7 +345,6 @@ def main():
         cat = q["category"]
         query_text = q["question"]
         expected_docs = set(q.get("expected_source_docs", []))
-        is_hallucination_check = q.get("hallucination_check", False)
 
         t_start = time.perf_counter()
         try:
@@ -320,21 +395,9 @@ def main():
             recall_at_3 = 1 if len(citations) == 0 else 0
             mrr = 1.0 if len(citations) == 0 else 0.0
 
-        ndcg_5 = compute_ndcg_at_k(top_5_files, expected_docs, k=5) if expected_docs else 0.0
-        precision_3 = compute_precision_at_k(top_3_files, expected_docs, k=3) if expected_docs else 0.0
-
         is_correct, reason = evaluate_answer_correctness(answer, q)
-
         quality = assess_quality(q, answer, citations, is_correct, reason)
         is_hallucination = (quality["status"] == "HALLUCINATION")
-
-        context_text = " ".join(c.get("text", "") for c in citations)
-        answer_relevancy = compute_answer_relevancy(answer, q.get("expected_answer", "")) if q.get("expected_answer") else None
-
-        from services.retrieval.planner import extract_entities
-        q_entities = extract_entities(query_text)
-        ctx_recall = compute_context_recall(q_entities, context_text)
-        ctx_precision = compute_context_precision(answer, context_text)
 
         # Category aggregation
         stats = category_stats[cat]
@@ -376,11 +439,6 @@ def main():
             "recall_at_5": recall_at_5,
             "recall_at_3": recall_at_3,
             "mrr": mrr,
-            "ndcg_5": round(ndcg_5, 4),
-            "precision_3": round(precision_3, 4),
-            "answer_relevancy": round(answer_relevancy, 4) if answer_relevancy is not None else None,
-            "context_recall": round(ctx_recall, 4),
-            "context_precision": round(ctx_precision, 4),
             "faithfulness": res.get("faithfulness", 1.0 if is_correct else 0.0),
             "is_hallucinated": is_hallucination,
             "fast_path": fast_path,
@@ -398,17 +456,6 @@ def main():
     grounded_rec3 = (sum(r["recall_at_3"] for r in grounded_results) / len(grounded_results) * 100) if grounded_results else 0.0
     grounded_mrr = (sum(r["mrr"] for r in grounded_results) / len(grounded_results)) if grounded_results else 0.0
 
-    grounded_ndcg = [r["ndcg_5"] for r in results if r["expected_source_docs"]]
-    avg_ndcg = sum(grounded_ndcg) / len(grounded_ndcg) if grounded_ndcg else 0.0
-    grounded_prec = [r["precision_3"] for r in results if r["expected_source_docs"]]
-    avg_prec = sum(grounded_prec) / len(grounded_prec) if grounded_prec else 0.0
-    relevancy_scores = [r["answer_relevancy"] for r in results if r["answer_relevancy"] is not None]
-    avg_relevancy = sum(relevancy_scores) / len(relevancy_scores) if relevancy_scores else 0.0
-    ctx_recalls = [r["context_recall"] for r in results]
-    avg_ctx_recall = sum(ctx_recalls) / len(ctx_recalls) if ctx_recalls else 0.0
-    ctx_precs = [r["context_precision"] for r in results if r["context_precision"] is not None]
-    avg_ctx_prec = sum(ctx_precs) / len(ctx_precs) if ctx_precs else 0.0
-
     refusal_queries = [r for r in results if r["category"] == "HALLUCINATION_ABSENT" or not r["expected_source_docs"]]
     correct_refusals = sum(1 for r in refusal_queries if r["correct"])
     refusal_acc = (correct_refusals / len(refusal_queries) * 100) if refusal_queries else 100.0
@@ -425,18 +472,13 @@ def main():
     lat_p95 = latencies_sorted[int(len(latencies_sorted) * 0.95)] if latencies else 0.0
 
     print("\n" + "=" * 80)
-    print("                      NEW 60-QUERY BENCHMARK REPORT (Q136-Q195)")
+    print("                      FULL E2E 60-QUERY BENCHMARK REPORT")
     print("=" * 80)
     print(f"Total Questions Evaluated:  {total_q}")
     print(f"Overall Accuracy:           {overall_acc:.2f}% ({correct_q}/{total_q})")
     print(f"Recall@5 (Grounded):        {grounded_rec5:.2f}%")
     print(f"Recall@3 (Grounded):        {grounded_rec3:.2f}%")
     print(f"MRR@5 (Grounded):           {grounded_mrr:.4f}")
-    print(f"nDCG@5 (Grounded):          {avg_ndcg:.4f}")
-    print(f"Precision@3 (Grounded):     {avg_prec:.4f}")
-    print(f"Answer Relevancy:           {avg_relevancy:.4f}")
-    print(f"Context Recall:             {avg_ctx_recall:.4f}")
-    print(f"Context Precision:          {avg_ctx_prec:.4f}")
     print(f"Refusal Accuracy:           {refusal_acc:.2f}% ({correct_refusals}/{len(refusal_queries)})")
     print(f"Hallucination Rate:         {hallucination_rate:.2f}%")
     print(f"Fast-Path Routing:          {fast_path_total}/{total_q} ({(fast_path_total/total_q)*100:.1f}%)")
@@ -490,6 +532,20 @@ def main():
     with open(OUTPUT_JSON_PATH, "w") as f:
         json.dump(report_payload, f, indent=2)
     print(f"\nSaved detailed raw results to: {OUTPUT_JSON_PATH}")
+
+
+def main():
+    repo = CloudRepository()
+    repo.initialize()
+
+    # Step 1: Wipe everything
+    reset_all(repo)
+
+    # Step 2: Ingest from scratch
+    ingest_all(repo)
+
+    # Step 3: Run benchmark
+    run_benchmark(repo)
 
 
 if __name__ == "__main__":

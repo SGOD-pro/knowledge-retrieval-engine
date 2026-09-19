@@ -152,12 +152,9 @@ def embed_batch(
     if provider == "test" or (provider is None and settings.ENVIRONMENT == "test"):
         return [_deterministic_vector(t, FULL_EMBEDDING_DIM) for t in texts]
 
-    import random
-    import time
     from concurrent.futures import ThreadPoolExecutor
 
     def _embed_single(text: str) -> list[float]:
-        time.sleep(random.uniform(0.02, 0.06))
         return embed_text(text, provider=provider)
 
     with ThreadPoolExecutor(max_workers=3) as executor:

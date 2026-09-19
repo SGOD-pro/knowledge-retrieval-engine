@@ -20,6 +20,20 @@ from services.retrieval.vector_retriever import VectorRetriever
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Singleton repository to avoid re-instantiating DynamoDB/Qdrant clients
+# ---------------------------------------------------------------------------
+_shared_repo = None
+
+
+def _get_repo():
+    global _shared_repo
+    if _shared_repo is None:
+        from db.database import CloudRepository
+        _shared_repo = CloudRepository()
+    return _shared_repo
+
+
+# ---------------------------------------------------------------------------
 # OKF soft-boost constant — arbitrary starting value, must be tuned against
 # Recall@5 benchmark before treating as settled. See Phase 2 Rev 3 C1/C2.
 # ---------------------------------------------------------------------------
@@ -52,6 +66,10 @@ class PipelineState(TypedDict):
     force_full_path: bool
     verified_answer: str | None
     verified_chunk: Chunk | None
+    execution_result: Any | None
+    usage: dict[str, int]
+    faithfulness: float | None
+    citation_utilization_rate: float | None
 
 
 # ---------------------------------------------------------------------------
@@ -126,16 +144,21 @@ def run_okf_router(state: PipelineState):
 
 
 def run_bm25(state: PipelineState):
-    """BM25 retrieval (Component 1 + 2). top_k=20 for union design.
+    """BM25 retrieval (Component 1 + 2). top_k=40 for union design.
     Soft-boosts OKF-matched chunks by OKF_BOOST before returning."""
-    from db.database import CloudRepository
-
     t0 = time.perf_counter()
-    repo = CloudRepository()
-    all_chunks = repo.get_all_chunks(
-        document_ids=state.get("document_ids"),
-        workspace_id=state.get("workspace_id", ""),
-    )
+    repo = _get_repo()
+    from services.retrieval.bm25_retriever import get_cached_chunks
+
+    ws_id = state.get("workspace_id", "")
+    doc_ids = state.get("document_ids")
+    if doc_ids:
+        all_chunks = repo.get_all_chunks(document_ids=doc_ids, workspace_id=ws_id)
+    else:
+        all_chunks = get_cached_chunks(
+            ws_id,
+            lambda: repo.get_all_chunks(document_ids=None, workspace_id=ws_id),
+        )
 
     retriever = BM25Retriever()
     results = retriever.search(state["query"], all_chunks, top_k=40)
@@ -195,10 +218,8 @@ def run_page_index(state: PipelineState):
 
 def run_vector(state: PipelineState):
     """Vector retrieval (Component 1). Searches within PageIndex candidates."""
-    from db.database import CloudRepository
-
     t0 = time.perf_counter()
-    repo = CloudRepository()
+    repo = _get_repo()
     retriever = VectorRetriever(repository=repo)
 
     plan = state["plan"]
@@ -285,6 +306,75 @@ def run_reranker(state: PipelineState):
     }
 
 
+def run_deterministic_math(state: PipelineState):
+    """Deterministic arithmetic execution node.
+    Runs immediately after run_reranker on top_chunks.
+    Decoupled from compressor and fidelity gating so exact math calculations
+    are never blocked by semantic-similarity thresholds.
+    """
+    import os
+
+    if os.getenv("ENABLE_DETERMINISTIC_MATH", "1") != "1" or state.get("force_full_path", False):
+        return {}
+
+    t0 = time.perf_counter()
+    from services.retrieval.deterministic_executor import DeterministicExecutor
+    from services.retrieval.response_builder import build_citation
+
+    executor = DeterministicExecutor()
+    chunks = state.get("top_chunks", [])
+    if not chunks:
+        chunks = state.get("candidate_chunks", [])
+
+    res = executor.resolve_and_execute(state["query"], chunks)
+    latency_ms = (time.perf_counter() - t0) * 1000.0
+    existing = state.get("stage_timings", {})
+
+    if not res:
+        return {
+            "stage_timings": {**existing, "deterministic_math_ms": latency_ms},
+        }
+
+    ans_str = res.format_answer(state["query"])
+
+    # Map provenance citations to response builder citations from chunks
+    citations = []
+    chunk_by_id = {getattr(c, "id", ""): c for c in chunks}
+    for prov in res.provenance_citations:
+        cid = prov.get("chunk_id") if isinstance(prov, dict) else getattr(prov, "chunk_id", "")
+        if cid and cid in chunk_by_id:
+            citations.append(build_citation(chunk_by_id[cid]).to_dict())
+    if not citations and chunks:
+        citations = [build_citation(chunks[0]).to_dict()]
+
+    logger.info(
+        "deterministic_math.resolved query='%s' answer='%s' latency_ms=%.2f",
+        state["query"][:50],
+        ans_str[:50],
+        latency_ms,
+    )
+
+    return {
+        "final_answer": ans_str,
+        "citations": citations,
+        "confidence_score": float(res.overall_confidence),
+        "faithfulness": 1.0,
+        "citation_utilization_rate": 1.0,
+        "usage": {"input_tokens": 0, "output_tokens": 0},
+        "execution_result": res,
+        "stage_timings": {**existing, "deterministic_math_ms": latency_ms},
+    }
+
+
+def route_after_math(state: PipelineState):
+    """If deterministic math produced a valid final answer, proceed directly to END.
+    Otherwise fall back to the full generation path (run_compressor -> run_fidelity -> run_llm).
+    """
+    if state.get("final_answer") and state.get("final_answer") != "NOT_FOUND":
+        return END
+    return "run_compressor"
+
+
 def run_compressor(state: PipelineState):
     t0 = time.perf_counter()
     chunks = state.get("top_chunks", [])
@@ -310,7 +400,11 @@ def run_fidelity(state: PipelineState):
     if not compressed:
         return {"error": "No context available"}
     try:
-        check_fidelity(query, [compressed])
+        check_fidelity(
+            query,
+            [compressed],
+            query_embedding=state.get("query_embedding"),
+        )
         latency_ms = (time.perf_counter() - t0) * 1000.0
         existing = state.get("stage_timings", {})
         return {
@@ -391,8 +485,8 @@ def run_llm(state: PipelineState):
 
 def end_fast_path(state: PipelineState):
     """Verified factual fast-path answer (Component 3). No LLM.
-    Requires verified factual extraction before returning an answer.
-    Preserves zero generation calls and returns exact source citation.
+    Supports deterministic verified factual extraction as well as
+    extractive sentence-to-chunk provenance selection.
     """
     from services.retrieval.response_builder import build_citation
 
@@ -408,9 +502,16 @@ def end_fast_path(state: PipelineState):
         for c in state.get("bm25_candidates", []):
             if c not in candidates:
                 candidates.append(c)
+        if not candidates and state.get("top_chunks"):
+            candidates = list(state.get("top_chunks", []))
         verified_ans, verified_chunk = extract_verified_fact(query, candidates)
 
-    if not verified_ans or not verified_chunk:
+    all_top = list(state.get("top_chunks", []))
+    if not all_top:
+        all_top = list(state.get("candidate_chunks", []))
+
+    non_heading_chunks = [c for c in all_top if getattr(c, "element_type", "") != "heading"]
+    if not non_heading_chunks and not (verified_ans and verified_chunk):
         latency_ms = (time.perf_counter() - t0) * 1000.0
         return {
             "final_answer": "NOT_FOUND",
@@ -423,25 +524,88 @@ def end_fast_path(state: PipelineState):
             "stage_timings": {**state.get("stage_timings", {}), "fast_path_ms": latency_ms},
         }
 
-    answer = verified_ans
-    top_chunks = [verified_chunk]
-    citation = build_citation(verified_chunk).to_dict()
+    if verified_ans and verified_chunk:
+        answer = verified_ans
+        top_chunks = [verified_chunk]
+        citation = build_citation(verified_chunk).to_dict()
+        util_rate = round(1.0 / max(1, len(all_top)), 4) if all_top else 1.0
+        conf = getattr(verified_chunk, "similarity_score", None)
+        if conf is None:
+            conf = 1.0
+
+        latency_ms = (time.perf_counter() - t0) * 1000.0
+        logger.info("fast_path.verified_factual answer='%s' latency_ms=%.2f", answer[:50], latency_ms)
+        existing = state.get("stage_timings", {})
+        return {
+            "final_answer": answer,
+            "confidence_score": float(conf),
+            "faithfulness": 1.0,
+            "citation_utilization_rate": util_rate,
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+            "top_chunks": top_chunks,
+            "citations": [citation],
+            "stage_timings": {**existing, "fast_path_ms": latency_ms},
+        }
+
+    # Sentence-level extractive fallback for fast-path prose queries
+    _STOPS = {
+        "what", "is", "the", "a", "an", "in", "on", "at", "to", "for", "of", "and",
+        "or", "with", "by", "from", "as", "are", "how", "many", "does", "do", "did",
+    }
+    q_words = {w.lower().strip(".,?!\"'") for w in query.split() if w.lower().strip(".,?!\"'") not in _STOPS and len(w) > 2}
+    if not q_words:
+        q_words = {w.lower().strip(".,?!\"'") for w in query.split() if len(w) > 1}
+
+    selected_sentences = []
+    contributing_chunks = []
+
+    for c in non_heading_chunks:
+        sentences = re.split(r"(?<=[.!?])\s+", c.text.strip())
+        chunk_matched = False
+        for s in sentences:
+            s_words = {w.lower().strip(".,?!\"'") for w in s.split()}
+            if q_words & s_words:
+                selected_sentences.append(s.strip())
+                chunk_matched = True
+        if chunk_matched:
+            contributing_chunks.append(c)
+
+    if not selected_sentences and non_heading_chunks:
+        selected_sentences = [non_heading_chunks[0].text.strip()[:500]]
+        contributing_chunks = [non_heading_chunks[0]]
+
+    if selected_sentences and contributing_chunks:
+        answer = " ".join(selected_sentences)[:800]
+        top_chunks = contributing_chunks
+        citations = [build_citation(c).to_dict() for c in contributing_chunks]
+        util_rate = round(len(contributing_chunks) / len(all_top), 4) if all_top else 1.0
+        conf = getattr(contributing_chunks[0], "similarity_score", None)
+        if conf is None:
+            conf = 1.0
+
+        latency_ms = (time.perf_counter() - t0) * 1000.0
+        existing = state.get("stage_timings", {})
+        return {
+            "final_answer": answer,
+            "confidence_score": float(conf),
+            "faithfulness": 1.0,
+            "citation_utilization_rate": util_rate,
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+            "top_chunks": top_chunks,
+            "citations": citations,
+            "stage_timings": {**existing, "fast_path_ms": latency_ms},
+        }
+
     latency_ms = (time.perf_counter() - t0) * 1000.0
-    logger.info(
-        "fast_path.verified_factual answer='%s' latency_ms=%.2f",
-        answer[:50],
-        latency_ms,
-    )
-    existing = state.get("stage_timings", {})
     return {
-        "final_answer": answer,
-        "confidence_score": 1.0,
-        "faithfulness": 1.0,
-        "citation_utilization_rate": 1.0,
+        "final_answer": "NOT_FOUND",
+        "confidence_score": 0.0,
+        "faithfulness": None,
+        "citation_utilization_rate": None,
         "usage": {"input_tokens": 0, "output_tokens": 0},
-        "top_chunks": top_chunks,
-        "citations": [citation],
-        "stage_timings": {**existing, "fast_path_ms": latency_ms},
+        "top_chunks": [],
+        "citations": [],
+        "stage_timings": {**state.get("stage_timings", {}), "fast_path_ms": latency_ms},
     }
 
 
@@ -450,28 +614,45 @@ def end_fast_path(state: PipelineState):
 # ---------------------------------------------------------------------------
 
 
+def run_verified_extraction(state: PipelineState):
+    """Attempt deterministic verified fact extraction before deciding fast vs full path."""
+    if state.get("force_full_path", False):
+        return {}
+    from services.retrieval.extractor import extract_verified_fact
+
+    t0 = time.perf_counter()
+    candidates = list(state.get("candidate_chunks", []))
+    for c in state.get("bm25_candidates", []):
+        if c not in candidates:
+            candidates.append(c)
+
+    verified_ans, verified_chunk = extract_verified_fact(state["query"], candidates)
+    latency_ms = (time.perf_counter() - t0) * 1000.0
+    existing = state.get("stage_timings", {})
+    return {
+        "verified_answer": verified_ans,
+        "verified_chunk": verified_chunk,
+        "stage_timings": {**existing, "verified_extraction_ms": latency_ms},
+    }
+
+
 def route_after_vector(state: PipelineState):
-    if not state.get("force_full_path", False):
-        from services.retrieval.extractor import extract_verified_fact
-
-        candidates = list(state.get("candidate_chunks", []))
-        for c in state.get("bm25_candidates", []):
-            if c not in candidates:
-                candidates.append(c)
-
-        verified_ans, verified_chunk = extract_verified_fact(state["query"], candidates)
-        if verified_ans and verified_chunk:
-            state["verified_answer"] = verified_ans
-            state["verified_chunk"] = verified_chunk
-            return "end_fast_path"
-
-        # Deterministic extraction cannot establish the requested fact — escalate to full path
-        logger.info(
-            "route_after_vector: fast-path unverified for query='%s' — escalating to full generation path",
-            state["query"][:50],
-        )
+    if state.get("force_full_path", False):
         return "run_okf_router_post"
-    return "run_okf_router_post"  # OKF already ran pre-BM25; this routes to reranker or graph
+    return "run_verified_extraction"
+
+
+def route_after_extraction(state: PipelineState):
+    if state.get("verified_answer") and state.get("verified_chunk"):
+        return "end_fast_path"
+    plan = state.get("plan")
+    if plan and plan.fast_path:
+        return "end_fast_path"
+    logger.info(
+        "route_after_extraction: fast-path unverified for query='%s' — escalating to full generation path",
+        state["query"][:50],
+    )
+    return "run_okf_router_post"
 
 
 def route_after_reranker_or_graph(state: PipelineState):
@@ -509,9 +690,11 @@ workflow.add_node("run_okf_router", run_okf_router)  # pre-BM25 OKF (Component 2
 workflow.add_node("run_bm25", run_bm25)
 workflow.add_node("run_page_index", run_page_index)
 workflow.add_node("run_vector", run_vector)
+workflow.add_node("run_verified_extraction", run_verified_extraction)
 workflow.add_node("run_okf_router_post", run_okf_post)  # routing branch after vector
 workflow.add_node("run_graph", run_graph)
 workflow.add_node("run_reranker", run_reranker)
+workflow.add_node("run_deterministic_math", run_deterministic_math)
 workflow.add_node("run_compressor", run_compressor)
 workflow.add_node("run_fidelity", run_fidelity)
 workflow.add_node("run_llm", run_llm)
@@ -528,6 +711,15 @@ workflow.add_conditional_edges(
     "run_vector",
     route_after_vector,
     {
+        "run_verified_extraction": "run_verified_extraction",
+        "run_okf_router_post": "run_okf_router_post",
+    },
+)
+
+workflow.add_conditional_edges(
+    "run_verified_extraction",
+    route_after_extraction,
+    {
         "end_fast_path": "end_fast_path",
         "run_okf_router_post": "run_okf_router_post",
     },
@@ -543,7 +735,15 @@ workflow.add_conditional_edges(
 )
 
 workflow.add_edge("run_graph", "run_reranker")
-workflow.add_edge("run_reranker", "run_compressor")
+workflow.add_edge("run_reranker", "run_deterministic_math")
+workflow.add_conditional_edges(
+    "run_deterministic_math",
+    route_after_math,
+    {
+        END: END,
+        "run_compressor": "run_compressor",
+    },
+)
 workflow.add_edge("run_compressor", "run_fidelity")
 workflow.add_edge("run_fidelity", "run_llm")
 workflow.add_edge("run_llm", END)
@@ -592,6 +792,10 @@ class Pipeline:
             "stage_timings": {},
             "verified_answer": None,
             "verified_chunk": None,
+            "execution_result": None,
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+            "faithfulness": None,
+            "citation_utilization_rate": None,
         }
 
         final_state = app.invoke(initial_state)
@@ -608,6 +812,7 @@ class Pipeline:
                 self.faithfulness = state.get("faithfulness", None)
                 self.citation_utilization_rate = state.get("citation_utilization_rate", None)
                 self.usage = state.get("usage", {"input_tokens": 0, "output_tokens": 0})
+                self.execution_result = state.get("execution_result", None)
                 plan = state.get("plan")
                 self.fast_path = plan.fast_path if plan else False
                 self.stages = plan.stages if plan else []

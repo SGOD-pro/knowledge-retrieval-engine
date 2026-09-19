@@ -4,14 +4,14 @@
 
 Dev environment is NOT fully local or fully cloud. It is a strict split:
 1. **LOCAL SERVICES (dev only):** Redis runs locally. QdrantDB runs locally (or Qdrant Cloud with dev API key). DynamoDB uses AWS dev credentials.
-2. **REAL CLOUD (Bedrock):** All LLM, embedding, and reranker calls hit real Bedrock/NVIDIA NIM endpoints using real API keys/credentials in every environment.
+2. **REAL CLOUD (Bedrock + OpenRouter):** LLM and embedding calls hit real Bedrock endpoints. Reranker calls route to OpenRouter (`nvidia/llama-nemotron-rerank-vl-1b-v2:free`). NVIDIA NIM direct is fully removed (410 Gone).
 3. **LOCAL LAMBDAS (dev):** `odl-parser-lambda` runs locally via direct Python import of `odl/main.py`. `bge_microservice` runs locally as a FastAPI app.
 4. **CORS:** Dev allows `http://localhost:5173`. Prod allows ONLY the configured frontend URL — no localhost, no wildcard `*`.
 
 ## Provider Routing
 
 `provider_client.py` reads `MODEL_PROVIDER` env var (dev|prod).
-- dev: Bedrock models + local Redis + QdrantDB + DynamoDB (dev credentials) + local BGE-small microservice.
+- dev: Bedrock models + OpenRouter reranker + local Redis + QdrantDB + DynamoDB (dev credentials) + local BGE-small microservice.
 ## Hybrid Architecture Decision (FastAPI Engine + Auxiliary Lambdas)
 
 The system adopts a **Hybrid Architecture**:

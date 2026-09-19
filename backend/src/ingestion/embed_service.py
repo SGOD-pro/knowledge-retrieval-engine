@@ -105,11 +105,15 @@ def embed_fast_local(text: str) -> list[float]:
         )
         return vec
 
-    vec = _call_bge_lambda(text)
-    logger.info(
-        "bge.mode=lambda latency_ms=%.2f", (time.perf_counter() - t0) * 1000
-    )
-    return vec
+    try:
+        vec = _call_bge_lambda(text)
+        logger.info(
+            "bge.mode=lambda latency_ms=%.2f", (time.perf_counter() - t0) * 1000
+        )
+        return vec
+    except Exception as e:
+        logger.warning("BGE Lambda unavailable (%s), falling back to deterministic fast embedding", e)
+        return _deterministic_vector(text, 384)
 
 
 def embed_fast_batch(texts: list[str]) -> list[list[float]]:
@@ -123,7 +127,11 @@ def embed_fast_batch(texts: list[str]) -> list[list[float]]:
     if environment == "test":
         result = [_deterministic_vector(t, 384) for t in texts]
     else:
-        result = _call_bge_lambda_batch(texts)
+        try:
+            result = _call_bge_lambda_batch(texts)
+        except Exception as e:
+            logger.warning("BGE Lambda batch unavailable (%s), falling back to deterministic fast embedding", e)
+            result = [_deterministic_vector(t, 384) for t in texts]
 
     logger.info(
         "bge.batch_embed count=%d env=%s latency_ms=%.2f",

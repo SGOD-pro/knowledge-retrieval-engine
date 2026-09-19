@@ -24,14 +24,14 @@ def rerank(
     # Call the provider
     scores = rerank_documents(query, documents, provider=provider)
 
-    # Assign scores back to chunks
-    for chunk, score in zip(candidates, scores):
-        # We temporarily store the score on the chunk object.
-        # Since Chunk might be frozen, we use object.__setattr__
-        object.__setattr__(chunk, "reranker_score", score)
-
-    # Sort descending by score
-    candidates.sort(key=lambda c: getattr(c, "reranker_score", 0.0), reverse=True)
+    # Assign scores back to chunks immutably
+    from dataclasses import replace
+    scored_candidates = [
+        replace(chunk, reranker_score=score)
+        for chunk, score in zip(candidates, scores)
+    ]
+    scored_candidates.sort(key=lambda c: (getattr(c, "reranker_score", 0.0) or 0.0), reverse=True)
+    candidates = scored_candidates
 
     # Filter by threshold
     from config import settings
