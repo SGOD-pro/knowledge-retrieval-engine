@@ -153,6 +153,9 @@ class WorkspacesRepository:
         """Cascade delete workspace, its documents, chunks, vectors, and chat sessions/messages."""
         from modules.chat.chat_repository import _WORKSPACE_SESSIONS, _SESSION_MESSAGES
         from qdrant_client.http import models as qmodels
+        from services.retrieval.bm25_retriever import invalidate_chunk_cache
+
+        invalidate_chunk_cache(workspace_id)
 
         if _is_test_env():
             if workspace_id not in _WORKSPACES and workspace_id not in _WORKSPACE_DOCS:
@@ -306,6 +309,9 @@ class WorkspacesRepository:
         raw_bytes: bytes | None = None,
         size_str: str | None = None,
     ) -> None:
+        from services.retrieval.bm25_retriever import invalidate_chunk_cache
+        invalidate_chunk_cache(workspace_id)
+
         if workspace_id not in _WORKSPACES and _is_test_env():
             self.create_workspace(
                 name=f"Workspace {workspace_id}", workspace_id=workspace_id

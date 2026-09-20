@@ -33,12 +33,12 @@ def test_query_isolated_by_workspace(monkeypatch):
     query_a = "What is the telescope telemetry policy?"
     query_b = "What is the derivatives risk policy?"
 
-    text_a1 = query_a
+    text_a1 = "The telescope telemetry policy requires daily recalibration of primary mirror alignment."
     text_a2 = "The observatory optical sensors operate at cryogenic temperatures in deep space."
     text_a3 = "Primary mirror alignment is recalibrated daily using laser interferometry."
     text_a4 = "Galactic redshift measurements are cataloged in the astrophysical repository database."
 
-    text_b1 = query_b
+    text_b1 = "The derivatives risk policy mandates quarterly audit verifications and counterparty risk limits."
     text_b2 = "Financial risk modeling evaluates credit default swaps and counterparty risk exposure."
     text_b3 = "Treasury asset yield curves dictate capital adequacy ratios under Basel III regulations."
     text_b4 = "Commercial lending collateral requirements mandate quarterly audit verifications."

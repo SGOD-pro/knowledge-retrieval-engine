@@ -45,6 +45,9 @@ from services.evaluation.benchmark_scorer import (
     grade_premise_correction,
     grade_arithmetic_answer,
     grade_json_schema,
+    grade_structured_numeric,
+    grade_structured_json,
+    grade_structured_premise,
     validate_citations,
     content_match,
     compute_answer_relevancy,
@@ -142,81 +145,64 @@ def compute_corpus_manifest_hash(documents_meta: list[dict]) -> tuple[str, dict[
     return combined_hash.hexdigest(), file_hashes
 
 
+GROUND_TRUTH_FILE = BACKEND_DIR / "evaluation_assets" / "canonical_60_ground_truth.json"
+
+
 def resolve_ground_truth_chunk_ids(
-    questions: list[dict],
+    ground_truth_entries: dict[str, Any],
     all_chunks: list[Any],
     doc_id_map: dict[str, str],
-) -> dict[str, set[str]]:
-    """Resolves structured ground truth chunk IDs per question.
-
-    Uses document_id and page/row locators from question metadata and evaluation_hint.
+) -> tuple[dict[str, set[str]], list[str]]:
+    """Resolves structured ground truth locators to chunk IDs post-ingestion.
+    Returns (resolved_map, unscorable_qids).
+    Never uses expected_answer, token overlap, or fallback to all document chunks.
     """
-    # Build lookup index by (document_id, page_number) and (document_id, row)
-    doc_filename_to_id = {fname: did for did, fname in doc_id_map.items()}
-    ground_truth = {}
+    doc_fname_to_id = {}
+    for k, v in doc_id_map.items():
+        if any(k.endswith(ext) for ext in (".pdf", ".csv", ".xls", ".xlsx")):
+            doc_fname_to_id[k] = v
+        else:
+            doc_fname_to_id[v] = k
+    resolved = {}
+    unscorable = []
 
-    for q in questions:
-        qid = q["id"]
-        expected_docs = q.get("expected_source_docs", [])
-        if not expected_docs:
-            ground_truth[qid] = set()
+    for qid, entry in ground_truth_entries.items():
+        ev_list = entry.get("relevant_evidence", [])
+        if not ev_list:
+            resolved[qid] = set()
             continue
 
-        target_doc_ids = {doc_filename_to_id[fn] for fn in expected_docs if fn in doc_filename_to_id}
-        hint = q.get("evaluation_hint", "").lower()
-        expected_ans = (q.get("expected_answer") or "").lower()
-
-        # Extract target page numbers from hint (e.g. "page 1", "pages 1-2")
-        target_pages = set()
-        for p_match in re.finditer(r"\bpage[s]?\s+(\d+)(?:\s*-\s*(\d+))?", hint):
-            start_p = int(p_match.group(1))
-            end_p = int(p_match.group(2)) if p_match.group(2) else start_p
-            for p in range(start_p, end_p + 1):
-                target_pages.add(p)
-
-        # Extract target row numbers from hint (e.g. "row 10")
-        target_rows = set()
-        for r_match in re.finditer(r"\brow\s+(\d+)", hint):
-            target_rows.add(int(r_match.group(1)))
-
         matched_ids = set()
-        for c in all_chunks:
-            if c.document_id not in target_doc_ids:
-                continue
+        for ev in ev_list:
+            fname = ev["source_filename"]
+            target_did = doc_fname_to_id.get(fname)
+            loc_type = ev["locator_type"]
+            loc_val = ev["locator"]
 
-            # Check page locator if specified
-            if target_pages:
-                if c.page_number in target_pages:
-                    matched_ids.add(c.id)
+            for c in all_chunks:
+                if c.document_id != target_did:
                     continue
 
-            # Check row locator if specified
-            if target_rows and c.metadata and "row" in c.metadata:
-                if c.metadata["row"] in target_rows:
-                    matched_ids.add(c.id)
-                    continue
+                if loc_type == "pdf_page":
+                    if c.page_number == int(loc_val):
+                        matched_ids.add(str(c.id))
+                elif loc_type in ("csv_row", "spreadsheet_row"):
+                    meta_row = (c.metadata or {}).get("row")
+                    if meta_row is not None and meta_row == int(loc_val):
+                        matched_ids.add(str(c.id))
+                    elif c.location_reference and (
+                        f"Row: {loc_val}" in c.location_reference
+                        or f"Row {loc_val}" in c.location_reference
+                    ):
+                        matched_ids.add(str(c.id))
 
-            # If no page or row in hint, check token overlap with expected answer in the chunk
-            if expected_ans and content_match(c.text, expected_ans):
-                matched_ids.add(c.id)
-
-        # If strict locators found matches, use them; otherwise fallback to any chunk from target docs that contains hint tokens
         if not matched_ids:
-            for c in all_chunks:
-                if c.document_id in target_doc_ids and (
-                    expected_ans and content_match(c.text, expected_ans)
-                ):
-                    matched_ids.add(c.id)
+            unscorable.append(qid)
+            resolved[qid] = set()
+        else:
+            resolved[qid] = matched_ids
 
-        # If still empty, include all chunks for the target doc (weakest fallback)
-        if not matched_ids:
-            for c in all_chunks:
-                if c.document_id in target_doc_ids:
-                    matched_ids.add(c.id)
-
-        ground_truth[qid] = matched_ids
-
-    return ground_truth
+    return resolved, unscorable
 
 
 def run_benchmark(
@@ -258,7 +244,19 @@ def run_benchmark(
         raise RuntimeError(f"No chunks found in workspace '{workspace_id}'. Workspace must be ingested prior to running benchmark.")
 
     doc_id_map = {d["doc_id"]: d["filename"] for d in documents_meta}
-    structured_ground_truth = resolve_ground_truth_chunk_ids(questions, all_ws_chunks, doc_id_map)
+
+    if not GROUND_TRUTH_FILE.exists():
+        raise FileNotFoundError(f"Evaluator ground truth file not found: {GROUND_TRUTH_FILE}")
+
+    with open(GROUND_TRUTH_FILE, "r", encoding="utf-8") as f:
+        ground_truth_data = json.load(f)
+
+    structured_ground_truth, unscorable_qids = resolve_ground_truth_chunk_ids(
+        ground_truth_data, all_ws_chunks, doc_id_map
+    )
+    if unscorable_qids:
+        logger.error("UNSCORABLE_GROUND_TRUTH detected on queries: %s", unscorable_qids)
+        raise RuntimeError(f"Benchmark failed: {len(unscorable_qids)} UNSCORABLE_GROUND_TRUTH queries cannot resolve locators.")
 
     service = QueryService(repo=repo)
 
@@ -275,6 +273,9 @@ def run_benchmark(
 
     refusal_total = 0
     refusal_correct = 0
+    no_evidence_total = 0
+    false_answer_count = 0
+    unsupported_citation_count = 0
 
     all_recalls = []
     all_precisions = []
@@ -307,21 +308,38 @@ def run_benchmark(
 
         ans_text = resp.get("answer", "")
         candidates = resp.get("retrieval_candidates", {})
-        reranked_ids = candidates.get("reranked", [])
+        reranked_ids = resp.get("reranked_chunk_ids") or candidates.get("reranked", [])
+        compressed_ids = set(resp.get("compressed_context_chunk_ids") or candidates.get("compressed_context", []))
+        llm_cited_ids = resp.get("llm_cited_chunk_ids") or candidates.get("llm_citations", [])
         top_citations = resp.get("citations", [])
+        final_citation_ids = resp.get("final_citation_chunk_ids") or [
+            str(c.get("chunk_id")) for c in top_citations if c.get("chunk_id")
+        ]
+
+        gt_entry = ground_truth_data.get(qid, {})
+        contract = gt_entry.get("answer_contract", {})
+        contract_type = contract.get("contract_type", "semantic")
 
         # Evaluate retrieval metrics against resolved structured ground truth
         rel_ids = structured_ground_truth.get(qid, set())
-        ret_metrics = compute_retrieval_metrics(reranked_ids, rel_ids)
+        has_positive_evidence = len(rel_ids) > 0
 
-        all_recalls.append(ret_metrics["recall_at_5"])
-        all_precisions.append(ret_metrics["precision_at_3"])
-        all_mrrs.append(ret_metrics["mrr_at_5"])
-        all_ndcgs.append(ret_metrics["ndcg_at_5"])
-
-        # Evaluate answer correctness
-        is_correct = False
-        is_refusal = False
+        if has_positive_evidence:
+            ret_metrics = compute_retrieval_metrics(reranked_ids, rel_ids)
+            all_recalls.append(ret_metrics["recall_at_5"])
+            all_precisions.append(ret_metrics["precision_at_3"])
+            all_mrrs.append(ret_metrics["mrr_at_5"])
+            all_ndcgs.append(ret_metrics["ndcg_at_5"])
+        else:
+            # Exclude no-evidence queries from retrieval aggregate metrics
+            ret_metrics = {
+                "recall_at_5": None,
+                "precision_at_3": None,
+                "mrr_at_5": None,
+                "ndcg_at_5": None,
+                "note": "excluded_no_positive_evidence",
+            }
+            no_evidence_total += 1
 
         refusal_indicators = [
             "couldn't find any relevant",
@@ -330,42 +348,50 @@ def run_benchmark(
             "not mentioned",
             "no information",
             "cannot find",
+            "absent",
+            "no positive source",
         ]
-        ans_is_refusal = any(ind in ans_text.lower() for ind in refusal_indicators)
+        ans_is_refusal = any(ind in ans_text.lower() for ind in refusal_indicators) or ans_text.strip() == "NOT_FOUND"
 
-        if is_hallucination and expected_ans is None:
+        # Evaluate answer correctness
+        is_correct = False
+        is_refusal = False
+
+        if contract_type == "refusal":
             refusal_total += 1
             if ans_is_refusal:
                 refusal_correct += 1
                 is_correct = True
                 is_refusal = True
-        elif category == "HALLUCINATION_PREMISE":
+            else:
+                false_answer_count += 1
+            if len(top_citations) > 0:
+                unsupported_citation_count += 1
+        elif contract_type == "numeric":
+            is_correct = grade_structured_numeric(ans_text, contract)
+        elif contract_type == "json_schema":
+            is_correct = grade_structured_json(ans_text, contract)
+        elif contract_type == "premise_correction":
             refusal_total += 1
-            is_correct = grade_premise_correction(ans_text, expected_ans or "")
+            is_correct = grade_structured_premise(ans_text, contract)
             if is_correct:
                 refusal_correct += 1
-        elif category == "NUMERIC" and expected_ans:
-            # Check if expected answer contains a specific float/int
-            raw_nums = re.findall(r"[-+]?\b\d[\d,]*(?:\.\d+)?\b", expected_ans)
-            if raw_nums:
-                target_val = float(raw_nums[0].replace(",", ""))
-                is_correct = grade_arithmetic_answer(ans_text, target_val)
-            else:
-                is_correct = content_match(ans_text, expected_ans)
-        elif category == "EDGE_ADVERSARIAL" and "json" in q_text.lower():
-            is_correct = grade_json_schema(ans_text, required_keys=["answer"])
         else:
             if expected_ans:
                 relevancy = compute_answer_relevancy(ans_text, expected_ans)
                 c_match = content_match(ans_text, expected_ans)
                 is_correct = c_match and relevancy >= 0.40
 
-        # Check citations validity
-        context_ids = set(candidates.get("context", [c.get("chunk_id") for c in top_citations]))
-        cit_val = validate_citations(top_citations, context_chunk_ids=context_ids if context_ids else None)
+        # Check citations validity against compressed context and ground truth
+        cit_val = validate_citations(
+            top_citations,
+            context_chunk_ids=compressed_ids if compressed_ids else None,
+            ground_truth_chunk_ids=rel_ids if rel_ids else None,
+        )
 
         executed_path = resp.get("executed_path", "full")
-        if executed_path == "full":
+        gen_calls = resp.get("generation_calls", 0)
+        if gen_calls > 0:
             llm_call_count += 1
 
         res_entry = {
@@ -382,6 +408,14 @@ def run_benchmark(
             "retrieval_metrics": ret_metrics,
             "citation_validity": cit_val,
             "latency_ms": round(query_latency_ms, 2),
+            "reranked_chunk_ids": reranked_ids,
+            "compressed_context_chunk_ids": list(compressed_ids),
+            "llm_cited_chunk_ids": llm_cited_ids,
+            "final_citation_chunk_ids": final_citation_ids,
+            "bedrock_embedding_calls": resp.get("bedrock_embedding_calls", 0),
+            "bge_lambda_calls": resp.get("bge_lambda_calls", 0),
+            "reranker_remote_calls": resp.get("reranker_remote_calls", 0),
+            "generation_calls": gen_calls,
             "citations": top_citations,
         }
         query_results.append(res_entry)
@@ -398,14 +432,18 @@ def run_benchmark(
             query_latency_ms,
         )
 
-    # Compute aggregate metrics
+    # Compute aggregate metrics with strict denominator handling
+    pos_count = len(all_recalls)
     overall_acc = round(sum(1 for r in query_results if r["is_correct"]) / total_q, 4)
     refusal_acc = round(refusal_correct / max(1, refusal_total), 4) if refusal_total > 0 else 1.0
-    avg_recall_5 = round(sum(all_recalls) / total_q, 4)
-    avg_precision_3 = round(sum(all_precisions) / total_q, 4)
-    avg_mrr_5 = round(sum(all_mrrs) / total_q, 4)
-    avg_ndcg_5 = round(sum(all_ndcgs) / total_q, 4)
+    avg_recall_5 = round(sum(all_recalls) / pos_count, 4) if pos_count > 0 else 0.0
+    avg_precision_3 = round(sum(all_precisions) / pos_count, 4) if pos_count > 0 else 0.0
+    avg_mrr_5 = round(sum(all_mrrs) / pos_count, 4) if pos_count > 0 else 0.0
+    avg_ndcg_5 = round(sum(all_ndcgs) / pos_count, 4) if pos_count > 0 else 0.0
     llm_act_rate = round(llm_call_count / total_q, 4)
+
+    false_answer_rate = round(false_answer_count / max(1, no_evidence_total), 4) if no_evidence_total > 0 else 0.0
+    unsupported_cit_rate = round(unsupported_citation_count / max(1, no_evidence_total), 4) if no_evidence_total > 0 else 0.0
 
     from providers.bedrock_models import get_embedding_model, get_llm_model
 
@@ -426,6 +464,12 @@ def run_benchmark(
         "reranker_policy": "openrouter:cross-encoder/ms-marco-MiniLM-L-6-v2",
         "cache_mode": "bypass_exact_and_semantic",
         "total_questions": total_q,
+        "denominators": {
+            "total_questions": total_q,
+            "positive_evidence_questions": pos_count,
+            "no_evidence_questions": no_evidence_total,
+            "refusal_evaluated_questions": refusal_total,
+        },
         "metrics": {
             "overall_accuracy": overall_acc,
             "refusal_accuracy": refusal_acc,
@@ -434,6 +478,10 @@ def run_benchmark(
             "mrr_at_5": avg_mrr_5,
             "ndcg_at_5": avg_ndcg_5,
             "llm_activation_rate": llm_act_rate,
+            "no_evidence_metrics": {
+                "false_answer_rate": false_answer_rate,
+                "unsupported_citation_rate": unsupported_cit_rate,
+            },
         },
         "query_latency_distribution_ms": {
             "min": round(min(all_latencies), 2),

@@ -48,6 +48,11 @@ def generate_completion(
         (text, usage) where usage = {"input_tokens": N, "output_tokens": M}
     """
     _llm_counter["generation_calls"] += 1
+    try:
+        from services.telemetry import record_generation
+        record_generation()
+    except Exception:
+        pass
     import time
     max_attempts = 5
     for attempt in range(max_attempts):

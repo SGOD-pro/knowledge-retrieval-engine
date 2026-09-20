@@ -33,6 +33,16 @@ _rl_lock = threading.Lock()
 _last_request_time = 0.0
 REQUEST_INTERVAL_SECONDS = 0.2  # Max 5 requests per second
 
+_reranker_counter = {"reranker_calls": 0}
+
+
+def reset_reranker_counter() -> None:
+    _reranker_counter["reranker_calls"] = 0
+
+
+def get_reranker_counter() -> dict:
+    return dict(_reranker_counter)
+
 _session: requests.Session | None = None
 _session_lock = threading.Lock()
 
@@ -145,6 +155,12 @@ def _openrouter_reranker(query: str, documents: list[str]) -> list[float]:
     for attempt in range(max_retries):
         _wait_for_rate_limit()
         try:
+            try:
+                from services.telemetry import record_reranker
+                record_reranker()
+            except Exception:
+                pass
+            _reranker_counter["reranker_calls"] += 1
             response = session.post(
                 _OPENROUTER_RERANK_URL,
                 headers=headers,

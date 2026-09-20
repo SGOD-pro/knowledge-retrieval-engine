@@ -80,6 +80,11 @@ def embed_text(
             input_token_count = response_body.get("inputTextTokenCount", 0)
             _token_counter["embed_calls"] += 1
             _token_counter["embed_input_tokens"] += input_token_count
+            try:
+                from services.telemetry import record_bedrock_embedding
+                record_bedrock_embedding()
+            except Exception:
+                pass
             logger.info(
                 "embed_provider.tokens input=%d total_embed_tokens=%d",
                 input_token_count,

@@ -65,6 +65,9 @@ class FastPathResponse:
         return d
 
 
+_DOC_FILENAME_CACHE: dict[str, str] = {}
+
+
 def build_citation(
     chunk: Chunk,
     document_filename: str | None = None,
@@ -113,12 +116,16 @@ def build_citation(
 
     # Resolve document filename
     doc_fname = document_filename or getattr(chunk, "document_filename", "") or ""
-    if not doc_fname:
+    did_str = str(chunk.document_id)
+    if not doc_fname and did_str in _DOC_FILENAME_CACHE:
+        doc_fname = _DOC_FILENAME_CACHE[did_str]
+    elif not doc_fname:
         try:
             from db.database import CloudRepository
-            doc = CloudRepository().get(str(chunk.document_id))
+            doc = CloudRepository().get(did_str)
             if doc and doc.filename:
                 doc_fname = doc.filename
+                _DOC_FILENAME_CACHE[did_str] = doc_fname
         except Exception:
             pass
     if not doc_fname:

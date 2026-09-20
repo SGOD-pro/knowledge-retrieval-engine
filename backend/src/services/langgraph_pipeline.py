@@ -182,13 +182,15 @@ def run_bm25(state: PipelineState):
 
     ws_id = state.get("workspace_id", "")
     doc_ids = state.get("document_ids")
+    cached_chunks = get_cached_chunks(
+        ws_id,
+        lambda: repo.get_all_chunks(document_ids=None, workspace_id=ws_id),
+    )
     if doc_ids:
-        all_chunks = repo.get_all_chunks(document_ids=doc_ids, workspace_id=ws_id)
+        doc_set = set(str(d) for d in doc_ids)
+        all_chunks = [c for c in cached_chunks if str(c.document_id) in doc_set]
     else:
-        all_chunks = get_cached_chunks(
-            ws_id,
-            lambda: repo.get_all_chunks(document_ids=None, workspace_id=ws_id),
-        )
+        all_chunks = cached_chunks
 
     retriever = BM25Retriever()
     results = retriever.search(state["query"], all_chunks, top_k=40)
@@ -269,9 +271,9 @@ def run_vector(state: PipelineState):
         query_embedding=state.get("query_embedding"),
         fast_path=is_fast_path,
         document_ids=state.get("document_ids"),
-        candidate_page_ids=state.get("candidate_page_ids"),
-        candidate_chunk_ids=state.get("candidate_chunk_ids"),
-        candidate_page_scopes=state.get("candidate_page_scopes"),
+        candidate_page_ids=None if is_fast_path else state.get("candidate_page_ids"),
+        candidate_chunk_ids=None if is_fast_path else state.get("candidate_chunk_ids"),
+        candidate_page_scopes=None if is_fast_path else state.get("candidate_page_scopes"),
         workspace_id=state.get("workspace_id", ""),
         top_k=40 if not is_fast_path else 10,
     )
@@ -451,6 +453,10 @@ def run_deterministic_math(state: PipelineState):
         latency_ms,
     )
 
+    cands = dict(state.get("retrieval_candidates", {}))
+    cands["compressed_context"] = [str(c.id) for c in chunks]
+    cands["llm_citations"] = [str(c.get("chunk_id")) for c in citations if c.get("chunk_id")]
+
     return {
         "final_answer": ans_str,
         "citations": citations,
@@ -460,6 +466,7 @@ def run_deterministic_math(state: PipelineState):
         "usage": {"input_tokens": 0, "output_tokens": 0},
         "execution_result": res,
         "executed_path": "deterministic_math",
+        "retrieval_candidates": cands,
         "stage_timings": {**existing, "deterministic_math_ms": latency_ms},
     }
 
@@ -484,9 +491,13 @@ def run_compressor(state: PipelineState):
         len(compressed),
     )
     existing = state.get("stage_timings", {})
+    compressed_chunk_ids = [str(c.id) for c in chunks if f"[{c.id}]" in compressed]
+    cands = dict(state.get("retrieval_candidates", {}))
+    cands["compressed_context"] = compressed_chunk_ids
     return {
         "compressed_text": compressed,
         "context_snippet": compressed[:500],  # expose for LLM faithfulness judge
+        "retrieval_candidates": cands,
         "stage_timings": {**existing, "compressor_ms": latency_ms},
     }
 
@@ -562,19 +573,46 @@ def run_llm(state: PipelineState):
     ans = response.get("answer", "NOT_FOUND")
     usage = response.get("usage", {"input_tokens": 0, "output_tokens": 0})
 
+    cands = dict(state.get("retrieval_candidates", {}))
+    compressed_ids = set(cands.get("compressed_context", []))
+    if not compressed_ids and compressed:
+        compressed_ids = {str(c.id) for c in top_chunks if f"[{c.id}]" in compressed}
+        cands["compressed_context"] = list(compressed_ids)
+
+    # Parse and validate citations directly from the LLM's JSON contract: {"answer": "...", "citations": ["chunk_id"]}
+    raw_citations = response.get("citations", [])
+    if isinstance(raw_citations, list):
+        valid_llm_citations = [
+            str(cid) for cid in raw_citations
+            if str(cid) in compressed_ids
+        ]
+    else:
+        valid_llm_citations = []
+    cands["llm_citations"] = valid_llm_citations
+
+    # Select final citations: preferred LLM cited chunks, else compressed context chunks
+    final_cited_chunks = []
+    chunk_by_id = {str(c.id): c for c in top_chunks}
+    for cid in valid_llm_citations:
+        if cid in chunk_by_id:
+            final_cited_chunks.append(chunk_by_id[cid])
+
+    if not final_cited_chunks and ans != "NOT_FOUND":
+        final_cited_chunks = [c for c in top_chunks if str(c.id) in compressed_ids]
+
     if ans == "NOT_FOUND" or not top_chunks:
         citation_utilization_rate = None
         faithfulness = None
+        final_cited_chunks = []
     else:
-        contributed = [c for c in top_chunks if f"[{c.id}]" in compressed]
-        citation_utilization_rate = round(len(contributed) / len(top_chunks), 4)
+        citation_utilization_rate = (
+            round(len(final_cited_chunks) / len(top_chunks), 4) if top_chunks else None
+        )
         faithfulness = compute_faithfulness(ans, compressed)
-    cands = dict(state.get("retrieval_candidates", {}))
-    cands["llm_citations"] = [str(getattr(c, "id", "")) for c in top_chunks]
 
     return {
         "final_answer": ans,
-        "citations": [build_citation(c).to_dict() for c in top_chunks],
+        "citations": [build_citation(c).to_dict() for c in final_cited_chunks],
         "confidence_score": confidence,
         "faithfulness": faithfulness,
         "citation_utilization_rate": citation_utilization_rate,
@@ -647,6 +685,11 @@ def end_fast_path(state: PipelineState):
             "top_chunks": top_chunks,
             "citations": [citation],
             "executed_path": "fast",
+            "retrieval_candidates": {
+                "reranked": [str(c.id) for c in top_chunks],
+                "compressed_context": [str(c.id) for c in top_chunks],
+                "llm_citations": [str(citation.get("chunk_id", ""))],
+            },
             "stage_timings": {**existing, "fast_path_ms": latency_ms},
         }
 
@@ -697,6 +740,11 @@ def end_fast_path(state: PipelineState):
             "top_chunks": top_chunks,
             "citations": citations,
             "executed_path": "fast",
+            "retrieval_candidates": {
+                "reranked": [str(c.id) for c in top_chunks],
+                "compressed_context": [str(c.id) for c in top_chunks],
+                "llm_citations": [str(c.get("chunk_id", "")) for c in citations if c.get("chunk_id")],
+            },
             "stage_timings": {**existing, "fast_path_ms": latency_ms},
         }
 
@@ -759,7 +807,8 @@ def route_after_extraction(state: PipelineState):
     if candidates:
         top_c = candidates[0]
         top_sim = getattr(top_c, "similarity_score", 0.0) or 0.0
-        if top_sim >= 0.40:
+        threshold = 0.40
+        if top_sim >= threshold:
             return "end_fast_path"
 
     # Escalate to full generation path

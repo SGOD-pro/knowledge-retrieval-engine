@@ -19,6 +19,7 @@ _CHUNK_CACHE_TTL = 300.0  # 5 minutes
 
 def get_cached_chunks(workspace_id: str, loader_fn, corpus_version: str = "") -> list[Chunk]:
     """Return cached chunks for a workspace and corpus version, refreshing from loader_fn if expired."""
+
     key = f"{workspace_id}::{corpus_version}" if corpus_version else workspace_id
     now = time.monotonic()
     cached = _CHUNK_CACHE.get(key)

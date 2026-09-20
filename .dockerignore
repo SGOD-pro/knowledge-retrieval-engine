@@ -1,0 +1,9 @@
+# Exclude development, evaluation assets, and benchmark answer keys from docker builds
+backend/evaluation_assets/
+backend/reports/
+data/test.json
+*.log
+.git
+.venv
+backend/.venv
+tmp/

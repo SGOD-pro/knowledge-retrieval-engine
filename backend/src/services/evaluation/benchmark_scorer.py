@@ -351,22 +351,153 @@ def grade_json_schema(answer: str, required_keys: list[str]) -> bool:
         return False
 
 
+def grade_structured_numeric(answer: str, contract: dict) -> bool:
+    """
+    Grades numeric calculation answers against a structured contract:
+      - target_values: list of float values (all must be matched within tolerance)
+      - operands: optional list of operands (must be present in context/calculation)
+      - required_sign: '+' or '-'
+      - required_units: list of unit keywords (e.g. ['%', 'percent'] - at least one must match)
+      - tolerance: float
+    """
+    if not answer or answer.strip() in ("NOT_FOUND", ""):
+        return False
+
+    raw_nums = re.findall(r"[-+]?\b\d[\d,]*(?:\.\d+)?\b", answer)
+    extracted_floats = []
+    for num_str in raw_nums:
+        clean_num = num_str.replace(",", "")
+        try:
+            extracted_floats.append(float(clean_num))
+        except ValueError:
+            continue
+
+    target_values = contract.get("target_values", [])
+    tol = contract.get("tolerance", 0.02)
+
+    # Check each target value
+    for target in target_values:
+        matched = False
+        for val in extracted_floats:
+            delta = abs(val - target)
+            allowed = max(tol, abs(target) * tol)
+            if delta <= allowed:
+                matched = True
+                break
+        if not matched:
+            return False
+
+    # Check required sign
+    req_sign = contract.get("required_sign")
+    if req_sign == "-":
+        has_negative = any(v < 0 for v in extracted_floats) or "negative" in answer.lower() or "minus" in answer.lower()
+        if not has_negative:
+            return False
+    elif req_sign == "+":
+        # Check that target values are not reported as negative
+        if any(v < 0 and abs(v) in target_values for v in extracted_floats):
+            return False
+
+    # Check required units
+    req_units = contract.get("required_units", [])
+    if req_units:
+        ans_lower = answer.lower()
+        unit_matched = any(u.lower() in ans_lower for u in req_units)
+        if not unit_matched:
+            return False
+
+    return True
+
+
+def grade_structured_json(answer: str, contract: dict) -> bool:
+    """
+    Grades structured JSON answers against contract requirements:
+      - required_keys: all keys must be present
+      - required_values: exact value match for specified keys
+    """
+    if not answer:
+        return False
+
+    clean_text = answer.strip()
+    if clean_text.startswith("```json"):
+        clean_text = clean_text[7:]
+    elif clean_text.startswith("```"):
+        clean_text = clean_text[3:]
+    if clean_text.endswith("```"):
+        clean_text = clean_text[:-3]
+    clean_text = clean_text.strip()
+
+    try:
+        data = json.loads(clean_text)
+        if not isinstance(data, dict):
+            return False
+
+        req_keys = contract.get("required_keys", [])
+        for k in req_keys:
+            if k not in data:
+                return False
+
+        req_vals = contract.get("required_values", {})
+        for k, expected_v in req_vals.items():
+            actual_v = data.get(k)
+            if actual_v != expected_v:
+                # Allow string/int conversion
+                if str(actual_v).strip() != str(expected_v).strip():
+                    return False
+
+        return True
+    except Exception:
+        return False
+
+
+def grade_structured_premise(answer: str, contract: dict) -> bool:
+    """
+    Grades premise correction questions against contract:
+      - rejected_generic_responses: must not be a lazy dismissal
+      - key_correction_terms: all required correction terms must appear
+    """
+    if not answer or answer.strip() in ("NOT_FOUND", ""):
+        return False
+
+    ans_clean = answer.strip().lower()
+    rejected = contract.get("rejected_generic_responses", [])
+    if ans_clean in rejected or len(tokenize(ans_clean)) < 3:
+        return False
+
+    key_terms = contract.get("key_correction_terms", [])
+    if key_terms:
+        for term in key_terms:
+            if term.lower() not in ans_clean:
+                return False
+        return True
+
+    exp_ans = contract.get("expected_answer")
+    if exp_ans:
+        return content_match(answer, exp_ans)
+
+    return True
+
+
 def validate_citations(
     citations: list[dict],
     context_chunk_ids: list[str] | set[str] | None = None,
+    ground_truth_chunk_ids: list[str] | set[str] | None = None,
 ) -> dict[str, Any]:
     """
     Validates that citations:
       1. Have non-empty document_filename and chunk_id.
-      2. If context_chunk_ids provided, chunk_id MUST exist in the retrieved context.
-      3. Have valid page_number (> 0) or non-empty location_reference.
+      2. If context_chunk_ids provided, chunk_id MUST exist in the retrieved compressed context.
+      3. If ground_truth_chunk_ids provided, at least one citation must match ground-truth chunk IDs.
+      4. Have valid page_number (> 0) or non-empty location_reference.
     """
     if not citations:
         return {"valid": True, "citation_count": 0, "errors": []}
 
     context_set = set(context_chunk_ids) if context_chunk_ids is not None else None
+    gt_set = set(ground_truth_chunk_ids) if ground_truth_chunk_ids else None
     errors = []
     valid_count = 0
+    gt_matched_count = 0
 
     for idx, c in enumerate(citations):
         cid = str(c.get("chunk_id", ""))
@@ -387,12 +518,20 @@ def validate_citations(
             errors.append(f"Citation {idx}: missing page_number and location_reference")
             continue
 
+        if gt_set is not None and cid in gt_set:
+            gt_matched_count += 1
+
         valid_count += 1
+
+    # If ground truth chunk IDs were supplied, verify ground-truth alignment
+    if gt_set is not None and len(gt_set) > 0 and gt_matched_count == 0:
+        errors.append("No citations match evaluator ground-truth evidence chunk IDs")
 
     return {
         "valid": len(errors) == 0,
         "citation_count": len(citations),
         "valid_count": valid_count,
+        "ground_truth_matched_count": gt_matched_count,
         "errors": errors,
     }
 

@@ -103,6 +103,10 @@ class DocumentsRepository:
             if all(x == 0.0 for x in chunk.embedding_full[384:]):
                 raise DataIntegrityError(f"DataIntegrityError: Chunk {chunk.id} has zero-padded embedding_full")
 
+        from services.retrieval.bm25_retriever import invalidate_chunk_cache
+        if getattr(document, "workspace_id", None):
+            invalidate_chunk_cache(document.workspace_id)
+
         if _is_test_env():
             _IN_MEMORY_DOCS[str(document.id)] = document
             for chunk in document.chunks:

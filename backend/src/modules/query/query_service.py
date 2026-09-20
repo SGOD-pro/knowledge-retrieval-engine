@@ -15,6 +15,9 @@ class QueryService:
         self.repo = repo or QueryRepository()
 
     def execute_query(self, req: QueryRequest) -> dict:
+        from services.telemetry import init_request_telemetry
+        req_telemetry = init_request_telemetry()
+
         if not req.workspace_id:
             from fastapi import HTTPException
             raise HTTPException(status_code=400, detail="workspace_id is required")
@@ -219,6 +222,7 @@ class QueryService:
             total_ms,
         )
 
+        final_cit_ids = [str(c.get("chunk_id")) for c in formatted_citations if c.get("chunk_id")]
         response_dict = {
             "answer": answer_text,
             "citations": formatted_citations,
@@ -237,12 +241,21 @@ class QueryService:
             "document_ids": req.document_ids or [],
             "retrieval_candidates": retrieval_candidates,
             "reranker_mode": reranker_mode,
+            "bedrock_embedding_calls": req_telemetry.bedrock_embedding_calls,
+            "bge_lambda_calls": req_telemetry.bge_lambda_calls,
+            "reranker_remote_calls": req_telemetry.reranker_remote_calls,
+            "generation_calls": req_telemetry.generation_calls,
+            "telemetry": req_telemetry.to_dict(),
+            "reranked_chunk_ids": retrieval_candidates.get("reranked", []),
+            "compressed_context_chunk_ids": retrieval_candidates.get("compressed_context", []),
+            "llm_cited_chunk_ids": retrieval_candidates.get("llm_citations", []),
+            "final_citation_chunk_ids": final_cit_ids,
         }
 
         # 4. Write Cache (ONLY if cache enabled and not in benchmark_mode)
         if (
             use_cache
-            and response.confidence_score >= CACHE_MIN_CONFIDENCE
+            and (response.confidence_score >= CACHE_MIN_CONFIDENCE or response.fast_path)
             and response.answer != "NOT_FOUND"
         ):
             from db.redis_cache import cache

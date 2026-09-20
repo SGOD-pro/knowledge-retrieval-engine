@@ -1,0 +1,6 @@
+# Exclude evaluation assets, reports and logs from backend container image
+evaluation_assets/
+reports/
+*.log
+.venv
+tmp/

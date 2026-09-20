@@ -11,6 +11,7 @@ Implements explicit answerability checks:
 
 import logging
 import re
+import unicodedata
 from schemas.models import Chunk
 
 logger = logging.getLogger(__name__)
@@ -70,7 +71,7 @@ def extract_verified_fact(query: str, chunks: list[Chunk]) -> tuple[str | None, 
     if abbr_m:
         target_abbr = abbr_m.group(1).upper()
         for c in chunks:
-            txt = getattr(c, "text", "")
+            txt = unicodedata.normalize("NFKD", getattr(c, "text", ""))
             # Pattern: "XYZ stands for Full Expansion"
             m = re.search(
                 r"\b" + re.escape(target_abbr) + r"\b\s+stands for\s+([^,.;\n\)]+)",
