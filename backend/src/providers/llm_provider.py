@@ -48,41 +48,55 @@ def generate_completion(
         (text, usage) where usage = {"input_tokens": N, "output_tokens": M}
     """
     _llm_counter["generation_calls"] += 1
-    try:
-        from aws.infra import get_client
+    import time
+    max_attempts = 5
+    for attempt in range(max_attempts):
+        try:
+            from aws.infra import get_client
 
-        client = get_client("bedrock-runtime")
+            client = get_client("bedrock-runtime")
 
-        messages = [{"role": "user", "content": [{"text": user_prompt}]}]
+            messages = [{"role": "user", "content": [{"text": user_prompt}]}]
 
-        response = client.converse(
-            modelId=get_llm_model(),
-            messages=messages,
-            system=[{"text": system_prompt}],
-            inferenceConfig={
-                "temperature": temperature,
-                "maxTokens": _MAX_TOKENS,
-            },
-        )
+            response = client.converse(
+                modelId=get_llm_model(),
+                messages=messages,
+                system=[{"text": system_prompt}],
+                inferenceConfig={
+                    "temperature": temperature,
+                    "maxTokens": _MAX_TOKENS,
+                },
+            )
 
-        text = response["output"]["message"]["content"][0]["text"]
+            text = response["output"]["message"]["content"][0]["text"]
 
-        # Extract real token counts from Bedrock Converse response
-        raw_usage = response.get("usage", {})
-        usage = {
-            "input_tokens": raw_usage.get("inputTokens", 0),
-            "output_tokens": raw_usage.get("outputTokens", 0),
-        }
+            # Extract real token counts from Bedrock Converse response
+            raw_usage = response.get("usage", {})
+            usage = {
+                "input_tokens": raw_usage.get("inputTokens", 0),
+                "output_tokens": raw_usage.get("outputTokens", 0),
+            }
 
-        logger.info(
-            "llm_provider.tokens input=%d output=%d model=%s",
-            usage["input_tokens"],
-            usage["output_tokens"],
-            get_llm_model(),
-        )
+            logger.info(
+                "llm_provider.tokens input=%d output=%d model=%s",
+                usage["input_tokens"],
+                usage["output_tokens"],
+                get_llm_model(),
+            )
 
-        return text, usage
+            return text, usage
 
-    except Exception as e:
-        logger.error("LLM request failed: %s", str(e))
-        raise e
+        except Exception as e:
+            err_str = str(e)
+            if ("ThrottlingException" in err_str or "Too many requests" in err_str) and attempt < max_attempts - 1:
+                sleep_s = 2 ** attempt
+                logger.warning(
+                    "Bedrock throttled, retrying in %ds (attempt %d/%d)...",
+                    sleep_s,
+                    attempt + 1,
+                    max_attempts,
+                )
+                time.sleep(sleep_s)
+                continue
+            logger.error("LLM request failed: %s", str(e))
+            raise e
