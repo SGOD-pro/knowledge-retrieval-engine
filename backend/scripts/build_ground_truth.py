@@ -89,12 +89,17 @@ for q in suite["questions"]:
                     explicit_rows = re.findall(r"row[s]?\s+(\d+)", hint, re.IGNORECASE)
                     rows_found = [int(r) for r in explicit_rows]
 
-                # Special case: Q152 (min/max year across all records) -> rows 2 to 10
+                # Special case: Q152 — min/max year across ALL 60,255 records.
+                # This is a corpus-wide aggregate; no single row covers both endpoints.
+                # The CSV is capped at 500 ingested chunks so 2013 rows are NOT in the index.
+                # Mark evidence as empty so the question is excluded from retrieval scoring
+                # rather than producing a false UNSCORABLE_GROUND_TRUTH result.
                 if qid == "Q152":
-                    rows_found = [2, 3]
-                # Special case: Q163 / Q164 (bills filter)
-                elif qid in ("Q163", "Q164"):
-                    rows_found = [2, 3, 4]
+                    rows_found = []  # corpus-wide aggregate — no single-row locator
+                # Special case: Q164 — count of Year==2013 records
+                # Data records 1-7 in the CSV have Year=2013 (rows 7-13 including header).
+                elif qid == "Q164":
+                    rows_found = [7, 8, 9, 10, 11, 12, 13]
                 elif not rows_found:
                     rows_found = [2]
 
@@ -117,6 +122,10 @@ for q in suite["questions"]:
                     rows_found.extend(range(start_r, end_r + 1))
                 if not rows_found:
                     rows_found = [2]
+                # Q145: evidence is O4 (South Andaman) AND O3 (North & Middle Andaman)
+                # ensure both rows 3 and 4 are present
+                if qid == "Q145" and 4 in rows_found and 3 not in rows_found:
+                    rows_found.append(3)
                 for r in sorted(set(rows_found)):
                     evidence_list.append({
                         "document_sha256": dhash,
@@ -147,27 +156,39 @@ for q in suite["questions"]:
         # Premise correction contract
         key_terms = []
         if qid == "Q142":
-            key_terms = ["per share", "share"]
+            # False premise: EPS is $2.03 million. Must correct to "per share".
+            # Reject any answer that affirms the million-dollar unit.
+            key_terms = ["per share"]
         elif qid == "Q148":
             key_terms = ["-92.55", "negative"]
         elif qid == "Q155":
-            key_terms = ["reconciliation", "arithmetic", "867750"]
+            # Reconciliation: income−expenditure ≠ surplus; difference = 1521
+            key_terms = ["109,848", "108,327", "1,521"]
         elif qid == "Q157":
-            key_terms = ["confidential", "suppressed", "code c"]
+            # Value is code C, not numeric zero
+            key_terms = ["not a numeric", "c"]
         elif qid == "Q165":
-            key_terms = ["2010", "title"]
+            # Title says 2016 but Year field is 2014
+            key_terms = ["2014", "title"]
         elif qid == "Q171":
-            key_terms = ["accuracy", "alone", "metric"]
+            # Accurate predictions don't guarantee interpretability
+            key_terms = ["accurately", "not interpretable"]
         elif qid == "Q172":
-            key_terms = ["mostly", "not always"]
+            # MoD beats A-MoD at ViT-Base 12.5%
+            key_terms = ["78.49", "78.42"]
         elif qid == "Q180":
-            key_terms = ["constant", "length", "feature"]
+            # O(tD): independent of L but depends on t and D
+            key_terms = ["o(td)", "sequence length"]
 
         answer_contract = {
             "contract_type": "premise_correction",
             "expected_answer": exp_ans,
             "key_correction_terms": key_terms,
             "rejected_generic_responses": ["no", "incorrect", "that is incorrect", "this is false", "actually no"],
+            "reject_if_affirms_any": (
+                ["correct unit", "correct unit.", "yes, basic", "yes. basic", "the correct unit"]
+                if qid == "Q142" else []
+            ),
         }
     elif cat == "NUMERIC":
         # Extract target numeric values and units
@@ -190,7 +211,7 @@ for q in suite["questions"]:
         elif qid == "Q145":
             target_vals = [30.67]
             operands = [91.92, 61.25]
-            required_units = ["percentage", "points", "%"]
+            required_units = ["percentage points", " pp"]  # compound phrase: reject relative-growth answers
         elif qid == "Q153":
             target_vals = [4191.0, 0.43]
             operands = [980268.0, 976077.0]
@@ -203,9 +224,13 @@ for q in suite["questions"]:
             target_vals = [50.0]
             required_units = ["days"]
         elif qid == "Q170":
+            # 196 annotation vectors each 512-dimensional; roles must not be swapped
             target_vals = [196.0, 512.0]
         elif qid == "Q173":
             target_vals = [2.04, 0.21]
+
+        # Build tolerance: Q138 requires tighter precision (0.01 pp)
+        tol = 0.01 if qid == "Q138" else 0.02
 
         answer_contract = {
             "contract_type": "numeric",
@@ -213,13 +238,25 @@ for q in suite["questions"]:
             "operands": operands,
             "required_sign": required_sign,
             "required_units": required_units,
-            "tolerance": 0.02,
+            "tolerance": tol,
+            # Direction enforcement for change questions
+            **({"required_direction": "decrease"} if qid == "Q153" else {}),
+            # Role binding: for Q170, 196 = annotation count, 512 = dimension
+            **({"required_roles": [
+                {"value": 196, "role": "annotation"},
+                {"value": 512, "role": "dimension"},
+            ]} if qid == "Q170" else {}),
         }
     elif qid == "Q194":
         answer_contract = {
             "contract_type": "json_schema",
             "required_keys": ["district", "men_interviewed"],
-            "required_values": {"men_interviewed": 108},
+            "required_values": {
+                "district": "North & Middle Andaman",
+                "men_interviewed": 108,
+            },
+            "allow_extra_keys": False,
+            "strict_format": True,
         }
     elif cat == "EDGE_ADVERSARIAL" and "json" in q["question"].lower():
         answer_contract = {

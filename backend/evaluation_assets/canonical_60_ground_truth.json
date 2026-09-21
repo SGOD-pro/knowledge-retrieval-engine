@@ -74,7 +74,7 @@
         "%",
         "percent"
       ],
-      "tolerance": 0.02
+      "tolerance": 0.01
     }
   },
   "Q139": {
@@ -166,8 +166,7 @@
       "contract_type": "premise_correction",
       "expected_answer": "No. Basic EPS is $2.03 per share for the three months ended June 27, 2026. Per-share amounts are excluded from the millions convention.",
       "key_correction_terms": [
-        "per share",
-        "share"
+        "per share"
       ],
       "rejected_generic_responses": [
         "no",
@@ -175,6 +174,13 @@
         "that is incorrect",
         "this is false",
         "actually no"
+      ],
+      "reject_if_affirms_any": [
+        "correct unit",
+        "correct unit.",
+        "yes, basic",
+        "yes. basic",
+        "the correct unit"
       ]
     }
   },
@@ -230,6 +236,12 @@
         "document_sha256": "e482b990d74eb46b5ce5a6e10606b745a914d4b1b57838c1c6149e80ec8ad498",
         "source_filename": "NFHS_5_India_Districts_Factsheet_Data.xls",
         "locator_type": "spreadsheet_row",
+        "locator": "3"
+      },
+      {
+        "document_sha256": "e482b990d74eb46b5ce5a6e10606b745a914d4b1b57838c1c6149e80ec8ad498",
+        "source_filename": "NFHS_5_India_Districts_Factsheet_Data.xls",
+        "locator_type": "spreadsheet_row",
         "locator": "4"
       }
     ],
@@ -244,9 +256,8 @@
       ],
       "required_sign": null,
       "required_units": [
-        "percentage",
-        "points",
-        "%"
+        "percentage points",
+        " pp"
       ],
       "tolerance": 0.02
     }
@@ -337,7 +348,8 @@
         "that is incorrect",
         "this is false",
         "actually no"
-      ]
+      ],
+      "reject_if_affirms_any": []
     }
   },
   "Q149": {
@@ -402,20 +414,7 @@
     "category": "TEMPORAL",
     "question": "What is the earliest and latest Year actually present in survay.csv?",
     "expected_answer": "2013 and 2025.",
-    "relevant_evidence": [
-      {
-        "document_sha256": "c029d234eefd3fee2563b9c0929946ca336509ab62a02bd111c80f978298c66c",
-        "source_filename": "survay.csv",
-        "locator_type": "csv_row",
-        "locator": "2"
-      },
-      {
-        "document_sha256": "c029d234eefd3fee2563b9c0929946ca336509ab62a02bd111c80f978298c66c",
-        "source_filename": "survay.csv",
-        "locator_type": "csv_row",
-        "locator": "3"
-      }
-    ],
+    "relevant_evidence": [],
     "answer_contract": {
       "contract_type": "semantic",
       "expected_answer": "2013 and 2025."
@@ -455,7 +454,8 @@
         "million",
         "%"
       ],
-      "tolerance": 0.02
+      "tolerance": 0.02,
+      "required_direction": "decrease"
     }
   },
   "Q154": {
@@ -511,9 +511,9 @@
       "contract_type": "premise_correction",
       "expected_answer": "Not exactly. Income minus expenditure is 108,327 million dollars, while H23 reports 109,848 million dollars. The difference is 1,521 million dollars, matching closing stocks minus opening stocks.",
       "key_correction_terms": [
-        "reconciliation",
-        "arithmetic",
-        "867750"
+        "109,848",
+        "108,327",
+        "1,521"
       ],
       "rejected_generic_responses": [
         "no",
@@ -521,7 +521,8 @@
         "that is incorrect",
         "this is false",
         "actually no"
-      ]
+      ],
+      "reject_if_affirms_any": []
     }
   },
   "Q156": {
@@ -559,9 +560,8 @@
       "contract_type": "premise_correction",
       "expected_answer": "No. The Value field contains C. It is not a numeric zero; the numeric amount cannot be recovered from that cell.",
       "key_correction_terms": [
-        "confidential",
-        "suppressed",
-        "code c"
+        "not a numeric",
+        "c"
       ],
       "rejected_generic_responses": [
         "no",
@@ -569,7 +569,8 @@
         "that is incorrect",
         "this is false",
         "actually no"
-      ]
+      ],
+      "reject_if_affirms_any": []
     }
   },
   "Q158": {
@@ -684,18 +685,6 @@
         "source_filename": "rs_status_bill_passed_assent-1952-2016.csv",
         "locator_type": "csv_row",
         "locator": "2"
-      },
-      {
-        "document_sha256": "85d048226e88f44a76f3bf68c3f96669162c3bd007081eb06ce7d57e4529e09e",
-        "source_filename": "rs_status_bill_passed_assent-1952-2016.csv",
-        "locator_type": "csv_row",
-        "locator": "3"
-      },
-      {
-        "document_sha256": "85d048226e88f44a76f3bf68c3f96669162c3bd007081eb06ce7d57e4529e09e",
-        "source_filename": "rs_status_bill_passed_assent-1952-2016.csv",
-        "locator_type": "csv_row",
-        "locator": "4"
       }
     ],
     "answer_contract": {
@@ -713,19 +702,43 @@
         "document_sha256": "85d048226e88f44a76f3bf68c3f96669162c3bd007081eb06ce7d57e4529e09e",
         "source_filename": "rs_status_bill_passed_assent-1952-2016.csv",
         "locator_type": "csv_row",
-        "locator": "2"
+        "locator": "7"
       },
       {
         "document_sha256": "85d048226e88f44a76f3bf68c3f96669162c3bd007081eb06ce7d57e4529e09e",
         "source_filename": "rs_status_bill_passed_assent-1952-2016.csv",
         "locator_type": "csv_row",
-        "locator": "3"
+        "locator": "8"
       },
       {
         "document_sha256": "85d048226e88f44a76f3bf68c3f96669162c3bd007081eb06ce7d57e4529e09e",
         "source_filename": "rs_status_bill_passed_assent-1952-2016.csv",
         "locator_type": "csv_row",
-        "locator": "4"
+        "locator": "9"
+      },
+      {
+        "document_sha256": "85d048226e88f44a76f3bf68c3f96669162c3bd007081eb06ce7d57e4529e09e",
+        "source_filename": "rs_status_bill_passed_assent-1952-2016.csv",
+        "locator_type": "csv_row",
+        "locator": "10"
+      },
+      {
+        "document_sha256": "85d048226e88f44a76f3bf68c3f96669162c3bd007081eb06ce7d57e4529e09e",
+        "source_filename": "rs_status_bill_passed_assent-1952-2016.csv",
+        "locator_type": "csv_row",
+        "locator": "11"
+      },
+      {
+        "document_sha256": "85d048226e88f44a76f3bf68c3f96669162c3bd007081eb06ce7d57e4529e09e",
+        "source_filename": "rs_status_bill_passed_assent-1952-2016.csv",
+        "locator_type": "csv_row",
+        "locator": "12"
+      },
+      {
+        "document_sha256": "85d048226e88f44a76f3bf68c3f96669162c3bd007081eb06ce7d57e4529e09e",
+        "source_filename": "rs_status_bill_passed_assent-1952-2016.csv",
+        "locator_type": "csv_row",
+        "locator": "13"
       }
     ],
     "answer_contract": {
@@ -750,7 +763,7 @@
       "contract_type": "premise_correction",
       "expected_answer": "No. Its title contains 2016, but the Year field is 2014 and the Date of Introduction is 17 December 2014.",
       "key_correction_terms": [
-        "2010",
+        "2014",
         "title"
       ],
       "rejected_generic_responses": [
@@ -759,7 +772,8 @@
         "that is incorrect",
         "this is false",
         "actually no"
-      ]
+      ],
+      "reject_if_affirms_any": []
     }
   },
   "Q166": {
@@ -865,7 +879,17 @@
       "operands": [],
       "required_sign": null,
       "required_units": [],
-      "tolerance": 0.02
+      "tolerance": 0.02,
+      "required_roles": [
+        {
+          "value": 196,
+          "role": "annotation"
+        },
+        {
+          "value": 512,
+          "role": "dimension"
+        }
+      ]
     }
   },
   "Q171": {
@@ -891,9 +915,8 @@
       "contract_type": "premise_correction",
       "expected_answer": "No. It explicitly demonstrates error modes where an attention model predicts accurately but is not interpretable or focuses incorrectly.",
       "key_correction_terms": [
-        "accuracy",
-        "alone",
-        "metric"
+        "accurately",
+        "not interpretable"
       ],
       "rejected_generic_responses": [
         "no",
@@ -901,7 +924,8 @@
         "that is incorrect",
         "this is false",
         "actually no"
-      ]
+      ],
+      "reject_if_affirms_any": []
     }
   },
   "Q172": {
@@ -921,8 +945,8 @@
       "contract_type": "premise_correction",
       "expected_answer": "Yes. For ViT-Base at 12.5% capacity, MoD reaches 78.49% and A-MoD 78.42%; MoD is higher by 0.07 percentage points.",
       "key_correction_terms": [
-        "mostly",
-        "not always"
+        "78.49",
+        "78.42"
       ],
       "rejected_generic_responses": [
         "no",
@@ -930,7 +954,8 @@
         "that is incorrect",
         "this is false",
         "actually no"
-      ]
+      ],
+      "reject_if_affirms_any": []
     }
   },
   "Q173": {
@@ -1089,9 +1114,8 @@
       "contract_type": "premise_correction",
       "expected_answer": "No. Its stated inference complexity is O(tD): independent of sequence length L, but dependent on polynomial order t and feature dimension D.",
       "key_correction_terms": [
-        "constant",
-        "length",
-        "feature"
+        "o(td)",
+        "sequence length"
       ],
       "rejected_generic_responses": [
         "no",
@@ -1099,7 +1123,8 @@
         "that is incorrect",
         "this is false",
         "actually no"
-      ]
+      ],
+      "reject_if_affirms_any": []
     }
   },
   "Q181": {
@@ -1455,8 +1480,11 @@
         "men_interviewed"
       ],
       "required_values": {
+        "district": "North & Middle Andaman",
         "men_interviewed": 108
-      }
+      },
+      "allow_extra_keys": false,
+      "strict_format": true
     }
   },
   "Q195": {

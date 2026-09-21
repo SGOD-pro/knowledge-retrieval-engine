@@ -152,19 +152,27 @@ def resolve_ground_truth_chunk_ids(
     ground_truth_entries: dict[str, Any],
     all_chunks: list[Any],
     doc_id_map: dict[str, str],
+    doc_hashes: dict[str, str] | None = None,
 ) -> tuple[dict[str, set[str]], list[str]]:
     """Resolves structured ground truth locators to chunk IDs post-ingestion.
     Returns (resolved_map, unscorable_qids).
-    Never uses expected_answer, token overlap, or fallback to all document chunks.
+
+    Rules:
+    - Never uses expected_answer, token overlap, or fallback to all document chunks.
+    - If doc_hashes is provided, the document_sha256 in each evidence entry must match
+      the actual corpus hash; mismatch marks the query UNSCORABLE_GROUND_TRUTH.
+    - ALL required evidence locators must resolve to at least one chunk; partial
+      resolution (some locators unmatched) marks the query UNSCORABLE_GROUND_TRUTH.
     """
-    doc_fname_to_id = {}
+    doc_fname_to_id: dict[str, str] = {}
     for k, v in doc_id_map.items():
         if any(k.endswith(ext) for ext in (".pdf", ".csv", ".xls", ".xlsx")):
             doc_fname_to_id[k] = v
         else:
             doc_fname_to_id[v] = k
-    resolved = {}
-    unscorable = []
+
+    resolved: dict[str, set[str]] = {}
+    unscorable: list[str] = []
 
     for qid, entry in ground_truth_entries.items():
         ev_list = entry.get("relevant_evidence", [])
@@ -172,35 +180,65 @@ def resolve_ground_truth_chunk_ids(
             resolved[qid] = set()
             continue
 
-        matched_ids = set()
+        all_matched: set[str] = set()
+        any_locator_unresolved = False
+
         for ev in ev_list:
             fname = ev["source_filename"]
+            ev_hash = ev.get("document_sha256", "")
             target_did = doc_fname_to_id.get(fname)
             loc_type = ev["locator_type"]
             loc_val = ev["locator"]
 
+            # Hash validation: if corpus hashes are available, verify match
+            if doc_hashes and ev_hash:
+                actual_hash = doc_hashes.get(fname, "")
+                if actual_hash and actual_hash != ev_hash:
+                    logger.warning(
+                        "resolve.hash_mismatch qid=%s fname=%s expected=%s actual=%s",
+                        qid, fname, ev_hash[:16], actual_hash[:16],
+                    )
+                    any_locator_unresolved = True
+                    continue
+
+            locator_matched: set[str] = set()
             for c in all_chunks:
-                if c.document_id != target_did:
+                if str(c.document_id) != str(target_did):
                     continue
 
                 if loc_type == "pdf_page":
-                    if c.page_number == int(loc_val):
-                        matched_ids.add(str(c.id))
+                    try:
+                        if c.page_number == int(loc_val):
+                            locator_matched.add(str(c.id))
+                    except (ValueError, TypeError):
+                        pass
                 elif loc_type in ("csv_row", "spreadsheet_row"):
-                    meta_row = (c.metadata or {}).get("row")
-                    if meta_row is not None and meta_row == int(loc_val):
-                        matched_ids.add(str(c.id))
-                    elif c.location_reference and (
-                        f"Row: {loc_val}" in c.location_reference
-                        or f"Row {loc_val}" in c.location_reference
-                    ):
-                        matched_ids.add(str(c.id))
+                    try:
+                        meta_row = (c.metadata or {}).get("row")
+                        if meta_row is not None and meta_row == int(loc_val):
+                            locator_matched.add(str(c.id))
+                        elif c.location_reference and (
+                            f"Row: {loc_val}" in c.location_reference
+                            or f"Row {loc_val}" in c.location_reference
+                        ):
+                            locator_matched.add(str(c.id))
+                    except (ValueError, TypeError):
+                        pass
 
-        if not matched_ids:
+            if not locator_matched:
+                any_locator_unresolved = True
+            else:
+                all_matched |= locator_matched
+
+        # ALL required locators must resolve; any unresolved locator → UNSCORABLE
+        if any_locator_unresolved:
+            unscorable.append(qid)
+            resolved[qid] = set()
+        elif not all_matched:
             unscorable.append(qid)
             resolved[qid] = set()
         else:
-            resolved[qid] = matched_ids
+            resolved[qid] = all_matched
 
     return resolved, unscorable
 

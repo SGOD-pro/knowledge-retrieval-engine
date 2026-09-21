@@ -1,6 +1,7 @@
 import json
 import math
 import re
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 
@@ -193,7 +194,19 @@ def compute_retrieval_metrics(
       - precision_at_3: fraction of top-3 retrieved chunks that are relevant
       - mrr_at_5: reciprocal rank of the first relevant chunk within top-5 (0 if none)
       - ndcg_at_5: normalized discounted cumulative gain at rank 5
+
+    Duplicate chunk IDs in retrieved_chunk_ids are deduplicated before scoring;
+    duplicates inflate DCG and recall beyond 1.0 and are a measurement defect.
     """
+    # Deduplicate retrieved IDs while preserving rank order
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for cid in retrieved_chunk_ids:
+        if cid not in seen:
+            seen.add(cid)
+            deduped.append(cid)
+    retrieved_chunk_ids = deduped
+
     if not relevant_chunk_ids:
         # If question has no relevant chunks (e.g. absent/refusal), retrieval of 0 chunks is perfect
         return {
@@ -203,7 +216,7 @@ def compute_retrieval_metrics(
             "ndcg_at_5": 1.0 if not retrieved_chunk_ids else 0.0,
         }
 
-    # Recall@k
+    # Recall@k: fraction of relevant chunks hit in top-k
     top_recall = retrieved_chunk_ids[:k_recall]
     recall_hits = sum(1 for cid in top_recall if cid in relevant_chunk_ids)
     recall = round(recall_hits / min(len(relevant_chunk_ids), k_recall), 4)
@@ -353,55 +366,102 @@ def grade_json_schema(answer: str, required_keys: list[str]) -> bool:
 
 def grade_structured_numeric(answer: str, contract: dict) -> bool:
     """
-    Grades numeric calculation answers against a structured contract:
-      - target_values: list of float values (all must be matched within tolerance)
-      - operands: optional list of operands (must be present in context/calculation)
-      - required_sign: '+' or '-'
-      - required_units: list of unit keywords (e.g. ['%', 'percent'] - at least one must match)
-      - tolerance: float
+    Grades numeric calculation answers against a structured contract.
+
+    Contract fields:
+      - target_values: list of Decimal/float values; all must be matched within
+        strict *absolute* tolerance (not scaled). Use Decimal for precision.
+      - required_roles: list of {"value": <number>, "role": <str>} dicts; the
+        answer must contain the value AND associate it with the named role.
+      - required_sign: '+' or '-'; applies to the primary result direction.
+      - required_direction: 'decrease' or 'increase'; for change questions.
+      - required_units: list of unit keywords; at least one must appear.
+      - tolerance: strict absolute tolerance (default 0.02). Not scaled by target.
     """
     if not answer or answer.strip() in ("NOT_FOUND", ""):
         return False
 
-    raw_nums = re.findall(r"[-+]?\b\d[\d,]*(?:\.\d+)?\b", answer)
-    extracted_floats = []
-    for num_str in raw_nums:
-        clean_num = num_str.replace(",", "")
-        try:
-            extracted_floats.append(float(clean_num))
-        except ValueError:
-            continue
+    ans_lower = answer.lower()
 
-    target_values = contract.get("target_values", [])
-    tol = contract.get("tolerance", 0.02)
+    def _parse_decimals(text: str) -> list[Decimal]:
+        nums = re.findall(r"[-+]?\b\d[\d,]*(?:\.\d+)?\b", text)
+        result = []
+        for n in nums:
+            try:
+                result.append(Decimal(n.replace(",", "")))
+            except InvalidOperation:
+                pass
+        return result
 
-    # Check each target value
+    extracted = _parse_decimals(answer)
+    tol = Decimal(str(contract.get("tolerance", 0.02)))
+    target_values = [Decimal(str(v)) for v in contract.get("target_values", [])]
+
+    # --- Required direction (increase / decrease) ---
+    req_direction = contract.get("required_direction")
+    if req_direction == "decrease":
+        decrease_words = {"decrease", "fell", "fall", "decline", "declined", "dropped",
+                          "reduced", "lower", "loss", "negative change", "contraction"}
+        increase_words = {"increase", "grew", "growth", "rose", "risen", "gain",
+                          "positive change", "higher", "improvement", "addition"}
+        words_in_ans = set(re.findall(r"\b\w+\b", ans_lower))
+        has_decrease = bool(words_in_ans & decrease_words)
+        has_increase = bool(words_in_ans & increase_words)
+        # Reject if affirms increase without also asserting decrease
+        if has_increase and not has_decrease:
+            return False
+        if not has_decrease:
+            return False
+    elif req_direction == "increase":
+        increase_words = {"increase", "grew", "growth", "rose", "gain", "positive change",
+                          "higher", "improvement"}
+        words_in_ans = set(re.findall(r"\b\w+\b", ans_lower))
+        if not (words_in_ans & increase_words):
+            return False
+
+    # --- Required roles: value must appear in answer with the correct semantic role ---
+    required_roles = contract.get("required_roles", [])
+    for role_spec in required_roles:
+        rv = Decimal(str(role_spec["value"]))
+        role_name = role_spec["role"].lower()
+        # Find position of the role name in the answer
+        role_pos = ans_lower.find(role_name)
+        if role_pos == -1:
+            return False
+        # Find numbers near the role name (within 30 chars before and 40 after).
+        # A tight window prevents a number that is semantically associated with
+        # a different role (e.g. "196-dimensional" 41 chars from "annotation") from
+        # satisfying the wrong role binding.
+        window = answer[max(0, role_pos - 30): role_pos + 40]
+        window_nums = _parse_decimals(window)
+        if not any(abs(wn - rv) <= tol for wn in window_nums):
+            return False
+
+    # --- Check each target value using strict absolute tolerance ---
     for target in target_values:
-        matched = False
-        for val in extracted_floats:
-            delta = abs(val - target)
-            allowed = max(tol, abs(target) * tol)
-            if delta <= allowed:
-                matched = True
-                break
+        matched = any(abs(ev - target) <= tol for ev in extracted)
         if not matched:
             return False
 
-    # Check required sign
+    # --- Required sign ---
     req_sign = contract.get("required_sign")
     if req_sign == "-":
-        has_negative = any(v < 0 for v in extracted_floats) or "negative" in answer.lower() or "minus" in answer.lower()
+        has_negative = (
+            any(v < 0 for v in extracted)
+            or "negative" in ans_lower
+            or "minus" in ans_lower
+            or "decrease" in ans_lower
+            or "fell" in ans_lower
+        )
         if not has_negative:
             return False
     elif req_sign == "+":
-        # Check that target values are not reported as negative
-        if any(v < 0 and abs(v) in target_values for v in extracted_floats):
+        if any(v < 0 and any(abs(v + t) <= tol for t in target_values) for v in extracted):
             return False
 
-    # Check required units
+    # --- Required units ---
     req_units = contract.get("required_units", [])
     if req_units:
-        ans_lower = answer.lower()
         unit_matched = any(u.lower() in ans_lower for u in req_units)
         if not unit_matched:
             return False
@@ -413,19 +473,30 @@ def grade_structured_json(answer: str, contract: dict) -> bool:
     """
     Grades structured JSON answers against contract requirements:
       - required_keys: all keys must be present
-      - required_values: exact value match for specified keys
+      - required_values: exact value match including type (int stays int, etc.)
+      - allow_extra_keys: if False (default), extra keys cause failure
+      - strict_format: if True, Markdown fences cause failure
     """
     if not answer:
         return False
 
     clean_text = answer.strip()
-    if clean_text.startswith("```json"):
-        clean_text = clean_text[7:]
-    elif clean_text.startswith("```"):
-        clean_text = clean_text[3:]
-    if clean_text.endswith("```"):
-        clean_text = clean_text[:-3]
-    clean_text = clean_text.strip()
+    strict_format = contract.get("strict_format", False)
+
+    # Detect Markdown fences
+    has_fence = clean_text.startswith("```")
+    if strict_format and has_fence:
+        return False
+
+    # Strip fences for parsing (when strict_format is False)
+    if not strict_format:
+        if clean_text.startswith("```json"):
+            clean_text = clean_text[7:]
+        elif clean_text.startswith("```"):
+            clean_text = clean_text[3:]
+        if clean_text.endswith("```"):
+            clean_text = clean_text[:-3]
+        clean_text = clean_text.strip()
 
     try:
         data = json.loads(clean_text)
@@ -437,13 +508,18 @@ def grade_structured_json(answer: str, contract: dict) -> bool:
             if k not in data:
                 return False
 
+        # By default, reject extra keys (strict schema)
+        allow_extra = contract.get("allow_extra_keys", False)
+        if not allow_extra:
+            if set(data.keys()) != set(req_keys):
+                return False
+
         req_vals = contract.get("required_values", {})
         for k, expected_v in req_vals.items():
             actual_v = data.get(k)
+            # Strict type equality for required values
             if actual_v != expected_v:
-                # Allow string/int conversion
-                if str(actual_v).strip() != str(expected_v).strip():
-                    return False
+                return False
 
         return True
     except Exception:
@@ -453,17 +529,31 @@ def grade_structured_json(answer: str, contract: dict) -> bool:
 def grade_structured_premise(answer: str, contract: dict) -> bool:
     """
     Grades premise correction questions against contract:
-      - rejected_generic_responses: must not be a lazy dismissal
-      - key_correction_terms: all required correction terms must appear
+      - rejected_generic_responses: must not be a lazy exact-match dismissal
+      - reject_if_affirms_any: list of phrases; answer fails if any appear (affirms false premise)
+      - key_correction_terms: all required correction terms must appear in the answer
+      - expected_answer: fallback content_match check when no key_correction_terms
+
+    An answer that affirms the false premise fails even if it contains
+    some correction language — the affirmation overrides.
     """
     if not answer or answer.strip() in ("NOT_FOUND", ""):
         return False
 
     ans_clean = answer.strip().lower()
+
+    # Reject lazy exact-match dismissals
     rejected = contract.get("rejected_generic_responses", [])
     if ans_clean in rejected or len(tokenize(ans_clean)) < 3:
         return False
 
+    # Reject if the answer affirms the false premise
+    reject_affirmations = contract.get("reject_if_affirms_any", [])
+    for phrase in reject_affirmations:
+        if phrase.lower() in ans_clean:
+            return False
+
+    # All key correction terms must appear verbatim
     key_terms = contract.get("key_correction_terms", [])
     if key_terms:
         for term in key_terms:
@@ -471,6 +561,7 @@ def grade_structured_premise(answer: str, contract: dict) -> bool:
                 return False
         return True
 
+    # Fallback: content_match against expected_answer
     exp_ans = contract.get("expected_answer")
     if exp_ans:
         return content_match(answer, exp_ans)

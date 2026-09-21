@@ -14,7 +14,7 @@
     --card: #FFF8F6;       /* Layer 2: Main Content Warm Orangey/Clay Tinted Surface */
     --muted: #FFF1ED;      /* Layer 3: Inner Component Callouts / Secondary */
     --accent: #FDEAE4;
-    --border: #ECDCD5;     /* Warm Orangey/Terracotta Border */
+    --border: oklch(90.543% 0.02003 45.04);     /* Warm Orangey/Terracotta Border */
     --radius: 1.5rem;
 
     --ring: #c96442;
