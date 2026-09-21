@@ -627,7 +627,8 @@ def run_llm(state: PipelineState):
         citation_utilization_rate = (
             round(len(final_cited_chunks) / len(top_chunks), 4) if top_chunks else None
         )
-        faithfulness = compute_faithfulness(ans, compressed)
+        ans_str = json.dumps(ans) if isinstance(ans, (dict, list)) else str(ans)
+        faithfulness = compute_faithfulness(ans_str, compressed)
 
     return {
         "final_answer": ans,

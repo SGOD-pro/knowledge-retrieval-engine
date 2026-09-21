@@ -79,10 +79,13 @@ def call(
         "3. If a question asks whether a premise, assumption, or claim is correct (e.g. 'Is that correct?', 'Right?', 'Is that the correct unit?'): state clearly whether it is correct or not, and explain why with the exact factual details from the context (e.g., correct units, actual fields, or dates).\n"
         "4. For multi-document or comparative questions, address each document, entity, or indicator mentioned.\n"
         "5. Preserve exact stored values, units, and negative signs (e.g., -92.55) as given in the context.\n"
-        "6. If the context contains PARTIAL information, provide what you can find and note what is missing.\n"
-        "7. If the answer is truly NOT in the context at all, respond with exactly: NOT_FOUND\n"
-        "8. NEVER infer, guess, or use knowledge outside the provided context.\n"
-        "9. Cite only chunk IDs that appear in the [chunk_id] format in the context.\n\n"
+        "6. When asked HOW an evaluation, check, or metric is conducted or computed, describe the operational mechanism (e.g. what is removed, omitted, or measured, and the resulting change in model loss or error) rather than just stating the name of the method.\n"
+        "7. For chronological or sequence questions, list all events or dates mentioned in chronological order.\n"
+        "8. If the query asks for a specific format (e.g., 'Answer only as a JSON object with keys...'), provide the requested JSON structure directly inside the 'answer' field.\n"
+        "9. If the context contains PARTIAL information, provide what you can find and note what is missing.\n"
+        "10. If the answer is truly NOT in the context at all, respond with exactly: NOT_FOUND\n"
+        "11. NEVER infer, guess, or use knowledge outside the provided context.\n"
+        "12. Cite only chunk IDs that appear in the [chunk_id] format in the context.\n\n"
         "Return ONLY valid JSON with this exact schema (no markdown code blocks):\n"
         '{"answer": "<your answer or NOT_FOUND>", "citations": ["chunk_id_1", "chunk_id_2"]}'
     )

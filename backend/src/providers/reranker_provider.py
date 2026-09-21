@@ -240,15 +240,16 @@ def _term_coverage_fallback(query: str, documents: list[str]) -> list[float]:
     """
     import re
     from rank_bm25 import BM25Plus
+    from services.retrieval.bm25_retriever import _tokenize
 
     if not documents:
         return []
 
-    q_tokens = re.findall(r"\w+", query.lower())
+    q_tokens = _tokenize(query)
     if not q_tokens:
         return [0.0] * len(documents)
 
-    doc_corpus = [re.findall(r"\w+", doc.lower()) for doc in documents]
+    doc_corpus = [_tokenize(doc) for doc in documents]
     try:
         bm25_local = BM25Plus(doc_corpus)
         raw_scores = bm25_local.get_scores(q_tokens)

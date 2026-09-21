@@ -56,7 +56,13 @@ def compute_faithfulness(answer: str, context: str) -> float | None:
         and numeric claims grounded in the retrieved context text.
     Note: This is a fast lexical approximation; NLI-based entailment is planned for v2.
     """
-    if not answer or answer in ("NOT_FOUND", "", "The context does not provide"):
+    if not answer:
+        return None
+
+    if not isinstance(answer, str):
+        answer = json.dumps(answer) if isinstance(answer, (dict, list)) else str(answer)
+
+    if answer in ("NOT_FOUND", "", "The context does not provide"):
         return None
 
     answer_clean = answer.strip()

@@ -342,11 +342,14 @@ class Planner:
             # If similarity to simple is greater, tentatively use fast path
             # but still override for data-extraction queries.
             centroid_suggests_fast = sim_simple > sim_synth
-            # Block fast path for aggregation/numeric/format even if centroid says simple
+            # Block fast path for complex analytical queries even if centroid says simple
             hard_block = (
                 flags["aggregation_flag"]
                 or flags["numeric_flag"]
                 or flags["format_flag"]
+                or flags["temporal_flag"]
+                or flags["comparison_flag"]
+                or flags["synthesis_flag"]
             )
             fast_path = centroid_suggests_fast and not hard_block
         else:

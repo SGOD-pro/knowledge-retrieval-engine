@@ -43,9 +43,33 @@ def invalidate_chunk_cache(workspace_id: str | None = None):
         _CHUNK_CACHE.clear()
 
 
+def _stem(word: str) -> str:
+    """Lightweight rule-based English stemmer for BM25 keyword matching."""
+    if len(word) <= 3:
+        return word
+    if word.endswith("ies") and len(word) > 4:
+        return word[:-3] + "y"  # inventories -> inventory
+    if word.endswith("es") and len(word) > 4 and word[-3] in "sxyzc":
+        return word[:-2]
+    if word.endswith("s") and not word.endswith("ss") and len(word) > 3:
+        return word[:-1]        # papers -> paper, stocks -> stock
+    if word.endswith("ing") and len(word) > 5:
+        return word[:-3]
+    if word.endswith("ed") and len(word) > 4:
+        return word[:-2]
+    return word
+
+
 def _tokenize(text: str) -> list[str]:
-    """Lowercase alphanumeric word tokenization (strips punctuation)."""
-    return re.findall(r"\w+", text.lower())
+    """Lowercase alphanumeric word tokenization with stemming support."""
+    words = re.findall(r"\w+", text.lower())
+    tokens = []
+    for w in words:
+        tokens.append(w)
+        s = _stem(w)
+        if s != w:
+            tokens.append(s)
+    return tokens
 
 
 # Cache BM25 index keyed on chunk id tuple so repeated queries don't re-index.
