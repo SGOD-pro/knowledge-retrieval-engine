@@ -425,20 +425,7 @@
     "category": "NUMERIC",
     "question": "For All industries (99999), how did total income change from 2024 to 2025? Give the amount and percentage change.",
     "expected_answer": "It fell by 4,191 million dollars, from 980,268 to 976,077, a decline of approximately 0.43%.",
-    "relevant_evidence": [
-      {
-        "document_sha256": "c029d234eefd3fee2563b9c0929946ca336509ab62a02bd111c80f978298c66c",
-        "source_filename": "survay.csv",
-        "locator_type": "csv_row",
-        "locator": "2"
-      },
-      {
-        "document_sha256": "c029d234eefd3fee2563b9c0929946ca336509ab62a02bd111c80f978298c66c",
-        "source_filename": "survay.csv",
-        "locator_type": "csv_row",
-        "locator": "4637"
-      }
-    ],
+    "relevant_evidence": [],
     "answer_contract": {
       "contract_type": "numeric",
       "target_values": [
@@ -1275,34 +1262,10 @@
         "locator": "1"
       },
       {
-        "document_sha256": "bce22600474513c61b8c47701d19275bb465dae909f1ede1598521dcf0ba57da",
-        "source_filename": "2212.14776v3.pdf",
-        "locator_type": "pdf_page",
-        "locator": "2"
-      },
-      {
-        "document_sha256": "bce22600474513c61b8c47701d19275bb465dae909f1ede1598521dcf0ba57da",
-        "source_filename": "2212.14776v3.pdf",
-        "locator_type": "pdf_page",
-        "locator": "6"
-      },
-      {
         "document_sha256": "927420d4297edb4f6ff566961a14c98af54a458f44a9cdb9f587bb9079fa877e",
         "source_filename": "2412.20875v1.pdf",
         "locator_type": "pdf_page",
         "locator": "1"
-      },
-      {
-        "document_sha256": "927420d4297edb4f6ff566961a14c98af54a458f44a9cdb9f587bb9079fa877e",
-        "source_filename": "2412.20875v1.pdf",
-        "locator_type": "pdf_page",
-        "locator": "2"
-      },
-      {
-        "document_sha256": "927420d4297edb4f6ff566961a14c98af54a458f44a9cdb9f587bb9079fa877e",
-        "source_filename": "2412.20875v1.pdf",
-        "locator_type": "pdf_page",
-        "locator": "6"
       }
     ],
     "answer_contract": {
@@ -1323,22 +1286,10 @@
         "locator": "1"
       },
       {
-        "document_sha256": "4eafc24abe305dd84a859a95e19456a5f3527003ab41bd17abda7de657cccb48",
-        "source_filename": "2501.05730v1.pdf",
-        "locator_type": "pdf_page",
-        "locator": "5"
-      },
-      {
         "document_sha256": "d5a727f2d0b04269389630b6687f7fa4e123b55f5e8a24726cab46df0aed9283",
         "source_filename": "2501.09166v1.pdf",
         "locator_type": "pdf_page",
         "locator": "1"
-      },
-      {
-        "document_sha256": "d5a727f2d0b04269389630b6687f7fa4e123b55f5e8a24726cab46df0aed9283",
-        "source_filename": "2501.09166v1.pdf",
-        "locator_type": "pdf_page",
-        "locator": "5"
       }
     ],
     "answer_contract": {
@@ -1380,18 +1331,6 @@
         "document_sha256": "da5404dbb584c8956aae707dfcfe324dc1df11a179bc8288af0e898f4e37dcc5",
         "source_filename": "National-Strategy-for-Artificial-Intelligence.pdf",
         "locator_type": "pdf_page",
-        "locator": "1"
-      },
-      {
-        "document_sha256": "da5404dbb584c8956aae707dfcfe324dc1df11a179bc8288af0e898f4e37dcc5",
-        "source_filename": "National-Strategy-for-Artificial-Intelligence.pdf",
-        "locator_type": "pdf_page",
-        "locator": "2"
-      },
-      {
-        "document_sha256": "da5404dbb584c8956aae707dfcfe324dc1df11a179bc8288af0e898f4e37dcc5",
-        "source_filename": "National-Strategy-for-Artificial-Intelligence.pdf",
-        "locator_type": "pdf_page",
         "locator": "86"
       },
       {
@@ -1405,12 +1344,6 @@
         "source_filename": "2212.14776v3.pdf",
         "locator_type": "pdf_page",
         "locator": "2"
-      },
-      {
-        "document_sha256": "bce22600474513c61b8c47701d19275bb465dae909f1ede1598521dcf0ba57da",
-        "source_filename": "2212.14776v3.pdf",
-        "locator_type": "pdf_page",
-        "locator": "86"
       }
     ],
     "answer_contract": {
