@@ -108,14 +108,15 @@ def decompose_query(query: str) -> QueryPlan:
 
     # Multi-hop comparative patterns:
     # Pattern: "Compare [X in/from A] with/and [Y in/from B]"
+    # Pattern: "Contrast [X] with/to [Y]"
     # Pattern: "Difference between [X in A] and [Y in B]"
     compare_m = re.search(
-        r"(?:compare|difference\s+between)\s+(.+?)\s+(?:with|and|versus|to)\s+(.+)",
+        r"(?:compare|difference\s+between|contrast)\s+(.+?)\s+(?:with|and|versus|to)\s+(.+)",
         query,
         re.IGNORECASE,
     )
 
-    if compare_m and ("from" in q_lower or "in" in q_lower or "between" in q_lower):
+    if compare_m:
         part1 = compare_m.group(1).strip()
         part2 = compare_m.group(2).strip()
 
@@ -135,6 +136,42 @@ def decompose_query(query: str) -> QueryPlan:
             target_operator=operator,
             source_hint=s2_match.group(1).strip() if s2_match else None,
         )
+        return QueryPlan(
+            primary_intent=QueryIntent.MULTI_HOP,
+            subgoals=(subgoal1, subgoal2),
+            root_operator=operator,
+            output_contract=contract,
+            requires_structural_retrieval=requires_structural,
+            requires_graph=requires_graph,
+            confidence=0.95,
+        )
+
+    # Multi-sentence queries
+    sentences = [s.strip() for s in re.split(r"(?<=[.?!])\s+", query) if len(s.strip()) > 15]
+    if len(sentences) >= 2:
+        subgoals = tuple(
+            Subgoal(
+                subgoal_id=f"sub_{i+1}",
+                query_text=s,
+                target_operator=operator,
+            )
+            for i, s in enumerate(sentences)
+        )
+        return QueryPlan(
+            primary_intent=QueryIntent.MULTI_HOP,
+            subgoals=subgoals,
+            root_operator=operator,
+            output_contract=contract,
+            requires_structural_retrieval=requires_structural,
+            requires_graph=requires_graph,
+            confidence=0.95,
+        )
+
+    # Multi-clause queries with conjunctions (e.g. "... and how does that relate to ...")
+    clause_m = re.search(r"^(.+?),\s*(?:and\s+how|and\s+what|and\s+why|and\s+whether)\s+(.+)", query, re.IGNORECASE)
+    if clause_m:
+        subgoal1 = Subgoal(subgoal_id="sub_1", query_text=clause_m.group(1).strip(), target_operator=operator)
+        subgoal2 = Subgoal(subgoal_id="sub_2", query_text=clause_m.group(2).strip(), target_operator=operator)
         return QueryPlan(
             primary_intent=QueryIntent.MULTI_HOP,
             subgoals=(subgoal1, subgoal2),

@@ -193,7 +193,26 @@ def run_bm25(state: PipelineState):
         all_chunks = cached_chunks
 
     retriever = BM25Retriever()
-    results = retriever.search(state["query"], all_chunks, top_k=40)
+    from services.retrieval.subgoal_decomposer import decompose_query
+    q_plan = decompose_query(state["query"])
+    if len(q_plan.subgoals) > 1:
+        per_subgoal_k = max(15, 40 // len(q_plan.subgoals))
+        seen_ids = set()
+        combined_results = []
+        for sg in q_plan.subgoals:
+            sg_res = retriever.search(sg.query_text, all_chunks, top_k=per_subgoal_k)
+            for c, s in sg_res:
+                if c.id not in seen_ids:
+                    seen_ids.add(c.id)
+                    combined_results.append((c, s))
+        overall_res = retriever.search(state["query"], all_chunks, top_k=25)
+        for c, s in overall_res:
+            if c.id not in seen_ids:
+                seen_ids.add(c.id)
+                combined_results.append((c, s))
+        results = combined_results
+    else:
+        results = retriever.search(state["query"], all_chunks, top_k=40)
 
     # OKF soft-boost — any chunk whose id appears in okf_seed_chunk_ids gets
     # its BM25 score multiplied by OKF_BOOST. This is a pre-reranker signal only.

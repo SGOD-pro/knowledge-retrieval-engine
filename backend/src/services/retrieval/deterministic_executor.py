@@ -345,17 +345,24 @@ class DeterministicExecutor:
                                 except Exception:
                                     pass
 
-            # Strategy 3: Line-by-line search in chunk text
+            # Strategy 3: Line-by-line search in chunk text (strict structured/key-value lines only)
             lines = txt.splitlines()
+            _DATE_MONTHS = r"(?:january|february|march|april|may|june|july|august|september|october|november|december)"
             for line in lines:
                 line_lower = line.lower()
+                # Skip long narrative prose or introductory lines
+                if len(line.split()) > 15 or "ended" in line_lower or "table shows" in line_lower or "refer to" in line_lower:
+                    continue
+
                 matches_line = term_clean in line_lower or all(kw in line_lower for kw in keywords)
                 if matches_line:
-                    num_matches = re.findall(r"(?<![A-Za-z0-9_])[-+]?\$?\s*[\d,]+(?:\.\d+)?(?:\s*[MBk%]|\s+million|\s+billion)?", line)
+                    # Remove date patterns like "June 27" or "March 16" so day numbers are not extracted as operands
+                    clean_line = re.sub(_DATE_MONTHS + r"\s+\d+", " ", line, flags=re.IGNORECASE)
+                    num_matches = re.findall(r"(?<![A-Za-z0-9_])[-+]?\$?\s*[\d,]+(?:\.\d+)?(?:\s*[MBk%]|\s+million|\s+billion)?", clean_line)
                     filtered = []
                     for nm in num_matches:
                         clean_nm = nm.strip().replace("$", "").replace(",", "")
-                        if clean_nm in ("2023", "2024", "2025", "2026", "2027") and clean_nm not in keywords:
+                        if clean_nm in ("2020", "2021", "2022", "2023", "2024", "2025", "2026", "2027", "2028") and clean_nm not in keywords:
                             continue
                         filtered.append(nm.strip())
                     if filtered:
@@ -366,7 +373,7 @@ class DeterministicExecutor:
                                 raw_value=candidate,
                                 normalized_value=dec_val,
                                 source_citation=citation,
-                                binding_confidence=0.90,
+                                binding_confidence=0.95,
                             )
                         except Exception:
                             continue
@@ -452,14 +459,16 @@ class DeterministicExecutor:
                 try:
                     ratio_res = self.execute(ExecutionOperator.RATIO, [op_part, op_total])
                     pct_dec = (ratio_res.result_value * Decimal("100")).quantize(Decimal("0.01"))
-                    return ExecutionResult(
-                        result_value=pct_dec,
-                        operator=ExecutionOperator.RATIO,
-                        operands=(op_part, op_total),
-                        input_binding_confidence=ratio_res.input_binding_confidence,
-                        overall_confidence=ratio_res.overall_confidence,
-                        provenance_citations=ratio_res.provenance_citations,
-                    )
+                    # Sanity check: a component percentage of a total cannot exceed 100% or be negative
+                    if Decimal("0") <= pct_dec <= Decimal("100.0"):
+                        return ExecutionResult(
+                            result_value=pct_dec,
+                            operator=ExecutionOperator.RATIO,
+                            operands=(op_part, op_total),
+                            input_binding_confidence=ratio_res.input_binding_confidence,
+                            overall_confidence=ratio_res.overall_confidence,
+                            provenance_citations=ratio_res.provenance_citations,
+                        )
                 except Exception:
                     pass
 
@@ -473,7 +482,8 @@ class DeterministicExecutor:
             term1, term2 = diff_m.group(1).strip(), diff_m.group(2).strip()
             op1 = self._extract_operand_from_chunks(term1, chunks, query)
             op2 = self._extract_operand_from_chunks(term2, chunks, query)
-            if op1 and op2:
+            # Guard: ignore trivial/casual matches where both operands normalized to 1 or 0
+            if op1 and op2 and not (op1.normalized_value in (0, 1) and op2.normalized_value in (0, 1)):
                 return self.execute(ExecutionOperator.DIFFERENCE, [op1, op2])
 
         between_m = re.search(

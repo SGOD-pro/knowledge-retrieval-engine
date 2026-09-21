@@ -50,8 +50,31 @@ def rerank(
         post_count,
     )
 
-    # Take top_k (fall back to candidates if all were filtered out by threshold)
-    top_chunks = filtered[:top_k] if filtered else candidates[:top_k]
+    # Take top_k with document diversity (fall back to candidates if all filtered out)
+    candidates_to_use = filtered if filtered else candidates
+    unique_docs = {str(getattr(c, "document_id", "")) for c in candidates_to_use}
+    if len(unique_docs) > 1 and top_k > 2:
+        max_per_doc = max(2, top_k - 2)
+        doc_counts: dict[str, int] = {}
+        top_chunks = []
+        deferred = []
+        for c in candidates_to_use:
+            d_id = str(getattr(c, "document_id", ""))
+            cnt = doc_counts.get(d_id, 0)
+            if cnt < max_per_doc:
+                top_chunks.append(c)
+                doc_counts[d_id] = cnt + 1
+                if len(top_chunks) == top_k:
+                    break
+            else:
+                deferred.append(c)
+        if len(top_chunks) < top_k:
+            for c in deferred:
+                top_chunks.append(c)
+                if len(top_chunks) == top_k:
+                    break
+    else:
+        top_chunks = candidates_to_use[:top_k]
 
     # Log latency and confidence score for this stage
     avg_score = (

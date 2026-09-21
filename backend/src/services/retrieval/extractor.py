@@ -93,17 +93,18 @@ def extract_verified_fact(query: str, chunks: list[Chunk]) -> tuple[str | None, 
                 return ans, c
 
     # -----------------------------------------------------------------------
-    # 3. Tabular Row / Field Extraction (CSV / XLS)
+    # 3. Generic Structured Row / Key-Value Extraction (CSV / XLS / Tables)
     # -----------------------------------------------------------------------
-    var_m = re.search(r"variable\s+code\s+([A-Za-z0-9]+)", q_lower)
-    year_m = re.search(r"\b(19\d\d|20\d\d)\b", query)
-    district_m = re.search(r"\b(?:in|for|from)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b", query)
+    # Evaluates structured rows without any hardcoded dataset or corpus rules.
+    # If explicit filters match and a single unambiguous target attribute is found,
+    # extracts the value; if ambiguous (>1 matching rows) or 0 matches, returns (None, None).
+    valid_matches: list[tuple[str, Chunk]] = []
 
     for c in chunks:
         txt = getattr(c, "text", "")
         fmt = getattr(c, "source_format", "")
         elem = getattr(c, "element_type", "")
-        is_tabular = fmt in ("csv", "xls", "xlsx") or elem in ("table_row", "cell", "table") or "Year:" in txt or "District" in txt
+        is_tabular = fmt in ("csv", "xls", "xlsx") or elem in ("table_row", "cell", "table", "row")
         if not is_tabular:
             continue
 
@@ -111,84 +112,36 @@ def extract_verified_fact(query: str, chunks: list[Chunk]) -> tuple[str | None, 
         if not row:
             continue
 
-        # --- A. survay.csv: variable_code + year ---
-        if var_m:
-            req_var = var_m.group(1).lower()
-            row_var = row.get("variable_code", "").lower()
-            if row_var == req_var:
-                if year_m:
-                    req_year = year_m.group(1)
-                    if row.get("year") != req_year:
-                        continue
-                ind_name = row.get("industry_name_nzsioc", "").lower()
-                ind_code = row.get("industry_code_nzsioc", "")
-                if "agriculture" in q_lower:
-                    if "agriculture" not in ind_name:
-                        continue
-                else:
-                    # Prefer All industries / total when no specific industry requested
-                    if "all industries" not in ind_name and ind_code != "99999":
-                        continue
-                val = row.get("value")
-                if val:
-                    logger.info("extractor.tabular_resolved survay var=%s year=%s value=%s", req_var, year_m.group(1) if year_m else "any", val)
-                    return val, c
+        # Count how many row values appear in the query (filter matches)
+        filter_matches = 0
+        for k, v in row.items():
+            val_clean = str(v).strip().lower()
+            if len(val_clean) >= 2 and val_clean in q_lower:
+                filter_matches += 1
 
-        # --- B. rs_status_bill_passed_assent CSV: bill title + status / dates ---
-        if "bill" in q_lower:
-            title_in_row = row.get("short title of the bill", "").lower()
-            bill_no_in_row = row.get("bill no.", "").lower()
-            # Match by bill number (e.g. Bill No. XLVI)
-            bill_no_m = re.search(r"\bbill\s+no\.?\s*([A-Za-z0-9]+)\b", q_lower)
-            matched_by_no = bill_no_m and bill_no_m.group(1) == bill_no_in_row
+        if filter_matches == 0:
+            continue
 
-            # Match by title words
-            title_clean = set(re.findall(r"\w+", title_in_row)) - {"the", "of", "and", "bill", "in"}
-            q_clean = set(re.findall(r"\w+", q_lower))
-            overlap = title_clean & q_clean
-            matched_by_title = len(overlap) >= 3 or (len(overlap) >= 2 and len(title_clean) <= 3)
+        # Identify requested target attributes whose keys appear in the query
+        target_candidates = []
+        for k, v in row.items():
+            k_clean = k.strip().lower()
+            val_clean = str(v).strip().lower()
+            # If the value itself is in the query, it was a filter, not the target
+            if val_clean in q_lower:
+                continue
+            if len(k_clean) >= 3 and (k_clean in q_lower or any(kw in q_lower for kw in k_clean.split() if len(kw) > 3)):
+                target_candidates.append((k, str(v).strip()))
 
-            if matched_by_no or matched_by_title:
-                if year_m and year_m.group(1) not in title_in_row and row.get("year") != year_m.group(1):
-                    # Year must match either introduction year or title year
-                    if not matched_by_no:
-                        continue
-                if "status" in q_lower:
-                    val = row.get("status")
-                    if val:
-                        logger.info("extractor.tabular_resolved bill_status='%s'", val)
-                        return val, c
-                if "act number" in q_lower or "gazette notification" in q_lower or "assent date" in q_lower or "assented to" in q_lower:
-                    val = row.get("assent date/ gazette notification / act no.")
-                    if val:
-                        logger.info("extractor.tabular_resolved bill_assent_date='%s'", val)
-                        return val, c
-                if "date of introduction" in q_lower or "introduced" in q_lower:
-                    val = row.get("date of introduction")
-                    if val:
-                        return val, c
+        if len(target_candidates) == 1:
+            target_key, target_val = target_candidates[0]
+            if target_val:
+                valid_matches.append((target_val, c))
 
-        # --- C. NFHS-5 Factsheet Data: district + indicator ---
-        dist_field = row.get("district names", "").lower()
-        if dist_field and district_m:
-            req_dist = district_m.group(1).lower()
-            if req_dist in dist_field:
-                # Check for household question
-                if "household" in q_lower:
-                    val = row.get("number of households surveyed")
-                    if val:
-                        logger.info("extractor.tabular_resolved nfhs district=%s households=%s", req_dist, val)
-                        return val, c
-                # Check for school attendance for women/girls
-                if "women" in q_lower and ("school" in q_lower or "attended" in q_lower or "education" in q_lower):
-                    for k, v in row.items():
-                        if "school" in k or "attended" in k:
-                            logger.info("extractor.tabular_resolved nfhs district=%s school=%s", req_dist, v)
-                            return v, c
-                # Check for indicator 1
-                if "indicator 1" in q_lower:
-                    for k, v in row.items():
-                        if "indicator 1" in k or "female population age 6 years" in k:
-                            return v, c
+    if len(valid_matches) == 1:
+        ans, c = valid_matches[0]
+        logger.info("extractor.generic_tabular_resolved value='%s'", ans)
+        return ans, c
 
     return None, None
+

@@ -9,6 +9,7 @@ provides no context for *which* college).
 """
 
 import csv
+import os
 from pathlib import Path
 
 from schemas.models import Chunk
@@ -36,7 +37,8 @@ def parse(path: Path, document_id: str, workspace_id: str = "") -> list[Chunk]:
             headers = [field.strip().replace("\n", " ") for field in row]
             continue  # Skip the header row itself — it is not a data chunk
 
-        if len(chunks) >= 500:
+        max_csv_chunks = int(os.getenv("CSV_MAX_CHUNKS", "5000"))
+        if len(chunks) >= max_csv_chunks:
             break
 
         # Build a natural-language sentence from all non-empty (header, value) pairs

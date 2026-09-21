@@ -53,6 +53,20 @@ def _tokenize(text: str) -> list[str]:
 _BM25_CACHE: dict[tuple[str, ...], tuple[BM25Plus, list[Chunk]]] = {}
 
 
+def _chunk_to_text(c: Chunk) -> str:
+    """Enrich chunk text with section path and metadata for BM25 indexing."""
+    parts = [c.text]
+    if c.section_path:
+        parts.extend(c.section_path)
+    if c.location_reference:
+        parts.append(c.location_reference)
+    if isinstance(c.metadata, dict):
+        for v in c.metadata.values():
+            if isinstance(v, str):
+                parts.append(v)
+    return " ".join(parts)
+
+
 def _get_bm25(chunks: Sequence[Chunk]) -> tuple[BM25Plus, list[Chunk]]:
     chunk_list = list(chunks)
     key = tuple(c.id for c in chunk_list)
@@ -60,7 +74,7 @@ def _get_bm25(chunks: Sequence[Chunk]) -> tuple[BM25Plus, list[Chunk]]:
         # Keep cache bounded
         if len(_BM25_CACHE) > 8:
             _BM25_CACHE.pop(next(iter(_BM25_CACHE)))
-        corpus = [_tokenize(c.text) for c in chunk_list]
+        corpus = [_tokenize(_chunk_to_text(c)) for c in chunk_list]
         _BM25_CACHE[key] = (BM25Plus(corpus), chunk_list)
     return _BM25_CACHE[key]
 
@@ -101,7 +115,32 @@ class BM25Retriever:
         )
 
         scored_chunks.sort(key=lambda item: item[1], reverse=True)
-        results = scored_chunks[:top_k]
+
+        # Enforce document diversity so a single large document doesn't monopolize top_k
+        unique_docs = {str(getattr(c, "document_id", "")) for c, _ in scored_chunks}
+        if len(unique_docs) > 1 and top_k > 5:
+            max_per_doc = max(6, top_k // 2)
+            doc_counts: dict[str, int] = {}
+            results = []
+            deferred = []
+            for item in scored_chunks:
+                doc_id = str(getattr(item[0], "document_id", ""))
+                cnt = doc_counts.get(doc_id, 0)
+                if cnt < max_per_doc:
+                    results.append(item)
+                    doc_counts[doc_id] = cnt + 1
+                    if len(results) == top_k:
+                        break
+                else:
+                    deferred.append(item)
+            if len(results) < top_k:
+                for item in deferred:
+                    results.append(item)
+                    if len(results) == top_k:
+                        break
+        else:
+            results = scored_chunks[:top_k]
+
 
         max_score = results[0][1] if results else 0.0
         confidence_score = min(1.0, max_score / 10.0) if max_score > 0 else 0.0
