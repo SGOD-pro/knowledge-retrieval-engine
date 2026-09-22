@@ -65,10 +65,18 @@ def rerank(
 
     # Take top_k with document diversity and page diversity (fall back to candidates if all filtered out)
     candidates_to_use = filtered if filtered else candidates
-    unique_docs = {str(getattr(c, "document_id", "")) for c in candidates_to_use}
 
     if top_k > 2:
-        max_per_doc = max(2, top_k - 2) if len(unique_docs) > 1 else top_k
+        # Only enforce document diversity across documents with competitive relevance scores
+        doc_max_scores: dict[str, float] = {}
+        for c in candidates_to_use:
+            d_id = str(getattr(c, "document_id", ""))
+            s = getattr(c, "reranker_score", 0.0) or 0.0
+            doc_max_scores[d_id] = max(doc_max_scores.get(d_id, 0.0), s)
+        competing_docs = {
+            d for d, s in doc_max_scores.items() if s >= max_score * 0.5
+        }
+        max_per_doc = max(2, top_k - 2) if len(competing_docs) > 1 else top_k
         max_per_page = 2
         doc_counts: dict[str, int] = {}
         page_counts: dict[tuple[str, int | str], int] = {}

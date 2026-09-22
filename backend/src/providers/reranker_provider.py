@@ -271,30 +271,37 @@ def _term_coverage_fallback(query: str, documents: list[str]) -> list[float]:
         overlap = len(q_set & doc_set) / max(1, len(q_set))
         scores.append(round(overlap, 4))
 
-    # Bigram and trigram phrase matching bonus: boosts documents with exact multi-word phrases
+    # Phrase and entity matching bonus: boosts documents with exact multi-word phrases and key entities
     clean_words = [w for w in re.findall(r"\b[a-z0-9]+\b", query.lower()) if len(w) > 1]
     phrase_stopwords = {
         "what", "is", "are", "was", "were", "the", "in", "of", "to", "for", "from",
         "by", "with", "and", "or", "a", "an", "at", "as", "on", "that", "this",
         "which", "how", "much", "many", "round", "two", "decimals", "calculate",
         "compute", "find", "does", "did", "their", "there", "show", "shows",
+        "came", "into", "been", "being", "have", "has", "had", "will", "would",
     }
     phrases: list[tuple[str, float]] = []
     for i in range(len(clean_words) - 1):
         w1, w2 = clean_words[i], clean_words[i + 1]
-        if (w1 not in phrase_stopwords or w2 not in phrase_stopwords) and (len(w1) > 2 or len(w2) > 2):
-            phrases.append((f"{w1} {w2}", 0.08))
+        if w1 not in phrase_stopwords and w2 not in phrase_stopwords:
+            phrases.append((f"{w1} {w2}", 0.10))
         if i + 2 < len(clean_words):
             w3 = clean_words[i + 2]
             non_stop = sum(1 for w in (w1, w2, w3) if w not in phrase_stopwords)
             if non_stop >= 2:
                 phrases.append((f"{w1} {w2} {w3}", 0.15))
 
-    if phrases:
+    # Entity tokens: capitalized words in query indicating named entities or proper nouns
+    entity_tokens = [w.lower() for w in re.findall(r"\b[A-Z][a-z0-9_]{2,}\b", query) if w.lower() not in phrase_stopwords]
+
+    if phrases or entity_tokens:
         boosted_scores = []
         for doc, score in zip(documents, scores):
             d_lower = doc.lower()
             bonus = min(0.35, sum(weight for phrase, weight in phrases if phrase in d_lower))
+            if entity_tokens:
+                ent_hits = sum(1 for ent in entity_tokens if ent in d_lower)
+                bonus += min(0.20, ent_hits * 0.10)
             boosted_scores.append(round(min(1.0, score + bonus), 4))
         scores = boosted_scores
 

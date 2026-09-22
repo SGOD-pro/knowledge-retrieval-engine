@@ -56,7 +56,9 @@ class ExecutionResult:
         unit_str = f" {self.unit}" if self.unit else (" million dollars" if ("million" in q_lower or "dollar" in q_lower) else "")
         if self.operator == ExecutionOperator.DIFFERENCE:
             if len(self.operands) >= 2:
-                return f"{self.result_value}{unit_str}: {self.operands[0].normalized_value} minus {self.operands[1].normalized_value}"
+                op0_str = f"{self.operands[0].normalized_value}%" if (self.unit == "percentage points" and "%" not in str(self.operands[0].normalized_value)) else str(self.operands[0].normalized_value)
+                op1_str = f"{self.operands[1].normalized_value}%" if (self.unit == "percentage points" and "%" not in str(self.operands[1].normalized_value)) else str(self.operands[1].normalized_value)
+                return f"{self.result_value}{unit_str}: {op0_str} minus {op1_str}"
             return f"{self.result_value}{unit_str}"
         if self.operator == ExecutionOperator.DATE_DIFFERENCE:
             if len(self.operands) >= 2:
@@ -447,19 +449,29 @@ class DeterministicExecutor:
             citation = {"chunk_id": chunk_id, "document_id": doc_id} if chunk_id else {}
 
             kv_matches = re.findall(
-                r"([A-Za-z0-9_\- /()]+?):\s*([^:\n]+?)(?=\s+[A-Za-z0-9_\- /()]+:|\. [A-Z]|\.?$)",
+                r"(?:^|[.\n]\s*)([A-Za-z0-9_\- /()]+?(?:No\.)?[A-Za-z0-9_\- /()]*?):\s*([^:\n]+?)(?=[.\n]|$)",
                 txt.strip(),
             )
             scored_candidates = []
             for k, v in kv_matches:
-                k_clean = k.lower().replace("_", " ")
+                k_clean = k.lower().replace("_", " ").strip(". ")
                 m = re.search(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b", v)
                 if m:
+                    is_rs = "rajya" in k_clean or bool(re.search(r"\brs\b", k_clean))
+                    is_ls = "lok" in k_clean or bool(re.search(r"\bls\b", k_clean))
+                    if "rajya" in keywords and not is_rs:
+                        continue
+                    if "lok" in keywords and not is_ls:
+                        continue
+                    if "assent" in keywords and "assent" not in k_clean:
+                        continue
                     score = sum(1 for kw in keywords if kw in k_clean)
-                    if "rajya" in keywords and "rajya" not in k_clean:
-                        continue
-                    if "lok" in keywords and "lok" not in k_clean:
-                        continue
+                    if "rajya" in keywords and is_rs:
+                        score += 2
+                    if "lok" in keywords and is_ls:
+                        score += 2
+                    if "assent" in keywords and "assent" in k_clean:
+                        score += 2
                     if score > 0:
                         scored_candidates.append((score, m.group(0)))
             if scored_candidates:
@@ -611,7 +623,7 @@ class DeterministicExecutor:
                 return self.execute(ExecutionOperator.DATE_DIFFERENCE, [op1, op2])
 
         between_m = re.search(
-            r"(?:.*?\b(?:calculate|find|compute|what\s+is)\s+)?(?:the\s+)?difference\s+between\s+([^,;]+?)\s+and\s+(.+?)(?:\s+in|\s+for|\s*\?|\.|$)",
+            r"(?:.*?\b(?:calculate|find|compute|what\s+is)\s+)?(?:the\s+)?(?:difference|gap)\s+(?:in\s+[^,;]+?\s+)?between\s+([^,;]+?)\s+and\s+(.+?)(?:\s+in|\s+for|\s*\?|\.|$)",
             query,
             re.IGNORECASE,
         )
@@ -620,7 +632,10 @@ class DeterministicExecutor:
             op1 = self._extract_operand_from_chunks(term1, chunks, query)
             op2 = self._extract_operand_from_chunks(term2, chunks, query)
             if op1 and op2:
-                return self.execute(ExecutionOperator.DIFFERENCE, [op1, op2])
+                detected_unit = None
+                if "%" in str(op1.raw_value) or "%" in str(op2.raw_value) or "gap" in q_lower or "percentage point" in q_lower:
+                    detected_unit = "percentage points"
+                return self.execute(ExecutionOperator.DIFFERENCE, [op1, op2], unit=detected_unit)
 
         subtract_m = re.search(
             r"(?:.*?\b(?:calculate|find|compute)\s+)?subtract\s+([^,;]+?)\s+from\s+(.+?)(?:\s+in|\s+for|\s*\?|\.|$)",
