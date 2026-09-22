@@ -88,19 +88,26 @@ def compute_complexity(query: str) -> tuple[float, dict[str, bool | int]]:
         "q2",
         "q3",
         "q4",
-        "2020",
-        "2021",
-        "2022",
-        "2023",
-        "2024",
-        "2025",
+        "quarter",
         "between",
         "during",
         "since",
         "year",
+        "years",
         "month",
+        "months",
+        "date",
+        "dates",
+        "timeline",
+        "chronological",
+        "in order",
+        "earliest",
+        "latest",
+        "history",
+        "trend",
     }
-    temporal_flag = any(re.search(rf"\b{w}\b", q_lower) for w in temporal_words)
+    has_year = bool(re.search(r"\b(?:19|20)\d{2}\b", q_lower))
+    temporal_flag = has_year or any(re.search(rf"\b{re.escape(w)}\b", q_lower) for w in temporal_words)
     comparison_flag = any(
         k in q_lower
         for k in [
@@ -168,8 +175,7 @@ def compute_complexity(query: str) -> tuple[float, dict[str, bool | int]]:
     aggregation_flag = any(
         k in q_lower
         for k in [
-            "list all",
-            "list the",
+            "list ",
             "enumerate",
             "all the",
             "all models",
@@ -181,6 +187,8 @@ def compute_complexity(query: str) -> tuple[float, dict[str, bool | int]]:
             "all areas",
             "focus areas",
             "mentioned in",
+            "in order",
+            "chronological",
         ]
     )
     # Numeric: queries specifically asking for precise numbers, counts, or values

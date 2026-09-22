@@ -33,37 +33,62 @@ def rerank(
     scored_candidates.sort(key=lambda c: (getattr(c, "reranker_score", 0.0) or 0.0), reverse=True)
     candidates = scored_candidates
 
-    # Filter by threshold
+    # Filter by threshold with calibration for low-probability scoring models
     from config import settings
 
     pre_count = len(candidates)
+    max_score = (
+        max((getattr(c, "reranker_score", 0.0) or 0.0) for c in candidates)
+        if candidates
+        else 0.0
+    )
+    # Calibrate threshold: if scores are on a low absolute probability scale,
+    # use relative cutoff (half of max_score) rather than hardcoded threshold.
+    effective_threshold = (
+        min(settings.RERANKER_THRESHOLD, max_score * 0.5)
+        if max_score > 0
+        else settings.RERANKER_THRESHOLD
+    )
     filtered = [
         c
         for c in candidates
-        if getattr(c, "reranker_score", 0.0) >= settings.RERANKER_THRESHOLD
+        if (getattr(c, "reranker_score", 0.0) or 0.0) >= effective_threshold
     ]
     post_count = len(filtered)
     logger.debug(
-        "reranker.filter_stats threshold=%.2f pre=%d post=%d",
+        "reranker.filter_stats threshold=%.2f effective=%.4f pre=%d post=%d",
         settings.RERANKER_THRESHOLD,
+        effective_threshold,
         pre_count,
         post_count,
     )
 
-    # Take top_k with document diversity (fall back to candidates if all filtered out)
+    # Take top_k with document diversity and page diversity (fall back to candidates if all filtered out)
     candidates_to_use = filtered if filtered else candidates
     unique_docs = {str(getattr(c, "document_id", "")) for c in candidates_to_use}
-    if len(unique_docs) > 1 and top_k > 2:
-        max_per_doc = max(2, top_k - 2)
+
+    if top_k > 2:
+        max_per_doc = max(2, top_k - 2) if len(unique_docs) > 1 else top_k
+        max_per_page = 2
         doc_counts: dict[str, int] = {}
+        page_counts: dict[tuple[str, int | str], int] = {}
         top_chunks = []
         deferred = []
         for c in candidates_to_use:
             d_id = str(getattr(c, "document_id", ""))
-            cnt = doc_counts.get(d_id, 0)
-            if cnt < max_per_doc:
+            p_num = getattr(c, "page_number", None)
+            if p_num is None and getattr(c, "metadata", None):
+                p_num = c.metadata.get("page")
+
+            d_cnt = doc_counts.get(d_id, 0)
+            p_key = (d_id, p_num) if p_num is not None else None
+            p_cnt = page_counts.get(p_key, 0) if p_key is not None else 0
+
+            if d_cnt < max_per_doc and (p_key is None or p_cnt < max_per_page):
                 top_chunks.append(c)
-                doc_counts[d_id] = cnt + 1
+                doc_counts[d_id] = d_cnt + 1
+                if p_key is not None:
+                    page_counts[p_key] = p_cnt + 1
                 if len(top_chunks) == top_k:
                     break
             else:

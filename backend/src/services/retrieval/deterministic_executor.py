@@ -49,13 +49,25 @@ class ExecutionResult:
     input_binding_confidence: float = 1.0
     overall_confidence: float = 1.0
     provenance_citations: tuple[dict[str, Any], ...] = ()
+    unit: str | None = None
 
     def format_answer(self, query: str = "") -> str:
         q_lower = query.lower()
+        unit_str = f" {self.unit}" if self.unit else (" million dollars" if ("million" in q_lower or "dollar" in q_lower) else "")
         if self.operator == ExecutionOperator.DIFFERENCE:
             if len(self.operands) >= 2:
-                return f"{self.result_value} (calculated as {self.operands[0].normalized_value} minus {self.operands[1].normalized_value})"
-            return f"{self.result_value}"
+                return f"{self.result_value}{unit_str}: {self.operands[0].normalized_value} minus {self.operands[1].normalized_value}"
+            return f"{self.result_value}{unit_str}"
+        if self.operator == ExecutionOperator.DATE_DIFFERENCE:
+            if len(self.operands) >= 2:
+                try:
+                    d1 = parse_date_value(self.operands[0].normalized_value)
+                    d2 = parse_date_value(self.operands[1].normalized_value)
+                    earlier, later = min(d1, d2), max(d1, d2)
+                    return f"{int(self.result_value)} days, from {earlier.strftime('%-d %B %Y')} to {later.strftime('%-d %B %Y')}"
+                except Exception:
+                    pass
+            return f"{int(self.result_value)} days"
         if self.operator == ExecutionOperator.PERCENTAGE_POINT_DIFFERENCE:
             if len(self.operands) >= 2:
                 return f"{self.result_value} percentage points ({self.operands[0].normalized_value}% minus {self.operands[1].normalized_value}%)"
@@ -186,7 +198,7 @@ class DeterministicExecutor:
         if operator == ExecutionOperator.DATE_DIFFERENCE:
             d_a = parse_date_value(operands[0].normalized_value)
             d_b = parse_date_value(operands[1].normalized_value)
-            delta_days = (d_a - d_b).days
+            delta_days = abs((d_a - d_b).days)
             return ExecutionResult(
                 result_value=Decimal(delta_days),
                 operator=operator,
@@ -194,6 +206,7 @@ class DeterministicExecutor:
                 input_binding_confidence=binding_conf,
                 overall_confidence=overall_conf,
                 provenance_citations=provenances,
+                unit="days",
             )
 
         a_dec = parse_decimal_value(operands[0].normalized_value)
@@ -230,6 +243,7 @@ class DeterministicExecutor:
             input_binding_confidence=binding_conf,
             overall_confidence=overall_conf,
             provenance_citations=provenances,
+            unit=unit,
         )
 
     def _extract_operand_from_chunks(
@@ -273,7 +287,33 @@ class DeterministicExecutor:
                 if chunk_has_diff_year:
                     continue
 
-            # First pass: check for exact phrase or all keywords in key
+            # First pass: check for schema-normalized entity-attribute-value pairs
+            # e.g., Variable_name: Closing stocks ... Value: 88214
+            var_name = None
+            var_val = None
+            for k, v in kv_matches:
+                k_clean = k.strip().lower().replace("_", " ")
+                v_clean = v.strip()
+                if any(attr in k_clean for attr in ["variable name", "variable", "indicator", "metric", "description", "concept"]):
+                    if term_clean in v_clean.lower() or all(kw in v_clean.lower() for kw in keywords):
+                        var_name = v_clean
+                if any(attr in k_clean for attr in ["value", "amount", "total", "data value"]):
+                    var_val = v_clean
+            if var_name and var_val:
+                val_m = re.search(r"[-+]?\$?\s*([\d,]+(?:\.\d+)?)\s*(?:[MBk%]|\s+million|\s+billion)?", var_val)
+                if val_m:
+                    try:
+                        dec_val = parse_decimal_value(val_m.group(0).strip())
+                        return Operand(
+                            raw_value=val_m.group(0).strip(),
+                            normalized_value=dec_val,
+                            source_citation=citation,
+                            binding_confidence=0.95,
+                        )
+                    except Exception:
+                        pass
+
+            # Second pass: check for exact phrase or all keywords in key
             for k, v in kv_matches:
                 k_lower = k.lower()
                 if term_clean in k_lower or all(kw in k_lower for kw in keywords):
@@ -348,35 +388,93 @@ class DeterministicExecutor:
             # Strategy 3: Line-by-line search in chunk text (strict structured/key-value lines only)
             lines = txt.splitlines()
             _DATE_MONTHS = r"(?:january|february|march|april|may|june|july|august|september|october|november|december)"
+            candidate_lines = []
             for line in lines:
                 line_lower = line.lower()
                 # Skip long narrative prose or introductory lines
                 if len(line.split()) > 15 or "ended" in line_lower or "table shows" in line_lower or "refer to" in line_lower:
                     continue
 
-                matches_line = term_clean in line_lower or all(kw in line_lower for kw in keywords)
-                if matches_line:
-                    # Remove date patterns like "June 27" or "March 16" so day numbers are not extracted as operands
-                    clean_line = re.sub(_DATE_MONTHS + r"\s+\d+", " ", line, flags=re.IGNORECASE)
-                    num_matches = re.findall(r"(?<![A-Za-z0-9_])[-+]?\$?\s*[\d,]+(?:\.\d+)?(?:\s*[MBk%]|\s+million|\s+billion)?", clean_line)
-                    filtered = []
-                    for nm in num_matches:
-                        clean_nm = nm.strip().replace("$", "").replace(",", "")
-                        if clean_nm in ("2020", "2021", "2022", "2023", "2024", "2025", "2026", "2027", "2028") and clean_nm not in keywords:
-                            continue
-                        filtered.append(nm.strip())
-                    if filtered:
-                        candidate = filtered[0]
-                        try:
-                            dec_val = parse_decimal_value(candidate)
-                            return Operand(
-                                raw_value=candidate,
-                                normalized_value=dec_val,
-                                source_citation=citation,
-                                binding_confidence=0.95,
-                            )
-                        except Exception:
-                            continue
+                if term_clean in line_lower or all(kw in line_lower for kw in keywords):
+                    # Score candidate line: prefer "Total <term>" or exact starts
+                    score = 50
+                    if line_lower.startswith("total " + term_clean) or line_lower.startswith("total " + " ".join(keywords)):
+                        score = 100
+                    elif line_lower.startswith(term_clean) or line_lower.startswith(" ".join(keywords)):
+                        score = 90
+                    elif "total" in line_lower:
+                        score = 80
+                    elif "other " in line_lower:
+                        score = 10
+                    candidate_lines.append((score, line))
+
+            candidate_lines.sort(key=lambda x: x[0], reverse=True)
+            for _, line in candidate_lines:
+                # Remove date patterns like "June 27" or "March 16" so day numbers are not extracted as operands
+                clean_line = re.sub(_DATE_MONTHS + r"\s+\d+", " ", line, flags=re.IGNORECASE)
+                num_matches = re.findall(r"(?<![A-Za-z0-9_])[-+]?\$?\s*[\d,]+(?:\.\d+)?(?:\s*[MBk%]|\s+million|\s+billion)?", clean_line)
+                filtered = []
+                for nm in num_matches:
+                    clean_nm = nm.strip().replace("$", "").replace(",", "")
+                    if clean_nm in ("2020", "2021", "2022", "2023", "2024", "2025", "2026", "2027", "2028") and clean_nm not in keywords:
+                        continue
+                    filtered.append(nm.strip())
+                if filtered:
+                    candidate = filtered[0]
+                    try:
+                        dec_val = parse_decimal_value(candidate)
+                        return Operand(
+                            raw_value=candidate,
+                            normalized_value=dec_val,
+                            source_citation=citation,
+                            binding_confidence=0.95,
+                        )
+                    except Exception:
+                        continue
+        return None
+
+    def _extract_date_operand_from_chunks(
+        self, term: str, chunks: list[Any], query: str = ""
+    ) -> Operand | None:
+        term_clean = term.strip().lower()
+        keywords = [w for w in re.findall(r"\w+", term_clean) if w not in {"the", "of", "and", "in", "date", "dates", "bill", "passage"}]
+        for chunk in chunks:
+            txt = getattr(chunk, "text", "")
+            if not txt:
+                continue
+            chunk_id = getattr(chunk, "id", "")
+            doc_id = getattr(chunk, "document_id", "")
+            citation = {"chunk_id": chunk_id, "document_id": doc_id} if chunk_id else {}
+
+            kv_matches = re.findall(
+                r"([A-Za-z0-9_\- /()]+?):\s*([^:\n]+?)(?=\s+[A-Za-z0-9_\- /()]+:|\. [A-Z]|\.?$)",
+                txt.strip(),
+            )
+            scored_candidates = []
+            for k, v in kv_matches:
+                k_clean = k.lower().replace("_", " ")
+                m = re.search(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b", v)
+                if m:
+                    score = sum(1 for kw in keywords if kw in k_clean)
+                    if "rajya" in keywords and "rajya" not in k_clean:
+                        continue
+                    if "lok" in keywords and "lok" not in k_clean:
+                        continue
+                    if score > 0:
+                        scored_candidates.append((score, m.group(0)))
+            if scored_candidates:
+                scored_candidates.sort(key=lambda x: x[0], reverse=True)
+                raw_d = scored_candidates[0][1]
+                try:
+                    dt = parse_date_value(raw_d)
+                    return Operand(
+                        raw_value=raw_d,
+                        normalized_value=raw_d,
+                        source_citation=citation,
+                        binding_confidence=0.95,
+                    )
+                except Exception:
+                    pass
         return None
 
     def resolve_and_execute(self, query: str, chunks: list[Any]) -> ExecutionResult | None:
@@ -391,6 +489,7 @@ class DeterministicExecutor:
                 "minus", "subtract", "difference between", "diff between",
                 "percentage difference", "percentage point", "percentage points",
                 "percentage of", "ratio of", "ratio between", "sum of", "average of",
+                "days elapsed", "days between", "calendar days", "elapsed between",
             ]
         )
         if not has_math_intent:
@@ -478,13 +577,38 @@ class DeterministicExecutor:
             query,
             re.IGNORECASE,
         )
+        if not diff_m and "minus" in q_lower:
+            diff_m = re.search(
+                r"(?:.*?\b(?:calculate|find|compute|what\s+is)\s+)?(.+?)\s+(?:minus|-)\s+(.+?)(?:\s+in|\s+for|\s*\?|\.|$)",
+                query,
+                re.IGNORECASE,
+            )
         if diff_m:
             term1, term2 = diff_m.group(1).strip(), diff_m.group(2).strip()
             op1 = self._extract_operand_from_chunks(term1, chunks, query)
             op2 = self._extract_operand_from_chunks(term2, chunks, query)
             # Guard: ignore trivial/casual matches where both operands normalized to 1 or 0
             if op1 and op2 and not (op1.normalized_value in (0, 1) and op2.normalized_value in (0, 1)):
-                return self.execute(ExecutionOperator.DIFFERENCE, [op1, op2])
+                detected_unit = None
+                for c in chunks:
+                    c_txt = getattr(c, "text", "").lower()
+                    if "in millions" in c_txt or "dollars (millions)" in c_txt or "(in millions" in c_txt:
+                        detected_unit = "million dollars"
+                        break
+                return self.execute(ExecutionOperator.DIFFERENCE, [op1, op2], unit=detected_unit)
+
+        # Date difference in calendar days
+        date_diff_m = re.search(
+            r"(?:how\s+many\s+)?(?:calendar\s+)?days\s+(?:elapsed\s+)?between\s+([^,;]+?)\s+and\s+(.+?)(?:\s+for|\s+in|\s*\?|\.|$)",
+            query,
+            re.IGNORECASE,
+        )
+        if date_diff_m:
+            term1, term2 = date_diff_m.group(1).strip(), date_diff_m.group(2).strip()
+            op1 = self._extract_date_operand_from_chunks(term1, chunks, query)
+            op2 = self._extract_date_operand_from_chunks(term2, chunks, query)
+            if op1 and op2:
+                return self.execute(ExecutionOperator.DATE_DIFFERENCE, [op1, op2])
 
         between_m = re.search(
             r"(?:.*?\b(?:calculate|find|compute|what\s+is)\s+)?(?:the\s+)?difference\s+between\s+([^,;]+?)\s+and\s+(.+?)(?:\s+in|\s+for|\s*\?|\.|$)",

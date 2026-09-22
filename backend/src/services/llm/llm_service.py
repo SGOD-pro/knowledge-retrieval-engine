@@ -82,10 +82,13 @@ def call(
         "6. When asked HOW an evaluation, check, or metric is conducted or computed, describe the operational mechanism (e.g. what is removed, omitted, or measured, and the resulting change in model loss or error) rather than just stating the name of the method.\n"
         "7. For chronological or sequence questions, list all events or dates mentioned in chronological order.\n"
         "8. If the query asks for a specific format (e.g., 'Answer only as a JSON object with keys...'), provide the requested JSON structure directly inside the 'answer' field.\n"
-        "9. If the context contains PARTIAL information, provide what you can find and note what is missing.\n"
-        "10. If the answer is truly NOT in the context at all, respond with exactly: NOT_FOUND\n"
-        "11. NEVER infer, guess, or use knowledge outside the provided context.\n"
-        "12. Cite only chunk IDs that appear in the [chunk_id] format in the context.\n\n"
+        "9. When computing or reporting percentages, ratios, or arithmetic calculations: state the formula and operands used (e.g. '30,739 / 109,417 × 100 = 28.09%'), and round percentages to two decimal places unless asked otherwise.\n"
+        "10. When performing sums, aggregations, or additions across multiple entities/districts/items: provide both the total and the individual component breakdown (e.g. 'Total 2,624: EntityA 882 + EntityB 874...').\n"
+        "11. When a question asks for a statistic, date, or value without specifying necessary qualifiers (such as period, year, segment, or basis), explicitly state the available qualifiers or dimensions from the context (e.g. 'For the three months ended June 27, 2026, ...').\n"
+        "12. If the context contains PARTIAL information, provide what you can find and note what is missing.\n"
+        "13. If the answer is truly NOT in the context at all, respond with exactly: NOT_FOUND\n"
+        "14. NEVER infer, guess, or use knowledge outside the provided context.\n"
+        "15. Cite only chunk IDs that appear in the [chunk_id] format in the context.\n\n"
         "Return ONLY valid JSON with this exact schema (no markdown code blocks):\n"
         '{"answer": "<your answer or NOT_FOUND>", "citations": ["chunk_id_1", "chunk_id_2"]}'
     )

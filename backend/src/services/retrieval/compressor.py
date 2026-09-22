@@ -59,7 +59,7 @@ def compress_chunks(query: str, chunks: list[Chunk]) -> str:
 
     # 2. Allocate fair character budget per chunk
     num_chunks = len(interleaved_chunks)
-    budget_per_chunk = min(1200, max(600, 4800 // max(1, num_chunks)))
+    budget_per_chunk = min(1800, max(800, 5500 // max(1, num_chunks)))
     MAX_TOTAL_CHARS = 5500
 
     compressed_text = []
@@ -70,16 +70,16 @@ def compress_chunks(query: str, chunks: list[Chunk]) -> str:
         if not c_text:
             continue
 
-        is_tabular = (
-            getattr(c, "source_format", "") in _TABULAR_FORMATS
-            or getattr(c, "element_type", "") in _TABULAR_ELEMENT_TYPES
-        )
+        if len(c_text) <= budget_per_chunk:
+            snippet = c_text
+        else:
+            is_tabular = (
+                getattr(c, "source_format", "") in _TABULAR_FORMATS
+                or getattr(c, "element_type", "") in _TABULAR_ELEMENT_TYPES
+            )
 
-        snippet = ""
-        if is_tabular:
-            if len(c_text) <= budget_per_chunk:
-                snippet = c_text
-            else:
+            snippet = ""
+            if is_tabular:
                 # Wide tabular row: split into parts (header: value pairs)
                 parts = [p.strip() for p in c_text.replace("\n", ". ").split(". ") if p.strip()]
                 if len(parts) <= 3:
@@ -101,55 +101,69 @@ def compress_chunks(query: str, chunks: list[Chunk]) -> str:
                         snippet += "."
                     if len(snippet) > budget_per_chunk:
                         snippet = snippet[:budget_per_chunk].rsplit(" ", 1)[0] + "."
-        else:
-            # Prose / PDF chunks: score sentences to center snippet on key evidence window
-            raw_sents = [s.strip() for s in re.split(r"(?<=[.?!])\s+|\n+", c_text) if len(s.strip()) > 10]
-            if not raw_sents:
-                raw_sents = [c_text]
+            else:
+                # Prose / PDF chunks: score sentences to center snippet on key evidence window
+                raw_sents = [s.strip() for s in re.split(r"(?<=[.?!])\s+|\n+", c_text) if len(s.strip()) > 10]
+                if not raw_sents:
+                    raw_sents = [c_text]
 
-            # Score sentences against query words (rare/longer words get higher weight)
-            scored_sents = []
-            for idx, s in enumerate(raw_sents):
-                score = 0
-                s_lower = s.lower()
-                for w in query_words:
-                    if w in s_lower:
-                        score += 3 if (len(w) > 3 or any(ch.isdigit() for ch in w)) else 1
-                scored_sents.append((idx, score))
+                # Score sentences against query words (rare/longer words get higher weight)
+                scored_sents = []
+                for idx, s in enumerate(raw_sents):
+                    score = 0
+                    s_lower = s.lower()
+                    for w in query_words:
+                        if w in s_lower:
+                            score += 3 if (len(w) > 3 or any(ch.isdigit() for ch in w)) else 1
+                    scored_sents.append((idx, score))
 
-            scored_sents.sort(key=lambda x: x[1], reverse=True)
-            best_idx = scored_sents[0][0] if scored_sents and scored_sents[0][1] > 0 else 0
+                scored_sents.sort(key=lambda x: x[1], reverse=True)
+                best_idx = scored_sents[0][0] if scored_sents and scored_sents[0][1] > 0 else 0
 
-            # Expand window around best_idx until budget_per_chunk is filled
-            left = best_idx
-            right = best_idx
-            curr_sents = [raw_sents[best_idx]]
-            curr_len = len(raw_sents[best_idx])
+                # Expand window around best_idx until budget_per_chunk is filled
+                left = best_idx
+                right = best_idx
+                curr_sents = [raw_sents[best_idx]]
+                curr_len_sent = len(raw_sents[best_idx])
 
-            while True:
-                expanded = False
-                if left > 0:
-                    cand = raw_sents[left - 1]
-                    if curr_len + len(cand) + 1 <= budget_per_chunk:
-                        curr_sents.insert(0, cand)
-                        curr_len += len(cand) + 1
-                        left -= 1
-                        expanded = True
-                if right < len(raw_sents) - 1:
-                    cand = raw_sents[right + 1]
-                    if curr_len + len(cand) + 1 <= budget_per_chunk:
-                        curr_sents.append(cand)
-                        curr_len += len(cand) + 1
-                        right += 1
-                        expanded = True
-                if not expanded:
-                    break
+                # Check if the very first lines contain header / column / date metadata
+                if left > 1 and len(raw_sents) > 3:
+                    for h_idx in range(min(3, left)):
+                        h_line = raw_sents[h_idx]
+                        h_lower = h_line.lower()
+                        if any(kw in h_lower for kw in ["months ended", "quarter", "statement", "unaudited", "table", "year", "date"]):
+                            if curr_len_sent + len(h_line) + 1 <= budget_per_chunk:
+                                curr_sents.insert(h_idx, h_line)
+                                curr_len_sent += len(h_line) + 1
 
-            prefix = "..." if left > 0 else ""
-            suffix = "..." if right < len(raw_sents) - 1 else ""
-            snippet = f"{prefix} {' '.join(curr_sents)} {suffix}".strip()
-            if len(snippet) > budget_per_chunk:
-                snippet = snippet[:budget_per_chunk].rsplit(" ", 1)[0] + "..."
+                while True:
+                    expanded = False
+                    if left > 0:
+                        cand = raw_sents[left - 1]
+                        if cand not in curr_sents and curr_len_sent + len(cand) + 1 <= budget_per_chunk:
+                            curr_sents.insert(0, cand)
+                            curr_len_sent += len(cand) + 1
+                            left -= 1
+                            expanded = True
+                        elif cand in curr_sents:
+                            left -= 1
+                    if right < len(raw_sents) - 1:
+                        cand = raw_sents[right + 1]
+                        if cand not in curr_sents and curr_len_sent + len(cand) + 1 <= budget_per_chunk:
+                            curr_sents.append(cand)
+                            curr_len_sent += len(cand) + 1
+                            right += 1
+                            expanded = True
+                        elif cand in curr_sents:
+                            right += 1
+                    if not expanded:
+                        break
+
+                prefix = "..." if left > 0 and raw_sents[0] not in curr_sents else ""
+                suffix = "..." if right < len(raw_sents) - 1 else ""
+                snippet = f"{prefix} {' '.join(curr_sents)} {suffix}".strip()
+                if len(snippet) > budget_per_chunk:
+                    snippet = snippet[:budget_per_chunk].rsplit(" ", 1)[0] + "..."
 
         if not snippet:
             continue
