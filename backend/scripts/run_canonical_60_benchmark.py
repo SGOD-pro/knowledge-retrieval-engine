@@ -344,7 +344,11 @@ def run_benchmark(
         # Assert response was NOT cached
         assert not resp.get("cached", False), f"Query {qid} returned cached response in benchmark_mode"
 
-        ans_text = resp.get("answer", "")
+        ans_raw = resp.get("answer", "")
+        if isinstance(ans_raw, (dict, list)):
+            ans_text = json.dumps(ans_raw)
+        else:
+            ans_text = str(ans_raw or "")
         candidates = resp.get("retrieval_candidates", {})
         reranked_ids = resp.get("reranked_chunk_ids") or candidates.get("reranked", [])
         compressed_ids = set(resp.get("compressed_context_chunk_ids") or candidates.get("compressed_context", []))
