@@ -175,6 +175,10 @@ def resolve_ground_truth_chunk_ids(
     unscorable: list[str] = []
 
     for qid, entry in ground_truth_entries.items():
+        if entry.get("question_type") == "structured_aggregate":
+            resolved[qid] = set()
+            continue
+
         ev_list = entry.get("relevant_evidence", [])
         if not ev_list:
             resolved[qid] = set()
@@ -314,6 +318,11 @@ def run_benchmark(
     no_evidence_total = 0
     false_answer_count = 0
     unsupported_citation_count = 0
+    structured_agg_total = 0
+    structured_agg_correct = 0
+    premise_correction_total = 0
+    premise_correction_correct = 0
+    infra_failure_count = 0
 
     all_recalls = []
     all_precisions = []
@@ -344,6 +353,9 @@ def run_benchmark(
         # Assert response was NOT cached
         assert not resp.get("cached", False), f"Query {qid} returned cached response in benchmark_mode"
 
+        if resp.get("status") == "error" or resp.get("error_code"):
+            infra_failure_count += 1
+
         ans_raw = resp.get("answer", "")
         if isinstance(ans_raw, (dict, list)):
             ans_text = json.dumps(ans_raw)
@@ -361,12 +373,22 @@ def run_benchmark(
         gt_entry = ground_truth_data.get(qid, {})
         contract = gt_entry.get("answer_contract", {})
         contract_type = contract.get("contract_type", "semantic")
+        question_type = gt_entry.get("question_type") or ("structured_aggregate" if contract_type == "structured_aggregate" else "retrieval")
 
         # Evaluate retrieval metrics against resolved structured ground truth
         rel_ids = structured_ground_truth.get(qid, set())
         has_positive_evidence = len(rel_ids) > 0
 
-        if has_positive_evidence:
+        if question_type == "structured_aggregate":
+            structured_agg_total += 1
+            ret_metrics = {
+                "recall_at_5": None,
+                "precision_at_3": None,
+                "mrr_at_5": None,
+                "ndcg_at_5": None,
+                "note": "excluded_structured_aggregate",
+            }
+        elif has_positive_evidence:
             ret_metrics = compute_retrieval_metrics(reranked_ids, rel_ids)
             all_recalls.append(ret_metrics["recall_at_5"])
             all_precisions.append(ret_metrics["precision_at_3"])
@@ -411,13 +433,17 @@ def run_benchmark(
                 unsupported_citation_count += 1
         elif contract_type == "numeric":
             is_correct = grade_structured_numeric(ans_text, contract)
+            if question_type == "structured_aggregate" and is_correct:
+                structured_agg_correct += 1
         elif contract_type == "json_schema":
             is_correct = grade_structured_json(ans_text, contract)
         elif contract_type == "premise_correction":
             refusal_total += 1
+            premise_correction_total += 1
             is_correct = grade_structured_premise(ans_text, contract)
             if is_correct:
                 refusal_correct += 1
+                premise_correction_correct += 1
         else:
             if expected_ans:
                 relevancy = compute_answer_relevancy(ans_text, expected_ans)
@@ -508,8 +534,13 @@ def run_benchmark(
         "total_questions": total_q,
         "denominators": {
             "total_questions": total_q,
-            "positive_evidence_questions": pos_count,
+            "answerable_retrieval_questions": pos_count,
+            "answerable_structured_aggregate_questions": structured_agg_total,
+            "refusal_questions": max(0, refusal_total - premise_correction_total),
+            "premise_correction_questions": premise_correction_total,
             "no_evidence_questions": no_evidence_total,
+            "infrastructure_failures": infra_failure_count,
+            "positive_evidence_questions": pos_count,
             "refusal_evaluated_questions": refusal_total,
         },
         "metrics": {
@@ -554,6 +585,14 @@ def run_benchmark(
 - **Benchmark Type**: `{benchmark_type}`
 - **Test Suite SHA-256**: `{suite_sha256}`
 - **Corpus Manifest SHA-256**: `{corpus_manifest_sha256}`
+
+## Question Breakdown & Truthful Denominators
+- **Total Questions**: {total_q}
+- **Answerable Retrieval Questions**: {pos_count}
+- **Answerable Structured Aggregate Questions**: {structured_agg_total}
+- **Refusal / No-Evidence Questions**: {no_evidence_total}
+- **Premise Correction Questions**: {premise_correction_total}
+- **Infrastructure Failures**: {infra_failure_count}
 
 ## Quality & Accuracy Metrics
 

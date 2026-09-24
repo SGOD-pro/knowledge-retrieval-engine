@@ -77,6 +77,8 @@ class PipelineState(TypedDict):
     graph_chunks: list[Chunk]
     retrieval_candidates: dict[str, list[str]]
     reranker_mode: str
+    status: str | None
+    error_code: str | None
 
 
 # ---------------------------------------------------------------------------
@@ -122,17 +124,24 @@ def route_query(state: PipelineState):
     plan = planner.route(state["query"])
     if state.get("force_full_path", False):
         from dataclasses import replace
-        plan = replace(plan, fast_path=False)
+        plan = replace(plan, fast_path=False, use_structured_aggregate=False)
+
+    is_structured = getattr(plan, "use_structured_aggregate", False)
 
     # 2. Re-use existing query_embedding if provided by query_service;
-    # only embed via Titan if full path is chosen and embedding not yet computed
+    # only embed via Titan if full path is chosen (not structured and not fast-path)
+    # and embedding not yet computed
     query_embedding = state.get("query_embedding")
-    if not plan.fast_path and query_embedding is None:
+    if not plan.fast_path and not is_structured and query_embedding is None:
         from providers.embedding_provider import embed_text
         query_embedding = embed_text(state["query"])
 
     latency_ms = (time.perf_counter() - t0) * 1000.0
-    planned = "fast" if plan.fast_path else "full"
+    if is_structured:
+        planned = "structured_aggregate"
+    else:
+        planned = "fast" if plan.fast_path else "full"
+
     logger.info("route_query.latency_ms=%.2f fast_path=%s planned=%s", latency_ms, plan.fast_path, planned)
     return {
         "query_embedding": query_embedding,
@@ -859,6 +868,33 @@ def run_okf_post(state: PipelineState):
     return {}
 
 
+def run_structured_aggregate(state: PipelineState):
+    from services.retrieval.run_structured_aggregate import execute
+    res = execute(state)
+    if res.get("executed_path") == "structured_aggregate_fallback":
+        q_emb = state.get("query_embedding")
+        if q_emb is None:
+            from providers.embedding_provider import embed_text
+            res["query_embedding"] = embed_text(state["query"])
+    return res
+
+
+def route_after_route_query(state: PipelineState) -> str:
+    plan = state.get("plan")
+    if plan and getattr(plan, "use_structured_aggregate", False):
+        return "run_structured_aggregate"
+    return "run_okf_router"
+
+
+def route_after_structured(state: PipelineState) -> str:
+    ea = state.get("executed_path")
+    if ea == "structured_aggregate":
+        return END
+    if ea in ("structured_aggregate_incomplete", "structured_aggregate_storage_failure", "structured_aggregate_ambiguous"):
+        return END
+    return "run_okf_router"
+
+
 # ---------------------------------------------------------------------------
 # Build LangGraph
 # ---------------------------------------------------------------------------
@@ -866,6 +902,7 @@ def run_okf_post(state: PipelineState):
 workflow = StateGraph(PipelineState)
 
 workflow.add_node("route_query", route_query)
+workflow.add_node("run_structured_aggregate", run_structured_aggregate)
 workflow.add_node("run_okf_router", run_okf_router)  # pre-BM25 OKF (Component 2)
 workflow.add_node("run_bm25", run_bm25)
 workflow.add_node("run_page_index", run_page_index)
@@ -880,9 +917,24 @@ workflow.add_node("run_fidelity", run_fidelity)
 workflow.add_node("run_llm", run_llm)
 workflow.add_node("end_fast_path", end_fast_path)
 
-# Edge order: route_query → OKF (pre-BM25) → BM25 → PageIndex → vector → branch
+# Edge order: route_query → structured_aggregate / OKF → BM25 → PageIndex → vector → branch
 workflow.add_edge(START, "route_query")
-workflow.add_edge("route_query", "run_okf_router")
+workflow.add_conditional_edges(
+    "route_query",
+    route_after_route_query,
+    {
+        "run_structured_aggregate": "run_structured_aggregate",
+        "run_okf_router": "run_okf_router",
+    },
+)
+workflow.add_conditional_edges(
+    "run_structured_aggregate",
+    route_after_structured,
+    {
+        END: END,
+        "run_okf_router": "run_okf_router",
+    },
+)
 workflow.add_edge("run_okf_router", "run_bm25")
 workflow.add_edge("run_bm25", "run_page_index")
 workflow.add_edge("run_page_index", "run_vector")
@@ -984,6 +1036,8 @@ class Pipeline:
             "usage": {"input_tokens": 0, "output_tokens": 0},
             "faithfulness": None,
             "citation_utilization_rate": None,
+            "status": "pending",
+            "error_code": None,
         }
 
         final_state = app.invoke(initial_state)
@@ -1001,11 +1055,14 @@ class Pipeline:
                 self.citation_utilization_rate = state.get("citation_utilization_rate", None)
                 self.usage = state.get("usage", {"input_tokens": 0, "output_tokens": 0})
                 self.execution_result = state.get("execution_result", None)
+                self.status = state.get("status", "success")
+                self.error_code = state.get("error_code")
                 plan = state.get("plan")
                 self.fast_path = plan.fast_path if plan else False
                 self.stages = plan.stages if plan else []
                 self.planned_path = state.get("planned_path", "fast" if self.fast_path else "full")
                 self.executed_path = state.get("executed_path", "fast" if self.fast_path else "full")
+                self.structured_aggregate = (self.executed_path == "structured_aggregate")
                 self.reranker_mode = state.get("reranker_mode", "remote_success")
                 self.retrieval_candidates = state.get("retrieval_candidates", {})
 

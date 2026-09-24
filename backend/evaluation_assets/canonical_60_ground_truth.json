@@ -412,20 +412,62 @@
   "Q152": {
     "id": "Q152",
     "category": "TEMPORAL",
+    "question_type": "structured_aggregate",
     "question": "What is the earliest and latest Year actually present in survay.csv?",
     "expected_answer": "2013 and 2025.",
-    "relevant_evidence": [],
+    "relevant_evidence": [
+      {
+        "document_sha256": "c029d234eefd3fee2563b9c0929946ca336509ab62a02bd111c80f978298c66c",
+        "source_filename": "survay.csv",
+        "locator_type": "csv_column_aggregate",
+        "locator": "Year",
+        "locator_metadata": {
+          "operator": "min_max",
+          "expected_values": [
+            2013,
+            2025
+          ]
+        }
+      }
+    ],
     "answer_contract": {
-      "contract_type": "semantic",
-      "expected_answer": "2013 and 2025."
+      "contract_type": "numeric",
+      "target_values": [
+        2013.0,
+        2025.0
+      ],
+      "required_units": [],
+      "tolerance": 0.0
     }
   },
   "Q153": {
     "id": "Q153",
     "category": "NUMERIC",
+    "question_type": "structured_aggregate",
     "question": "For All industries (99999), how did total income change from 2024 to 2025? Give the amount and percentage change.",
     "expected_answer": "It fell by 4,191 million dollars, from 980,268 to 976,077, a decline of approximately 0.43%.",
-    "relevant_evidence": [],
+    "relevant_evidence": [
+      {
+        "document_sha256": "c029d234eefd3fee2563b9c0929946ca336509ab62a02bd111c80f978298c66c",
+        "source_filename": "survay.csv",
+        "locator_type": "csv_row",
+        "locator": "Year=2025,Industry_code_NZSIOC=99999,Variable_code=H01",
+        "locator_metadata": {
+          "row_value": 976077,
+          "unit": "Dollars (millions)"
+        }
+      },
+      {
+        "document_sha256": "c029d234eefd3fee2563b9c0929946ca336509ab62a02bd111c80f978298c66c",
+        "source_filename": "survay.csv",
+        "locator_type": "csv_row",
+        "locator": "Year=2024,Industry_code_NZSIOC=99999,Variable_code=H01",
+        "locator_metadata": {
+          "row_value": 980268,
+          "unit": "Dollars (millions)"
+        }
+      }
+    ],
     "answer_contract": {
       "contract_type": "numeric",
       "target_values": [
@@ -436,7 +478,7 @@
         980268.0,
         976077.0
       ],
-      "required_sign": null,
+      "required_sign": "-",
       "required_units": [
         "million",
         "%"

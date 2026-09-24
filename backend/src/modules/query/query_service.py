@@ -32,6 +32,19 @@ class QueryService:
             ws_chunks = self.repo.get_all_chunks(workspace_id=req.workspace_id)
             ws_doc_ids = list({str(c.document_id) for c in ws_chunks if str(c.document_id)})
 
+        # Also include document IDs for structured tables in workspace (e.g. CSV table stores)
+        try:
+            from db.table_store import get_shared_table_store
+            store = get_shared_table_store()
+            tables = store.list_tables(req.workspace_id)
+            for tid in tables:
+                ver = store.get_active_version(tid, req.workspace_id)
+                t_meta = store.get_table(tid, req.workspace_id, version=ver)
+                if t_meta and t_meta.document_id and t_meta.document_id not in ws_doc_ids:
+                    ws_doc_ids.append(t_meta.document_id)
+        except Exception:
+            pass
+
         if req.document_ids is not None:
             # req.document_ids is an optional additional filter on top of workspace scope, not a replacement
             target_doc_ids = [d_id for d_id in req.document_ids if d_id in set(ws_doc_ids)]
@@ -83,6 +96,9 @@ class QueryService:
                 pass
 
         # 2. Check Semantic Cache (Layer 1) — bypassed in benchmark_mode or cache=False
+        # Also bypassed for structured-aggregate queries: route is resolved first;
+        # if the query will be answered deterministically from the table store, no
+        # embedding is needed here and generating one wastes budget + adds latency.
         query_embedding = None
         if use_cache:
             try:
@@ -91,7 +107,7 @@ class QueryService:
                 plan = planner.route(req.query)
                 is_full = (not plan.fast_path) or getattr(req, "force_full_path", False)
 
-                if is_full:
+                if is_full and not getattr(plan, "use_structured_aggregate", False):
                     from providers.embedding_provider import embed_text
                     from providers.provider_client import get_active_provider
 
@@ -197,12 +213,17 @@ class QueryService:
                     }
                 )
 
+        status = getattr(response, "status", "success")
+        error_code = getattr(response, "error_code", None)
         answer_text = response.answer
         if answer_text == "NOT_FOUND" or not answer_text:
-            answer_text = "I couldn't find any relevant passages in the workspace documents matching your query."
+            if error_code == "incomplete_data":
+                answer_text = "Table data is incomplete: required records are missing from table storage."
+            else:
+                answer_text = "I couldn't find any relevant passages in the workspace documents matching your query."
 
         faithfulness = getattr(response, "faithfulness", None)
-        if response.answer == "NOT_FOUND" or not response.answer:
+        if response.answer == "NOT_FOUND" or not response.answer or error_code == "incomplete_data":
             faithfulness = None
 
         citation_util = getattr(response, "citation_utilization_rate", None)
@@ -234,6 +255,9 @@ class QueryService:
             "retrieval_path": executed_path,
             "planned_path": planned_path,
             "executed_path": executed_path,
+            "status": status,
+            "error_code": error_code,
+            "structured_aggregate": getattr(response, "structured_aggregate", False),
             "faithfulness": faithfulness,
             "citation_utilization_rate": citation_util,
             "token_usage": usage,
@@ -245,6 +269,7 @@ class QueryService:
             "bge_lambda_calls": req_telemetry.bge_lambda_calls,
             "reranker_remote_calls": req_telemetry.reranker_remote_calls,
             "generation_calls": req_telemetry.generation_calls,
+            "structured_aggregate_calls": getattr(req_telemetry, "structured_aggregate_calls", 0),
             "telemetry": req_telemetry.to_dict(),
             "reranked_chunk_ids": retrieval_candidates.get("reranked", []),
             "compressed_context_chunk_ids": retrieval_candidates.get("compressed_context", []),
@@ -333,6 +358,8 @@ class QueryService:
             "type": "result",
             "data": res,
         }
+
+    execute = execute_query
 
 
 query_service = QueryService()

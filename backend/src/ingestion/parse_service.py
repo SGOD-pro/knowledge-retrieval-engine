@@ -87,6 +87,25 @@ def ingest_document(
     )
     chunks_list = list(doc.chunks)
 
+    # Structured table ingestion (runs independently before embedding)
+    if doc.source_format == "csv":
+        try:
+            from db.table_store import get_shared_table_store
+            from ingestion.csv_table_ingester import ingest_csv_to_table_store
+
+            store = get_shared_table_store()
+            res = ingest_csv_to_table_store(path, doc.id, workspace_id, store)
+            logger.info(
+                "parse_service.structured_ingested doc_id=%s source=%d persisted=%d rejected=%d complete=%s",
+                doc.id,
+                res.source_rows,
+                res.persisted_rows,
+                res.rejected_rows,
+                res.coverage_complete,
+            )
+        except Exception as e:
+            logger.error("parse_service.structured_ingest_failed doc_id=%s error=%s", doc.id, e)
+
     # Embed both columns
     try:
         from ingestion.embed_service import embed_chunks_dual

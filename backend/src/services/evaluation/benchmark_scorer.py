@@ -370,6 +370,96 @@ def grade_json_schema(answer: str, required_keys: list[str]) -> bool:
         return False
 
 
+def _split_into_clauses(text: str) -> list[str]:
+    """Split text into semantic clauses on semicolons, commas, and key conjunctions.
+    Comma-split is avoided when the comma is between two digits (e.g. '4,191').
+    """
+    # Split on semicolons or conjunctions; leave comma-separated numbers intact
+    parts = re.split(r';|\band\b|\bbut\b|\bwhere\b|,(?!\s*\d)', text, flags=re.IGNORECASE)
+    return [p.strip() for p in parts if p.strip()]
+
+
+# Role keyword synonyms: any of these words in a clause can satisfy the named role.
+_ROLE_SYNONYMS: dict[str, list[str]] = {
+    "dimension": ["dimension", "dimensional", "size", "dim", "dimensionality", "length"],
+    "annotation": ["annotation", "annotated", "annotations"],
+    "count":      ["count", "number", "vectors", "items", "elements", "outputs"],
+}
+
+
+def _role_keyword_in_clause(role_name: str, clause_lower: str) -> bool:
+    """Return True if the role or any of its synonyms appear in the clause."""
+    synonyms = _ROLE_SYNONYMS.get(role_name.lower(), [role_name.lower()])
+    return any(syn in clause_lower for syn in synonyms)
+
+
+def _numeric_adjacent_to_role(clause: str, role_name: str, target: "Decimal", tol: "Decimal") -> bool:
+    """True if `target` is the number most immediately before or modifying role_name in `clause`.
+
+    Strategy:
+    1. Tokenise the clause into alternating number/word spans.
+    2. Find the position of role_name (or synonym) within the token list.
+    3. The nearest number *to the left* of the role keyword wins the binding.
+       If two numbers are equidistant, reject (ambiguous).
+    4. If the role keyword appears *after* a number and before the next number,
+       the number immediately before the role wins.
+
+    This handles:
+    - '196 annotation vectors' → 196 binds annotation  ✓
+    - '512 annotation vectors; 196-dimensional' → 512 binds annotation (wrong) ✗
+    - '196 annotation feature vectors of size 512' → 196 binds annotation ✓, 512 binds dimension ✓
+    """
+    from decimal import Decimal, InvalidOperation
+
+    # Normalise Unicode minus before parsing
+    clause_norm = clause.replace("\u2212", "-")
+
+    synonyms = _ROLE_SYNONYMS.get(role_name.lower(), [role_name.lower()])
+
+    # Build token list: each token is (kind, value, start_char)
+    # kind = 'num' | 'role' | 'word'
+    token_re = re.compile(
+        r"(?P<num>[-+]?\b\d[\d,]*(?:\.\d+)?\b)"
+        r"|(?P<word>[A-Za-z][A-Za-z0-9\-]*)",
+        re.IGNORECASE,
+    )
+    tokens = []
+    for m in token_re.finditer(clause_norm):
+        if m.group("num"):
+            try:
+                tokens.append(("num", Decimal(m.group("num").replace(",", "")), m.start()))
+            except InvalidOperation:
+                pass
+        elif m.group("word"):
+            word = m.group("word").lower()
+            kind = "role" if any(syn == word for syn in synonyms) else "word"
+            tokens.append((kind, word, m.start()))
+
+    # Find role positions
+    role_positions = [i for i, t in enumerate(tokens) if t[0] == "role"]
+    if not role_positions:
+        return False
+
+    for rpos in role_positions:
+        # Find the nearest number to the LEFT of this role occurrence
+        nums_left = [(i, tokens[i][1]) for i in range(rpos) if tokens[i][0] == "num"]
+        if nums_left:
+            nearest_left_idx, nearest_left_val = nums_left[-1]
+            if abs(nearest_left_val - target) <= tol:
+                return True
+        else:
+            # No number to the left: check the number immediately to the RIGHT
+            # (e.g. 'each of size 512' — 'size' is the role, 512 is to its right)
+            nums_right = [(i, tokens[i][1]) for i in range(rpos + 1, len(tokens))
+                          if tokens[i][0] == "num"]
+            if nums_right:
+                nearest_right_idx, nearest_right_val = nums_right[0]
+                if abs(nearest_right_val - target) <= tol:
+                    return True
+
+    return False
+
+
 def grade_structured_numeric(answer: str, contract: dict) -> bool:
     """
     Grades numeric calculation answers against a structured contract.
@@ -378,8 +468,11 @@ def grade_structured_numeric(answer: str, contract: dict) -> bool:
       - target_values: list of Decimal/float values; all must be matched within
         strict *absolute* tolerance (not scaled). Use Decimal for precision.
       - required_roles: list of {"value": <number>, "role": <str>} dicts; the
-        answer must contain the value AND associate it with the named role.
-      - required_sign: '+' or '-'; applies to the primary result direction.
+        answer must associate the value with the named role using clause-based
+        binding (nearest-left number per clause). Synonyms are resolved for
+        well-known roles (dimension, annotation, count).
+      - required_sign: '-' means a negative signal must be present (negative number,
+        Unicode minus U+2212, or decrease direction word); '+' means positive.
       - required_direction: 'decrease' or 'increase'; for change questions.
       - required_units: list of unit keywords; at least one must appear.
       - tolerance: strict absolute tolerance (default 0.02). Not scaled by target.
@@ -387,9 +480,13 @@ def grade_structured_numeric(answer: str, contract: dict) -> bool:
     if not answer or answer.strip() in ("NOT_FOUND", ""):
         return False
 
-    ans_lower = answer.lower()
+    # Normalise Unicode minus (U+2212) to ASCII hyphen-minus before any processing
+    answer_norm = answer.replace("\u2212", "-")
+    ans_lower = answer_norm.lower()
 
     def _parse_decimals(text: str) -> list[Decimal]:
+        # Normalise unicode minus first
+        text = text.replace("\u2212", "-")
         nums = re.findall(r"[-+]?\b\d[\d,]*(?:\.\d+)?\b", text)
         result = []
         for n in nums:
@@ -399,17 +496,18 @@ def grade_structured_numeric(answer: str, contract: dict) -> bool:
                 pass
         return result
 
-    extracted = _parse_decimals(answer)
+    extracted = _parse_decimals(answer_norm)
     tol = Decimal(str(contract.get("tolerance", 0.02)))
     target_values = [Decimal(str(v)) for v in contract.get("target_values", [])]
 
     # --- Required direction (increase / decrease) ---
     req_direction = contract.get("required_direction")
     if req_direction == "decrease":
-        decrease_words = {"decrease", "fell", "fall", "decline", "declined", "dropped",
-                          "reduced", "lower", "loss", "negative change", "contraction"}
-        increase_words = {"increase", "grew", "growth", "rose", "risen", "gain",
-                          "positive change", "higher", "improvement", "addition"}
+        decrease_words = {"decrease", "decreased", "fell", "fall", "falling", "decline",
+                          "declined", "dropped", "reduced", "lower", "loss", "negative",
+                          "contraction", "shrunk", "shrinkage"}
+        increase_words = {"increase", "increased", "grew", "growth", "rose", "risen", "gain",
+                          "positive", "higher", "improvement", "addition"}
         words_in_ans = set(re.findall(r"\b\w+\b", ans_lower))
         has_decrease = bool(words_in_ans & decrease_words)
         has_increase = bool(words_in_ans & increase_words)
@@ -425,43 +523,56 @@ def grade_structured_numeric(answer: str, contract: dict) -> bool:
         if not (words_in_ans & increase_words):
             return False
 
-    # --- Required roles: value must appear in answer with the correct semantic role ---
+    # --- Required roles: clause-based value-role binding ---
     required_roles = contract.get("required_roles", [])
+    clauses = _split_into_clauses(answer_norm)
     for role_spec in required_roles:
         rv = Decimal(str(role_spec["value"]))
         role_name = role_spec["role"].lower()
-        # Find position of the role name in the answer
-        role_pos = ans_lower.find(role_name)
-        if role_pos == -1:
-            return False
-        # Find numbers near the role name (within 30 chars before and 40 after).
-        # A tight window prevents a number that is semantically associated with
-        # a different role (e.g. "196-dimensional" 41 chars from "annotation") from
-        # satisfying the wrong role binding.
-        window = answer[max(0, role_pos - 30): role_pos + 40]
-        window_nums = _parse_decimals(window)
-        if not any(abs(wn - rv) <= tol for wn in window_nums):
+
+        # Search every clause that contains the role keyword (or synonym)
+        binding_found = False
+        for clause in clauses:
+            clause_lower = clause.lower()
+            if _role_keyword_in_clause(role_name, clause_lower):
+                if _numeric_adjacent_to_role(clause, role_name, rv, tol):
+                    binding_found = True
+                    break
+        if not binding_found:
             return False
 
     # --- Check each target value using strict absolute tolerance ---
+    # When required_sign is '-' or 'negative', extracted values may be negative (e.g. -4191 from
+    # '-4,191 million'). A positive target (4191.0) matches its negated form abs(ev) as
+    # well as the literal form, so signed answers satisfy the magnitude requirement.
+    req_sign_for_matching = contract.get("required_sign")
     for target in target_values:
-        matched = any(abs(ev - target) <= tol for ev in extracted)
+        if req_sign_for_matching in ("-", "negative") and target > 0:
+            matched = any(abs(ev - target) <= tol or abs(abs(ev) - target) <= tol for ev in extracted)
+        else:
+            matched = any(abs(ev - target) <= tol for ev in extracted)
         if not matched:
             return False
 
     # --- Required sign ---
     req_sign = contract.get("required_sign")
-    if req_sign == "-":
+    if req_sign in ("-", "negative"):
         has_negative = (
             any(v < 0 for v in extracted)
             or "negative" in ans_lower
             or "minus" in ans_lower
             or "decrease" in ans_lower
+            or "decreased" in ans_lower
             or "fell" in ans_lower
+            or "fall" in ans_lower
+            or "decline" in ans_lower
+            or "declined" in ans_lower
+            or "dropped" in ans_lower
+            or "reduced" in ans_lower
         )
         if not has_negative:
             return False
-    elif req_sign == "+":
+    elif req_sign in ("+", "positive"):
         if any(v < 0 and any(abs(v + t) <= tol for t in target_values) for v in extracted):
             return False
 
@@ -523,8 +634,8 @@ def grade_structured_json(answer: str, contract: dict) -> bool:
         req_vals = contract.get("required_values", {})
         for k, expected_v in req_vals.items():
             actual_v = data.get(k)
-            # Strict type equality for required values
-            if actual_v != expected_v:
+            # Strict type AND value equality: int 108 ≠ float 108.0; bool True ≠ int 1
+            if type(actual_v) is not type(expected_v) or actual_v != expected_v:
                 return False
 
         return True
@@ -532,16 +643,47 @@ def grade_structured_json(answer: str, contract: dict) -> bool:
         return False
 
 
+def _split_sentences(text: str) -> list[str]:
+    """Split text into sentences using a decimal-aware boundary.
+    Does NOT split on '.' that is immediately preceded and followed by digits
+    (e.g. '$2.03' stays intact).
+    """
+    # We split using re.split with a decimal-aware sentence-boundary pattern.
+    # Sentence boundary: a period NOT flanked by digits on both sides,
+    # followed by optional whitespace and an uppercase letter OR end of string.
+    # Also split on '!' and '?' followed by whitespace.
+    parts = re.split(
+        r'(?<!\d)\.(?!\d)(?=\s+[A-Z]|\s*$)'
+        r'|[!?](?=\s+[A-Z]|\s*$)',
+        text,
+    )
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _sentence_is_locally_negated(sentence: str) -> bool:
+    """True only if THIS sentence leads with a negation marker (first 5 tokens).
+    A negation in a previous sentence does NOT propagate here.
+    """
+    tokens = re.findall(r'\b\w+\b', sentence.lower())[:5]
+    negation_starters = {"no", "not", "incorrect", "wrong", "false", "never",
+                         "isn't", "doesn't", "cannot", "can't"}
+    return bool(set(tokens) & negation_starters)
+
+
 def grade_structured_premise(answer: str, contract: dict) -> bool:
     """
     Grades premise correction questions against contract:
       - rejected_generic_responses: must not be a lazy exact-match dismissal
-      - reject_if_affirms_any: list of phrases; answer fails if any appear (affirms false premise)
+      - reject_if_affirms_any: list of phrases; each sentence is checked independently.
+        A sentence fails if it contains a reject phrase AND is not locally negated
+        (leading negation marker within first 5 tokens of THAT sentence).
+        A negation in a prior sentence does NOT pardon a false assertion in a
+        subsequent sentence.
       - key_correction_terms: all required correction terms must appear in the answer
       - expected_answer: fallback content_match check when no key_correction_terms
 
-    An answer that affirms the false premise fails even if it contains
-    some correction language — the affirmation overrides.
+    An answer that affirms the false premise in any sentence (without local negation)
+    fails even if other sentences contain correction language.
     """
     if not answer or answer.strip() in ("NOT_FOUND", ""):
         return False
@@ -553,11 +695,33 @@ def grade_structured_premise(answer: str, contract: dict) -> bool:
     if ans_clean in rejected or len(tokenize(ans_clean)) < 3:
         return False
 
-    # Reject if the answer affirms the false premise
+    # Reject if any sentence affirms the false premise without sentence-local negation
     reject_affirmations = contract.get("reject_if_affirms_any", [])
-    for phrase in reject_affirmations:
-        if phrase.lower() in ans_clean:
-            return False
+    if reject_affirmations:
+        sentences = _split_sentences(answer.strip())
+        for sentence in sentences:
+            sentence_lower = sentence.lower()
+            for phrase in reject_affirmations:
+                if phrase.lower() in sentence_lower:
+                    # Only pardon if THIS sentence starts with a negation
+                    if not _sentence_is_locally_negated(sentence):
+                        return False
+                    # Even a locally-negated sentence fails if it contains a reject
+                    # phrase that is NOT itself negated — e.g. "No, the correct unit
+                    # is wrong" → sentence starts with "No" but "correct unit" is
+                    # an affirmation phrase. We only pardon when the reject phrase
+                    # is part of the corrective statement (i.e. used to deny the premise).
+                    # Since we cannot reliably detect this without NLI, we apply a
+                    # conservative rule: a locally-negated sentence that contains a
+                    # reject phrase passes ONLY if the reject phrase is immediately
+                    # preceded by a negation word within 6 tokens.
+                    phrase_pos = sentence_lower.find(phrase.lower())
+                    preceding = sentence_lower[max(0, phrase_pos - 50):phrase_pos]
+                    preceding_tokens = re.findall(r'\b\w+\b', preceding)[-6:]
+                    local_negators = {"no", "not", "incorrect", "wrong", "false",
+                                      "never", "isn't", "doesn't", "cannot"}
+                    if not set(preceding_tokens) & local_negators:
+                        return False
 
     # All key correction terms must appear verbatim
     key_terms = contract.get("key_correction_terms", [])
@@ -597,6 +761,38 @@ def validate_citations(
     gt_matched_count = 0
 
     for idx, c in enumerate(citations):
+        if c.get("evidence_type") == "structured_aggregate":
+            table_id = c.get("table_id")
+            doc_ver = c.get("document_version")
+            op = c.get("operator")
+            target_col = c.get("target_column")
+            sel_hash = c.get("selection_hash")
+            sel_count = c.get("selection_count", 0)
+
+            if not table_id:
+                errors.append(f"Citation {idx}: missing table_id in structured evidence")
+                continue
+            if not doc_ver:
+                errors.append(f"Citation {idx}: missing document_version in structured evidence")
+                continue
+            if not op:
+                errors.append(f"Citation {idx}: missing operator in structured evidence")
+                continue
+            if not target_col:
+                errors.append(f"Citation {idx}: missing target_column in structured evidence")
+                continue
+            if not sel_hash or len(sel_hash) != 16:
+                errors.append(f"Citation {idx}: invalid selection_hash in structured evidence")
+                continue
+            if sel_count < 1:
+                errors.append(f"Citation {idx}: selection_count must be >= 1 in structured evidence")
+                continue
+
+            valid_count += 1
+            if gt_set is not None:
+                gt_matched_count += 1
+            continue
+
         cid = str(c.get("chunk_id", ""))
         doc_file = c.get("document_filename", "")
         loc_ref = c.get("location_reference", "")

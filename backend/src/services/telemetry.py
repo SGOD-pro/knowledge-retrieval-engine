@@ -14,6 +14,7 @@ class RequestTelemetry:
     bge_lambda_calls: int = 0
     reranker_remote_calls: int = 0
     generation_calls: int = 0
+    structured_aggregate_calls: int = 0
 
     def to_dict(self) -> dict[str, int]:
         return asdict(self)
@@ -62,3 +63,10 @@ def record_generation() -> None:
     telemetry = _current_telemetry.get()
     if telemetry is not None:
         telemetry.generation_calls += 1
+
+
+def record_structured_aggregate() -> None:
+    telemetry = _current_telemetry.get()
+    if telemetry is not None:
+        telemetry.structured_aggregate_calls += 1
+

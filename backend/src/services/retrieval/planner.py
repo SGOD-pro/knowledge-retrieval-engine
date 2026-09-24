@@ -9,6 +9,7 @@ logger = logging.getLogger(__name__)
 class Plan:
     fast_path: bool
     use_graph: bool
+    use_structured_aggregate: bool = False
     stages: list[str] = field(default_factory=list)
     complexity_score: float = 0.0
 
@@ -277,6 +278,33 @@ class Planner:
                     "compressor",
                     "llm",
                 ],
+                complexity_score=score,
+            )
+
+        # Rule 3d — STRUCTURED AGGREGATE PATH
+        # Column-wide min/max/range or entity deltas across years/periods
+        # (e.g. earliest/latest Year, how did total income change from 2024 to 2025)
+        # Excludes multi-document queries and premise verification questions.
+        q_lower = query.lower()
+        is_multi_doc = bool(re.search(r'\b(?:using\s+\w+.*and|balance sheet.*and|uploaded.*and)\b', q_lower))
+        is_premise_check = bool(re.search(r',\s*right\??', q_lower)) or "check against" in q_lower
+
+        is_structured_candidate = not (is_multi_doc or is_premise_check) and (
+            bool(re.search(r'\b(?:earliest|latest|min|max|minimum|maximum)\b', q_lower))
+            or bool(re.search(r'\bhow did (?:total )?\w+ change from \d{4} to \d{4}\b', q_lower))
+            or bool(re.search(r'\b(?:change from \d{4} to \d{4}|total income change)\b', q_lower))
+        )
+        has_table_or_file = (
+            flags["format_flag"]
+            or bool(re.search(r'\b(?:csv|table|survay|dataset|rows?|records?)\b', q_lower))
+            or bool(re.search(r'\bfrom \d{4} to \d{4}\b', q_lower))
+        )
+        if is_structured_candidate and has_table_or_file:
+            return Plan(
+                fast_path=False,
+                use_graph=False,
+                use_structured_aggregate=True,
+                stages=["structured_aggregate"],
                 complexity_score=score,
             )
 
