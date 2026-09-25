@@ -74,7 +74,8 @@ assert res.result_value == 2013
 assert res.secondary_value == 2025
 
 cit = build_structured_evidence_ref(res, '{ws}')
-val = validate_citations([cit])
+retained = {{res.selection_hash}}
+val = validate_citations([cit], retained_structured_hashes=retained)
 assert val['valid'] is True, f"Citation validation failed: {{val['errors']}}"
 print('QUERY_SUCCESS', res.answer_text, cit['selection_hash'])
 """

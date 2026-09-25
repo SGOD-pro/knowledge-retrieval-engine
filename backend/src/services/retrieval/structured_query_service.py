@@ -296,28 +296,84 @@ class StructuredQueryService:
         year_idx, _ = self._find_column_by_semantic_match(["year"], schema)
         val_idx, val_col_name = self._find_column_by_semantic_match(["value", "amount", "total"], schema)
 
-        # Entity filter (e.g. 99999 or All industries)
+        # Year-based predicates (always required)
         predicates_start: list[Predicate] = [Predicate(column_index=year_idx, op=PredicateOp.EQ, value=year_start)]
         predicates_end: list[Predicate] = [Predicate(column_index=year_idx, op=PredicateOp.EQ, value=year_end)]
         pred_cols = ["Year"]
         pred_vals = [f"{year_start},{year_end}"]
 
-        # Check for industry code or variable code in query
-        if "99999" in query:
-            ind_idx, _ = self._find_column_by_semantic_match(["industry_code_nzsioc", "industry_code"], schema)
-            predicates_start.append(Predicate(column_index=ind_idx, op=PredicateOp.EQ, value="99999"))
-            predicates_end.append(Predicate(column_index=ind_idx, op=PredicateOp.EQ, value="99999"))
-            pred_cols.append("Industry_code_NZSIOC")
-            pred_vals.append("99999")
+        # Probe-based filter extraction: collect candidate filter terms from the query, then
+        # verify each against actual stored column values.  No hardcoded column names or values.
+        #
+        # Candidates come from:
+        #   a) Terms inside parentheses: "All industries (99999)" → "99999"
+        #   b) Quoted strings: '"Total income"' → "Total income"
+        #   c) Consecutive capitalized or all-digit tokens (2+ chars) not already used as years.
+        candidates: list[str] = []
 
-        if "total income" in query.lower() or "income" in query.lower():
-            var_idx, _ = self._find_column_by_semantic_match(["variable_code", "variable_name"], schema)
-            # Try H01 or Total income
-            var_name_idx, _ = self._find_column_by_semantic_match(["variable_name"], schema)
-            predicates_start.append(Predicate(column_index=var_name_idx, op=PredicateOp.EQ, value="Total income"))
-            predicates_end.append(Predicate(column_index=var_name_idx, op=PredicateOp.EQ, value="Total income"))
-            pred_cols.append("Variable_name")
-            pred_vals.append("Total income")
+        # a) Parenthesized terms
+        candidates += re.findall(r'\(([^)]+)\)', query)
+
+        # b) Quoted phrases
+        candidates += re.findall(r'"([^"]+)"', query)
+        candidates += re.findall(r"'([^']+)'", query)
+
+        # c) Title-case multi-word noun phrases (2–4 words)
+        candidates += re.findall(r'\b([A-Z][a-z]+(?: [a-z]* ?[A-Z]?[a-z]+){1,3})\b', query)
+
+        # Filter: skip year tokens, pure punctuation, and single-word stopwords
+        skip_words = {
+            "from", "between", "table", "rows", "records", "year", "years", "month",
+            "how", "did", "change", "what", "the", "and", "for", "all", "give",
+        }
+        filtered_candidates = []
+        for c in candidates:
+            c = c.strip()
+            if not c:
+                continue
+            # Skip if it's a year already captured
+            if re.fullmatch(r'20\d{2}|19\d{2}', c):
+                continue
+            if c.lower() in skip_words:
+                continue
+            filtered_candidates.append(c)
+
+        # Remove duplicates while preserving order
+        seen: set[str] = set()
+        unique_candidates: list[str] = []
+        for c in filtered_candidates:
+            if c.lower() not in seen:
+                seen.add(c.lower())
+                unique_candidates.append(c)
+
+        # Probe without any predicate to sample diverse column values (limit=200 for coverage).
+        # This maximises the chance of finding categorical values like "99999" or "Total income".
+        try:
+            probe_rows = self.store.query_rows(
+                table_id, workspace_id, predicates=[], limit=200, version=version
+            )
+        except Exception:
+            probe_rows = []
+
+        already_bound: set[int] = {year_idx, val_idx}
+        for cand in unique_candidates:
+            cand_lower = cand.lower().strip()
+            for col in schema.columns:
+                if col.col_index in already_bound:
+                    continue
+                # Check if cand appears as a cell value in this column
+                for row in probe_rows:
+                    try:
+                        cell_val = str(row.cells[col.col_index].normalized_value).strip()
+                    except (IndexError, AttributeError):
+                        continue
+                    if cell_val.lower() == cand_lower or cell_val == cand:
+                        predicates_start.append(Predicate(column_index=col.col_index, op=PredicateOp.EQ, value=cell_val))
+                        predicates_end.append(Predicate(column_index=col.col_index, op=PredicateOp.EQ, value=cell_val))
+                        pred_cols.append(col.name)
+                        pred_vals.append(cell_val)
+                        already_bound.add(col.col_index)
+                        break  # cand bound to this column
 
         # Execute queries for period 1 and period 2
         try:
@@ -341,13 +397,23 @@ class StructuredQueryService:
         direction = "fell" if delta < 0 else "increased"
         pct_change = (abs_delta / v1) * Decimal("100")
 
-        # Units check
-        unit = "million"
+        # Derive unit label from the schema: look for a 'unit' column; fallback to None.
+        unit: str | None = None
+        for col in schema.columns:
+            if "unit" in col.name.lower():
+                # Read unit value from the first result row
+                try:
+                    unit = str(r1.cells[col.col_index].normalized_value).strip() or None
+                except (IndexError, AttributeError):
+                    pass
+                break
+
+        unit_label = f" {unit}" if unit else ""
         answer_text = (
-            f"It {direction} by {abs_delta:,} million dollars, from {v1:,} to {v2:,}, "
+            f"It {direction} by {abs_delta:,}{unit_label}, from {v1:,} to {v2:,}, "
             f"a decline of approximately {pct_change:.2f}%."
             if delta < 0 else
-            f"It {direction} by {abs_delta:,} million dollars, from {v1:,} to {v2:,}, "
+            f"It {direction} by {abs_delta:,}{unit_label}, from {v1:,} to {v2:,}, "
             f"an increase of approximately {pct_change:.2f}%."
         )
 

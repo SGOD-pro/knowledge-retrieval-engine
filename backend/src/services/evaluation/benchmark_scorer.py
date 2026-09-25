@@ -743,13 +743,16 @@ def validate_citations(
     citations: list[dict],
     context_chunk_ids: list[str] | set[str] | None = None,
     ground_truth_chunk_ids: list[str] | set[str] | None = None,
+    retained_structured_hashes: set[str] | None = None,
 ) -> dict[str, Any]:
-    """
-    Validates that citations:
+    """Validates that citations:
       1. Have non-empty document_filename and chunk_id.
       2. If context_chunk_ids provided, chunk_id MUST exist in the retrieved compressed context.
       3. If ground_truth_chunk_ids provided, at least one citation must match ground-truth chunk IDs.
       4. Have valid page_number (> 0) or non-empty location_reference.
+      5. Structured-aggregate citations: selection_hash must be 16 hex chars AND, when
+         retained_structured_hashes is provided, must be present in that set (i.e. the hash
+         must correspond to an actual query that was executed during this request — not invented).
     """
     if not citations:
         return {"valid": True, "citation_count": 0, "errors": []}
@@ -786,6 +789,13 @@ def validate_citations(
                 continue
             if sel_count < 1:
                 errors.append(f"Citation {idx}: selection_count must be >= 1 in structured evidence")
+                continue
+            # Phase 4: verify hash matches a real executed query when caller supplies retained hashes
+            if retained_structured_hashes is not None and sel_hash not in retained_structured_hashes:
+                errors.append(
+                    f"Citation {idx}: selection_hash '{sel_hash}' not in retained execution evidence "
+                    f"(fabricated or stale citation)"
+                )
                 continue
 
             valid_count += 1
