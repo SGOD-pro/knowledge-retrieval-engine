@@ -418,7 +418,8 @@ def run_benchmark(
         ans_is_refusal = any(ind in ans_text.lower() for ind in refusal_indicators) or ans_text.strip() == "NOT_FOUND"
 
         is_infra_error = (resp.get("status") == "error" or bool(resp.get("error_code")))
-
+        is_correct = False
+        is_refusal = False
         if contract_type == "refusal":
             refusal_total += 1
             if is_infra_error:
