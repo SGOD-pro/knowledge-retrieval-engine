@@ -79,6 +79,8 @@ class PipelineState(TypedDict):
     reranker_mode: str
     status: str | None
     error_code: str | None
+    selected_strategies: dict[str, Any] | None
+    retained_evidence_items: list[Any]
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +121,7 @@ def _rrf_merge(
 def route_query(state: PipelineState):
     t0 = time.perf_counter()
     from services.retrieval.planner import planner
+    from services.retrieval.strategy_router import StrategyRouter
 
     # 1. Route query deterministically without remote embedding calls
     plan = planner.route(state["query"])
@@ -126,7 +129,10 @@ def route_query(state: PipelineState):
         from dataclasses import replace
         plan = replace(plan, fast_path=False, use_structured_aggregate=False)
 
-    is_structured = getattr(plan, "use_structured_aggregate", False)
+    router = StrategyRouter()
+    selected_strategies = router.route(state["query"], plan=plan)
+
+    is_structured = getattr(plan, "use_structured_aggregate", False) or ("structured_table" in selected_strategies.primary)
 
     # 2. Re-use existing query_embedding if provided by query_service;
     # only embed via Titan if full path is chosen (not structured and not fast-path)
@@ -142,12 +148,13 @@ def route_query(state: PipelineState):
     else:
         planned = "fast" if plan.fast_path else "full"
 
-    logger.info("route_query.latency_ms=%.2f fast_path=%s planned=%s", latency_ms, plan.fast_path, planned)
+    logger.info("route_query.latency_ms=%.2f fast_path=%s planned=%s primary_strategies=%s", latency_ms, plan.fast_path, planned, selected_strategies.primary)
     return {
         "query_embedding": query_embedding,
         "plan": plan,
         "planned_path": planned,
         "executed_path": planned,
+        "selected_strategies": selected_strategies.to_dict(),
         "stage_timings": {"route_query_ms": latency_ms},
     }
 
@@ -425,8 +432,33 @@ def run_reranker(state: PipelineState):
         "reranked": [str(c.id) for c in top_chunks],
     }
 
+    from services.retrieval.evidence_contract import evidence_item_from_chunk
+    retained_evidence_items = []
+    ws_id = state.get("workspace_id", "")
+    for c in top_chunks:
+        strat = getattr(c, "strategy", None) or (c.metadata.get("strategy") if isinstance(getattr(c, "metadata", None), dict) else None)
+        if not strat:
+            if c in vector:
+                strat = "vector_rerank"
+            elif c in bm25:
+                strat = "bm25"
+            elif c in graph:
+                strat = "knowledge_graph"
+            else:
+                strat = "vector_rerank"
+        if isinstance(getattr(c, "metadata", None), dict):
+            c.metadata["strategy"] = strat
+        ev = evidence_item_from_chunk(
+            chunk=c,
+            workspace_id=ws_id,
+            strategy=strat,
+            score=getattr(c, "reranker_score", 0.0),
+        )
+        retained_evidence_items.append(ev)
+
     return {
         "top_chunks": top_chunks,
+        "retained_evidence_items": retained_evidence_items,
         "retrieval_candidates": retrieval_candidates,
         "reranker_mode": reranker_mode,
         "executed_path": "full",
@@ -648,6 +680,7 @@ def run_llm(state: PipelineState):
         "citation_utilization_rate": citation_utilization_rate,
         "usage": usage,
         "executed_path": "full",
+        "status": "success",
         "retrieval_candidates": cands,
         "stage_timings": {**existing, "llm_ms": latency_ms},
     }
@@ -705,7 +738,11 @@ def end_fast_path(state: PipelineState):
 
         latency_ms = (time.perf_counter() - t0) * 1000.0
         logger.info("fast_path.verified_factual answer='%s' latency_ms=%.2f", answer[:50], latency_ms)
-        existing = state.get("stage_timings", {})
+        from services.retrieval.evidence_contract import evidence_item_from_chunk
+        retained_evidence_items = [
+            evidence_item_from_chunk(c, workspace_id=state.get("workspace_id", ""), strategy="vector_rerank")
+            for c in top_chunks
+        ]
         return {
             "final_answer": answer,
             "confidence_score": float(conf),
@@ -714,7 +751,9 @@ def end_fast_path(state: PipelineState):
             "usage": {"input_tokens": 0, "output_tokens": 0},
             "top_chunks": top_chunks,
             "citations": [citation],
+            "retained_evidence_items": retained_evidence_items,
             "executed_path": "fast",
+            "status": "success",
             "retrieval_candidates": {
                 "reranked": [str(c.id) for c in top_chunks],
                 "compressed_context": [str(c.id) for c in top_chunks],
@@ -761,6 +800,11 @@ def end_fast_path(state: PipelineState):
 
         latency_ms = (time.perf_counter() - t0) * 1000.0
         existing = state.get("stage_timings", {})
+        from services.retrieval.evidence_contract import evidence_item_from_chunk
+        retained_evidence_items = [
+            evidence_item_from_chunk(c, workspace_id=state.get("workspace_id", ""), strategy="vector_rerank")
+            for c in top_chunks
+        ]
         return {
             "final_answer": answer,
             "confidence_score": float(conf),
@@ -769,7 +813,9 @@ def end_fast_path(state: PipelineState):
             "usage": {"input_tokens": 0, "output_tokens": 0},
             "top_chunks": top_chunks,
             "citations": citations,
+            "retained_evidence_items": retained_evidence_items,
             "executed_path": "fast",
+            "status": "success",
             "retrieval_candidates": {
                 "reranked": [str(c.id) for c in top_chunks],
                 "compressed_context": [str(c.id) for c in top_chunks],
@@ -881,7 +927,9 @@ def run_structured_aggregate(state: PipelineState):
 
 def route_after_route_query(state: PipelineState) -> str:
     plan = state.get("plan")
-    if plan and getattr(plan, "use_structured_aggregate", False):
+    selected = state.get("selected_strategies", {}) or {}
+    primary = selected.get("primary", [])
+    if (plan and getattr(plan, "use_structured_aggregate", False)) or ("structured_table" in primary):
         return "run_structured_aggregate"
     return "run_okf_router"
 
@@ -1038,6 +1086,8 @@ class Pipeline:
             "citation_utilization_rate": None,
             "status": "pending",
             "error_code": None,
+            "selected_strategies": None,
+            "retained_evidence_items": [],
         }
 
         final_state = app.invoke(initial_state)
@@ -1057,6 +1107,24 @@ class Pipeline:
                 self.execution_result = state.get("execution_result", None)
                 self.status = state.get("status", "success")
                 self.error_code = state.get("error_code")
+                self.retained_evidence_items = state.get("retained_evidence_items", [])
+                self.selected_strategies = state.get("selected_strategies", {})
+
+                # Ensure every citation carries the strategy of its matched retained evidence item
+                retained_map = {str(ev.evidence_id): ev.strategy for ev in self.retained_evidence_items}
+                for ev in self.retained_evidence_items:
+                    loc_cid = ev.locator.get("chunk_id")
+                    if loc_cid:
+                        retained_map[str(loc_cid)] = ev.strategy
+                    tbl_id = ev.locator.get("table_id")
+                    if tbl_id:
+                        retained_map[str(tbl_id)] = ev.strategy
+                for cit in self.citations:
+                    if isinstance(cit, dict) and not cit.get("strategy"):
+                        cid = str(cit.get("chunk_id", ""))
+                        tid = str(cit.get("table_id", ""))
+                        cit["strategy"] = retained_map.get(cid) or retained_map.get(tid) or "vector_rerank"
+
                 plan = state.get("plan")
                 self.fast_path = plan.fast_path if plan else False
                 self.stages = plan.stages if plan else []

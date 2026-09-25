@@ -744,6 +744,7 @@ def validate_citations(
     context_chunk_ids: list[str] | set[str] | None = None,
     ground_truth_chunk_ids: list[str] | set[str] | None = None,
     retained_structured_hashes: set[str] | None = None,
+    retained_evidence_items: list[Any] | None = None,
 ) -> dict[str, Any]:
     """Validates that citations:
       1. Have non-empty document_filename and chunk_id.
@@ -751,11 +752,40 @@ def validate_citations(
       3. If ground_truth_chunk_ids provided, at least one citation must match ground-truth chunk IDs.
       4. Have valid page_number (> 0) or non-empty location_reference.
       5. Structured-aggregate citations: selection_hash must be 16 hex chars AND, when
-         retained_structured_hashes is provided, must be present in that set (i.e. the hash
-         must correspond to an actual query that was executed during this request — not invented).
+         retained_structured_hashes or retained_evidence_items is provided, must match an actual query
+         executed and retained for this request (not invented).
+      6. When retained_evidence_items is provided, every citation must map back to an EvidenceItem
+         retained for this request.
     """
     if not citations:
         return {"valid": True, "citation_count": 0, "errors": []}
+
+    # Extract retained hashes and chunk IDs from retained_evidence_items if provided
+    retained_chunk_ids: set[str] | None = None
+    all_retained_hashes: set[str] | None = set(retained_structured_hashes) if retained_structured_hashes is not None else None
+
+    if retained_evidence_items is not None:
+        retained_chunk_ids = set()
+        if all_retained_hashes is None:
+            all_retained_hashes = set()
+        for item in retained_evidence_items:
+            ev_id = str(getattr(item, "evidence_id", ""))
+            if ev_id:
+                retained_chunk_ids.add(ev_id)
+            locator = getattr(item, "locator", {}) or {}
+            c_locator_id = locator.get("chunk_id")
+            if c_locator_id:
+                retained_chunk_ids.add(str(c_locator_id))
+            c_payload = getattr(item, "citation_payload", {}) or {}
+            cp_id = c_payload.get("chunk_id")
+            if cp_id:
+                retained_chunk_ids.add(str(cp_id))
+
+            # Structured payload / hashes
+            sp = getattr(item, "structured_payload", {}) or {}
+            shash = sp.get("selection_hash") or locator.get("selection_hash") or c_payload.get("selection_hash")
+            if shash:
+                all_retained_hashes.add(str(shash))
 
     context_set = set(context_chunk_ids) if context_chunk_ids is not None else None
     gt_set = set(ground_truth_chunk_ids) if ground_truth_chunk_ids else None
@@ -790,8 +820,8 @@ def validate_citations(
             if sel_count < 1:
                 errors.append(f"Citation {idx}: selection_count must be >= 1 in structured evidence")
                 continue
-            # Phase 4: verify hash matches a real executed query when caller supplies retained hashes
-            if retained_structured_hashes is not None and sel_hash not in retained_structured_hashes:
+            # Verify hash matches a real executed query when caller supplies retained hashes/evidence
+            if all_retained_hashes is not None and sel_hash not in all_retained_hashes:
                 errors.append(
                     f"Citation {idx}: selection_hash '{sel_hash}' not in retained execution evidence "
                     f"(fabricated or stale citation)"
@@ -813,6 +843,9 @@ def validate_citations(
             continue
         if context_set is not None and cid not in context_set:
             errors.append(f"Citation {idx}: chunk_id {cid} not in context chunk IDs")
+            continue
+        if retained_chunk_ids is not None and cid not in retained_chunk_ids:
+            errors.append(f"Citation {idx}: chunk_id {cid} not in retained evidence items")
             continue
         if not doc_file:
             errors.append(f"Citation {idx}: missing document_filename")

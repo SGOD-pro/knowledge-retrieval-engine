@@ -38,6 +38,7 @@ class Citation:
     text: str = ""
     document_filename: str = ""
     page_number: int | None = None
+    strategy: str = ""
     # Presigned S3 URLs for images co-extracted with this chunk.
     # Generated fresh per query so they are never stale.
     image_urls: tuple[str, ...] = ()
@@ -145,6 +146,12 @@ def build_citation(
                 pass
         image_urls = tuple(urls)
 
+    strat = (
+        getattr(chunk, "strategy", "")
+        or ((chunk.metadata or {}).get("strategy") if isinstance(getattr(chunk, "metadata", None), dict) else "")
+        or "vector_rerank"
+    )
+
     return Citation(
         chunk_id=chunk.id,
         document_id=str(chunk.document_id),
@@ -155,6 +162,7 @@ def build_citation(
         location_reference=loc_ref,
         text=chunk.text[:500],
         text_snippet=chunk.text[:200],
+        strategy=strat,
         image_urls=image_urls,
     )
 

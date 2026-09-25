@@ -417,19 +417,22 @@ def run_benchmark(
         ]
         ans_is_refusal = any(ind in ans_text.lower() for ind in refusal_indicators) or ans_text.strip() == "NOT_FOUND"
 
-        # Evaluate answer correctness
-        is_correct = False
-        is_refusal = False
+        is_infra_error = (resp.get("status") == "error" or bool(resp.get("error_code")))
 
         if contract_type == "refusal":
             refusal_total += 1
-            if ans_is_refusal:
+            if is_infra_error:
+                # Requirement 15: Infrastructure failure is scored as incorrect or unmeasured, never as a correct refusal
+                is_correct = False
+                is_refusal = False
+                false_answer_count += 1
+            elif ans_is_refusal:
                 refusal_correct += 1
                 is_correct = True
                 is_refusal = True
             else:
                 false_answer_count += 1
-            if len(top_citations) > 0:
+            if len(top_citations) > 0 and not is_infra_error:
                 unsupported_citation_count += 1
         elif contract_type == "numeric":
             is_correct = grade_structured_numeric(ans_text, contract)

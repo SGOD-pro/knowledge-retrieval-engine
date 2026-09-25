@@ -37,6 +37,7 @@ def build_structured_evidence_ref(result: StructuredQueryResult, workspace_id: s
         "secondary_value": str(result.secondary_value) if result.secondary_value is not None else None,
         "schema_binding_confidence": result.schema_binding_confidence,
         "location_reference": f"{result.selection_count} row(s) from {result.table_id}",
+        "strategy": "structured_table",
         "text": result.answer_text,
         "text_snippet": result.answer_text[:200],
     }
@@ -106,9 +107,40 @@ def execute(state: dict[str, Any]) -> dict[str, Any]:
     record_structured_aggregate()
 
     citation = build_structured_evidence_ref(result, workspace_id)
+    from services.retrieval.evidence_contract import EvidenceItem
+    ev_item = EvidenceItem(
+        evidence_id=f"table_{result.table_id}_{result.selection_hash}",
+        workspace_id=workspace_id,
+        document_id=result.document_id,
+        document_version=result.document_version,
+        source_type="table_row_set",
+        locator={
+            "table_id": result.table_id,
+            "selection_hash": result.selection_hash,
+            "row_ids": result.row_ids,
+            "selection_count": result.selection_count,
+            "total_rows_in_table": result.total_rows_in_table,
+            "location_reference": citation["location_reference"],
+        },
+        text=result.answer_text,
+        structured_payload={
+            "table_id": result.table_id,
+            "document_version": result.document_version,
+            "operator": result.operator,
+            "target_column": result.target_column,
+            "selection_hash": result.selection_hash,
+            "selection_count": result.selection_count,
+        },
+        score=result.overall_confidence,
+        strategy="structured_table",
+        provenance={"table_id": result.table_id, "row_indices": result.row_indices},
+        citation_payload=citation,
+    )
+
     return {
         "final_answer": result.answer_text,
         "citations": [citation],
+        "retained_evidence_items": [ev_item],
         "confidence_score": result.overall_confidence,
         "faithfulness": None,
         "citation_utilization_rate": None,
