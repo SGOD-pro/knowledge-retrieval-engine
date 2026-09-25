@@ -261,48 +261,48 @@ class DocumentsRepository:
         from boto3.dynamodb.conditions import Key
 
         if workspace_id:
-            try:
-                response = self.table.query(
-                    IndexName="GSI1",
-                    KeyConditionExpression=Key("GSI1PK").eq(f"WORKSPACE#{workspace_id}")
-                    & Key("GSI1SK").begins_with("CHUNK#"),
-                )
-                items = response.get("Items", [])
-                while "LastEvaluatedKey" in response:
+            from services.retrieval.bm25_retriever import get_cached_chunks
+
+            def _fetch_workspace_chunks() -> list[Chunk]:
+                try:
                     response = self.table.query(
                         IndexName="GSI1",
                         KeyConditionExpression=Key("GSI1PK").eq(f"WORKSPACE#{workspace_id}")
                         & Key("GSI1SK").begins_with("CHUNK#"),
-                        ExclusiveStartKey=response["LastEvaluatedKey"],
                     )
-                    items.extend(response.get("Items", []))
+                    items = response.get("Items", [])
+                    while "LastEvaluatedKey" in response:
+                        response = self.table.query(
+                            IndexName="GSI1",
+                            KeyConditionExpression=Key("GSI1PK").eq(f"WORKSPACE#{workspace_id}")
+                            & Key("GSI1SK").begins_with("CHUNK#"),
+                            ExclusiveStartKey=response["LastEvaluatedKey"],
+                        )
+                        items.extend(response.get("Items", []))
+                    return [self._parse_chunk(row) for row in items]
+                except Exception as e:
+                    logger.warning("DynamoDB GSI1 query failed for workspace %s: %s", workspace_id, e)
+                    from boto3.dynamodb.conditions import Attr
 
-                chunks = [self._parse_chunk(row) for row in items]
-                if document_ids is not None:
-                    doc_id_set = set(document_ids)
-                    chunks = [c for c in chunks if str(c.document_id) in doc_id_set]
-                return chunks
-            except Exception as e:
-                logger.warning("DynamoDB GSI1 query failed for workspace %s: %s", workspace_id, e)
-                from boto3.dynamodb.conditions import Attr
-
-                resp = self.table.scan(
-                    FilterExpression=Attr("workspace_id").eq(workspace_id)
-                    & Attr("SK").begins_with("CHUNK#")
-                )
-                items = resp.get("Items", [])
-                while "LastEvaluatedKey" in resp:
                     resp = self.table.scan(
                         FilterExpression=Attr("workspace_id").eq(workspace_id)
-                        & Attr("SK").begins_with("CHUNK#"),
-                        ExclusiveStartKey=resp["LastEvaluatedKey"],
+                        & Attr("SK").begins_with("CHUNK#")
                     )
-                    items.extend(resp.get("Items", []))
-                chunks = [self._parse_chunk(row) for row in items]
-                if document_ids is not None:
-                    doc_id_set = set(document_ids)
-                    chunks = [c for c in chunks if str(c.document_id) in doc_id_set]
-                return chunks
+                    items = resp.get("Items", [])
+                    while "LastEvaluatedKey" in resp:
+                        resp = self.table.scan(
+                            FilterExpression=Attr("workspace_id").eq(workspace_id)
+                            & Attr("SK").begins_with("CHUNK#"),
+                            ExclusiveStartKey=resp["LastEvaluatedKey"],
+                        )
+                        items.extend(resp.get("Items", []))
+                    return [self._parse_chunk(row) for row in items]
+
+            chunks = get_cached_chunks(workspace_id, _fetch_workspace_chunks)
+            if document_ids is not None:
+                doc_id_set = set(document_ids)
+                chunks = [c for c in chunks if str(c.document_id) in doc_id_set]
+            return chunks
         elif document_ids is not None:
             chunks = []
             for d in document_ids:

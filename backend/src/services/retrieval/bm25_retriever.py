@@ -14,7 +14,7 @@ import re
 
 # Workspace-level chunk cache with TTL to avoid repeated DynamoDB full scans
 _CHUNK_CACHE: dict[str, tuple[float, list[Chunk]]] = {}  # key -> (expiry_timestamp, chunks)
-_CHUNK_CACHE_TTL = 300.0  # 5 minutes
+_CHUNK_CACHE_TTL = 3600.0  # 1 hour cache to prevent repetitive DynamoDB scans
 
 
 def get_cached_chunks(workspace_id: str, loader_fn, corpus_version: str = "") -> list[Chunk]:
