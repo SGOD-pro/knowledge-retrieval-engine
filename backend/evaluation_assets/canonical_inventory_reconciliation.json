@@ -1,0 +1,172 @@
+{
+  "workspace_id": "ws_fresh_benchmark",
+  "manifest_path": "data/test.json",
+  "total_documents": 9,
+  "total_dynamodb_chunks": 963,
+  "total_qdrant_points": 963,
+  "identity_reconciliation_passed": true,
+  "documents": [
+    {
+      "filename": "2212.14776v3.pdf",
+      "document_id": "146d0881-4242-5d5d-9eba-733f4aed0ff2",
+      "source_path": "data/academic_research/set_aside/2212.14776v3.pdf",
+      "source_size_bytes": 3405123,
+      "source_sha256": "bce22600474513c61b8c47701d19275bb465dae909f1ede1598521dcf0ba57da",
+      "dynamodb_chunk_count": 25,
+      "qdrant_point_count": 25,
+      "identity_sets_identical": true,
+      "chunk_ids_sample": [
+        "146d0881-4242-5d5d-9eba-733f4aed0ff2:page:10:element:9",
+        "146d0881-4242-5d5d-9eba-733f4aed0ff2:page:11:element:10",
+        "146d0881-4242-5d5d-9eba-733f4aed0ff2:page:12:element:11",
+        "146d0881-4242-5d5d-9eba-733f4aed0ff2:page:13:element:12",
+        "146d0881-4242-5d5d-9eba-733f4aed0ff2:page:14:element:13"
+      ],
+      "total_chunk_ids_verified": 25
+    },
+    {
+      "filename": "2412.20875v1.pdf",
+      "document_id": "57153001-e0ed-5d5e-b87d-446304baf3fa",
+      "source_path": "data/academic_research/set_aside/2412.20875v1.pdf",
+      "source_size_bytes": 4054765,
+      "source_sha256": "927420d4297edb4f6ff566961a14c98af54a458f44a9cdb9f587bb9079fa877e",
+      "dynamodb_chunk_count": 28,
+      "qdrant_point_count": 28,
+      "identity_sets_identical": true,
+      "chunk_ids_sample": [
+        "57153001-e0ed-5d5e-b87d-446304baf3fa:page:10:element:9",
+        "57153001-e0ed-5d5e-b87d-446304baf3fa:page:11:element:10",
+        "57153001-e0ed-5d5e-b87d-446304baf3fa:page:12:element:11",
+        "57153001-e0ed-5d5e-b87d-446304baf3fa:page:13:element:12",
+        "57153001-e0ed-5d5e-b87d-446304baf3fa:page:14:element:13"
+      ],
+      "total_chunk_ids_verified": 28
+    },
+    {
+      "filename": "2501.05730v1.pdf",
+      "document_id": "909a043f-91c7-52ba-a094-f8e66a4567ac",
+      "source_path": "data/academic_research/set_aside/2501.05730v1.pdf",
+      "source_size_bytes": 1938722,
+      "source_sha256": "4eafc24abe305dd84a859a95e19456a5f3527003ab41bd17abda7de657cccb48",
+      "dynamodb_chunk_count": 18,
+      "qdrant_point_count": 18,
+      "identity_sets_identical": true,
+      "chunk_ids_sample": [
+        "909a043f-91c7-52ba-a094-f8e66a4567ac:page:10:element:9",
+        "909a043f-91c7-52ba-a094-f8e66a4567ac:page:1:element:0:s0",
+        "909a043f-91c7-52ba-a094-f8e66a4567ac:page:1:element:0:s1",
+        "909a043f-91c7-52ba-a094-f8e66a4567ac:page:2:element:1:s0",
+        "909a043f-91c7-52ba-a094-f8e66a4567ac:page:2:element:1:s1"
+      ],
+      "total_chunk_ids_verified": 18
+    },
+    {
+      "filename": "2501.09166v1.pdf",
+      "document_id": "ca943585-8d6d-5e10-ae0e-0b0879138996",
+      "source_path": "data/academic_research/set_aside/2501.09166v1.pdf",
+      "source_size_bytes": 299711,
+      "source_sha256": "d5a727f2d0b04269389630b6687f7fa4e123b55f5e8a24726cab46df0aed9283",
+      "dynamodb_chunk_count": 13,
+      "qdrant_point_count": 13,
+      "identity_sets_identical": true,
+      "chunk_ids_sample": [
+        "ca943585-8d6d-5e10-ae0e-0b0879138996:page:10:element:9",
+        "ca943585-8d6d-5e10-ae0e-0b0879138996:page:11:element:10",
+        "ca943585-8d6d-5e10-ae0e-0b0879138996:page:12:element:11",
+        "ca943585-8d6d-5e10-ae0e-0b0879138996:page:13:element:12",
+        "ca943585-8d6d-5e10-ae0e-0b0879138996:page:1:element:0"
+      ],
+      "total_chunk_ids_verified": 13
+    },
+    {
+      "filename": "SEC-Form-10Q.pdf",
+      "document_id": "47b8443f-c726-5de1-8e75-8c434f49ce85",
+      "source_path": "data/financial_tables/SEC-Form-10Q.pdf",
+      "source_size_bytes": 322159,
+      "source_sha256": "3518726963892d32ec11a876a5dfa44810cd557d577b91eae28fccad29962505",
+      "dynamodb_chunk_count": 40,
+      "qdrant_point_count": 40,
+      "identity_sets_identical": true,
+      "chunk_ids_sample": [
+        "47b8443f-c726-5de1-8e75-8c434f49ce85:page:10:element:9",
+        "47b8443f-c726-5de1-8e75-8c434f49ce85:page:11:element:10:s0",
+        "47b8443f-c726-5de1-8e75-8c434f49ce85:page:11:element:10:s1",
+        "47b8443f-c726-5de1-8e75-8c434f49ce85:page:12:element:11",
+        "47b8443f-c726-5de1-8e75-8c434f49ce85:page:13:element:12"
+      ],
+      "total_chunk_ids_verified": 40
+    },
+    {
+      "filename": "National-Strategy-for-Artificial-Intelligence.pdf",
+      "document_id": "f2a70a0f-14bd-5746-864d-369342b1262b",
+      "source_path": "data/policy_regulatory/National-Strategy-for-Artificial-Intelligence.pdf",
+      "source_size_bytes": 4615281,
+      "source_sha256": "da5404dbb584c8956aae707dfcfe324dc1df11a179bc8288af0e898f4e37dcc5",
+      "dynamodb_chunk_count": 139,
+      "qdrant_point_count": 139,
+      "identity_sets_identical": true,
+      "chunk_ids_sample": [
+        "f2a70a0f-14bd-5746-864d-369342b1262b:page:100:element:94",
+        "f2a70a0f-14bd-5746-864d-369342b1262b:page:101:element:95",
+        "f2a70a0f-14bd-5746-864d-369342b1262b:page:102:element:96",
+        "f2a70a0f-14bd-5746-864d-369342b1262b:page:103:element:97",
+        "f2a70a0f-14bd-5746-864d-369342b1262b:page:104:element:98"
+      ],
+      "total_chunk_ids_verified": 139
+    },
+    {
+      "filename": "NFHS_5_India_Districts_Factsheet_Data.xls",
+      "document_id": "c8ac7e8f-7b37-5992-9ee1-de7f76289637",
+      "source_path": "data/non_pdf_formats/NFHS_5_India_Districts_Factsheet_Data.xls",
+      "source_size_bytes": 757248,
+      "source_sha256": "e482b990d74eb46b5ce5a6e10606b745a914d4b1b57838c1c6149e80ec8ad498",
+      "dynamodb_chunk_count": 100,
+      "qdrant_point_count": 100,
+      "identity_sets_identical": true,
+      "chunk_ids_sample": [
+        "c8ac7e8f-7b37-5992-9ee1-de7f76289637:xls:Sheet1:row1",
+        "c8ac7e8f-7b37-5992-9ee1-de7f76289637:xls:Sheet1:row10",
+        "c8ac7e8f-7b37-5992-9ee1-de7f76289637:xls:Sheet1:row100",
+        "c8ac7e8f-7b37-5992-9ee1-de7f76289637:xls:Sheet1:row11",
+        "c8ac7e8f-7b37-5992-9ee1-de7f76289637:xls:Sheet1:row12"
+      ],
+      "total_chunk_ids_verified": 100
+    },
+    {
+      "filename": "rs_status_bill_passed_assent-1952-2016.csv",
+      "document_id": "5b242ec0-c2fa-590e-9708-362138d88025",
+      "source_path": "data/non_pdf_formats/rs_status_bill_passed_assent-1952-2016.csv",
+      "source_size_bytes": 97861,
+      "source_sha256": "85d048226e88f44a76f3bf68c3f96669162c3bd007081eb06ce7d57e4529e09e",
+      "dynamodb_chunk_count": 100,
+      "qdrant_point_count": 100,
+      "identity_sets_identical": true,
+      "chunk_ids_sample": [
+        "5b242ec0-c2fa-590e-9708-362138d88025:csv:row10",
+        "5b242ec0-c2fa-590e-9708-362138d88025:csv:row100",
+        "5b242ec0-c2fa-590e-9708-362138d88025:csv:row101",
+        "5b242ec0-c2fa-590e-9708-362138d88025:csv:row11",
+        "5b242ec0-c2fa-590e-9708-362138d88025:csv:row12"
+      ],
+      "total_chunk_ids_verified": 100
+    },
+    {
+      "filename": "survay.csv",
+      "document_id": "01ec810e-68db-558e-ac2c-f74168e5a078",
+      "source_path": "data/non_pdf_formats/survay.csv",
+      "source_size_bytes": 9525994,
+      "source_sha256": "c029d234eefd3fee2563b9c0929946ca336509ab62a02bd111c80f978298c66c",
+      "dynamodb_chunk_count": 500,
+      "qdrant_point_count": 500,
+      "identity_sets_identical": true,
+      "chunk_ids_sample": [
+        "01ec810e-68db-558e-ac2c-f74168e5a078:csv:row10",
+        "01ec810e-68db-558e-ac2c-f74168e5a078:csv:row100",
+        "01ec810e-68db-558e-ac2c-f74168e5a078:csv:row101",
+        "01ec810e-68db-558e-ac2c-f74168e5a078:csv:row102",
+        "01ec810e-68db-558e-ac2c-f74168e5a078:csv:row103"
+      ],
+      "total_chunk_ids_verified": 500
+    }
+  ]
+}

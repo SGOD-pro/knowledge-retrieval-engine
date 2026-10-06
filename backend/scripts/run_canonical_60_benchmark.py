@@ -260,6 +260,10 @@ def run_benchmark(
 
     verify_live_providers()
 
+    from db.table_store import get_shared_table_store
+    durable_store = get_shared_table_store(require_durable=True)
+    logger.info("Durable TableStore backend verified: %s", type(durable_store).__name__)
+
     test_file = ROOT_DIR / test_path
     if not test_file.exists():
         raise FileNotFoundError(f"Test suite file not found: {test_file}")

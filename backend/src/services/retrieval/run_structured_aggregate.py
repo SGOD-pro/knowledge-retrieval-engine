@@ -12,6 +12,7 @@ from services.retrieval.structured_query_service import (
     StorageFailureError,
     StructuredQueryResult,
     StructuredQueryService,
+    UnresolvedFilterError,
     UnsupportedQueryError,
 )
 from services.telemetry import record_structured_aggregate
@@ -86,6 +87,17 @@ def execute(state: dict[str, Any]) -> dict[str, Any]:
             "status": "error",
             "error_code": "storage_failure",
             "error": str(e),
+            "stage_timings": {**existing_timings, "structured_aggregate_ms": latency_ms},
+        }
+    except UnresolvedFilterError as e:
+        latency_ms = (time.perf_counter() - t0) * 1000.0
+        logger.warning("structured_aggregate.unresolved_filter query='%s' error=%s", query[:60], e)
+        return {
+            "final_answer": "NOT_FOUND",
+            "executed_path": "structured_aggregate_unresolved_filter",
+            "status": "error",
+            "error_code": "unresolved_filter",
+            "error": f"Required filter could not be resolved: {e}",
             "stage_timings": {**existing_timings, "structured_aggregate_ms": latency_ms},
         }
     except UnsupportedQueryError as e:

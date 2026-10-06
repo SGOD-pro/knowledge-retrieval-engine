@@ -51,13 +51,24 @@ def test_route_semantic_factual_query():
 
 
 def test_route_multi_hop_query():
-    """Multi-hop entity relations route to knowledge_graph + vector_rerank."""
-    router = StrategyRouter()
+    """Multi-hop entity relations route to knowledge_graph + vector_rerank when graph isolation is verified."""
+    router = StrategyRouter(graph_isolation_verified=True)
     res = router.route(
         query="How is entity Alpha related to entity Beta through their common partner?",
     )
     assert "knowledge_graph" in res.primary
     assert "vector_rerank" in res.primary
+
+
+def test_route_multi_hop_query_when_unverified_falls_back():
+    """Multi-hop entity relations safely fall back to vector + bm25 when graph isolation is unverified."""
+    router = StrategyRouter(graph_isolation_verified=False)
+    res = router.route(
+        query="How is entity Alpha related to entity Beta through their common partner?",
+    )
+    assert "knowledge_graph" not in res.primary
+    assert "vector_rerank" in res.primary
+    assert "bm25" in res.primary
 
 
 def test_route_page_layout_query():

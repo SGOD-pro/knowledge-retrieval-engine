@@ -41,8 +41,10 @@ class StrategyRouter:
     def __init__(
         self,
         capability_map: dict[str, Any] | None = None,
+        graph_isolation_verified: bool = False,
     ) -> None:
         self.capability_map = capability_map or {}
+        self.graph_isolation_verified = graph_isolation_verified
 
     def route(
         self,
@@ -66,10 +68,12 @@ class StrategyRouter:
             )
 
         # 2. Structured table query (aggregation, range, comparison, sum, count, delta)
-        table_keywords = r"\b(total|sum of|average|mean of|earliest and latest|how did.*change from|percentage change|difference between|min|max|highest|lowest)\b"
+        # Distinguish numeric aggregation from qualitative narrative discussion
+        is_qualitative = bool(re.search(r"\b(describe|explain|discuss|opinion|morale|sentiment|narrative|qualitative)\b", q_lower))
+        table_keywords = r"\b(total\s+(?:of|across|in|for|amount|income|revenue|sales|expenditure|expenses|number|count|assets|value|cost|tax|profit|funding|budget|headcount|rows?|records?)|sum of|average|mean of|earliest and latest|how did.*change from|percentage change|difference between|min\b|max\b|minimum|maximum|highest\s+(?:value|amount|number|rate)|lowest\s+(?:value|amount|number|rate))\b"
         has_table_agg = bool(re.search(table_keywords, q_lower))
         has_table_target = bool(
-            re.search(r"\b(table|survey|dataset|columns?|rows?|industr(y|ies)|variable|code|income|expenditure|sales)\b", q_lower)
+            re.search(r"\b(table|survey|dataset|sheet|spreadsheet|file|columns?|rows?|records?|fields?|industr(y|ies)|variable|code|income|expenditure|sales|year|date|period)\b|\.(?:csv|xlsx|tsv)", q_lower)
         )
         plan_is_structured = bool(
             plan and (
@@ -78,7 +82,7 @@ class StrategyRouter:
             )
         )
 
-        if (has_table_agg and has_table_target) or plan_is_structured:
+        if ((has_table_agg and has_table_target and not is_qualitative) or plan_is_structured):
             return SelectedStrategies(
                 primary=["structured_table"],
                 fallback=["vector_rerank"],
@@ -116,10 +120,20 @@ class StrategyRouter:
         relation_pattern = r"\b(related to|relationship between|connected to|through their|subsidiary of|parent company|affiliated with|multi-hop)\b"
         plan_is_graph = bool(plan and getattr(plan, "requires_graph", False))
         if re.search(relation_pattern, q_lower) or plan_is_graph:
+            # Graph workspace isolation check:
+            # okf_entities and okf_relations currently lack workspace partition keys/scoping.
+            # Prevent graph selection until scoped reads and cross-workspace rejection tests pass.
+            if self.graph_isolation_verified:
+                return SelectedStrategies(
+                    primary=["knowledge_graph", "vector_rerank"],
+                    fallback=["page_index"],
+                    reason="multi_hop_entity_relation_query",
+                    max_parallel=2,
+                )
             return SelectedStrategies(
-                primary=["knowledge_graph", "vector_rerank"],
-                fallback=["bm25"],
-                reason="multi_hop_entity_relationship_query",
+                primary=["vector_rerank", "bm25"],
+                fallback=["page_index"],
+                reason="multi_hop_query_graph_isolation_unverified_falling_back_to_vector_bm25",
                 max_parallel=2,
             )
 

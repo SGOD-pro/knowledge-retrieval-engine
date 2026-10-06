@@ -1,0 +1,133 @@
+{
+  "status": "PASSED",
+  "tested_commit": "9bb716bc106d2461803de577012b6093dfcb94ca",
+  "source_manifest": {
+    "path": "/home/swyra/projects/knowledge-retrieval-engine/data/non_pdf_formats/survay.csv",
+    "sha256": "c029d234eefd3fee2563b9c0929946ca336509ab62a02bd111c80f978298c66c",
+    "expected_rows": 60255
+  },
+  "isolated_workspace": "ws_survay_verify_3797a7b9",
+  "document_id": "doc_survay_21a826bf",
+  "backend_identity": "DynamoDBTableStore (kre-table)",
+  "ground_truth": {
+    "source_rows": 60255,
+    "min_year": 2013,
+    "max_year": 2025,
+    "target_industry": "99999",
+    "target_variable": "Total income",
+    "val_2024": 980268,
+    "val_2025": 976077,
+    "row_idx_2024": 4636,
+    "row_idx_2025": 1,
+    "signed_delta": -4191,
+    "abs_delta": 4191,
+    "pct_change_exact": "-0.4275361431771719570566416531",
+    "rounded_pct": "0.43"
+  },
+  "ingestion": {
+    "elapsed_seconds": 882.44,
+    "document_chunks": 500,
+    "active_version": "c029d234eefd3fee2563b9c0929946ca",
+    "coverage_complete": true,
+    "manifest": {
+      "parser_version": "1.0.0",
+      "updated_at_utc": "2026-09-28T11:33:46.848209+00:00",
+      "content_hash": "c029d234eefd3fee2563b9c0929946ca336509ab62a02bd111c80f978298c66c",
+      "completed_at_utc": "2026-09-28T11:33:45.536391+00:00",
+      "table_id": "survay",
+      "attempted_rows": "60255",
+      "rejection_reasons": [],
+      "processing_finished": true,
+      "document_version": "c029d234eefd3fee2563b9c0929946ca",
+      "exclusion_policy": null,
+      "checkpoint_batch": "609",
+      "source_rows": "60255",
+      "coverage_complete": true,
+      "document_id": "doc_survay_21a826bf",
+      "persisted_rows": "60255",
+      "rejected_rows": "0",
+      "allow_rejections": false,
+      "schema_version": "eb7a40fb10c21a98",
+      "workspace_id": "ws_survay_verify_3797a7b9"
+    }
+  },
+  "queries": {
+    "Q1_range": {
+      "backend_identity": "DynamoDBTableStore(kre-table)",
+      "answer": "2013 and 2025.",
+      "executed_path": "structured_aggregate",
+      "latency_ms": 83341.73,
+      "citations": [
+        {
+          "evidence_type": "structured_aggregate",
+          "document_id": "doc_survay_21a826bf",
+          "document_version": "c029d234eefd3fee2563b9c0929946ca",
+          "table_id": "survay",
+          "operator": "range",
+          "target_column": "Year",
+          "predicate_columns": [],
+          "predicate_values": [],
+          "selection_count": 60255,
+          "total_rows_in_table": 60255,
+          "selection_hash": "38f9121b44ab67f9",
+          "result_value": "2013",
+          "secondary_value": "2025",
+          "schema_binding_confidence": 1.0,
+          "location_reference": "60255 row(s) from survay",
+          "strategy": "structured_table",
+          "text": "2013 and 2025.",
+          "text_snippet": "2013 and 2025.",
+          "id": 1
+        }
+      ],
+      "process_elapsed_ms": 96403.04062299947
+    },
+    "Q2_delta": {
+      "backend_identity": "DynamoDBTableStore(kre-table)",
+      "answer": "It fell by 4,191 Dollars (millions), from 980,268 to 976,077, a decline of approximately 0.43%.",
+      "executed_path": "structured_aggregate",
+      "latency_ms": 76900.27,
+      "citations": [
+        {
+          "evidence_type": "structured_aggregate",
+          "document_id": "doc_survay_21a826bf",
+          "document_version": "c029d234eefd3fee2563b9c0929946ca",
+          "table_id": "survay",
+          "operator": "compare",
+          "target_column": "Value",
+          "predicate_columns": [
+            "Year",
+            "Industry_code_NZSIOC",
+            "Variable_name"
+          ],
+          "predicate_values": [
+            "2024,2025",
+            "99999",
+            "Total income"
+          ],
+          "selection_count": 2,
+          "total_rows_in_table": 60255,
+          "selection_hash": "3985934bdd904a02",
+          "result_value": "4191",
+          "secondary_value": "0.43",
+          "schema_binding_confidence": 0.98,
+          "location_reference": "2 row(s) from survay",
+          "strategy": "structured_table",
+          "text": "It fell by 4,191 Dollars (millions), from 980,268 to 976,077, a decline of approximately 0.43%.",
+          "text_snippet": "It fell by 4,191 Dollars (millions), from 980,268 to 976,077, a decline of approximately 0.43%.",
+          "id": 1
+        }
+      ],
+      "process_elapsed_ms": 87833.38178899976
+    }
+  },
+  "comparison": {
+    "source_row_count_match": true,
+    "q1_min_max_match": true,
+    "q2_operands_match": true,
+    "q2_delta_match": true,
+    "q2_percentage_match": true,
+    "all_passed": true
+  },
+  "blockers": []
+}

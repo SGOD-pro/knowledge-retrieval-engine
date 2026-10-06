@@ -9,6 +9,7 @@ from decimal import Decimal
 import hashlib
 import json
 import logging
+import time
 from typing import Any
 import uuid
 
@@ -282,11 +283,18 @@ class DynamoDBTableStore:
                 }
             })
 
-            try:
-                self.client.transact_write_items(TransactItems=transact_items)
-            except ClientError as e:
-                logger.error("DynamoDBTableStore transact_write_items failed: %s", e)
-                raise
+            max_retries = 6
+            for attempt in range(max_retries):
+                try:
+                    self.client.transact_write_items(TransactItems=transact_items)
+                    break
+                except Exception as e:
+                    if attempt == max_retries - 1:
+                        logger.error("DynamoDBTableStore transact_write_items failed after %d attempts: %s", max_retries, e)
+                        raise
+                    sleep_time = min(15.0, (2 ** attempt) * 0.5)
+                    logger.warning("DynamoDBTableStore transact_write_items retry %d/%d after %.2fs error: %s", attempt + 1, max_retries, sleep_time, e)
+                    time.sleep(sleep_time)
 
     def publish_active_version(
         self,

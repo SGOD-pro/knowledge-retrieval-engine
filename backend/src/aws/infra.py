@@ -55,7 +55,11 @@ _LOCAL_REGION = "us-east-1"
 _clients: dict = {}
 _resources: dict = {}
 
-_RETRY_CONFIG = Config(retries={"max_attempts": 3, "mode": "adaptive"})
+_RETRY_CONFIG = Config(
+    connect_timeout=15,
+    read_timeout=30,
+    retries={"max_attempts": 5, "mode": "adaptive"},
+)
 
 
 def _is_floci_available() -> bool:

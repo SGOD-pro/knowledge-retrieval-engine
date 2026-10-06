@@ -105,6 +105,7 @@ def ingest_document(
             )
         except Exception as e:
             logger.error("parse_service.structured_ingest_failed doc_id=%s error=%s", doc.id, e)
+            raise
 
     # Embed both columns
     try:

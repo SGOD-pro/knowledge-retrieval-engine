@@ -26,6 +26,10 @@ class Settings(BaseSettings):
     ODL_PARSER_LAMBDA_NAME: str = "odl-parser-lambda-prod"
     REDIS_URL: str = "redis://localhost:6379/0"
 
+    # TableStore Persistence Configuration
+    TABLE_STORE_BACKEND: str | None = None
+    TABLE_STORE_SQLITE_PATH: str | None = None
+
     # BGE Embedding Lambda function
     BGE_EMBEDDING_LAMBDA_NAME: str = "bge-text-embeder"
 

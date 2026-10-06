@@ -125,6 +125,12 @@ class SQLiteTableStore:
 
     def __init__(self, db_path: Path | str = ":memory:") -> None:
         self.db_path = str(db_path)
+        if self.db_path != ":memory:":
+            resolved = Path(self.db_path).resolve()
+            resolved.parent.mkdir(parents=True, exist_ok=True)
+            self.absolute_db_path = str(resolved)
+        else:
+            self.absolute_db_path = ":memory:"
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._init_db()

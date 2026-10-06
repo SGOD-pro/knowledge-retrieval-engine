@@ -938,7 +938,12 @@ def route_after_structured(state: PipelineState) -> str:
     ea = state.get("executed_path")
     if ea == "structured_aggregate":
         return END
-    if ea in ("structured_aggregate_incomplete", "structured_aggregate_storage_failure", "structured_aggregate_ambiguous"):
+    if ea in (
+        "structured_aggregate_incomplete",
+        "structured_aggregate_storage_failure",
+        "structured_aggregate_ambiguous",
+        "structured_aggregate_unresolved_filter",
+    ):
         return END
     return "run_okf_router"
 

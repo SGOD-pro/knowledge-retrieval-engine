@@ -12,7 +12,7 @@ import re
 from typing import Any
 
 from db.table_store.base import AggregateOp, Predicate, PredicateOp, TableStore
-from schemas.structured_table import TableSchema
+from schemas.structured_table import InferredDtype, TableSchema
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +50,15 @@ class UnsupportedQueryError(StructuredExecutionError):
 
 class AmbiguousBindingError(StructuredExecutionError):
     """Two or more columns match with similar confidence; cannot resolve safely."""
+
+
+class UnresolvedFilterError(StructuredExecutionError):
+    """A required filter entity was not found in the table."""
+
+    def __init__(self, table_id: str, filter_values: list[Any]) -> None:
+        super().__init__(f"Required filter(s) {filter_values} not found in table '{table_id}'")
+        self.table_id = table_id
+        self.filter_values = filter_values
 
 
 class IncompleteDataError(StructuredExecutionError):
@@ -108,8 +117,9 @@ class StructuredQueryService:
         selected_meta = None
         selected_ver = None
 
-        # Check explicit table name or file in query
-        for tid, meta, ver in candidate_tables:
+        # Check explicit table name or file in query (sort by length descending to match more specific names first)
+        candidate_tables_sorted = sorted(candidate_tables, key=lambda x: len(x[0]), reverse=True)
+        for tid, meta, ver in candidate_tables_sorted:
             if tid in q_lower or (tid + ".csv") in q_lower or (tid + ".xlsx") in q_lower:
                 selected_tid, selected_meta, selected_ver = tid, meta, ver
                 break
@@ -218,10 +228,20 @@ class StructuredQueryService:
         schema: TableSchema,
         total_rows: int,
     ) -> StructuredQueryResult:
-        # Identify target column: e.g. "Year"
-        target_col_idx, target_col_name = self._find_column_by_semantic_match(
-            ["year", "date", "period", "time"], schema
-        )
+        # Identify target column: check if query specifically mentions a column name
+        q_lower = query.lower()
+        mentioned_col = None
+        for col in schema.columns:
+            if col.name.lower() in q_lower:
+                mentioned_col = (col.col_index, col.name)
+                break
+
+        if mentioned_col:
+            target_col_idx, target_col_name = mentioned_col
+        else:
+            target_col_idx, target_col_name = self._find_column_by_semantic_match(
+                ["year", "date", "period", "time", "value", "amount", "score", "count"], schema
+            )
 
         try:
             min_val, count, min_ids, min_idx, digest_min = self.store.execute_single_pass_query(
@@ -293,8 +313,32 @@ class StructuredQueryService:
         year_start, year_end = min(years), max(years)
 
         # Map columns
-        year_idx, _ = self._find_column_by_semantic_match(["year"], schema)
-        val_idx, val_col_name = self._find_column_by_semantic_match(["value", "amount", "total"], schema)
+        year_idx, _ = self._find_column_by_semantic_match(["year", "date", "period"], schema)
+
+        # Check if query mentions a specific metric column name
+        q_lower = query.lower()
+        mentioned_val_col = None
+        # Prioritize numeric columns (decimal, integer, percentage, currency) mentioned in the query
+        for col in schema.columns:
+            if col.col_index == year_idx:
+                continue
+            if col.inferred_dtype in (InferredDtype.DECIMAL, InferredDtype.INTEGER, InferredDtype.PERCENTAGE, InferredDtype.CURRENCY, "decimal", "integer", "percentage", "currency"):
+                if col.name.lower() in q_lower:
+                    mentioned_val_col = (col.col_index, col.name)
+                    break
+
+        if not mentioned_val_col:
+            for col in schema.columns:
+                if col.col_index == year_idx:
+                    continue
+                if col.name.lower() in q_lower:
+                    mentioned_val_col = (col.col_index, col.name)
+                    break
+
+        if mentioned_val_col:
+            val_idx, val_col_name = mentioned_val_col
+        else:
+            val_idx, val_col_name = self._find_column_by_semantic_match(["value", "amount", "total"], schema)
 
         # Year-based predicates (always required)
         predicates_start: list[Predicate] = [Predicate(column_index=year_idx, op=PredicateOp.EQ, value=year_start)]
@@ -308,7 +352,9 @@ class StructuredQueryService:
         # Candidates come from:
         #   a) Terms inside parentheses: "All industries (99999)" → "99999"
         #   b) Quoted strings: '"Total income"' → "Total income"
-        #   c) Consecutive capitalized or all-digit tokens (2+ chars) not already used as years.
+        #   c) Capitalized multi-word noun phrases
+        #   d) Phrases between query intent verbs ("how did X change")
+        #   e) Non-stopword n-grams and single identifier tokens (e.g. "total income", "StationDeep")
         candidates: list[str] = []
 
         # a) Parenthesized terms
@@ -318,14 +364,39 @@ class StructuredQueryService:
         candidates += re.findall(r'"([^"]+)"', query)
         candidates += re.findall(r"'([^']+)'", query)
 
-        # c) Title-case multi-word noun phrases (2–4 words)
+        # c) Capitalized multi-word noun phrases
         candidates += re.findall(r'\b([A-Z][a-z]+(?: [a-z]* ?[A-Z]?[a-z]+){1,3})\b', query)
+
+        # d) Phrases between intent verbs
+        candidates += re.findall(
+            r'(?:how did|what did|change in|measure of|value of)\s+([a-zA-Z0-9_ ]+?)\s+(?:change|from|between)',
+            query,
+            re.IGNORECASE,
+        )
 
         # Filter: skip year tokens, pure punctuation, and single-word stopwords
         skip_words = {
             "from", "between", "table", "rows", "records", "year", "years", "month",
             "how", "did", "change", "what", "the", "and", "for", "all", "give",
+            "amount", "percentage", "to", "in", "of", "on", "at", "by", "with",
         }
+
+        # e) Single identifier tokens (capitalized, alphanumeric, or leading-zero codes)
+        candidates += [
+            w for w in re.findall(r'\b[A-Za-z0-9_]{2,}\b', query)
+            if w.lower() not in skip_words and not re.fullmatch(r'20\d{2}|19\d{2}', w)
+        ]
+
+        # f) Non-stopword bi-grams and tri-grams
+        words = re.findall(r'\b[a-zA-Z0-9_]+\b', query)
+        for i in range(len(words) - 1):
+            w1, w2 = words[i], words[i + 1]
+            if w1.lower() not in skip_words and w2.lower() not in skip_words:
+                candidates.append(f"{w1} {w2}")
+        for i in range(len(words) - 2):
+            w1, w2, w3 = words[i], words[i + 1], words[i + 2]
+            if w1.lower() not in skip_words and w3.lower() not in skip_words:
+                candidates.append(f"{w1} {w2} {w3}")
         filtered_candidates = []
         for c in candidates:
             c = c.strip()
@@ -346,8 +417,25 @@ class StructuredQueryService:
                 seen.add(c.lower())
                 unique_candidates.append(c)
 
-        # Probe without any predicate to sample diverse column values (limit=200 for coverage).
-        # This maximises the chance of finding categorical values like "99999" or "Total income".
+        # Collect explicitly requested filter entities (e.g. "For <target>", quoted phrases, parenthesized terms)
+        explicit_requirements: list[str] = []
+        for m in re.finditer(r'\bfor\s+([A-Za-z0-9_]+(?:\s+[A-Za-z0-9_]+)?)\b', query, re.IGNORECASE):
+            target = m.group(1).strip()
+            if target.lower() not in skip_words and not re.fullmatch(r'20\d{2}|19\d{2}', target):
+                if target.lower() != table_id.lower() and target.lower() not in (table_id.lower() + ".csv", table_id.lower() + ".xlsx"):
+                    explicit_requirements.append(target)
+        for q_str in re.findall(r'["\']([^"\']+)["\']', query):
+            q_clean = q_str.strip()
+            if q_clean.lower() not in skip_words and not re.fullmatch(r'20\d{2}|19\d{2}', q_clean):
+                if q_clean.lower() != table_id.lower() and q_clean.lower() not in (table_id.lower() + ".csv", table_id.lower() + ".xlsx"):
+                    explicit_requirements.append(q_clean)
+        for p_str in re.findall(r'\(([^)]+)\)', query):
+            p_clean = p_str.strip()
+            if p_clean.lower() not in skip_words and not re.fullmatch(r'20\d{2}|19\d{2}', p_clean):
+                if p_clean.lower() != table_id.lower() and p_clean.lower() not in (table_id.lower() + ".csv", table_id.lower() + ".xlsx"):
+                    explicit_requirements.append(p_clean)
+
+        # Check probe rows first (fast in-memory check)
         try:
             probe_rows = self.store.query_rows(
                 table_id, workspace_id, predicates=[], limit=200, version=version
@@ -358,10 +446,11 @@ class StructuredQueryService:
         already_bound: set[int] = {year_idx, val_idx}
         for cand in unique_candidates:
             cand_lower = cand.lower().strip()
+            bound = False
             for col in schema.columns:
                 if col.col_index in already_bound:
                     continue
-                # Check if cand appears as a cell value in this column
+                # Check probe rows first (fast in-memory check)
                 for row in probe_rows:
                     try:
                         cell_val = str(row.cells[col.col_index].normalized_value).strip()
@@ -373,17 +462,87 @@ class StructuredQueryService:
                         pred_cols.append(col.name)
                         pred_vals.append(cell_val)
                         already_bound.add(col.col_index)
-                        break  # cand bound to this column
+                        bound = True
+                        break
+                if bound:
+                    break
 
-        # Execute queries for period 1 and period 2
+            # If not found in first 200 probe rows, query store directly with predicate
+            # (supports categorical/entity values located outside the first 200 rows, e.g. COHORT_DEEP at row 250).
+            # Restrict deep store search to explicit requirements; do NOT scan 60,000 rows for table names or non-entity tokens.
+            if not bound and explicit_requirements:
+                is_explicit = any(
+                    cand_lower == req.lower()
+                    for req in explicit_requirements
+                )
+                is_table_name = (
+                    cand_lower == table_id.lower()
+                    or cand_lower in (f"{table_id.lower()}.csv", f"{table_id.lower()}.xlsx")
+                )
+                if is_explicit and not is_table_name:
+                    for col in schema.columns:
+                        if col.col_index in already_bound:
+                            continue
+                        try:
+                            val_pred = cand
+                            if col.inferred_dtype in ("integer", "decimal") and cand.isdigit():
+                                val_pred = int(cand)
+                            matching = self.store.query_rows(
+                                table_id,
+                                workspace_id,
+                                predicates=[Predicate(column_index=col.col_index, op=PredicateOp.EQ, value=val_pred)],
+                                limit=1,
+                                version=version,
+                            )
+                            if matching:
+                                matched_val = str(matching[0].cells[col.col_index].normalized_value).strip()
+                                pred_obj = matching[0].cells[col.col_index].normalized_value
+                                predicates_start.append(Predicate(column_index=col.col_index, op=PredicateOp.EQ, value=pred_obj))
+                                predicates_end.append(Predicate(column_index=col.col_index, op=PredicateOp.EQ, value=pred_obj))
+                                pred_cols.append(col.name)
+                                pred_vals.append(matched_val)
+                                already_bound.add(col.col_index)
+                                bound = True
+                                break
+                        except Exception:
+                            pass
+
+        # Check if an explicitly requested filter entity could not be resolved in the table
+        if explicit_requirements:
+            any_bound = False
+            for req in explicit_requirements:
+                req_lower = req.lower()
+                for pv in pred_vals:
+                    if req_lower in str(pv).lower() or str(pv).lower() in req_lower:
+                        any_bound = True
+                        break
+                if any_bound:
+                    break
+            if not any_bound:
+                raise UnresolvedFilterError(
+                    table_id=table_id,
+                    filter_values=explicit_requirements,
+                )
+
+        # Execute queries for period 1 and period 2 (limit=2 to detect duplicate matches)
         try:
-            rows_start = self.store.query_rows(table_id, workspace_id, predicates=predicates_start, limit=1, version=version)
-            rows_end = self.store.query_rows(table_id, workspace_id, predicates=predicates_end, limit=1, version=version)
+            rows_start = self.store.query_rows(table_id, workspace_id, predicates=predicates_start, limit=2, version=version)
+            rows_end = self.store.query_rows(table_id, workspace_id, predicates=predicates_end, limit=2, version=version)
         except Exception as e:
             raise StorageFailureError(f"Failed to query rows: {e}") from e
 
         if not rows_start or not rows_end:
-            raise UnsupportedQueryError(f"Matching entity rows not found for years {year_start} and {year_end}")
+            raise UnresolvedFilterError(
+                table_id=table_id,
+                filter_values=pred_vals,
+            )
+
+        if len(rows_start) > 1 or len(rows_end) > 1:
+            raise AmbiguousBindingError(
+                f"Duplicate matches found for period comparison in table '{table_id}' "
+                f"({len(rows_start)} rows for year {year_start}, {len(rows_end)} rows for year {year_end}). "
+                f"Query requires additional filter predicates to resolve uniquely."
+            )
 
         r1, r2 = rows_start[0], rows_end[0]
         v1_raw = r1.cells[val_idx].normalized_value
@@ -392,10 +551,8 @@ class StructuredQueryService:
         v1 = Decimal(str(v1_raw).replace(",", "").strip())
         v2 = Decimal(str(v2_raw).replace(",", "").strip())
 
-        delta = v2 - v1  # 976077 - 980268 = -4191
+        delta = v2 - v1  # e.g. 976077 - 980268 = -4191
         abs_delta = abs(delta)
-        direction = "fell" if delta < 0 else "increased"
-        pct_change = (abs_delta / v1) * Decimal("100")
 
         # Derive unit label from the schema: look for a 'unit' column; fallback to None.
         unit: str | None = None
@@ -409,13 +566,47 @@ class StructuredQueryService:
                 break
 
         unit_label = f" {unit}" if unit else ""
-        answer_text = (
-            f"It {direction} by {abs_delta:,}{unit_label}, from {v1:,} to {v2:,}, "
-            f"a decline of approximately {pct_change:.2f}%."
-            if delta < 0 else
-            f"It {direction} by {abs_delta:,}{unit_label}, from {v1:,} to {v2:,}, "
-            f"an increase of approximately {pct_change:.2f}%."
-        )
+
+        # Zero-baseline convention:
+        # If initial baseline v1 == 0, percentage change (v2 - v1)/v1 is mathematically undefined (division by zero / 0/0).
+        # We return the absolute delta, set secondary_value (percentage_change) to None,
+        # and provide an explicit explanation for 0→positive, 0→negative, and 0→0.
+        if v1 == 0:
+            pct_change: Decimal | None = None
+            if delta > 0:
+                answer_text = (
+                    f"It increased by {abs_delta:,}{unit_label}, from 0 to {v2:,}. "
+                    f"Percentage change is undefined because the initial baseline value is 0."
+                )
+            elif delta < 0:
+                answer_text = (
+                    f"It fell by {abs_delta:,}{unit_label}, from 0 to {v2:,}. "
+                    f"Percentage change is undefined because the initial baseline value is 0."
+                )
+            else:
+                # 0 -> 0 convention:
+                # Value remained unchanged at 0 (change of 0). Percentage change is indeterminate (0/0)
+                # and mathematically undefined from a zero baseline; returned as null with explicit explanation.
+                answer_text = (
+                    f"It remained unchanged at 0{unit_label} (change of 0). "
+                    f"Percentage change is undefined because the initial baseline value is 0."
+                )
+        else:
+            pct_change = round(abs_delta / abs(v1) * Decimal("100"), 2)
+            if delta < 0:
+                answer_text = (
+                    f"It fell by {abs_delta:,}{unit_label}, from {v1:,} to {v2:,}, "
+                    f"a decline of approximately {pct_change:.2f}%."
+                )
+            elif delta > 0:
+                answer_text = (
+                    f"It increased by {abs_delta:,}{unit_label}, from {v1:,} to {v2:,}, "
+                    f"an increase of approximately {pct_change:.2f}%."
+                )
+            else:
+                answer_text = (
+                    f"It remained unchanged at {v1:,}{unit_label} (change of 0, 0.00% change)."
+                )
 
         selected_ids = [r1.row_id, r2.row_id]
         selected_idx = [r1.row_index, r2.row_index]
@@ -430,7 +621,7 @@ class StructuredQueryService:
             selection_count=2,
             total_rows_in_table=total_rows,
             result_value=abs_delta,
-            secondary_value=round(pct_change, 2),
+            secondary_value=pct_change,
             row_ids=selected_ids,
             row_indices=selected_idx,
             selection_hash=selection_hash,

@@ -820,6 +820,7 @@ def validate_citations(
             if sel_count < 1:
                 errors.append(f"Citation {idx}: selection_count must be >= 1 in structured evidence")
                 continue
+
             # Verify hash matches a real executed query when caller supplies retained hashes/evidence
             if all_retained_hashes is not None and sel_hash not in all_retained_hashes:
                 errors.append(
@@ -827,6 +828,71 @@ def validate_citations(
                     f"(fabricated or stale citation)"
                 )
                 continue
+
+            # A matching hash alone must not validate altered citation fields.
+            # When retained_evidence_items is supplied, verify every field matches the retained record.
+            if retained_evidence_items is not None:
+                matching_ev = None
+                for ev_it in retained_evidence_items:
+                    sp = getattr(ev_it, "structured_payload", {}) or {}
+                    loc = getattr(ev_it, "locator", {}) or {}
+                    h = sp.get("selection_hash") or loc.get("selection_hash")
+                    if str(h) == str(sel_hash):
+                        matching_ev = ev_it
+                        break
+
+                if matching_ev is not None:
+                    sp = getattr(matching_ev, "structured_payload", {}) or {}
+                    loc = getattr(matching_ev, "locator", {}) or {}
+                    expected_table = sp.get("table_id") or loc.get("table_id")
+                    expected_ver = getattr(matching_ev, "document_version", None) or sp.get("document_version")
+                    expected_op = sp.get("operator")
+                    expected_col = sp.get("target_column")
+                    expected_count = sp.get("selection_count") or loc.get("selection_count")
+                    expected_ws = getattr(matching_ev, "workspace_id", None)
+                    expected_res = sp.get("result_value")
+
+                    if expected_table and table_id != expected_table:
+                        errors.append(f"Citation {idx}: table_id '{table_id}' altered from retained evidence '{expected_table}'")
+                        continue
+                    if expected_ver and doc_ver != expected_ver:
+                        errors.append(f"Citation {idx}: document_version '{doc_ver}' altered from retained evidence '{expected_ver}'")
+                        continue
+                    if expected_op and op != expected_op:
+                        errors.append(f"Citation {idx}: operator '{op}' altered from retained evidence '{expected_op}'")
+                        continue
+                    if expected_col and target_col != expected_col:
+                        errors.append(f"Citation {idx}: target_column '{target_col}' altered from retained evidence '{expected_col}'")
+                        continue
+                    if expected_count is not None and int(sel_count) != int(expected_count):
+                        errors.append(f"Citation {idx}: selection_count {sel_count} altered from retained evidence {expected_count}")
+                        continue
+                    if expected_ws and c.get("workspace_id") and c.get("workspace_id") != expected_ws:
+                        errors.append(f"Citation {idx}: workspace_id '{c.get('workspace_id')}' altered from retained evidence '{expected_ws}'")
+                        continue
+                    if expected_res is not None and c.get("result_value") is not None and str(c.get("result_value")) != str(expected_res):
+                        errors.append(f"Citation {idx}: result_value '{c.get('result_value')}' altered from retained evidence '{expected_res}'")
+                        continue
+
+                    # Predicates validation
+                    cp = getattr(matching_ev, "citation_payload", {}) or {}
+                    expected_pcols = cp.get("predicate_columns")
+                    expected_pvals = cp.get("predicate_values")
+                    if expected_pcols is not None and c.get("predicate_columns") is not None and c.get("predicate_columns") != expected_pcols:
+                        errors.append(f"Citation {idx}: predicate_columns altered from retained evidence")
+                        continue
+                    if expected_pvals is not None and c.get("predicate_values") is not None and c.get("predicate_values") != expected_pvals:
+                        errors.append(f"Citation {idx}: predicate_values altered from retained evidence")
+                        continue
+                    if c.get("predicates") is not None and c.get("predicates") != cp.get("predicates"):
+                        errors.append(f"Citation {idx}: predicates altered from retained evidence")
+                        continue
+
+                    # Provenance validation
+                    expected_prov = getattr(matching_ev, "provenance", None)
+                    if expected_prov is not None and c.get("provenance") is not None and c.get("provenance") != expected_prov:
+                        errors.append(f"Citation {idx}: provenance altered from retained evidence")
+                        continue
 
             valid_count += 1
             if gt_set is not None:
