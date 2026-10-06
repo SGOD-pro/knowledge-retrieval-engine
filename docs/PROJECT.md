@@ -45,5 +45,11 @@ Unbounded autonomous browsing, arbitrary code execution, treating generated summ
 ## Migration Context
 The current repository already contains FastAPI/LangGraph, DynamoDB, QdrantDB, Redis, source adapters, retrieval services, structured execution, frontend pages and benchmark assets. The refactor replaces conflicting base contracts/orchestration while reusing compatible infrastructure.
 
-## Documentation Authority
+## Documentation Authority & Bible Pin
+This documentation package derives from and implements the authoritative Architecture Bible:
+- **Source Document:** `KRE_ARCHITECTURE_BIBLE_REFACTOR_READY_2026-10-06.md`
+- **Version:** `2026-10-06 — v3`
+- **SHA-256 Hash:** `4e37baf68909bd41e7e8ef0bcc4cc67bc9dec6713cb6f50766671b0f77eaf3ca`
+
 `PROJECT.md`, `REQUIREMENTS.md`, `ARCHITECTURE.md` and `TECHNICAL_SPEC.md` form the core design contract. `DIAGRAMS.md` and `diagrams/` are projections, not independent architecture decisions.
+

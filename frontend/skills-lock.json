@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "skills": {
+    "anti-ui-slop": {
+      "source": "uizze/uizze",
+      "sourceType": "github",
+      "skillPath": "skills/anti-ui-slop/SKILL.md",
+      "computedHash": "ef2b42a1b2b21836f6c8df084ee6397c38c209fdaaedfb40159d183d01269759"
+    },
+    "ui-design": {
+      "source": "uizze/uizze",
+      "sourceType": "github",
+      "skillPath": "skills/ui-design/SKILL.md",
+      "computedHash": "ccec81b87687bbda6f444b71a8b406ed0e048b13a206eaeb373996a12186a807"
+    },
+    "ui-radar": {
+      "source": "uizze/uizze",
+      "sourceType": "github",
+      "skillPath": "skills/ui-radar/SKILL.md",
+      "computedHash": "413647021152e4874720c3a0e3da394c0f7b46cdc9f31c189954c6ed854cb196"
+    }
+  }
+}

@@ -1,71 +1,62 @@
-# MEMORY.md — State and Caching Strategy
+# MEMORY.md — State and Caching Strategy (v3 Architecture Aligned)
+
+> **Architectural Authority Note:** Policies here reflect the v3 Architecture (`KRE_ARCHITECTURE_BIBLE_REFACTOR_READY_2026-10-06.md`). Previous v1 notes and session state entries from July-August 2026 are retained below for historical audit provenance and are explicitly superseded.
 
 ## Benchmark Data Incident (2026-08-10)
 - **RETRACTION**: The data previously listed in `benchmark_results.md` is fully retracted as a mock-data incident (similar to the prior mocked-embeddings failure). It did not reflect any real script run and is false.
 - **SOURCE OF TRUTH**: The ONLY valid benchmark data source is the `backend/tmp/benchmark_results.json` file. All UI rendering of benchmark metrics (KPIs) must read exactly from this JSON payload, rendering the actual (and currently failing) system values (e.g., `14616.6ms` p95 latency) with no sanitization or fabricated values. Cache Hit Rate and Hallucination Rate have no valid fields in this JSON and must be rendered as missing/not-live.
 
-## Redis Cache
+## Version-Aware & Authorization-Aware Cache (Current Policy — v3)
 
-```yaml
-Key:   sha256(normalize(query) + doc_scope_hash)
-Value: {answer, citations, retrieval_path, confidence, latency_breakdown}
-TTL:   24 hours
-Write: only when confidence >= MEDIUM (>= 0.50)
-Read:  checked before any retrieval stage runs
+```text
+CacheKey = H(
+  workspace,
+  authorized_principal_scope,
+  session_context_hash,
+  query_hash,
+  source_version_set,
+  snapshot_version,
+  capability_policy_version,
+  access_policy_version
+)
 ```
 
-### Do NOT Cache:
-- Responses with `confidence < 0.50` (LOW)
-- Responses where LLM returned `NOT_FOUND`
-- Responses with `coverage_ratio < 0.6`
+- **Cache Guards:**
+  - Never allow a cache hit to bypass authorization or deletion/tombstone checks.
+  - Final response delivery must recheck access and source tombstone states even on a cache hit.
+  - Write to cache only when answer is verified (`COMPLETE` or supported `PARTIAL`).
+  - Do NOT cache responses with `NO_SUPPORT`, `RETRIEVAL_INCOMPLETE`, unverified fallbacks, or raw failed searches.
+- **Invalidation:** Immediate authorization barrier. On deletion/revocation or tombstoning of source `D`, cancel running jobs and invalidate all cache entries whose scope touches `D`.
 
-### Invalidation:
-- On re-ingestion of document `D`: `DELETE` all cache keys where `doc_scope_hash` includes `D`.
+### [SUPERSEDED] Historical v1 Cache Policy
+> *Historical Record:* The v1 cache key `sha256(normalize(query) + doc_scope_hash)` and naive query normalization without principal scope, session context, or snapshot generation checks are **SUPERSEDED** by the v3 Version-Aware Cache policy above. Agents must not implement or reintroduce the v1 cache key.
 
-## Semantic Cache — QdrantDB-backed
+## Vector Store & Selective Embedding Policy (Current Policy — v3)
 
-Collections: `kre_cache_fast` (384-dim) and `kre_cache_full` (1024-dim)
-  query_embedding  vector
-  redis_key        payload field
-  doc_scope_hash   payload field
-  provider         payload field
+- **Selective Prose Chunking & Embedding:**
+  - Baseline prose chunking follows accepted paragraph/heading/page boundaries with bounded token size and overlap only where needed.
+  - Large tables and structured datasets are NOT embedded row-by-row into vectors. Instead, index table schema, headers, and navigation metadata, routing data operations to the structured dataset executor.
+  - Vector coverage metadata records exactly which prose blocks were embedded; excluded blocks remain visible in metadata and lexical/source access when valid.
+- **No Document Embedding During Q&A:**
+  - Query embedding is strictly for the incoming question or bounded query variants.
+  - Under no circumstances may document chunking or document embedding be performed during query time.
+- **Embedding-Model Compatibility:**
+  - Vectors from different models or dimensions (e.g., BGE-small 384-dim vs Titan V2 1024-dim) reside in separate collections/named vectors and are NEVER compared against each other, mixed in similarity calculations, or merged across dimensions.
+- **Historical Note:** The legacy rule stating "Both vectors populated at ingestion time for every chunk" is **SUPERSEDED** by selective prose chunking.
 
-Lookup: cosine similarity threshold >= 0.95 against the appropriate collection.
+## Persistent Sessions, History, and Observability (Current Policy — v3)
 
-## Vector Store — QdrantDB
-
-Collection `kre_chunks` with two named vectors, never merged:
-- `embedding_fast` (384-dim) for BGE-small microservice ONNX embeddings.
-- `embedding_full` (1024-dim) for Titan V2 API embeddings.
-
-Both vectors populated at ingestion time for every chunk.
-Query-time routing rule (Rule 19): fast-path queries embed via BGE-small microservice and search ONLY `embedding_fast`. Full-path queries embed via the active API provider and search ONLY `embedding_full`. No query ever compares against both vectors, and no code path merges results across them.
-
-No FAISS index is used. No PostgreSQL/pgvector is used.
-
-## PageIndex
-- **Storage:** DynamoDB (persistent), stored as chunk metadata.
-
-## OKF Knowledge Graph — DynamoDB
-
-OKF entities, properties, and relations stored in DynamoDB tables (`okf_entities`, `okf_properties`).
-Graph traversal executes against DynamoDB adjacency entries.
-Zero LLM calls at query time — pure database lookup.
-
-## Redis — ElastiCache Serverless
-
-Same TTL, same write-guard conditions. ElastiCache Serverless used in cloud, local Redis in dev.
-
-## What Is Not Cached
-- Retrieval plans, Reranker scores, LOW confidence responses, `NOT_FOUND` responses.
-
-## Feedback Storage (write now, act on it in v2)
-Collect only. Do not wire to reranking weights.
-
-## No Persistent User State in v1
-No session store, conversation history, query logging to persistent storage.
+- **Persistent Sessions & History:**
+  - Sessions are first-class persistent resources (`session_id`).
+  - Conversation history, session-selected source sets, and interpretation variables are persisted to support multi-turn query context, session-aware caching, and auditability.
+- **Query Logging & Lineage:**
+  - All query executions, model ledger allocations, tool executions, and durable lineages are persisted for audit, reproduction, and observability.
+- **[SUPERSEDED] Historical v1 Rule:** The v1 note "No Persistent User State in v1: No session store, conversation history, query logging to persistent storage" is **SUPERSEDED** and historical only.
 
 ---
+
+# Historical Session Logs (2026-07-24 to 2026-08-16) — SUPERSEDED BY V3 ARCHITECTURE
+*The following entries are archived implementation notes from earlier development phases. Where they contradict v3 contracts, v3 takes precedence.*
 
 ## Session State — Phase 1 Backend (2026-07-24)
 

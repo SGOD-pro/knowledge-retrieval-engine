@@ -13,3 +13,7 @@ Track separately:
 - queue/runtime
 
 Every model/tool invocation records operation, provider, tokens/usage where available, retries, latency and cost estimate/actual. Remote reranking/verification is not treated as free.
+
+### Operational Policy
+Query embedding is strictly allocated for incoming user questions or bounded query rewrites (maximum 2 batches under `query-default-v3`). Document chunk embedding at query time is strictly prohibited to protect query cost and latency bounds.
+

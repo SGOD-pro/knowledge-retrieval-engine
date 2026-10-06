@@ -1,5 +1,30 @@
 # KRE Refactor Migration Map
 
+## Authoritative Architecture Bible Pin
+- **Source Document:** `KRE_ARCHITECTURE_BIBLE_REFACTOR_READY_2026-10-06.md`
+- **Version:** `2026-10-06 — v3`
+- **SHA-256 Hash:** `4e37baf68909bd41e7e8ef0bcc4cc67bc9dec6713cb6f50766671b0f77eaf3ca`
+- **Rule:** Future edits cannot alter or drop architecture decisions without an explicit ADR update and traceability record.
+
+## Architecture Bible → Modular Documentation Traceability Matrix
+
+| Bible Section & Topic | Primary Refactored Doc(s) | Key Architectural Decision / Contract Preserved |
+|---|---|---|
+| **§0, §1, §2, §71, §72** Canonical Overview & Planes | `ARCHITECTURE.md`, `WORKFLOW.md`, `diagrams/01_SYSTEM_OVERVIEW.md` | Independent baseline vs asynchronous enrichment; 4 architectural planes; master execution flow. |
+| **§4, §5, §6, §7, §8, §9, §49** Ingestion & Canonical Evidence | `TECHNICAL_SPEC.md §2`, `diagrams/02_INGESTION_PUBLICATION.md`, `diagrams/03_CANONICAL_EVIDENCE.md` | Format adapters; typed CanonicalEvidence with `extraction_pipeline_version` & `quality`; extraction QA. |
+| **§10, §12, §14, §15, §50** Capabilities & Knowledge Map | `TECHNICAL_SPEC.md §3`, `ADR-003`, `diagrams/04_KNOWLEDGE_MAP.md` | CapabilityManifest with typed coverage; Knowledge Map as routing hint rather than factual proof. |
+| **§13, ADR-001** Baseline vs Enrichment Decoupling | `ADR-001`, `WORKFLOW.md`, `DATABASE.md` | Baseline queryable immediately; enrichment failure isolation; prepared lexical/canonical fallback. |
+| **§16, §18, §19, §51** Query Contract & Routing | `TECHNICAL_SPEC.md §4`, `API.md`, `diagrams/05_QUERY_ROUTING.md` | Explicit nested `requirements` array; per-requirement capability routing; clarification on material ambiguity. |
+| **§17, ADR-004** Query Model Budgets | `ADR-004`, `COST.md` | `query-default-v3` limits (generation 2, reranker 2, encoder-verify 1, embed 2, LAYA 2, expansion 1, attempts 3); reserved synthesis/verifier finishing slots; no document embedding during Q&A. |
+| **§20, §21, §29, §30, §52, §55** Discovery Fan-In & Ranking | `diagrams/06_RETRIEVAL_EXECUTION_JOIN.md`, `TECHNICAL_SPEC.md §6, §7`, `ADR-002` | Pre-fusion discovery fan-in barrier; branch status payload; deadline handling; early-stop rules; RRF only for ranked discovery; fixed bounded reranking. |
+| **§26, §27, §28, §40, §52** Structured Execution & CSV/XLSX | `TECHNICAL_SPEC.md §5`, `ADR-002` | Registered dataset references; allowlisted AST; value policies (nulls, cached Excel formulas, currencies); empty/all-null vs zero; zero denominators; missing operands prohibited; durable lineage. |
+| **§31, §32, §33, §38, §39, §53, §54, §60** Evidence Verification & Answer | `WORKFLOW.md`, `diagrams/07_VERIFICATION_ANSWER.md`, `TECHNICAL_SPEC.md §8, §9` | Mechanical + semantic validation; `PartialAnswerReady → AnswerMode → FinalValidation`; safe-fallback verified template/excerpts or failure; terminal exits. |
+| **§34, §35, §36** LAYA Bounded Escalation | `diagrams/08_LAYA.md`, `TECHNICAL_SPEC.md §10` | Typed decision-only escalation; code validates and executes; bounded candidate and step limits. |
+| **§3, §45, §47, §48, §65, §66, §67** Lifecycle & CAS Publication | `ADR-005`, `DATABASE.md`, `diagrams/09_LIFECYCLE.md` | Monotonic generations (manifest, source, baseline, enrichment); expected-generation CAS; atomic delta merge; simultaneous uploads; tombstones & deletion barriers; idempotent `JobKey`. |
+| **§46** Version-Aware Cache | `MEMORY.md`, `DATABASE.md` | CacheKey includes workspace, principal scope, session hash, query hash, snapshot, versions; cache hit never bypasses access/tombstones; session persistence. |
+| **§8, §11, §37, §56, §57, §58, §61, §68** Corpus Controls | `diagrams/10_LARGE_CORPUS.md`, `TECHNICAL_SPEC.md §11`, `PERFORMANCE.md` | Bounded batches, backpressure, checkpoints, retries, partitioning, deadlines, cancellation, cursor pagination for exhaustive lists, hierarchical whole-doc summaries. |
+| **§69, §70, §73** Refactoring Guardrails & Gates | `MIGRATION_MAP.md`, `DEVELOPMENT.md` | 7-stage refactoring order; mandatory invariant checks; acceptance gates require executable tests before claims. |
+
 ## Existing Repository Reviewed
 The current repository includes root design/evaluation docs, FastAPI routers, a unified repository facade, DynamoDB/Qdrant/Redis, ingestion adapters, providers, `modules/`, schemas, retrieval services, LangGraph orchestration, frontend workspace/chat/library/viewer/graph pages and benchmark/evaluation assets.
 
@@ -18,3 +43,4 @@ FastAPI route families, repository/storage abstractions, compatible adapters, pr
 
 ## Replace/Refactor First
 Pipeline state/orchestration, planner contract, capability/snapshot registry, publication logic, structured/RRF boundary, verification interfaces, model-budget scheduler and ingestion/enrichment publication flow.
+

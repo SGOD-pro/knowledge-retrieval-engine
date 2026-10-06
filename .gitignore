@@ -20,3 +20,4 @@ tmp/
 backend/tmp/
 backend/reports/
 *.log
+.agents

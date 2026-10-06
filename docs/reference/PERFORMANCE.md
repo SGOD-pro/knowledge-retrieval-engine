@@ -7,7 +7,7 @@ T_{seq}=\sum_i T_i
 \]
 Independent discovery:
 \[
-T_{parallel}pprox\max(T_{branch})
+T_{parallel}\approx\max(T_{branch})
 \]
 
 ## Bounds
