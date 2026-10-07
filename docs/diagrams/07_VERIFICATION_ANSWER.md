@@ -11,8 +11,8 @@ flowchart TD
     CO -->|Missing + progress possible| EXP["LAYA / bounded expansion"]
     CO -->|No support or retrieval incomplete| OUT["Explicit scoped status / Incomplete"]
     PART --> MODE
-    MODE -->|Deterministic| DET["Approved template"]
-    MODE -->|Narrative with reserved budget| LLM["Bounded synthesis"]
+    MODE -->|Deterministic: 0 or 1 gen calls| DET["Approved template"]
+    MODE -->|Narrative: 2 gen calls reserved| LLM["Bounded synthesis"]
     LLM --> SV["Final semantic verification"]
     SV -->|Supported wording| FM["Final mechanical & access checks"]
     SV -->|Unsupported wording| SF["Safe fallback: verified template/excerpts"]
@@ -23,4 +23,3 @@ flowchart TD
     OK -->|Yes| ANS["Validated answer, citations & completeness"]
     OK -->|No| REV["Explicit failure: invalid or revoked"]
 ```
-

@@ -110,7 +110,7 @@ Cross-module messages carry, where applicable:
   "value_policy": {
     "nulls": "error",
     "excel_formulas": "validated_cached_values",
-    "currency": "USD"
+    "currency": "USD_million"
   }
 }
 ```
@@ -123,6 +123,7 @@ Cross-module messages carry, where applicable:
   "snapshot_id": "snap_42",
   "requirement_id": "r1",
   "execution_id": "exec_7",
+  "evidence_id": "execution:ws_1:exec_7",
   "execution_record_ref": "execution:ws_1:exec_7",
   "source_id": "sheet_1",
   "source_version": 3,
@@ -136,7 +137,7 @@ Cross-module messages carry, where applicable:
     "selection_digest": "sha256:...",
     "lineage_ref": "execution:ws_1:exec_7:lineage"
   },
-  "result": {"value": 184, "unit": "USD"},
+  "result": {"value": 184.2, "unit": "USD_million"},
   "coverage_status": "COMPLETE_FOR_SELECTION",
   "qualifications": [],
   "status": "VERIFIED"
@@ -191,7 +192,7 @@ Typed decision only; code validates and executes. Budget, deadline, candidate li
 ## 11. Large Data & Operational Rules
 - **Selective Prose Chunking & Embedding:** Only readable narrative prose blocks are chunked and embedded. Tabular datasets index schema/navigation text and route to structured execution.
 - **No Document Embedding During Q&A:** Query embedding is restricted to the question or bounded query variants. No document chunking/embedding occurs at query time.
-- **Embedding-Model Compatibility:** Distinct models (e.g. BGE-small 384 vs Titan 1024) use separate collections/vectors and are never cross-queried or merged across dimensions.
+- **Embedding-Model Compatibility:** Different embedding models use separate collections or separate named-vector configurations within one collection. Compatibility encompasses model identity/version, dimensions, normalization, and distance metric—not dimension alone. A query vector is never compared against an incompatible model's vectors; compatible ranked candidate lists are fused via RRF, while raw vectors or similarity scores are never mixed across models.
 - **Prepared Fallback Behavior:** If dense retrieval fails or is unavailable, use prepared baseline lexical/canonical fallbacks. Do not mark incomplete indexes as ready.
 - **Source-Supported Graph Relations:** Graph relations require exact source locators. Cross-source edges retain all supporting source versions and invalidate if supporting sources change.
 - **Exhaustive-List Coverage:** "List all X" requires deterministic cursor pagination and completeness verification, never a top-k similarity sample.

@@ -69,7 +69,7 @@ Only readable narrative prose blocks are chunked and embedded. Tabular datasets 
 Query-time embedding is strictly for the incoming question or bounded query rewrites. Under no circumstances may document chunking or embedding occur during query time.
 
 ### FR-23 Embedding-Model Compatibility
-Dense vectors from distinct embedding models (e.g. BGE-small 384 vs Titan 1024) are stored in separate collections/vectors and are never cross-queried, compared, or merged across dimensions.
+Different embedding models may use separate collections or separate named-vector configurations within one collection. Compatibility encompasses model identity/version, dimensions, normalization, and distance metric—not dimension alone. A query vector is never compared against an incompatible model's vectors. Compatible ranked candidate lists may be fused according to the RRF contract; raw incompatible vectors or similarity values are not mixed.
 
 ### FR-24 Prepared Fallback Behavior
 Baseline lexical and canonical evidence paths provide guaranteed operational fallback when optional enrichment or dense retrieval fails or is pending. Incomplete indexes cannot be marked ready.

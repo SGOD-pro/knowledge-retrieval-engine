@@ -41,7 +41,10 @@ CacheKey = H(
   - Query embedding is strictly for the incoming question or bounded query variants.
   - Under no circumstances may document chunking or document embedding be performed during query time.
 - **Embedding-Model Compatibility:**
-  - Vectors from different models or dimensions (e.g., BGE-small 384-dim vs Titan V2 1024-dim) reside in separate collections/named vectors and are NEVER compared against each other, mixed in similarity calculations, or merged across dimensions.
+  - Different embedding models may use separate collections OR separate named-vector configurations within one collection (e.g., named vectors `embedding_fast` and `embedding_full` in QdrantDB).
+  - Compatibility encompasses model identity/version, dimensions, normalization, and distance metric—not dimension alone.
+  - A query vector is never compared against an incompatible model's vectors.
+  - Compatible ranked candidate lists may be fused according to the RRF contract; raw incompatible vectors or similarity values are never mixed.
 - **Historical Note:** The legacy rule stating "Both vectors populated at ingestion time for every chunk" is **SUPERSEDED** by selective prose chunking.
 
 ## Persistent Sessions, History, and Observability (Current Policy — v3)

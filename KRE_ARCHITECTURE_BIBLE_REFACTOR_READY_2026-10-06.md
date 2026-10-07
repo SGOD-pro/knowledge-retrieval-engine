@@ -1,5 +1,5 @@
 # KRE Architecture Bible — Canonical Connected System (Refactor-ready v3)
-## Version: 2026-10-06 — v0.3
+## Version: 2026-10-06 — v3
 
 > **Purpose:** This document is the single architecture source of truth for rebuilding KRE.
 > It reconciles the earlier diagrams instead of replacing their concepts.

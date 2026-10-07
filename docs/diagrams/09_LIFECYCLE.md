@@ -2,18 +2,22 @@
 
 ```mermaid
 flowchart TB
-    NEW["New immutable version"] --> BUILD["Build affected artifacts in staging"]
-    BUILD --> QA["Validate"]
-    QA --> PUB["Generation-checked atomic publish"]
-    PUB --> ACTIVE["New active snapshot"]
-    ACTIVE --> ENR["Optional enrichment"]
-    ENR --> EQA["Validate generation/source"]
-    EQA --> EPUB["Atomic enrich active snapshot"]
+    REG["Register target immutable source version (v8)\nPrevious version (v7) remains active & queryable"] --> STAGE["Build baseline artifacts in staging\n(input_source_version: 8)"]
+    STAGE --> BQA{"Baseline QA passes?"}
+    BQA -->|No| FAIL["Keep active v7 baseline & report failure"]
+    BQA -->|Yes| CAS_BASE{"Atomic CAS Baseline Publish:\n- manifest_gen == expected_manifest_gen\n- active_version == expected_active_ver (v7)\n- target registered & not tombstoned\n- artifacts match target version"}
+    CAS_BASE -->|CAS Conflict| RETRY{"Bounded Re-read & Revalidate:\nStale/tombstoned/incompatible?"}
+    RETRY -->|Yes| ABORT["Abort retry & discard"]
+    RETRY -->|No| MERGE_DELTA["Merge localized delta preserving\nconcurrent document updates"]
+    MERGE_DELTA --> CAS_BASE
+    CAS_BASE -->|Commit Success| ACTIVATE["Activate v8 in workspace manifest\nmanifest_generation++ (v8 now active)"]
 
-    DEL["Delete/revoke"] --> TOM["Atomic tombstone/access barrier"]
-    TOM --> INV["Cancel jobs + invalidate dependent cache"]
+    ACTIVATE --> ENR_BUILD["Build optional enrichment in background\nBound to (v8, baseline_generation)"]
+    ENR_BUILD --> EQA{"Enrichment QA passes?"}
+    EQA -->|Yes| CAS_ENR{"Atomic CAS Enrichment Publish:\n- manifest_gen == expected_manifest_gen\n- active_version == target_source_version (v8)\n- active_baseline_gen == based_on_baseline_gen\n- not tombstoned & enrichment_gen not superseded"}
+    CAS_ENR -->|Yes| ENR_EXTEND["Extend active manifest with enrichment\n(Does NOT switch active version)"]
+    CAS_ENR -->|No / Stale Baseline| ENR_DISC["Discard stale enrichment artifact\n(Do not overwrite newer baseline/enrichment)"]
 
-    STALE["Stale job"] --> CHECK{"Generation/source still matches?"}
-    CHECK -->|No| DISC["Discard/rebuild"]
-    CHECK -->|Yes| PUB
+    DEL["Delete / Revoke source"] --> TOMB["Atomic tombstone & immediate access barrier\nmanifest_generation++"]
+    TOMB --> CLEANUP["Cancel background jobs, invalidate cache &\ndependent cross-source edges; abort final delivery"]
 ```
