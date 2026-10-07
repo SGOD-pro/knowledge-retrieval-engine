@@ -281,7 +281,7 @@
   "query_id": "q_3",
   "snapshot_id": "snap_42",
   "status": "COMPLETE",
-  "answer": "For Q3 2024, the European division reported 184.2 million USD in revenue, meeting operating targets.",
+  "answer": "For 2024, the European division reported 184.2 million USD in revenue.",
   "requirements": [
     {
       "requirement_id": "r1",
@@ -292,7 +292,7 @@
   "claims": [
     {
       "claim_id": "c1",
-      "text": "The European division reported 184.2 million USD in revenue for Q3 2024.",
+      "text": "For 2024, the European division reported 184.2 million USD in revenue.",
       "support": ["ev_1"],
       "status": "SUPPORTED"
     }
