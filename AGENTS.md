@@ -63,3 +63,40 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 ---
 
 **These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
+
+## Stack
+
+* Language / Runtime: Python 3.12 (backend), TypeScript (frontend)
+* Framework: FastAPI (backend), React 19 with Vite (frontend)
+* Key dependencies: LangGraph, Qdrant, DynamoDB, Redis, Tailwind CSS
+* Package manager: uv (backend), npm (frontend)
+
+## Build approach
+
+Tracer Bullet, vertical end to end slices, thin but complete through every layer
+
+## Commands
+
+```bash
+# Start both servers
+./start-server.sh
+
+# Backend server
+cd backend && uv run uvicorn src.main:app --port 8001 --reload
+
+# Frontend server
+cd frontend && npm run dev
+
+# Tests
+cd backend && uv run pytest
+cd frontend && npm run test
+```
+
+## Specs
+
+Stored in docs/specs/ and foundational design in docs/PROJECT.md and KRE_ARCHITECTURE_BIBLE_REFACTOR_READY_2026-10-06.md
+
+## Context files
+
+* [backend/AGENTS.md](backend/AGENTS.md) (FastAPI service, ingestion pipelines, retrieval orchestration, deterministic execution)
+* [frontend/AGENTS.md](frontend/AGENTS.md) (React and Vite web interface, workspace management, chat, document viewer)

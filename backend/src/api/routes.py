@@ -9,13 +9,14 @@ from modules.query import query_router, query_service
 from modules.system import system_router, system_service
 from modules.workspaces import workspaces_router, workspaces_service
 from modules.chat import chat_router, chat_service
+from api.workspace_boundary_routes import router as workspace_boundary_router
 
 router = APIRouter()
 
 # Mount all modular sub-routers
+router.include_router(workspace_boundary_router)
 router.include_router(system_router)
 router.include_router(auth_router)
-router.include_router(workspaces_router)
 router.include_router(chat_router)
 router.include_router(documents_router)
 router.include_router(query_router)

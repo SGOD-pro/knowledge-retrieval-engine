@@ -16,6 +16,7 @@ _ENV_FILES = (
 
 class Settings(BaseSettings):
     ENVIRONMENT: Literal["dev", "prod", "test"] = "dev"
+    KRE_AUTH_MODE: str = "test"
 
     # AWS Region
     AWS_REGION: str = "us-east-1"
@@ -29,6 +30,10 @@ class Settings(BaseSettings):
     # TableStore Persistence Configuration
     TABLE_STORE_BACKEND: str | None = None
     TABLE_STORE_SQLITE_PATH: str | None = None
+
+    # Workspace Boundary Persistence Configuration
+    WORKSPACE_REPO_BACKEND: str | None = None
+    WORKSPACE_SQLITE_PATH: str | None = None
 
     # BGE Embedding Lambda function
     BGE_EMBEDDING_LAMBDA_NAME: str = "bge-text-embeder"
