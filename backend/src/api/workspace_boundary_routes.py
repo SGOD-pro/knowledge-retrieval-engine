@@ -37,7 +37,14 @@ global_execution_engine = ControlledFixtureExecutionEngine()
 
 def get_boundary_repo() -> Any:
     """Dependency provider for authoritative workspace boundary repository."""
-    return get_workspace_boundary_repo()
+    try:
+        return get_workspace_boundary_repo()
+    except (sqlite3.OperationalError, sqlite3.DatabaseError) as err:
+        logger.error("Authoritative storage connection failure: %s", err)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Authoritative storage unreachable",
+        )
 
 
 class CreateWorkspacePayload(BaseModel):
