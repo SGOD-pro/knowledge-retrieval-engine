@@ -78,75 +78,68 @@ Build core identity contracts and workspace boundary enforcement using explicit 
 - [x] Test it: `/test workspace authorization and boundary isolation`
 - [x] Review it (fresh model): `/check review workspace authorization and boundary isolation`
 - [x] Document it: `/document workspace authorization and boundary isolation`
+**Note:** Latest review (2026-10-09) is Blocked. Remaining gaps: test fixtures used in production routes, synchronous sleep blocks event loop in DynamoDB store, missing sys.path injection for test imports.
 Spec [0002](../specs/0002-workspace-authorization-and-boundary-isolation.md) · code in `backend/src/`
+
+## Deferred
 
 ### 3. Snapshot registry, publication, and atomic deletion · needs a decision · GA
 Implement CAS publication, baseline generation counters, active source version tracking, bounded manifest layout under DynamoDB limits, and immediate tombstone deletion barriers. (basis: Architecture Bible §3, §45, §47, §48, §65, §66, §67; docs/reference/DATABASE.md; docs/MIGRATION_MAP.md Traceability Matrix)
 **Done when:** multi item atomic publication updates manifests with generation checks, reads never observe incomplete publications, and deletions block access immediately.
 - [ ] Design it (spec): `/architect snapshot registry, publication, and atomic deletion`
+*(Deferred: preserve design and dependencies; do not overwrite or renumber it)*
+
+* **Advanced distributed scaling and optimization**: Multi node distributed partitioning, distributed worker clustering, and advanced cluster optimization (basis: Architecture Bible §8, §37, §56; docs/MIGRATION_MAP.md Traceability Matrix) · needs a decision · GA
+* **Independent external security audit**: Formal third party compliance certification and independent external penetration testing (basis: docs/reference/SECURITY.md) · GA
 
 ## Slice 1: Core walking skeleton
 
-### 4. Core walking skeleton · needs a decision
-Prove the complete path works end to end on a single structured dataset using a small production compatible subset of later slices with explicit test identities through intended production interfaces. It exercises workspace boundary isolation, uses shared identity contracts, performs restricted AST execution against table storage, persists durable provenance, and renders verified results in the web client, without requiring authentication screens, workspace management UI, or throwaway parallel pipelines. (basis: Tracer Bullet principle: validate the entire pipeline connects before expanding breadth; docs/MIGRATION_MAP.md Replace/Refactor First)
-**Done when:** a query with explicit test workspace and principal contexts uploads a structured file, registers a baseline snapshot, executes deterministically via restricted AST, passes boundary isolation checks, and displays verified results with durable provenance in the web client.
-- [ ] Design it (spec): `/architect core walking skeleton`
+### 4. Core engine walking skeleton and benchmarks · needs a decision
+Make the next milestone a bounded core engine walking skeleton that proves the complete path works end to end. Include minimum readiness and consistent source/version bindings. Defer advanced distributed publication and cleanup infrastructure.
+**Done when:** the skeleton supports one development workspace using existing identity and access checks; real CSV and text PDF ingestion with source/version provenance; full structured dataset processing without row truncation; typed, restricted lookup/filter/aggregation execution; BM25 and baseline vector retrieval with embeddings built at ingestion; reranking, evidence-backed answers, citations, and insufficient-evidence responses; and reproducible benchmarks for correctness, evidence support, coverage, token usage, ingestion time, and query latency.
+- [ ] Design it (spec): `/architect core engine walking skeleton and benchmarks`
 
-## Slice 2: Baseline ingestion pipeline
+## Slice 2: PageIndex integration
 
-### 5. Baseline ingestion pipeline · needs a decision
-Harden document ingestion across PDF, DOCX, PPTX, CSV, and XLSX into typed CanonicalEvidence, with bounded batching, checkpoints, cancellation, and incomplete coverage handling, publishing a usable baseline snapshot without waiting for optional enrichment. (basis: Architecture Bible §4, §5, §6, §7, §8, §11, §13; docs/WORKFLOW.md; docs/MIGRATION_MAP.md Traceability Matrix)
-**Done when:** multi format documents ingest asynchronously with extraction QA and locators, checkpoints and cancellation function cleanly, incomplete coverage is flagged, and baseline snapshots publish independently of enrichment.
-- [ ] Design it (spec): `/architect baseline ingestion pipeline`
+### 5. PageIndex integration · needs a decision
+Plan PageIndex integration as a subsequent, independently verifiable slice after the baseline works.
+**Done when:** PageIndex is integrated into the retrieval pipeline and independently verified.
+- [ ] Design it (spec): `/architect PageIndex integration`
 
-## Slice 3: Deterministic structured execution
+## Slice 3: OKF integration
 
-### 6. Deterministic structured execution · needs a decision · GA
-Execute tabular operations over registered CSV and XLSX datasets using an allowlisted abstract syntax tree with strict null policies and durable lineage, running outside of reciprocal rank fusion. (basis: Architecture Bible §26, §27, §28, §40, §52; docs/TECHNICAL_SPEC.md §5; docs/MIGRATION_MAP.md Traceability Matrix)
-**Done when:** structured data queries execute deterministically against table stores without language model hallucination, handle empty or zero values safely, and produce mandatory execution evidence outside of reciprocal rank fusion.
-- [ ] Design it (spec): `/architect deterministic structured execution`
+### 6. OKF integration · needs a decision
+Plan OKF integration as a subsequent, independently verifiable slice after the baseline works.
+**Done when:** OKF is integrated into the enrichment pipeline and independently verified.
+- [ ] Design it (spec): `/architect OKF integration`
 
-## Slice 4: Baseline discovery retrieval and fusion
+## Slice 4: Knowledge graph enrichment
 
-### 7. Baseline discovery retrieval and fusion · needs a decision
-Retrieve lexical and dense candidates from baseline indexes, enforce a pre fusion barrier, apply cursor pagination for exhaustive lists, handle deadlines, and merge compatible discovery candidates using reciprocal rank fusion. (basis: Architecture Bible §19, §20, §21, §29, §30, §52, §55; docs/TECHNICAL_SPEC.md §6, §7; docs/MIGRATION_MAP.md Traceability Matrix)
-**Done when:** queries over text chunks retrieve BM25 and vector candidates, apply deadlines and cursor pagination, merge ranked lists through reciprocal rank fusion, and apply bounded reranking without including structured evidence.
-- [ ] Design it (spec): `/architect baseline discovery retrieval and fusion`
+### 7. Knowledge graph enrichment · needs a decision
+Plan knowledge graph enrichment as a subsequent, independently verifiable slice after the baseline works.
+**Done when:** the knowledge graph is integrated and independently verified.
+- [ ] Design it (spec): `/architect knowledge graph enrichment`
 
-## Slice 5: Knowledge Map and requirement router
+## Slice 5: LAYA bounded escalation
 
-### 8. Knowledge Map and requirement router · needs a decision
-Decompose user queries into explicit requirement arrays, inspect capability readiness across sources, and route each requirement to the least expensive ready path. (basis: Architecture Bible §10, §12, §14, §15, §16, §18, §19, §50, §51; docs/TECHNICAL_SPEC.md §3, §4; docs/MIGRATION_MAP.md Traceability Matrix)
-**Done when:** the planner creates verifiable requirement items, routes structured requirements to execution and semantic requirements to discovery, and requests clarification whenever material ambiguity exists.
-- [ ] Design it (spec): `/architect Knowledge Map and requirement router`
+### 8. LAYA bounded escalation · needs a decision
+Plan LAYA integration for bounded heuristic and query expansion escalation when discovery finds no support.
+**Done when:** LAYA is integrated as a subsequent, independently verifiable slice.
+- [ ] Design it (spec): `/architect LAYA bounded escalation`
 
-## Slice 6: Evidence verification and answer assembly
+## Slice 6: End to end interface integration
 
-### 9. Evidence verification and answer assembly · needs a decision · GA
-Join retrieved evidence by requirement, enforce mechanical and semantic validation under a strict query budget, and assemble grounded answers. (basis: Architecture Bible §17, §31, §32, §33, §38, §39, §53, §54, §60; docs/WORKFLOW.md; docs/TECHNICAL_SPEC.md §8, §9; docs/MIGRATION_MAP.md Traceability Matrix)
-**Done when:** evidence joins by requirement identifier, passes locator and support checks, respects the query model budget ledger, and emits validated answers or explicit refusal notifications.
-- [ ] Design it (spec): `/architect evidence verification and answer assembly`
-
-## Slice 7: End to end interface integration
-
-### 10. End to end interface integration
+### 9. End to end interface integration
 Connect the refactored backend execution pipeline to the React web application in test workspace mode, updating the query input, citation links, and document viewer highlights. (basis: Architecture Bible §71, §72; docs/MIGRATION_MAP.md Reuse First; frontend/AGENTS.md)
 **Done when:** users in the web interface can view live ingestion status, ask multi part queries in test workspace mode, click citations to jump to exact document locations, and see clean error or refusal messages.
 - [ ] Build it: `/develop end to end interface integration`
 
-## Slice 8: Production authentication and multi user workspaces
+## Slice 7: Production authentication and multi user workspaces
 
-### 11. Production authentication, workspace membership, and session persistence · needs a decision · GA
+### 10. Production authentication, workspace membership, and session persistence · needs a decision · GA
 Implement real authentication provider integration, user account management, workspace ownership and membership access controls, and persistent chat sessions prior to multi user release. (basis: Architecture Bible §3, §16, §46; docs/reference/SECURITY.md; docs/reference/API.md)
 **Done when:** users can authenticate through real identity providers, create and manage workspaces with explicit membership permissions, and resume persistent chat sessions with full authorization enforcement.
 - [ ] Design it (spec): `/architect production authentication, workspace membership, and session persistence`
-
-## Deferred
-Out of scope for this core engine pass, kept so the plan stays honest.
-* **LAYA bounded escalation**: Bounded heuristic and query expansion escalation when discovery finds no support (basis: Architecture Bible §22, §34, §35, §36; docs/MIGRATION_MAP.md Traceability Matrix) · needs a decision
-* **Optional asynchronous OKF and graph enrichment**: Background PageIndex and knowledge graph construction running out of band without blocking baseline queries (basis: Architecture Bible §13, §16; docs/MIGRATION_MAP.md Traceability Matrix) · needs a decision
-* **Advanced distributed scaling and optimization**: Multi node distributed partitioning, distributed worker clustering, and advanced cluster optimization (basis: Architecture Bible §8, §37, §56; docs/MIGRATION_MAP.md Traceability Matrix) · needs a decision · GA
-* **Independent external security audit**: Formal third party compliance certification and independent external penetration testing (basis: docs/reference/SECURITY.md) · GA
 
 ## References
 
