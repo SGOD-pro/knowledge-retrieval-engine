@@ -3,9 +3,9 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from config import settings
-from api.routes import router
-from security.auth import validate_auth_configuration
+from src.config import settings
+from src.api.routes import router
+from src.security.auth import validate_auth_configuration
 
 # Prohibit test authentication mode in production at startup (AC-5)
 validate_auth_configuration(settings.ENVIRONMENT, settings.KRE_AUTH_MODE)
