@@ -330,6 +330,28 @@ class InMemoryWorkspaceBoundaryRepository:
             self._jobs[job.job_id] = job
 
 
+from functools import wraps
+from typing import Callable, TypeVar, Any, cast
+
+F = TypeVar("F", bound=Callable[..., Any])
+
+def _handle_sqlite_errors(func: F) -> F:
+    @wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return func(*args, **kwargs)
+        except (sqlite3.OperationalError, sqlite3.DatabaseError) as e:
+            from src.schemas.contracts.boundary import StorageUnavailableError
+            raise StorageUnavailableError(f"Database error: {str(e)}") from e
+    return cast(F, wrapper)
+
+def _translate_sqlite_errors_for_class(cls: type) -> type:
+    for attr_name, attr_value in cls.__dict__.items():
+        if callable(attr_value) and (not attr_name.startswith("__") or attr_name == "__init__"):
+            setattr(cls, attr_name, _handle_sqlite_errors(attr_value))
+    return cls
+
+@_translate_sqlite_errors_for_class
 class SQLiteWorkspaceBoundaryRepository:
     """Durable SQLite backed repository for workspaces, tombstones, and manifests."""
 

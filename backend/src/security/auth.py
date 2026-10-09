@@ -6,7 +6,6 @@ and restricted background worker context instantiation.
 """
 
 import os
-import sqlite3
 from typing import Any
 from fastapi import Header, HTTPException, Request, status
 
@@ -20,6 +19,7 @@ from src.schemas.contracts.boundary import (
     WorkspaceRecord,
 )
 from src.schemas.contracts.envelope import TrustedAuthContext
+from src.schemas.contracts.boundary import StorageUnavailableError
 from src.db.workspace_boundary_repo import workspace_boundary_repo
 
 
@@ -212,7 +212,7 @@ async def require_auth_context(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Resource not found",
             )
-        except (sqlite3.OperationalError, sqlite3.DatabaseError) as err:
+        except StorageUnavailableError as err:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Authoritative storage unreachable",

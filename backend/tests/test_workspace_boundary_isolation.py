@@ -608,6 +608,7 @@ def test_qdrant_pre_dispatch_filter_rejection():
 def test_sqlite_workspace_boundary_repo_persistence_across_restart(tmp_path):
     """Proves durable repository state, tombstones, and CAS counters survive restart."""
     from src.db.workspace_boundary_repo import SQLiteWorkspaceBoundaryRepository
+    from src.schemas.contracts.boundary import StorageUnavailableError
 
     db_path = tmp_path / "test_boundary.db"
 
@@ -693,6 +694,7 @@ def test_empty_or_whitespace_payloads_return_400():
 def test_sqlite_workspace_boundary_repo_reset_and_access_denials(tmp_path):
     """Proves SQLite repository fixture reset, foreign deletion rejection, and job/snapshot storage."""
     from src.db.workspace_boundary_repo import SQLiteWorkspaceBoundaryRepository
+    from src.schemas.contracts.boundary import StorageUnavailableError
     from src.schemas.contracts.boundary import JobRecord, SnapshotRecord
 
     db_path = tmp_path / "sqlite_coverage.db"
@@ -780,13 +782,13 @@ def test_get_workspace_boundary_repo_backend_selection_and_prod_barrier(monkeypa
 # ---------------------------------------------------------------------------
 def test_store_failure_handling_returns_503(monkeypatch):
     """Proves unhandled authoritative database errors trigger HTTP 503 Service Unavailable."""
-    import sqlite3
     from src.db.workspace_boundary_repo import SQLiteWorkspaceBoundaryRepository
+    from src.schemas.contracts.boundary import StorageUnavailableError
 
     alice_headers = {"Authorization": "Bearer test_token_alice"}
 
     def failing_get_workspace(*args, **kwargs):
-        raise sqlite3.OperationalError("database is locked or disk full")
+        raise StorageUnavailableError("database is locked or disk full")
 
     # Monkeypatch repository get_workspace to simulate storage crash
     monkeypatch.setattr(SQLiteWorkspaceBoundaryRepository, "get_workspace", failing_get_workspace)
@@ -798,10 +800,48 @@ def test_store_failure_handling_returns_503(monkeypatch):
 
     # 2. POST /workspaces triggers 503
     def failing_create_workspace(*args, **kwargs):
-        raise sqlite3.OperationalError("disk I/O error")
+        raise StorageUnavailableError("disk I/O error")
 
     monkeypatch.setattr(SQLiteWorkspaceBoundaryRepository, "create_workspace", failing_create_workspace)
     resp_create = client.post("/api/v1/workspaces", json={"name": "Crash Project"}, headers=alice_headers)
     assert resp_create.status_code == 503
     assert "Authoritative storage unreachable" in resp_create.json()["detail"]
+
+
+def test_concurrent_workspace_deletion_handled_as_404(monkeypatch, reset_repo_state):
+    from src.db.workspace_boundary_repo import get_workspace_boundary_repo
+    repo = get_workspace_boundary_repo()
+    repo.create_workspace(name='Alice Project', owner_principal_id='usr_alice', workspace_id='ws_alice_1')
+    """Proves that FileNotFoundError during source creation or deletion returns HTTP 404."""
+    # We will monkeypatch create_source to throw FileNotFoundError
+    from src.db.workspace_boundary_repo import SQLiteWorkspaceBoundaryRepository
+    
+    alice_headers = {"Authorization": "Bearer test_token_alice"}
+    
+    def failing_create_source(*args, **kwargs):
+        raise FileNotFoundError("Workspace ws_alice_1 not found")
+        
+    monkeypatch.setattr(repo, 'create_source', failing_create_source)
+    
+    resp_create = client.post(
+        "/api/v1/workspaces/ws_alice_1/sources",
+        json={"title": "Concurrent Source"},
+        headers=alice_headers
+    )
+    
+    assert resp_create.status_code == 404
+    assert "Workspace not found" in resp_create.json()["detail"]
+
+    def failing_delete_source(*args, **kwargs):
+        raise FileNotFoundError("Workspace ws_alice_1 not found")
+        
+    monkeypatch.setattr(repo, "record_source_tombstone", failing_delete_source)
+    
+    resp_delete = client.delete(
+        "/api/v1/workspaces/ws_alice_1/sources/src_concurrent_123",
+        headers=alice_headers
+    )
+    
+    assert resp_delete.status_code == 404
+    assert "Workspace not found" in resp_delete.json()["detail"]
 

@@ -5,7 +5,6 @@ or tombstoned resources, and supports deterministic query delivery gate rechecks
 """
 
 import logging
-import sqlite3
 from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
@@ -18,8 +17,9 @@ from src.schemas.contracts.boundary import (
     QueryExecutionOutcome,
     SourceItem,
     WorkspaceRecord,
+    StorageUnavailableError,
 )
-from src.schemas.contracts.envelope import TrustedAuthContext
+from src.schemas.contracts.envelope import IdentityEnvelope, TrustedAuthContext
 from src.db.workspace_boundary_repo import get_workspace_boundary_repo
 from src.security.auth import require_auth_context
 from src.services.cache_delivery import (
@@ -39,7 +39,7 @@ def get_boundary_repo() -> Any:
     """Dependency provider for authoritative workspace boundary repository."""
     try:
         return get_workspace_boundary_repo()
-    except (sqlite3.OperationalError, sqlite3.DatabaseError) as err:
+    except StorageUnavailableError as err:
         logger.error("Authoritative storage connection failure: %s", err)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -62,6 +62,15 @@ class WorkspaceQueryPayload(BaseModel):
     query: str = Field(..., min_length=1)
     session_id: str | None = None
     snapshot_id: str = "snap_default"
+
+
+def _enforce_workspace_boundary(workspace_id: str, auth_context: TrustedAuthContext) -> None:
+    """Enforce IdentityEnvelope validation against the trusted authorization context."""
+    try:
+        IdentityEnvelope(workspace_id=workspace_id).validate_auth(auth_context)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Resource not found")
+
 
 
 @router.post(
@@ -90,7 +99,7 @@ async def create_workspace_boundary_endpoint(
             name=payload.name.strip(),
             owner_principal_id=auth_context.principal_id,
         )
-    except (sqlite3.OperationalError, sqlite3.DatabaseError) as err:
+    except StorageUnavailableError as err:
         logger.error("Authoritative storage failure during workspace creation: %s", err)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -115,15 +124,16 @@ async def get_workspace_boundary_endpoint(
     repo: Any = Depends(get_boundary_repo),
 ):
     """Retrieve workspace metadata, returning 404 for foreign or tombstoned workspaces."""
+    _enforce_workspace_boundary(workspace_id, auth_context)
     try:
         record = repo.get_workspace(workspace_id)
-    except (sqlite3.OperationalError, sqlite3.DatabaseError) as err:
+    except StorageUnavailableError as err:
         logger.error("Authoritative storage failure retrieving workspace: %s", err)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Authoritative storage unreachable",
         )
-    if not record or record.status == "tombstoned" or record.owner_principal_id != auth_context.principal_id:
+    if not record or record.status == "tombstoned":
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Resource not found")
 
     return {
@@ -145,9 +155,10 @@ async def list_workspace_sources_endpoint(
     repo: Any = Depends(get_boundary_repo),
 ):
     """List untombstoned sources in workspace."""
+    _enforce_workspace_boundary(workspace_id, auth_context)
     try:
         sources = repo.list_sources(workspace_id)
-    except (sqlite3.OperationalError, sqlite3.DatabaseError) as err:
+    except StorageUnavailableError as err:
         logger.error("Authoritative storage failure listing sources: %s", err)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -168,6 +179,7 @@ async def create_workspace_source_endpoint(
     repo: Any = Depends(get_boundary_repo),
 ):
     """Register a new source in the authorized workspace."""
+    _enforce_workspace_boundary(workspace_id, auth_context)
     if not payload.title or not payload.title.strip():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -180,7 +192,12 @@ async def create_workspace_source_endpoint(
             title=payload.title.strip(),
             source_id=payload.source_id,
         )
-    except (sqlite3.OperationalError, sqlite3.DatabaseError) as err:
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Workspace not found"
+        )
+    except StorageUnavailableError as err:
         logger.error("Authoritative storage failure creating source: %s", err)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -205,9 +222,10 @@ async def get_workspace_source_endpoint(
     repo: Any = Depends(get_boundary_repo),
 ):
     """Get source metadata, returning 404 if deleted or foreign (AC-8)."""
+    _enforce_workspace_boundary(workspace_id, auth_context)
     try:
         item = repo.get_source(workspace_id, source_id)
-    except (sqlite3.OperationalError, sqlite3.DatabaseError) as err:
+    except StorageUnavailableError as err:
         logger.error("Authoritative storage failure getting source: %s", err)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -234,13 +252,19 @@ async def delete_workspace_source_endpoint(
     repo: Any = Depends(get_boundary_repo),
 ):
     """Tombstone source atomically, incrementing manifest generation (AC-8, AC-9)."""
+    _enforce_workspace_boundary(workspace_id, auth_context)
     try:
         tombstone = repo.record_source_tombstone(
             workspace_id=workspace_id,
             source_id=source_id,
             caller_principal_id=auth_context.principal_id,
         )
-    except (sqlite3.OperationalError, sqlite3.DatabaseError) as err:
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Workspace not found"
+        )
+    except StorageUnavailableError as err:
         logger.error("Authoritative storage failure deleting source: %s", err)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -266,6 +290,7 @@ async def query_workspace_boundary_endpoint(
     repo: Any = Depends(get_boundary_repo),
 ):
     """Execute query with delivery gate rechecks, literal query hashing, and recomputation (AC-10, AC-11, AC-12)."""
+    _enforce_workspace_boundary(workspace_id, auth_context)
     # 1. Compute exact literal query hash and descriptor
     query_hash = CacheKeyDescriptor.compute_query_hash(payload.query)
     source_version_hash = CacheKeyDescriptor.compute_source_version_set_hash(())
@@ -293,7 +318,7 @@ async def query_workspace_boundary_endpoint(
         )
     except FileNotFoundError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workspace not found")
-    except (sqlite3.OperationalError, sqlite3.DatabaseError) as err:
+    except StorageUnavailableError as err:
         logger.error("Authoritative storage failure evaluating query: %s", err)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

@@ -20,6 +20,11 @@ class WorkspaceAccessDeniedError(PermissionError):
     pass
 
 
+class StorageUnavailableError(Exception):
+    """Raised when the underlying backend storage system is unavailable."""
+    pass
+
+
 class CASConflictError(Exception):
     """Raised specifically when compare and swap encounters a generation mismatch."""
     pass
