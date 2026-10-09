@@ -731,7 +731,7 @@ class ErrorEnvelope(BaseModel):
 * `KRE_AUTH_MODE`: string setting defaulting to `test` in development (accepts test bearer tokens).
 * `ENVIRONMENT`: string setting (`development`, `test`, `production`). Prohibits `KRE_AUTH_MODE="test"` when set to `production`.
 * `KRE_REDIS_URL`: connection string for Redis cache (e.g. `redis://localhost:6379/0`).
-* `KRE_TABLESTORE_TYPE`: storage backend selection (`sqlite` for local development, `dynamodb` for integration tests).
+* `KRE_WORKSPACE_REPO_BACKEND`: storage backend selection (`sqlite` for local development, `dynamodb` for production and integration tests).
 * `KRE_QDRANT_URL`: connection string for vector database (e.g. `http://localhost:6333`).
 
 **Critical test scenarios**:
