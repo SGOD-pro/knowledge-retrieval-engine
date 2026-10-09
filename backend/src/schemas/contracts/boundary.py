@@ -286,4 +286,4 @@ class ErrorEnvelope(BaseModel):
     title: str
     status: int
     detail: str
-    instance: str | None = None
+    instance: str

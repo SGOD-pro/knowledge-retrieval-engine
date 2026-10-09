@@ -14,3 +14,20 @@ def _clean_bm25_chunk_cache():
     invalidate_chunk_cache()
     yield
     invalidate_chunk_cache()
+
+@pytest.fixture(autouse=True)
+def _clean_redis_cache():
+    from db.redis_cache import cache
+    cache._mem_cache.clear()
+    if cache.client:
+        try:
+            cache.client.flushdb()
+        except Exception:
+            pass
+    yield
+    cache._mem_cache.clear()
+    if cache.client:
+        try:
+            cache.client.flushdb()
+        except Exception:
+            pass

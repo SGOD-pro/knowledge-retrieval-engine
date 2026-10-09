@@ -327,7 +327,7 @@ async def query_workspace_boundary_endpoint(
 
     if outcome.status == "INSUFFICIENT_COVERAGE":
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail={
                 "type": "urn:kre:error:insufficient_coverage",
                 "title": "Insufficient Coverage",

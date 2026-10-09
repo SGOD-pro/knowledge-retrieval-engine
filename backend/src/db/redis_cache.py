@@ -70,7 +70,7 @@ class RedisCache:
         self._mem_cache[key] = value
         if self.client:
             try:
-                self.client.setex(key, ttl, json.dumps(value))
+                self.client.set(key, json.dumps(value), ex=ttl)
             except Exception as e:
                 pass
 
