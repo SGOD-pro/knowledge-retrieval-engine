@@ -17,7 +17,7 @@ _These are recommendations to keep your build orderly, not requirements. Skip an
 | D | Web application and document viewer shell | Existing | existing |
 | E | Benchmark suite and test assets | Existing | existing |
 | 1 | Contracts and identity envelope | Foundation | done |
-| 2 | Workspace authorization and boundary isolation | Foundation | in-progress |
+| 2 | Workspace authorization and boundary isolation | Foundation | done |
 | 3 | Snapshot registry, publication, and atomic deletion | Foundation | planned |
 | 4 | Core walking skeleton | Slice 1 | planned |
 | 5 | Baseline ingestion pipeline | Slice 2 | planned |
@@ -64,7 +64,7 @@ Define cross module message envelopes, typed CanonicalEvidence, CapabilityArtifa
 - [x] Test it: `/test contracts and identity envelope`
 Spec [0001](../specs/0001-contracts-and-identity-envelope.md) · code in `backend/src/schemas/contracts/`
 
-### 2. Workspace authorization and boundary isolation · in-progress · GA
+### 2. Workspace authorization and boundary isolation · done · GA
 Build core identity contracts and workspace boundary enforcement using explicit test workspace and test principal contexts through intended production interfaces. Enforce principal scoping, cache isolation, immediate deletion barriers, and cross workspace leakage tests without requiring full account management or authentication infrastructure up front. (basis: Architecture Bible §3, §46; docs/reference/SECURITY.md; docs/reference/TESTING.md)
 **Done when:** requests through production interfaces validate workspace and principal identifiers, cache hits never cross workspace boundaries, deletion tombstones block access immediately, and cross workspace leakage test suites pass cleanly.
 - [x] Design it (spec): `/architect workspace authorization and boundary isolation`
