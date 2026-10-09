@@ -41,15 +41,22 @@ from src.security.auth import (
     validate_auth_configuration,
 )
 from src.services.cache_delivery import (
-    ControlledFixtureExecutionEngine,
-    InMemoryCacheStore,
     delivery_gate_recheck,
     evaluate_query_delivery_and_recomputation,
 )
+from tests.boundary_test_fixtures import ControlledFixtureExecutionEngine, InMemoryCacheStore
 from src.services.vector_boundary import MockQdrantClient, dispatch_qdrant_search
+from api.workspace_boundary_routes import get_cache_store, get_execution_engine
 
 client = TestClient(app)
 
+@pytest.fixture(autouse=True)
+def setup_dependency_overrides():
+    """Ensure overrides are applied before every test in case other tests clear them."""
+    app.dependency_overrides[get_cache_store] = lambda: InMemoryCacheStore()
+    app.dependency_overrides[get_execution_engine] = lambda: ControlledFixtureExecutionEngine()
+    yield
+    # We could clear them here, but we leave them since this module owns these tests.
 
 @pytest.fixture(autouse=True)
 def reset_repo_state():
@@ -560,6 +567,7 @@ def test_graceful_cache_fallback_on_connection_error():
         auth_context=auth,
         cache_store=cache,
         table_store=workspace_boundary_repo,
+        execution_engine=ControlledFixtureExecutionEngine(),
     )
     assert outcome.status == "SUCCESS"
 

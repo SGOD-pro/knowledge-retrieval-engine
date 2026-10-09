@@ -22,20 +22,24 @@ from src.schemas.contracts.boundary import (
 from src.schemas.contracts.envelope import IdentityEnvelope, TrustedAuthContext
 from src.db.workspace_boundary_repo import get_workspace_boundary_repo
 from src.security.auth import require_auth_context
-from src.services.cache_delivery import (
-    ControlledFixtureExecutionEngine,
-    InMemoryCacheStore,
-    evaluate_query_delivery_and_recomputation,
-)
+from src.services.cache_delivery import evaluate_query_delivery_and_recomputation
+from src.api.boundary_adapters import ProductionExecutionEngine, RedisCacheAdapter
 
 router = APIRouter(prefix="", tags=["workspace-boundary"])
 
-# In-memory cache store for boundary API requests
-global_cache_store = InMemoryCacheStore()
-global_execution_engine = ControlledFixtureExecutionEngine()
+global_cache_store = RedisCacheAdapter()
+global_execution_engine = ProductionExecutionEngine()
 
+
+
+def get_cache_store() -> Any:
+    return global_cache_store
+
+def get_execution_engine() -> Any:
+    return global_execution_engine
 
 def get_boundary_repo() -> Any:
+
     """Dependency provider for authoritative workspace boundary repository."""
     try:
         return get_workspace_boundary_repo()
@@ -78,7 +82,7 @@ def _enforce_workspace_boundary(workspace_id: str, auth_context: TrustedAuthCont
     status_code=status.HTTP_201_CREATED,
     response_model=dict[str, Any],
 )
-async def create_workspace_boundary_endpoint(
+def create_workspace_boundary_endpoint(
     request: Request,
     payload: CreateWorkspacePayload,
     auth_context: TrustedAuthContext = Depends(require_auth_context),
@@ -118,7 +122,7 @@ async def create_workspace_boundary_endpoint(
     status_code=status.HTTP_200_OK,
     response_model=dict[str, Any],
 )
-async def get_workspace_boundary_endpoint(
+def get_workspace_boundary_endpoint(
     workspace_id: str,
     auth_context: TrustedAuthContext = Depends(require_auth_context),
     repo: Any = Depends(get_boundary_repo),
@@ -149,7 +153,7 @@ async def get_workspace_boundary_endpoint(
     status_code=status.HTTP_200_OK,
     response_model=dict[str, Any],
 )
-async def list_workspace_sources_endpoint(
+def list_workspace_sources_endpoint(
     workspace_id: str,
     auth_context: TrustedAuthContext = Depends(require_auth_context),
     repo: Any = Depends(get_boundary_repo),
@@ -172,7 +176,7 @@ async def list_workspace_sources_endpoint(
     status_code=status.HTTP_201_CREATED,
     response_model=dict[str, Any],
 )
-async def create_workspace_source_endpoint(
+def create_workspace_source_endpoint(
     workspace_id: str,
     payload: CreateSourcePayload,
     auth_context: TrustedAuthContext = Depends(require_auth_context),
@@ -215,7 +219,7 @@ async def create_workspace_source_endpoint(
     status_code=status.HTTP_200_OK,
     response_model=dict[str, Any],
 )
-async def get_workspace_source_endpoint(
+def get_workspace_source_endpoint(
     workspace_id: str,
     source_id: str,
     auth_context: TrustedAuthContext = Depends(require_auth_context),
@@ -245,7 +249,7 @@ async def get_workspace_source_endpoint(
     status_code=status.HTTP_200_OK,
     response_model=dict[str, Any],
 )
-async def delete_workspace_source_endpoint(
+def delete_workspace_source_endpoint(
     workspace_id: str,
     source_id: str,
     auth_context: TrustedAuthContext = Depends(require_auth_context),
@@ -283,11 +287,13 @@ async def delete_workspace_source_endpoint(
     status_code=status.HTTP_200_OK,
     response_model=dict[str, Any],
 )
-async def query_workspace_boundary_endpoint(
+def query_workspace_boundary_endpoint(
     workspace_id: str,
     payload: WorkspaceQueryPayload,
     auth_context: TrustedAuthContext = Depends(require_auth_context),
     repo: Any = Depends(get_boundary_repo),
+    cache_store: Any = Depends(get_cache_store),
+    execution_engine: Any = Depends(get_execution_engine),
 ):
     """Execute query with delivery gate rechecks, literal query hashing, and recomputation (AC-10, AC-11, AC-12)."""
     _enforce_workspace_boundary(workspace_id, auth_context)
@@ -312,9 +318,9 @@ async def query_workspace_boundary_endpoint(
             query_input=payload.query,
             cache_key_descriptor=descriptor,
             auth_context=auth_context,
-            cache_store=global_cache_store,
+            cache_store=cache_store,
             table_store=repo,
-            execution_engine=global_execution_engine,
+            execution_engine=execution_engine,
         )
     except FileNotFoundError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workspace not found")
