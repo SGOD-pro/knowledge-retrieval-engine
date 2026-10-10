@@ -187,7 +187,7 @@ def extract_bearer_token(authorization: str | None) -> str:
     return parts[1]
 
 
-async def require_auth_context(
+def require_auth_context(
     request: Request,
     authorization: str | None = Header(None),
 ) -> TrustedAuthContext:

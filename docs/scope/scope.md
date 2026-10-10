@@ -78,7 +78,7 @@ Build core identity contracts and workspace boundary enforcement using explicit 
 - [x] Test it: `/test workspace authorization and boundary isolation`
 - [x] Review it (fresh model): `/check review workspace authorization and boundary isolation`
 - [x] Document it: `/document workspace authorization and boundary isolation`
-**Note:** Latest review (2026-10-09) is Blocked. Remaining gaps: test fixtures used in production routes, synchronous sleep blocks event loop in DynamoDB store, missing sys.path injection for test imports.
+**Note:** Blockers reconciled on October 10 2026. Application routes wired to configured DynamoDB and Redis dependencies, test fixtures isolated to test suites, synchronous DynamoDB and auth execution offloaded to worker thread pools without blocking the async event loop, and test sys.path imports restored. Live AWS verification remains deferred.
 Spec [0002](../specs/0002-workspace-authorization-and-boundary-isolation.md) · code in `backend/src/`
 
 ## Deferred
@@ -94,10 +94,18 @@ Implement CAS publication, baseline generation counters, active source version t
 
 ## Slice 1: Core walking skeleton
 
-### 4. Core engine walking skeleton and benchmarks · needs a decision
+### 4. Core engine walking skeleton and benchmarks
 Make the next milestone a bounded core engine walking skeleton that proves the complete path works end to end. Include minimum readiness and consistent source/version bindings. Defer advanced distributed publication and cleanup infrastructure.
 **Done when:** the skeleton supports one development workspace using existing identity and access checks; real CSV and text PDF ingestion with source/version provenance; full structured dataset processing without row truncation; typed, restricted lookup/filter/aggregation execution; BM25 and baseline vector retrieval with embeddings built at ingestion; reranking, evidence-backed answers, citations, and insufficient-evidence responses; and reproducible benchmarks for correctness, evidence support, coverage, token usage, ingestion time, and query latency.
-- [ ] Design it (spec): `/architect core engine walking skeleton and benchmarks`
+- [x] Design it (spec): `/architect core engine walking skeleton and benchmarks`
+- [ ] Build it: `/develop core engine walking skeleton and benchmarks`
+   - [ ] Data model & API routes
+   - [ ] Core execution & Retrieval
+   - [ ] Answer assembly
+   - [ ] Benchmarks & Cross-check boundaries
+- [ ] Verify it: `/check verify core engine walking skeleton and benchmarks`
+- [ ] Test it: `/test core engine walking skeleton and benchmarks`
+Spec [0004](../specs/0004-core-engine-walking-skeleton.md) · code in (filled by /develop)
 
 ## Slice 2: PageIndex integration
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Any
@@ -66,9 +67,12 @@ class StructuredTableStrategy:
         }
 
         try:
-            result: StructuredQueryResult | None = self.service.execute(
-                query=query,
-                workspace_id=workspace_id,
+            loop = asyncio.get_running_loop()
+            result: StructuredQueryResult | None = await loop.run_in_executor(
+                None,
+                self.service.execute,
+                query,
+                workspace_id,
             )
         except IncompleteDataError as e:
             latency_ms = (time.perf_counter() - start_time) * 1000.0

@@ -9,11 +9,13 @@ FastAPI service providing parsing, structural indexing, retrieval orchestration,
 | `src/main.py` | FastAPI application entry point, CORS settings, and router mounting |
 | `src/config.py` | Pydantic application settings, environment controls, and search thresholds |
 | `src/api/routes.py` | Central API router mounting modules for auth, workspaces, documents, query, chat, and graph |
+| `src/security/auth.py` | Workspace authentication context and test principal provider |
 | `src/services/langgraph_pipeline.py` | LangGraph query execution graph orchestrating planning, retrieval, and evidence verification |
 | `src/services/retrieval/deterministic_executor.py` | Deterministic structured data executor for tabular queries |
 | `src/services/retrieval/strategy_router.py` | Strategy router directing retrieval across evidence sources |
 | `src/ingestion/parse_service.py` | Document parser routing files to specialized format adapters |
 | `src/db/database.py` | Database access repository for DynamoDB and related data stores |
+| `src/db/workspace_boundary_repo.py` | Workspace boundary repository for DynamoDB, SQLite, and memory stores |
 | `src/schemas/contracts/` | Shared frozen Pydantic contracts and identity envelopes |
 
 ## Commands
@@ -28,7 +30,7 @@ uv run uvicorn src.main:app --port 8001 --reload
 uv run pytest
 
 # Run single test
-uv run pytest tests/test_evidence_contract.py
+uv run pytest tests/test_contracts_and_identity.py
 ```
 
 ## Conventions
@@ -45,6 +47,7 @@ uv run pytest tests/test_evidence_contract.py
 
 ## Related specs
 * [docs/specs/0001-contracts-and-identity-envelope.md](../docs/specs/0001-contracts-and-identity-envelope.md)
+* [docs/specs/0002-workspace-authorization-and-boundary-isolation.md](../docs/specs/0002-workspace-authorization-and-boundary-isolation.md)
 * [docs/TECHNICAL_SPEC.md](../docs/TECHNICAL_SPEC.md)
 * [docs/ARCHITECTURE.md](../docs/ARCHITECTURE.md)
 * [docs/REQUIREMENTS.md](../docs/REQUIREMENTS.md)

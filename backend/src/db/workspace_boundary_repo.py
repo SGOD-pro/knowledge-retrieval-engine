@@ -22,6 +22,7 @@ from src.schemas.contracts.boundary import (
     PublicationManifestRecord,
     SnapshotRecord,
     SourceItem,
+    StorageUnavailableError,
     TombstoneRecord,
     WorkspaceAccessDeniedError,
     WorkspaceRecord,
@@ -922,6 +923,494 @@ class SQLiteWorkspaceBoundaryRepository:
                 )
 
 
+
+class DynamoDBWorkspaceBoundaryRepository:
+    """Durable DynamoDB backed repository for workspace boundaries, generation fencing, and tombstones."""
+
+    def __init__(
+        self,
+        table_name: str | None = None,
+        dynamodb_resource: Any | None = None,
+        dynamodb_client: Any | None = None,
+    ) -> None:
+        self._table_name = table_name or settings.DYNAMODB_TABLE_NAME
+        self._resource = dynamodb_resource
+        self._client = dynamodb_client
+        self._table = None
+        self._lock = threading.RLock()
+
+    @property
+    def client(self) -> Any:
+        if self._client is None:
+            from src.aws.infra import get_client
+            self._client = get_client("dynamodb")
+        return self._client
+
+    @property
+    def resource(self) -> Any:
+        if self._resource is None:
+            from src.aws.infra import get_resource
+            self._resource = get_resource("dynamodb")
+        return self._resource
+
+    @property
+    def table(self) -> Any:
+        if self._table is None:
+            self._table = self.resource.Table(self._table_name)
+        return self._table
+
+    def reset_fixtures(self) -> None:
+        """Seed baseline test fixtures into DynamoDB."""
+        self.create_workspace("Workspace Alpha", "usr_alice", workspace_id="ws_alpha")
+        self.create_workspace("Workspace Beta", "usr_bob", workspace_id="ws_beta")
+
+    def get_workspace(self, workspace_id: str) -> WorkspaceRecord | None:
+        try:
+            resp = self.table.get_item(
+                Key={"PK": f"WORKSPACE#{workspace_id}", "SK": "BOUNDARY_META"}
+            )
+        except Exception as err:
+            raise StorageUnavailableError(f"DynamoDB error getting workspace {workspace_id}: {err}") from err
+
+        item = resp.get("Item")
+        if not item:
+            return None
+        return WorkspaceRecord(
+            workspace_id=item["workspace_id"],
+            name=item["name"],
+            owner_principal_id=item["owner_principal_id"],
+            manifest_generation=int(item["manifest_generation"]),
+            status=item["status"],
+            created_at=item["created_at"],
+            updated_at=item["updated_at"],
+        )
+
+    def create_workspace(
+        self,
+        name: str,
+        owner_principal_id: str,
+        workspace_id: str | None = None,
+    ) -> WorkspaceRecord:
+        ws_id = workspace_id or f"ws_{uuid.uuid4().hex[:12]}"
+        now = _now_utc()
+        record = WorkspaceRecord(
+            workspace_id=ws_id,
+            name=name,
+            owner_principal_id=owner_principal_id,
+            manifest_generation=1,
+            status="active",
+            created_at=now,
+            updated_at=now,
+        )
+        try:
+            self.table.put_item(
+                Item={
+                    "PK": f"WORKSPACE#{ws_id}",
+                    "SK": "BOUNDARY_META",
+                    "workspace_id": ws_id,
+                    "name": name,
+                    "owner_principal_id": owner_principal_id,
+                    "manifest_generation": 1,
+                    "status": "active",
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            )
+            self.table.put_item(
+                Item={
+                    "PK": f"WORKSPACE#{ws_id}",
+                    "SK": "BOUNDARY_MANIFEST",
+                    "workspace_id": ws_id,
+                    "manifest_generation": 1,
+                    "active_source_ids_json": "[]",
+                    "updated_at": now,
+                }
+            )
+        except Exception as err:
+            raise StorageUnavailableError(f"DynamoDB error creating workspace {ws_id}: {err}") from err
+        return record
+
+    def tombstone_workspace(
+        self,
+        workspace_id: str,
+        caller_principal_id: str,
+        reason: str = "user_requested",
+    ) -> TombstoneRecord:
+        ws = self.get_workspace(workspace_id)
+        if not ws:
+            raise FileNotFoundError(f"Workspace {workspace_id} not found")
+        if ws.owner_principal_id != caller_principal_id:
+            raise WorkspaceAccessDeniedError("Cannot delete foreign workspace")
+
+        now = _now_utc()
+        next_gen = ws.manifest_generation + 1
+        tombstone = TombstoneRecord(
+            workspace_id=workspace_id,
+            resource_type="workspace",
+            resource_id=workspace_id,
+            manifest_generation=next_gen,
+            tombstoned_at=now,
+            deleted_by_principal_id=caller_principal_id,
+            reason=reason,
+        )
+        try:
+            self.table.put_item(
+                Item={
+                    "PK": f"WORKSPACE#{workspace_id}",
+                    "SK": f"TOMBSTONE#workspace#{workspace_id}",
+                    "workspace_id": workspace_id,
+                    "resource_type": "workspace",
+                    "resource_id": workspace_id,
+                    "manifest_generation": next_gen,
+                    "tombstoned_at": now,
+                    "deleted_by_principal_id": caller_principal_id,
+                    "reason": reason,
+                }
+            )
+            self.table.update_item(
+                Key={"PK": f"WORKSPACE#{workspace_id}", "SK": "BOUNDARY_META"},
+                UpdateExpression="SET #st = :tomb, manifest_generation = :gen, updated_at = :upd",
+                ExpressionAttributeNames={"#st": "status"},
+                ExpressionAttributeValues={
+                    ":tomb": "tombstoned",
+                    ":gen": next_gen,
+                    ":upd": now,
+                },
+            )
+        except Exception as err:
+            raise StorageUnavailableError(f"DynamoDB error tombstoning workspace {workspace_id}: {err}") from err
+        return tombstone
+
+    def has_tombstone(self, workspace_id: str, resource_type: str, resource_id: str) -> bool:
+        try:
+            resp = self.table.get_item(
+                Key={
+                    "PK": f"WORKSPACE#{workspace_id}",
+                    "SK": f"TOMBSTONE#{resource_type}#{resource_id}",
+                }
+            )
+            return "Item" in resp
+        except Exception as err:
+            raise StorageUnavailableError(f"DynamoDB error checking tombstone: {err}") from err
+
+    def get_tombstone(
+        self,
+        workspace_id: str,
+        resource_type: str,
+        resource_id: str,
+    ) -> TombstoneRecord | None:
+        try:
+            resp = self.table.get_item(
+                Key={
+                    "PK": f"WORKSPACE#{workspace_id}",
+                    "SK": f"TOMBSTONE#{resource_type}#{resource_id}",
+                }
+            )
+            item = resp.get("Item")
+            if not item:
+                return None
+            return TombstoneRecord(
+                workspace_id=item["workspace_id"],
+                resource_type=item["resource_type"],
+                resource_id=item["resource_id"],
+                manifest_generation=int(item["manifest_generation"]),
+                tombstoned_at=item["tombstoned_at"],
+                deleted_by_principal_id=item["deleted_by_principal_id"],
+                reason=item["reason"],
+            )
+        except Exception as err:
+            raise StorageUnavailableError(f"DynamoDB error getting tombstone: {err}") from err
+
+    def record_source_tombstone(
+        self,
+        workspace_id: str,
+        source_id: str,
+        caller_principal_id: str,
+        reason: str = "user_requested",
+    ) -> TombstoneRecord:
+        ws = self.get_workspace(workspace_id)
+        if not ws or ws.status == "tombstoned":
+            raise FileNotFoundError(f"Workspace {workspace_id} not found")
+
+        existing = self.get_tombstone(workspace_id, "source", source_id)
+        if existing:
+            return existing
+
+        now = _now_utc()
+        next_gen = ws.manifest_generation + 1
+        tombstone = TombstoneRecord(
+            workspace_id=workspace_id,
+            resource_type="source",
+            resource_id=source_id,
+            manifest_generation=next_gen,
+            tombstoned_at=now,
+            deleted_by_principal_id=caller_principal_id,
+            reason=reason,
+        )
+        try:
+            self.table.put_item(
+                Item={
+                    "PK": f"WORKSPACE#{workspace_id}",
+                    "SK": f"TOMBSTONE#source#{source_id}",
+                    "workspace_id": workspace_id,
+                    "resource_type": "source",
+                    "resource_id": source_id,
+                    "manifest_generation": next_gen,
+                    "tombstoned_at": now,
+                    "deleted_by_principal_id": caller_principal_id,
+                    "reason": reason,
+                }
+            )
+            try:
+                self.table.update_item(
+                    Key={"PK": f"WORKSPACE#{workspace_id}", "SK": f"BOUNDARY_SOURCE#{source_id}"},
+                    UpdateExpression="SET #st = :tomb, updated_at = :upd",
+                    ExpressionAttributeNames={"#st": "status"},
+                    ExpressionAttributeValues={":tomb": "tombstoned", ":upd": now},
+                )
+            except Exception:
+                pass
+            self.table.update_item(
+                Key={"PK": f"WORKSPACE#{workspace_id}", "SK": "BOUNDARY_META"},
+                UpdateExpression="SET manifest_generation = :gen, updated_at = :upd",
+                ExpressionAttributeValues={":gen": next_gen, ":upd": now},
+            )
+        except Exception as err:
+            raise StorageUnavailableError(f"DynamoDB error recording source tombstone: {err}") from err
+        return tombstone
+
+    def get_source(self, workspace_id: str, source_id: str) -> SourceItem | None:
+        if self.has_tombstone(workspace_id, "source", source_id):
+            return None
+        try:
+            resp = self.table.get_item(
+                Key={"PK": f"WORKSPACE#{workspace_id}", "SK": f"BOUNDARY_SOURCE#{source_id}"}
+            )
+            item = resp.get("Item")
+            if not item:
+                return None
+            return SourceItem(
+                source_id=item["source_id"],
+                title=item["title"],
+                status=item["status"],
+                created_at=item["created_at"],
+                updated_at=item["updated_at"],
+            )
+        except Exception as err:
+            raise StorageUnavailableError(f"DynamoDB error getting source: {err}") from err
+
+    def list_sources(self, workspace_id: str) -> list[SourceItem]:
+        from boto3.dynamodb.conditions import Key
+        try:
+            resp = self.table.query(
+                KeyConditionExpression=Key("PK").eq(f"WORKSPACE#{workspace_id}") & Key("SK").begins_with("BOUNDARY_SOURCE#")
+            )
+            items = []
+            for item in resp.get("Items", []):
+                s_id = item["source_id"]
+                if self.has_tombstone(workspace_id, "source", s_id) or item["status"] == "tombstoned":
+                    continue
+                items.append(
+                    SourceItem(
+                        source_id=s_id,
+                        title=item["title"],
+                        status=item["status"],
+                        created_at=item["created_at"],
+                        updated_at=item["updated_at"],
+                    )
+                )
+            return items
+        except Exception as err:
+            raise StorageUnavailableError(f"DynamoDB error listing sources: {err}") from err
+
+    def create_source(
+        self,
+        workspace_id: str,
+        title: str,
+        source_id: str | None = None,
+    ) -> SourceItem:
+        ws = self.get_workspace(workspace_id)
+        if not ws or ws.status == "tombstoned":
+            raise FileNotFoundError(f"Workspace {workspace_id} not found")
+
+        s_id = source_id or f"src_{uuid.uuid4().hex[:12]}"
+        now = _now_utc()
+        item = SourceItem(
+            source_id=s_id,
+            title=title,
+            status="registered",
+            created_at=now,
+            updated_at=now,
+        )
+        try:
+            self.table.put_item(
+                Item={
+                    "PK": f"WORKSPACE#{workspace_id}",
+                    "SK": f"BOUNDARY_SOURCE#{s_id}",
+                    "workspace_id": workspace_id,
+                    "source_id": s_id,
+                    "title": title,
+                    "status": "registered",
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            )
+        except Exception as err:
+            raise StorageUnavailableError(f"DynamoDB error creating source: {err}") from err
+        return item
+
+    def get_snapshot(self, workspace_id: str, snapshot_id: str) -> SnapshotRecord | None:
+        try:
+            resp = self.table.get_item(
+                Key={"PK": f"WORKSPACE#{workspace_id}", "SK": f"BOUNDARY_SNAPSHOT#{snapshot_id}"}
+            )
+            item = resp.get("Item")
+            if not item:
+                return None
+            return SnapshotRecord(
+                snapshot_id=item["snapshot_id"],
+                workspace_id=item["workspace_id"],
+                manifest_generation=int(item["manifest_generation"]),
+                status=item["status"],
+                source_versions=tuple(tuple(x) for x in json.loads(item["source_versions_json"])),
+                artifact_ids=tuple(json.loads(item["artifact_ids_json"])),
+                created_at=item["created_at"],
+            )
+        except Exception as err:
+            raise StorageUnavailableError(f"DynamoDB error getting snapshot: {err}") from err
+
+    def save_snapshot(self, snapshot: SnapshotRecord) -> None:
+        try:
+            self.table.put_item(
+                Item={
+                    "PK": f"WORKSPACE#{snapshot.workspace_id}",
+                    "SK": f"BOUNDARY_SNAPSHOT#{snapshot.snapshot_id}",
+                    "workspace_id": snapshot.workspace_id,
+                    "snapshot_id": snapshot.snapshot_id,
+                    "manifest_generation": snapshot.manifest_generation,
+                    "status": snapshot.status,
+                    "source_versions_json": json.dumps(snapshot.source_versions),
+                    "artifact_ids_json": json.dumps(list(snapshot.artifact_ids)),
+                    "created_at": snapshot.created_at,
+                }
+            )
+        except Exception as err:
+            raise StorageUnavailableError(f"DynamoDB error saving snapshot: {err}") from err
+
+    def get_manifest(self, workspace_id: str) -> PublicationManifestRecord | None:
+        try:
+            resp = self.table.get_item(
+                Key={"PK": f"WORKSPACE#{workspace_id}", "SK": "BOUNDARY_MANIFEST"}
+            )
+            item = resp.get("Item")
+            if not item:
+                return None
+            return PublicationManifestRecord(
+                workspace_id=item["workspace_id"],
+                manifest_generation=int(item["manifest_generation"]),
+                active_source_ids=tuple(json.loads(item["active_source_ids_json"])),
+                updated_at=item["updated_at"],
+            )
+        except Exception as err:
+            raise StorageUnavailableError(f"DynamoDB error getting manifest: {err}") from err
+
+    def cas_update_manifest(
+        self,
+        workspace_id: str,
+        expected_generation: int,
+        delta: dict[str, Any],
+    ) -> PublicationManifestRecord:
+        manifest = self.get_manifest(workspace_id)
+        if not manifest:
+            raise FileNotFoundError(f"Manifest for workspace {workspace_id} not found")
+
+        if manifest.manifest_generation != expected_generation:
+            raise CASConflictError(
+                f"CAS conflict on workspace {workspace_id}: expected generation {expected_generation}, got {manifest.manifest_generation}"
+            )
+
+        active_set = set(manifest.active_source_ids)
+        for s_id in delta.get("add_source_ids", ()):
+            if self.has_tombstone(workspace_id, "source", s_id):
+                continue
+            active_set.add(s_id)
+        for s_id in delta.get("remove_source_ids", ()):
+            active_set.discard(s_id)
+
+        next_gen = expected_generation + 1
+        now = _now_utc()
+        new_active = tuple(sorted(active_set))
+
+        try:
+            self.table.update_item(
+                Key={"PK": f"WORKSPACE#{workspace_id}", "SK": "BOUNDARY_MANIFEST"},
+                UpdateExpression="SET manifest_generation = :next_gen, active_source_ids_json = :sources, updated_at = :upd",
+                ConditionExpression="manifest_generation = :exp",
+                ExpressionAttributeValues={
+                    ":next_gen": next_gen,
+                    ":sources": json.dumps(list(new_active)),
+                    ":upd": now,
+                    ":exp": expected_generation,
+                },
+            )
+        except Exception as err:
+            err_code = getattr(err, "response", {}).get("Error", {}).get("Code", "")
+            if err_code == "ConditionalCheckFailedException" or "ConditionalCheckFailed" in str(err):
+                raise CASConflictError(
+                    f"CAS conflict on workspace {workspace_id}: expected generation {expected_generation}"
+                ) from err
+            raise StorageUnavailableError(f"DynamoDB error updating manifest: {err}") from err
+
+        return PublicationManifestRecord(
+            workspace_id=workspace_id,
+            manifest_generation=next_gen,
+            active_source_ids=new_active,
+            updated_at=now,
+        )
+
+    def get_job(self, job_id: str) -> JobRecord | None:
+        try:
+            resp = self.table.get_item(
+                Key={"PK": "GLOBAL_JOB", "SK": f"JOB#{job_id}"}
+            )
+            item = resp.get("Item")
+            if not item:
+                return None
+            return JobRecord(
+                job_id=item["job_id"],
+                workspace_id=item["workspace_id"],
+                operation=item["operation"],
+                target_source_id=item.get("target_source_id"),
+                target_source_version=item.get("target_source_version"),
+                status=item["status"],
+                is_trusted_system_job=bool(item.get("is_trusted_system_job", True)),
+                created_at=item["created_at"],
+                updated_at=item["updated_at"],
+            )
+        except Exception as err:
+            raise StorageUnavailableError(f"DynamoDB error getting job: {err}") from err
+
+    def save_job(self, job: JobRecord) -> None:
+        try:
+            self.table.put_item(
+                Item={
+                    "PK": "GLOBAL_JOB",
+                    "SK": f"JOB#{job.job_id}",
+                    "job_id": job.job_id,
+                    "workspace_id": job.workspace_id,
+                    "operation": job.operation,
+                    "target_source_id": job.target_source_id,
+                    "target_source_version": job.target_source_version,
+                    "status": job.status,
+                    "is_trusted_system_job": job.is_trusted_system_job,
+                    "created_at": job.created_at,
+                    "updated_at": job.updated_at,
+                }
+            )
+        except Exception as err:
+            raise StorageUnavailableError(f"DynamoDB error saving job: {err}") from err
+
+
 _SHARED_BOUNDARY_REPO: WorkspaceBoundaryRepositoryBase | None = None
 
 
@@ -932,10 +1421,11 @@ def get_workspace_boundary_repo(
     """Return process scoped workspace boundary repository.
 
     Backend selection:
-      1. Explicit environment variable: KRE_WORKSPACE_REPO_BACKEND in ('sqlite', 'memory').
+      1. Explicit environment variable: KRE_WORKSPACE_REPO_BACKEND in ('dynamodb', 'sqlite', 'memory').
       2. If require_durable=True or ENVIRONMENT == 'prod', 'memory' is strictly rejected.
-      3. ENVIRONMENT == 'prod' or 'dev': SQLiteWorkspaceBoundaryRepository with durable persistent storage.
-      4. ENVIRONMENT == 'test': InMemoryWorkspaceBoundaryRepository (or SQLite if explicitly selected).
+      3. ENVIRONMENT == 'prod': DynamoDBWorkspaceBoundaryRepository with durable persistent storage.
+      4. ENVIRONMENT == 'dev': Live DynamoDBWorkspaceBoundaryRepository if configured, else SQLiteWorkspaceBoundaryRepository.
+      5. ENVIRONMENT == 'test': InMemoryWorkspaceBoundaryRepository (or SQLite/DynamoDB if explicitly selected).
     """
     global _SHARED_BOUNDARY_REPO
     if reset or _SHARED_BOUNDARY_REPO is None:
@@ -945,16 +1435,20 @@ def get_workspace_boundary_repo(
             or ""
         ).lower().strip()
 
-        env = (settings.ENVIRONMENT or "").lower()
+        env = (getattr(settings, "ENVIRONMENT", "") or os.getenv("ENVIRONMENT") or "").lower().strip()
 
-        if backend_override == "memory":
+        if backend_override == "dynamodb":
+            _SHARED_BOUNDARY_REPO = DynamoDBWorkspaceBoundaryRepository()
+        elif backend_override == "sqlite":
+            _SHARED_BOUNDARY_REPO = SQLiteWorkspaceBoundaryRepository()
+        elif backend_override == "memory":
             if require_durable or env in ("prod", "production"):
                 raise RuntimeError("Memory repository cannot be used when durable backend is required or in production.")
             _SHARED_BOUNDARY_REPO = InMemoryWorkspaceBoundaryRepository()
-        elif backend_override == "sqlite":
-            _SHARED_BOUNDARY_REPO = SQLiteWorkspaceBoundaryRepository()
         else:
-            if require_durable or env in ("prod", "production", "dev"):
+            if env in ("prod", "production"):
+                _SHARED_BOUNDARY_REPO = DynamoDBWorkspaceBoundaryRepository()
+            elif require_durable or env == "dev":
                 _SHARED_BOUNDARY_REPO = SQLiteWorkspaceBoundaryRepository()
             else:
                 _SHARED_BOUNDARY_REPO = InMemoryWorkspaceBoundaryRepository()
@@ -978,8 +1472,10 @@ __all__ = [
     "WorkspaceBoundaryRepositoryBase",
     "InMemoryWorkspaceBoundaryRepository",
     "SQLiteWorkspaceBoundaryRepository",
+    "DynamoDBWorkspaceBoundaryRepository",
     "WorkspaceBoundaryRepositoryProxy",
     "WorkspaceBoundaryRepository",
     "get_workspace_boundary_repo",
     "workspace_boundary_repo",
 ]
+
