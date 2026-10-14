@@ -19,7 +19,7 @@ _These are recommendations to keep your build orderly, not requirements. Skip an
 | 1 | Contracts and identity envelope | Foundation | done |
 | 2 | Workspace authorization and boundary isolation | Foundation | done |
 | 3 | Snapshot registry, publication, and atomic deletion | Foundation | planned |
-| 4 | Core walking skeleton | Slice 1 | in progress |
+| 4 | Core walking skeleton | Slice 1 | done |
 | 5 | Baseline ingestion pipeline | Slice 2 | planned |
 | 6 | Deterministic structured execution | Slice 3 | planned |
 | 7 | Baseline discovery retrieval and fusion | Slice 4 | planned |
@@ -94,7 +94,7 @@ Implement CAS publication, baseline generation counters, active source version t
 
 ## Slice 1: Core walking skeleton
 
-### 4. Core engine walking skeleton and benchmarks
+### 4. Core engine walking skeleton and benchmarks · done
 Make the next milestone a bounded core engine walking skeleton that proves the complete path works end to end. Include minimum readiness and consistent source/version bindings. Defer advanced distributed publication and cleanup infrastructure.
 **Done when:** the skeleton supports one development workspace using existing identity and access checks; real CSV and text PDF ingestion with source/version provenance; full structured dataset processing without row truncation; typed, restricted lookup/filter/aggregation execution; BM25 and baseline vector retrieval with embeddings built at ingestion; reranking, evidence-backed answers, citations, and insufficient-evidence responses; and reproducible benchmarks for correctness, evidence support, coverage, token usage, ingestion time, and query latency.
 - [x] Design it (spec): `/architect core engine walking skeleton and benchmarks`
@@ -105,7 +105,7 @@ Make the next milestone a bounded core engine walking skeleton that proves the c
    - [x] Answer assembly and confidence scoring
    - [x] Benchmarks and cross check boundaries
 - [x] Verify it: `/check verify core engine walking skeleton and benchmarks`
-- [ ] Test it: `/test core engine walking skeleton and benchmarks`
+- [x] Test it: `/test core engine walking skeleton and benchmarks`
 Spec [0004](../specs/0004-core-engine-walking-skeleton.md) · code in `backend/src/`
 
 ## Slice 2: PageIndex integration

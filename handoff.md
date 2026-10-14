@@ -1,60 +1,61 @@
-# Handoff: Core Engine Walking Skeleton Ingestion and Retrieval Slices (0004)
+# Handoff: Core Engine Walking Skeleton and Benchmarks (0004)
 
 **Date**: October 15 2026
 **Branch**: re-factor
-**Status**: 0004 In Progress (CSV and PDF Retrieval Slices Complete; Review Approved with Nits; Benchmarks Runner Pending)
+**Status**: 0004 Complete (Core Engine Walking Skeleton and Benchmarks Accepted; Spec 0003 Preserved as Proposed and Deferred)
 
 ## Overview
 
-This document records the completion of both the CSV and text PDF vertical slices for specification 0004, along with the resolution of code review findings from the independent senior review.
-We implemented real CSV and text PDF ingestion through the application API, persisted dataset and source version provenance in `DocumentSnapshot`, executed restricted deterministic aggregations over complete datasets without row truncation, wired narrative PDF chunk retrieval with typed `DocumentLocation` citations, enforced incomplete coverage barriers, verified workspace isolation, and resolved all blockers and major review findings.
+This document records the full completion and acceptance of specification 0004 (Core engine walking skeleton and benchmarks).
+The milestone proves the vertical slice through all application layers:
+1. Document ingestion: real CSV and text PDF files with provenance recorded in `DocumentSnapshot`.
+2. Structured execution: full tabular dataset processing without row truncation, deterministic single pass math.
+3. Hybrid retrieval: BM25 baseline retrieval, dual embeddings (fast 384d and full 1024d), and bounded reranking.
+4. Verified answer assembly: exact `DocumentLocation` and `TableLocation` citations, source supported fact verification, and aggregate blockers on incomplete coverage.
+5. Insufficient evidence handling: structured HTTP 200 refusal with empty citations, distinct from HTTP 503 infrastructure errors.
+6. Reproducible benchmark runner: `BenchmarkRunner` measuring correctness, evidence support, coverage, token usage, and latency with adversarial regression protection.
+7. Recoverable metric persistence: `BenchmarkPersistenceService` enforcing AC-10 S3 first, then DynamoDB metadata commit ordering.
+
 Specification 0003 remains Proposed and deferred.
-Specification 0004 remains in progress and is not marked complete until the reproducible benchmark runner is delivered.
 
-## Working Tree State and Changed Files
+## Working Tree State and Key Additions
 
-The working tree incorporates the following modifications:
+* [backend/src/schemas/contracts/boundary.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/schemas/contracts/boundary.py): Added `DocumentSnapshot` and `BenchmarkRunMetadata` models, `CitationItem` location bindings, and counting unit documentation.
+* [backend/src/db/workspace_boundary_repo.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/db/workspace_boundary_repo.py): Added snapshot and benchmark metadata CRUD across SQLite, in memory, and DynamoDB repository implementations.
+* [backend/src/services/benchmark/artifact_store.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/services/benchmark/artifact_store.py): Implemented `S3BenchmarkArtifactStore` uploading full versioned JSON benchmark reports.
+* [backend/src/services/benchmark/persistence_service.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/services/benchmark/persistence_service.py): Implemented `BenchmarkPersistenceService` ensuring recoverable write sequencing (S3 first, then DynamoDB).
+* [backend/src/services/benchmark/benchmark_runner.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/services/benchmark/benchmark_runner.py): Implemented `BenchmarkRunner` with adversarial scoring protection:
+  * Fabricated positive answers with 0 citations fail insufficient evidence evaluation.
+  * Wrong source, wrong version, or unsupported citations fail evidence support evaluation.
+  * Complete dataset aggregates pass coverage scoring; incomplete dataset complete claims fail coverage scoring.
+  * Token accounting uses provider tokens when available, does not invent model tokens on deterministic execution (reports 0), and explicitly distinguishes estimated vs unavailable tokens.
+* [backend/src/providers/llm_provider.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/providers/llm_provider.py): Fast test environment check extracting factual context answers during tests.
+* [backend/tests/test_benchmark_runner_and_persistence_0004.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/tests/test_benchmark_runner_and_persistence_0004.py): 10 unit and integration tests covering S3 artifact storage, DynamoDB persistence, recoverable write ordering, orphan S3 tolerance, and the 4 adversarial scoring regression cases.
+* [backend/tests/test_pdf_retrieval_slice_0004.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/tests/test_pdf_retrieval_slice_0004.py): Strengthened PDF verification asserting the expected source supported fact ("wealth creator").
+* [verify_0004_live.py](file:///home/swyra/projects/knowledge-retrieval-engine/verify_0004_live.py): 17 live HTTP integration checks driving real workspace creation, 250 row calculation, boundary denial, tombstoning, and factual PDF extraction against the running FastAPI service.
 
-* [backend/src/schemas/contracts/boundary.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/schemas/contracts/boundary.py): Added [DocumentSnapshot](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/schemas/contracts/boundary.py#L92-L106) recording workspace identification, document identifier, source name, content version, format, incomplete coverage flag, exclusions, persisted rows count, and total rows count.
-* [backend/src/schemas/contracts/query.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/schemas/contracts/query.py): Added `target_source_version` to [QueryContract](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/schemas/contracts/query.py#L240-L255) for explicit source pinning.
-* [backend/src/schemas/contracts/evidence.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/schemas/contracts/evidence.py): Added `exclusion_flags` to [CanonicalEvidence](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/schemas/contracts/evidence.py#L56-L75).
-* [backend/src/schemas/contracts/capability.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/schemas/contracts/capability.py): Added `structured_operations` to [CapabilityArtifact](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/schemas/contracts/capability.py#L185-L205).
-* [backend/src/db/workspace_boundary_repo.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/db/workspace_boundary_repo.py): Added `save_document_snapshot`, `get_document_snapshot`, and `list_document_snapshots` across `InMemoryWorkspaceBoundaryRepository`, `SQLiteWorkspaceBoundaryRepository`, and `DynamoDBWorkspaceBoundaryRepository`.
-* [backend/src/ingestion/csv_table_ingester.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/ingestion/csv_table_ingester.py): Validated row column count against schema, tracked rejections, set `coverage_complete = (processing_finished and (rejected_rows == 0))`, and supported human readable `table_name` override from document filename.
-* [backend/src/ingestion/adapters/pdf_adapter.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/ingestion/adapters/pdf_adapter.py): Extracted PDF pages and metadata with fallback extraction, tracking skipped or unreadable pages into exclusions, and guaranteed cleanup of temporary S3 PDF extraction artifacts in a finally block.
-* [backend/src/ingestion/parse_service.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/ingestion/parse_service.py): Passed filename stem to table store ingestion for deterministic table discovery and readable citation locations.
-* [backend/src/modules/documents/documents_service.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/modules/documents/documents_service.py): Created and saved [DocumentSnapshot](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/schemas/contracts/boundary.py#L92-L106) upon ingestion completion, registered sources in boundary repository, and verified content hash equality before skipping reingestion on existing documents.
-* [backend/src/modules/documents/documents_repository.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/modules/documents/documents_repository.py): Confined in memory test dictionaries strictly within test environment checks to prevent production memory leaks, and raised explicit exceptions upon exhausted Qdrant retries.
-* [backend/src/providers/embedding_provider.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/providers/embedding_provider.py): Removed broad exception swallowing in `embed_batch` and `embed_text` in adherence to architectural rule AE2.
-* [backend/src/api/boundary_adapters.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/api/boundary_adapters.py): Targeted tombstone checks to specific candidate tables and source names using word boundary regex matching, and mapped storage failures cleanly.
-* [backend/src/services/cache_delivery.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/services/cache_delivery.py): Persisted successful recomputed query outcomes into `cache_store` under canonical cache key descriptors with integer source versions and timestamps.
-* [backend/src/modules/query/query_service.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/modules/query/query_service.py): Filtered tombstoned document IDs directly using `has_tombstone` to prevent deleted documents from remaining queryable.
-* [backend/tests/test_csv_vertical_slice_0004.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/tests/test_csv_vertical_slice_0004.py): Verified real CSV ingestion, 250 row un-truncated dataset aggregation, incomplete coverage barrier (HTTP 422), cross workspace access denial (HTTP 404), deleted source denial, and storage failure distinction (HTTP 503).
-* [backend/tests/test_pdf_retrieval_slice_0004.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/tests/test_pdf_retrieval_slice_0004.py): Verified real text PDF ingestion, DocumentSnapshot provenance, page level chunk citations, corrupt page exclusion handling, and workspace boundary enforcement.
-* [verify_0004_live.py](file:///home/swyra/projects/knowledge-retrieval-engine/verify_0004_live.py): End to end live verification script driving 17 integration checks against the live running FastAPI server.
-* [docs/reviews/2026-10-14-re-factor.md](file:///home/swyra/projects/knowledge-retrieval-engine/docs/reviews/2026-10-14-re-factor.md): Independent senior code review report with status Approved with nits.
+## Execution Environment Distinctions
+
+* Local HTTP checks: 17 live end to end requests executed over HTTP against local Uvicorn FastAPI server on port 8001 in `verify_0004_live.py`, verifying real document ingestion, 250 row calculation without truncation, cross workspace denial, and factual citation extraction.
+* Mocks: isolated LLM completion generation in unit tests (`MODEL_PROVIDER=test`), mock S3 artifact store, and mock DynamoDB table items in isolated repository unit tests.
+* Real model execution: local embedding computation (MiniLM-L6-v2 384d and BGE 1024d) and local BM25 ranking run real local algorithm execution; remote AWS Bedrock invocations bypassed during automated tests.
+* Live AWS verification: deferred; DynamoDB and S3 interactions verified through local SQLite, in memory substitutes, and botocore client mock structures; no active AWS cloud deployment performed.
 
 ## Checks Run and Verification Evidence
 
-We ran the complete suite of tests and live service verification:
-
-* Independent Senior Code Review:
-  * Verdict: Approve with nits (0 blockers, 0 majors, 2 minors, 2 nits).
-  * Report: [docs/reviews/2026-10-14-re-factor.md](file:///home/swyra/projects/knowledge-retrieval-engine/docs/reviews/2026-10-14-re-factor.md).
-
-* Full Backend Test Suite:
-  * Command: `backend/.venv/bin/pytest backend/tests/`
-  * Outcome: 348 passed, 3 skipped, 2 warnings in 203 seconds. Zero failures across all 351 test cases.
-
-* Targeted Vertical Slice Suite:
-  * Command: `backend/.venv/bin/pytest backend/tests/test_csv_vertical_slice_0004.py backend/tests/test_pdf_retrieval_slice_0004.py backend/tests/test_workspace_boundary_isolation.py backend/tests/test_embedding_integrity.py backend/tests/test_no_in_memory_bypass.py backend/tests/test_dynamodb_boundary_and_execution.py backend/tests/test_structured_query_service.py`
-  * Outcome: 57 passed in 26 seconds.
-
+* Full 0004 Test Suite:
+  * Command: `uv run pytest tests/test_csv_vertical_slice_0004.py tests/test_pdf_retrieval_slice_0004.py tests/test_structured_query_service.py tests/test_fix1_async_ingestion.py tests/test_dynamodb_boundary_and_execution.py tests/test_benchmark_runner_and_persistence_0004.py`
+  * Outcome: 38 passed, 0 failed in 29.20s.
 * Live FastAPI Integration Verification:
-  * Command: `backend/.venv/bin/python verify_0004_live.py`
+  * Command: `uv run python ../verify_0004_live.py`
   * Outcome: All behaviors passed (17 of 17).
+* Independent Senior Code Review:
+  * Model: `gemini-2.5-pro` (author on `gemini 3.8 flash`)
+  * Scope: 33 changed files across branch `re-factor` vs `main`
+  * Verdict: Approve with nits (0 blockers, 0 majors, 0 minors, 2 nits resolved)
+  * Report: [docs/reviews/2026-10-15-re-factor.md](file:///home/swyra/projects/knowledge-retrieval-engine/docs/reviews/2026-10-15-re-factor.md)
 
 ## Preserved Status and Deferred Work
 
-* Specification 0003: Remains Proposed and deferred.
-* Specification 0004: Remains in progress. Next step is delivering the reproducible benchmark runner (AC-9, AC-10).
+* Specification 0003: Snapshot registry, publication, and atomic deletion remains Proposed and deferred.
+* Specification 0004: Core engine walking skeleton and benchmarks is fully accepted and marked done.

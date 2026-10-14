@@ -141,11 +141,14 @@ def test_pdf_retrieval_query_with_cited_document_location():
     assert outcome["status"] == "SUCCESS"
     assert len(outcome["answer"]) > 0
     assert len(outcome["citations"]) > 0
+    # Strengthened verification: check the expected source supported fact
+    assert "wealth creator" in outcome["answer"].lower()
 
-    # 3. Verify citation contains typed DocumentLocation
+    # 3. Verify citation contains typed DocumentLocation and fact snippet
     cit = outcome["citations"][0]
     assert cit["source_id"] == doc_id
     assert len(cit["snippet"]) > 0
+    assert "wealth creator" in cit["snippet"].lower()
     loc = cit["location"]
     assert loc["type"] == "document"
     assert loc["page"] == 1

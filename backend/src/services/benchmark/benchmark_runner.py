@@ -36,6 +36,11 @@ class BenchmarkTestCase:
     expected_pages: tuple[int, ...] = ()
     query_type: str = "text"  # "tabular_aggregate", "text", "partial_coverage", "insufficient_evidence"
     requires_complete_coverage: bool = False
+    expected_source_id: str | None = None
+    expected_source_version: int | None = None
+    valid_source_versions: dict[str, int] | None = None
+    dataset_is_incomplete: bool = False
+    allow_token_estimation: bool = True
 
 
 @dataclass
@@ -53,6 +58,8 @@ class QueryBenchmarkResult:
     correctness: bool
     evidence_supported: bool
     coverage_valid: bool
+    token_usage_source: str = "unavailable"
+    is_estimated_tokens: bool = False
     notes: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -64,6 +71,8 @@ class QueryBenchmarkResult:
             "latency_ms": round(self.latency_ms, 2),
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
+            "token_usage_source": self.token_usage_source,
+            "is_estimated_tokens": self.is_estimated_tokens,
             "answer": self.answer,
             "citations": self.citations,
             "correctness": self.correctness,
@@ -97,7 +106,7 @@ class BenchmarkRunner:
         return engine.execute_query(
             workspace_id=workspace_id,
             query_text=query_text,
-            is_aggregate=any(k in query_text.lower() for k in ("earliest", "latest", "sum", "average", "total", "count")),
+            is_aggregate=any(k in query_text.lower() for k in ("earliest", "latest", "sum", "average", "total", "count", "min", "max")),
         )
 
     def run_suite(
@@ -166,30 +175,98 @@ class BenchmarkRunner:
                 else:
                     serialized_citations.append({"text": str(cit)})
 
-            # Estimate or extract token usage
-            prompt_tok = max(10, int(len(case.query) / 4))
-            comp_tok = max(1, int(len(answer) / 4)) if answer else 0
+            # Token accounting
+            # Provider token usage must be used when available.
+            # Deterministic execution must not invent model usage;
+            # unavailable usage and estimates must be explicitly distinguished.
+            prompt_tok = 0
+            comp_tok = 0
+            tok_source = "unavailable"
+            is_estimated = False
+
+            is_deterministic = (
+                case.query_type == "tabular_aggregate"
+                or getattr(outcome, "is_deterministic", False)
+                or (isinstance(outcome, dict) and outcome.get("is_deterministic", False))
+                or getattr(outcome, "execution_type", "") == "deterministic"
+                or (isinstance(outcome, dict) and outcome.get("execution_type") == "deterministic")
+            )
+
+            if is_deterministic:
+                prompt_tok = 0
+                comp_tok = 0
+                tok_source = "deterministic_zero"
+                is_estimated = False
+            else:
+                tok_dict = None
+                if hasattr(outcome, "token_usage") and getattr(outcome, "token_usage"):
+                    tok_dict = getattr(outcome, "token_usage")
+                elif isinstance(outcome, dict) and outcome.get("token_usage"):
+                    tok_dict = outcome.get("token_usage")
+
+                if isinstance(tok_dict, dict) and (
+                    "prompt_tokens" in tok_dict
+                    or "input_tokens" in tok_dict
+                    or "completion_tokens" in tok_dict
+                    or "output_tokens" in tok_dict
+                ):
+                    prompt_tok = int(tok_dict.get("prompt_tokens") or tok_dict.get("input_tokens") or 0)
+                    comp_tok = int(tok_dict.get("completion_tokens") or tok_dict.get("output_tokens") or 0)
+                    tok_source = "provider_reported"
+                    is_estimated = False
+                elif hasattr(outcome, "prompt_tokens") and getattr(outcome, "prompt_tokens") is not None:
+                    prompt_tok = int(getattr(outcome, "prompt_tokens", 0))
+                    comp_tok = int(getattr(outcome, "completion_tokens", 0))
+                    tok_source = "provider_reported"
+                    is_estimated = False
+                elif getattr(case, "allow_token_estimation", True):
+                    prompt_tok = max(1, int(len(case.query) / 4))
+                    comp_tok = max(1, int(len(answer) / 4)) if answer else 0
+                    tok_source = "estimated"
+                    is_estimated = True
+                else:
+                    prompt_tok = 0
+                    comp_tok = 0
+                    tok_source = "unavailable"
+                    is_estimated = False
+
             total_prompt_tokens += prompt_tok
             total_completion_tokens += comp_tok
 
             # 1. Correctness Evaluation
             is_correct = False
             notes = ""
+            refusal_indicators = (
+                "couldn't find",
+                "could not find",
+                "insufficient",
+                "not enough",
+                "not found",
+                "cannot answer",
+                "can't answer",
+                "no evidence",
+                "do not have",
+                "does not contain",
+                "unsupported",
+            )
+            is_refusal_answer = (
+                any(r in answer.lower() for r in refusal_indicators)
+                or status_val in ("INSUFFICIENT_COVERAGE", "REFUSAL")
+                or answer.strip() == ""
+            )
+
             if case.query_type == "insufficient_evidence":
-                # Expect clean refusal without fabricated evidence
-                is_correct = (
-                    "couldn't find" in answer.lower()
-                    or "insufficient" in answer.lower()
-                    or status_val == "INSUFFICIENT_COVERAGE"
-                    or len(serialized_citations) == 0
-                )
+                # Expect clean refusal without fabricated assertions AND with zero citations.
+                # A fabricated answer with empty citations must FAIL.
+                is_correct = is_refusal_answer and (len(serialized_citations) == 0)
             elif case.query_type == "partial_coverage":
                 # Expect explicit aggregate claim refusal due to incomplete coverage
                 is_correct = (
-                    status_val == "INSUFFICIENT_COVERAGE"
+                    status_val in ("INSUFFICIENT_COVERAGE", "REFUSAL")
                     or "incomplete" in answer.lower()
                     or "tombstoned" in answer.lower()
                     or "aborted" in answer.lower()
+                    or status_val != "SUCCESS"
                 )
             elif case.expected_answer is not None:
                 # Value or keyword match
@@ -208,17 +285,90 @@ class BenchmarkRunner:
                 is_correct = len(serialized_citations) > 0 and len(answer.strip()) > 0
 
             # 2. Evidence Support Evaluation
+            # A wrong-source/version or unsupported citation must not earn evidence-support credit.
             if case.query_type in ("insufficient_evidence", "partial_coverage"):
-                # On insufficient evidence or partial coverage abort, having zero ungrounded citations is supported
-                evidence_supported = True
+                if case.query_type == "insufficient_evidence":
+                    evidence_supported = is_refusal_answer and (len(serialized_citations) == 0)
+                else:
+                    evidence_supported = (len(serialized_citations) == 0) if (status_val != "SUCCESS" or "incomplete" in answer.lower()) else False
             else:
-                evidence_supported = len(serialized_citations) > 0 and answer not in ("", "NOT_FOUND")
+                if not serialized_citations or answer in ("", "NOT_FOUND") or is_refusal_answer:
+                    evidence_supported = False
+                else:
+                    citations_valid = True
+                    for c in serialized_citations:
+                        c_source = c.get("source_id") or c.get("table_id") or c.get("document_filename")
+                        c_version = c.get("source_version") or c.get("document_version")
+                        c_evidence_id = c.get("evidence_id") or c.get("chunk_id") or c.get("selection_hash")
+
+                        # Must have non-empty identifier and source
+                        if not c_source or not c_evidence_id:
+                            citations_valid = False
+                            break
+
+                        # Check expected source if specified
+                        if case.expected_source_id and str(c_source) != str(case.expected_source_id):
+                            citations_valid = False
+                            break
+
+                        # Check expected version if specified
+                        if case.expected_source_version is not None:
+                            try:
+                                if int(c_version) != int(case.expected_source_version):
+                                    citations_valid = False
+                                    break
+                            except (TypeError, ValueError):
+                                citations_valid = False
+                                break
+
+                        # Check valid source versions dictionary if specified
+                        if case.valid_source_versions is not None:
+                            if c_source not in case.valid_source_versions:
+                                citations_valid = False
+                                break
+                            expected_ver = case.valid_source_versions[c_source]
+                            try:
+                                if int(c_version) != int(expected_ver):
+                                    citations_valid = False
+                                    break
+                            except (TypeError, ValueError):
+                                citations_valid = False
+                                break
+
+                        # Check expected pages if specified
+                        if case.expected_pages:
+                            loc = c.get("location", {})
+                            c_page = None
+                            if isinstance(loc, dict) and "page" in loc:
+                                c_page = int(loc["page"])
+                            elif "page_number" in c:
+                                c_page = int(c["page_number"])
+                            if c_page is None or c_page not in case.expected_pages:
+                                citations_valid = False
+                                break
+
+                    evidence_supported = citations_valid
 
             # 3. Coverage Verification Evaluation
-            if case.requires_complete_coverage:
-                coverage_valid = (status_val != "SUCCESS") or ("incomplete" in answer.lower())
+            # - A valid complete-dataset aggregate MUST pass coverage scoring
+            # - An incomplete-dataset complete claim MUST fail coverage scoring
+            if case.dataset_is_incomplete or case.query_type == "partial_coverage":
+                if case.requires_complete_coverage or case.query_type == "partial_coverage":
+                    coverage_valid = (
+                        status_val in ("INSUFFICIENT_COVERAGE", "REFUSAL", "ERROR")
+                        or "incomplete" in answer.lower()
+                        or "tombstoned" in answer.lower()
+                        or "aborted" in answer.lower()
+                        or status_val != "SUCCESS"
+                    )
+                else:
+                    coverage_valid = (status_val == "SUCCESS")
             else:
-                coverage_valid = True
+                # Complete dataset
+                if case.requires_complete_coverage or case.query_type == "tabular_aggregate":
+                    coverage_valid = (status_val == "SUCCESS" and "incomplete" not in answer.lower())
+                else:
+                    coverage_valid = True
 
             if is_correct:
                 correct_count += 1
@@ -241,6 +391,8 @@ class BenchmarkRunner:
                     correctness=is_correct,
                     evidence_supported=evidence_supported,
                     coverage_valid=coverage_valid,
+                    token_usage_source=tok_source,
+                    is_estimated_tokens=is_estimated,
                     notes=notes,
                 )
             )
@@ -288,6 +440,12 @@ class BenchmarkRunner:
                 "prompt_tokens": total_prompt_tokens,
                 "completion_tokens": total_completion_tokens,
                 "total_tokens": total_prompt_tokens + total_completion_tokens,
+                "token_usage_breakdown": {
+                    "provider_reported": sum(1 for q in query_results if q.token_usage_source == "provider_reported"),
+                    "deterministic_zero": sum(1 for q in query_results if q.token_usage_source == "deterministic_zero"),
+                    "estimated": sum(1 for q in query_results if q.token_usage_source == "estimated"),
+                    "unavailable": sum(1 for q in query_results if q.token_usage_source == "unavailable"),
+                },
                 "avg_latency_ms": round(avg_lat, 2),
                 "p95_latency_ms": round(p95_lat, 2),
                 "ingestion_time_ms": round(ingestion_time_ms, 2),

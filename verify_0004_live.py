@@ -197,9 +197,11 @@ passed_q10 = (
     r10_query.status_code == 200
     and q10_json.get("status") == "SUCCESS"
     and len(q10_json.get("answer", "")) > 0
+    and "wealth creator" in q10_json.get("answer", "").lower()
     and len(q10_json.get("citations", [])) >= 1
     and q10_json["citations"][0]["location"]["type"] == "document"
     and q10_json["citations"][0]["location"]["page"] == 1
+    and "wealth creator" in q10_json["citations"][0].get("snippet", "").lower()
 )
 record("Text PDF query with DocumentLocation citation", f"POST /workspaces/{ws_pdf_id}/query", r10_query, passed_q10, f"Answer: {q10_json.get('answer')[:100]}...")
 

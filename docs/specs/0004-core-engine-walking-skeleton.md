@@ -1,6 +1,6 @@
 # 0004: Core engine walking skeleton and benchmarks
 
-**Status**: In Progress
+**Status**: Accepted
 
 ## Summary
 This spec outlines the next milestone: a bounded core engine walking skeleton that proves the complete path works end to end. It establishes real document ingestion with provenance, structured data execution, hybrid retrieval, and evidence-backed answers, all validated by reproducible benchmarks for correctness and latency. Advanced distributed features are deferred.

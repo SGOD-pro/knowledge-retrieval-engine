@@ -422,3 +422,419 @@ def test_reproducible_benchmark_runner_execution():
 
     # Verify persistence call
     mock_persistence.persist_benchmark_run.assert_called_once()
+
+
+def test_adversarial_fabricated_answer_empty_citations_fails_insufficient_evidence():
+    """Adversarial case: Fabricated answer with empty citations must FAIL insufficient-evidence scoring.
+    
+    Verifies that an engine hallucinating facts without citations on an unanswerable question
+    is not credited for having 0 citations.
+    """
+    mock_persistence = MagicMock()
+    mock_persistence.persist_benchmark_run.side_effect = lambda *args, **kwargs: kwargs.get("metadata", args[1] if len(args) > 1 else None)
+
+    # Engine fabricates positive assertion without refusal, but leaves citations empty
+    def hallucinating_executor(query: str, workspace_id: str):
+        return QueryExecutionOutcome(
+            execution_id="exec_fab_1",
+            status="SUCCESS",
+            answer="The founder and CEO is John Doe and annual profits exceeded $50 million.",
+            citations=(),
+            surviving_source_ids=(),
+            tombstoned_source_ids=(),
+        )
+
+    runner = BenchmarkRunner(query_executor=hallucinating_executor, persistence_service=mock_persistence)
+    case = BenchmarkTestCase(
+        query_id="adv_insufficient_1",
+        query="What was the founder's secret personal recipe?",
+        query_type="insufficient_evidence",
+    )
+
+    report = runner.run_suite(workspace_id="ws_adv_1", test_cases=[case])
+    q_result = report.detailed_artifact["queries"][0]
+
+    # Must FAIL correctness and evidence support
+    assert q_result["correctness"] is False
+    assert q_result["evidence_supported"] is False
+    assert report.metadata.correctness_score == 0.0
+    assert report.metadata.evidence_support_score == 0.0
+
+
+def test_adversarial_wrong_source_or_version_citation_fails_evidence_support():
+    """Adversarial case: Citations citing wrong source, wrong version, or unsupported items fail evidence support."""
+    mock_persistence = MagicMock()
+    mock_persistence.persist_benchmark_run.side_effect = lambda *args, **kwargs: kwargs.get("metadata", args[1] if len(args) > 1 else None)
+
+    responses = {}
+
+    def dynamic_executor(query: str, workspace_id: str):
+        return responses[query]
+
+    runner = BenchmarkRunner(query_executor=dynamic_executor, persistence_service=mock_persistence)
+
+    # Sub-case A: Wrong source ID
+    responses["q_wrong_source"] = QueryExecutionOutcome(
+        execution_id="exec_ws_1",
+        status="SUCCESS",
+        answer="The fund policy requires conservative leverage.",
+        citations=(
+            CitationItem(
+                evidence_id="ev_01",
+                source_id="src_unrelated_foreign_doc",  # Wrong source
+                location=DocumentLocation(page=1),
+                snippet="Conservative leverage requirement.",
+                source_version=1,
+            ),
+        ),
+        surviving_source_ids=("src_unrelated_foreign_doc",),
+        tombstoned_source_ids=(),
+    )
+
+    # Sub-case B: Wrong source version (stale or future version)
+    responses["q_wrong_version"] = QueryExecutionOutcome(
+        execution_id="exec_wv_1",
+        status="SUCCESS",
+        answer="The fund policy requires conservative leverage.",
+        citations=(
+            CitationItem(
+                evidence_id="ev_02",
+                source_id="src_policy_pdf",
+                location=DocumentLocation(page=1),
+                snippet="Conservative leverage requirement.",
+                source_version=99,  # Wrong version (expected 1)
+            ),
+        ),
+        surviving_source_ids=("src_policy_pdf",),
+        tombstoned_source_ids=(),
+    )
+
+    # Sub-case C: Citation citing source version outside valid_source_versions
+    responses["q_unbound_version"] = QueryExecutionOutcome(
+        execution_id="exec_uv_1",
+        status="SUCCESS",
+        answer="Financial statement total assets.",
+        citations=(
+            CitationItem(
+                evidence_id="ev_03",
+                source_id="src_financials_csv",
+                location=TableLocation(table_id="financials", row_id=5),
+                snippet="Total Assets: 1000",
+                source_version=1,  # Version 1 is outdated/unbound when active is 2
+            ),
+        ),
+        surviving_source_ids=("src_financials_csv",),
+        tombstoned_source_ids=(),
+    )
+
+    # Sub-case D: Supported citation with matching source and version
+    responses["q_valid_evidence"] = QueryExecutionOutcome(
+        execution_id="exec_valid_1",
+        status="SUCCESS",
+        answer="The fund policy requires conservative leverage.",
+        citations=(
+            CitationItem(
+                evidence_id="ev_04",
+                source_id="src_policy_pdf",
+                location=DocumentLocation(page=1),
+                snippet="Conservative leverage requirement.",
+                source_version=1,
+            ),
+        ),
+        surviving_source_ids=("src_policy_pdf",),
+        tombstoned_source_ids=(),
+    )
+
+    test_cases = [
+        BenchmarkTestCase(
+            query_id="tc_wrong_source",
+            query="q_wrong_source",
+            expected_answer="conservative leverage",
+            expected_source_id="src_policy_pdf",
+            expected_source_version=1,
+            query_type="text",
+        ),
+        BenchmarkTestCase(
+            query_id="tc_wrong_version",
+            query="q_wrong_version",
+            expected_answer="conservative leverage",
+            expected_source_id="src_policy_pdf",
+            expected_source_version=1,
+            query_type="text",
+        ),
+        BenchmarkTestCase(
+            query_id="tc_unbound_version",
+            query="q_unbound_version",
+            expected_answer="Total Assets",
+            valid_source_versions={"src_financials_csv": 2},  # Only version 2 is valid
+            query_type="text",
+        ),
+        BenchmarkTestCase(
+            query_id="tc_valid_evidence",
+            query="q_valid_evidence",
+            expected_answer="conservative leverage",
+            expected_source_id="src_policy_pdf",
+            expected_source_version=1,
+            valid_source_versions={"src_policy_pdf": 1},
+            query_type="text",
+        ),
+    ]
+
+    report = runner.run_suite(workspace_id="ws_adv_2", test_cases=test_cases)
+    queries = {q["query_id"]: q for q in report.detailed_artifact["queries"]}
+
+    # Wrong source fails evidence support
+    assert queries["tc_wrong_source"]["evidence_supported"] is False
+
+    # Wrong version fails evidence support
+    assert queries["tc_wrong_version"]["evidence_supported"] is False
+
+    # Unbound / stale version fails evidence support
+    assert queries["tc_unbound_version"]["evidence_supported"] is False
+
+    # Matching source and version succeeds evidence support
+    assert queries["tc_valid_evidence"]["evidence_supported"] is True
+
+
+def test_adversarial_coverage_scoring_complete_vs_incomplete_datasets():
+    """Adversarial case: Complete-dataset aggregate passes coverage; incomplete-dataset complete claim fails."""
+    mock_persistence = MagicMock()
+    mock_persistence.persist_benchmark_run.side_effect = lambda *args, **kwargs: kwargs.get("metadata", args[1] if len(args) > 1 else None)
+
+    responses = {}
+
+    def dynamic_executor(query: str, workspace_id: str):
+        return responses[query]
+
+    runner = BenchmarkRunner(query_executor=dynamic_executor, persistence_service=mock_persistence)
+
+    # 1. Valid complete-dataset aggregate: Clean data, successful aggregation
+    responses["q_complete_aggregate"] = QueryExecutionOutcome(
+        execution_id="exec_cov_1",
+        status="SUCCESS",
+        answer="The total revenue across all rows is $1,250,000.",
+        citations=(
+            CitationItem(
+                evidence_id="ev_agg_1",
+                source_id="src_sales_csv",
+                location=TableLocation(table_id="sales", row_id=1),
+                snippet="Total sum: 1250000",
+                source_version=1,
+            ),
+        ),
+        surviving_source_ids=("src_sales_csv",),
+        tombstoned_source_ids=(),
+    )
+
+    # 2. Incomplete-dataset complete claim: Dataset has exclusions, but engine improperly claims SUCCESS
+    responses["q_improper_complete_claim"] = QueryExecutionOutcome(
+        execution_id="exec_cov_2",
+        status="SUCCESS",
+        answer="The total revenue across all rows is $950,000.",
+        citations=(
+            CitationItem(
+                evidence_id="ev_agg_2",
+                source_id="src_sales_corrupted_csv",
+                location=TableLocation(table_id="sales", row_id=1),
+                snippet="Total sum: 950000",
+                source_version=1,
+            ),
+        ),
+        surviving_source_ids=("src_sales_corrupted_csv",),
+        tombstoned_source_ids=(),
+    )
+
+    # 3. Incomplete-dataset correctly blocked/refused
+    responses["q_blocked_incomplete_claim"] = QueryExecutionOutcome(
+        execution_id="exec_cov_3",
+        status="INSUFFICIENT_COVERAGE",
+        answer="Aggregate query blocked: source dataset contains incomplete coverage (2 malformed rows excluded).",
+        citations=(),
+        surviving_source_ids=(),
+        tombstoned_source_ids=(),
+    )
+
+    test_cases = [
+        BenchmarkTestCase(
+            query_id="tc_valid_complete_aggregate",
+            query="q_complete_aggregate",
+            query_type="tabular_aggregate",
+            requires_complete_coverage=True,
+            dataset_is_incomplete=False,  # Complete dataset
+        ),
+        BenchmarkTestCase(
+            query_id="tc_improper_claim_incomplete_data",
+            query="q_improper_complete_claim",
+            query_type="tabular_aggregate",
+            requires_complete_coverage=True,
+            dataset_is_incomplete=True,  # Incomplete dataset!
+        ),
+        BenchmarkTestCase(
+            query_id="tc_properly_blocked_incomplete_data",
+            query="q_blocked_incomplete_claim",
+            query_type="partial_coverage",
+            requires_complete_coverage=True,
+            dataset_is_incomplete=True,  # Incomplete dataset!
+        ),
+    ]
+
+    report = runner.run_suite(workspace_id="ws_adv_3", test_cases=test_cases)
+    queries = {q["query_id"]: q for q in report.detailed_artifact["queries"]}
+
+    # Valid complete-dataset aggregate MUST pass coverage scoring
+    assert queries["tc_valid_complete_aggregate"]["coverage_valid"] is True
+
+    # Incomplete-dataset complete claim MUST FAIL coverage scoring
+    assert queries["tc_improper_claim_incomplete_data"]["coverage_valid"] is False
+
+    # Incomplete-dataset blocked claim passes coverage scoring
+    assert queries["tc_properly_blocked_incomplete_data"]["coverage_valid"] is True
+
+
+def test_adversarial_token_accounting_and_provenance_distinction():
+    """Adversarial case: Provider token usage is used when available, deterministic execution does not invent tokens,
+    and unavailable vs estimated token usage is explicitly distinguished.
+    """
+    mock_persistence = MagicMock()
+    mock_persistence.persist_benchmark_run.side_effect = lambda *args, **kwargs: kwargs.get("metadata", args[1] if len(args) > 1 else None)
+
+    responses = {}
+
+    def dynamic_executor(query: str, workspace_id: str):
+        return responses[query]
+
+    runner = BenchmarkRunner(query_executor=dynamic_executor, persistence_service=mock_persistence)
+
+    # Query 1: Provider token usage available
+    res_provider = QueryExecutionOutcome(
+        execution_id="exec_tok_1",
+        status="SUCCESS",
+        answer="Report on market risks and asset liquidity.",
+        citations=(
+            CitationItem(
+                evidence_id="ev_tok_1",
+                source_id="src_risk_doc",
+                location=DocumentLocation(page=1),
+                snippet="Market risks and liquidity factors.",
+                source_version=1,
+            ),
+        ),
+        surviving_source_ids=("src_risk_doc",),
+        tombstoned_source_ids=(),
+    )
+    # Attach provider token_usage dictionary
+    object.__setattr__(res_provider, "token_usage", {"prompt_tokens": 128, "completion_tokens": 42})
+    responses["q_provider_tokens"] = res_provider
+
+    # Query 2: Deterministic execution (tabular aggregate calculation, no model invoked)
+    responses["q_deterministic_math"] = QueryExecutionOutcome(
+        execution_id="exec_tok_2",
+        status="SUCCESS",
+        answer="Total sum is 5500.",
+        citations=(
+            CitationItem(
+                evidence_id="ev_tok_2",
+                source_id="src_math_csv",
+                location=TableLocation(table_id="math", row_id=1),
+                snippet="Sum: 5500",
+                source_version=1,
+            ),
+        ),
+        surviving_source_ids=("src_math_csv",),
+        tombstoned_source_ids=(),
+    )
+
+    # Query 3: Text query where provider token usage is unavailable and estimation is disabled
+    responses["q_unavailable_tokens"] = QueryExecutionOutcome(
+        execution_id="exec_tok_3",
+        status="SUCCESS",
+        answer="Historical interest rate trajectories.",
+        citations=(
+            CitationItem(
+                evidence_id="ev_tok_3",
+                source_id="src_rates_doc",
+                location=DocumentLocation(page=2),
+                snippet="Interest rate changes from 2010 to 2020.",
+                source_version=1,
+            ),
+        ),
+        surviving_source_ids=("src_rates_doc",),
+        tombstoned_source_ids=(),
+    )
+
+    # Query 4: Text query where estimation is explicitly permitted as fallback
+    responses["q_estimated_tokens"] = QueryExecutionOutcome(
+        execution_id="exec_tok_4",
+        status="SUCCESS",
+        answer="Brief summary of portfolio allocations.",
+        citations=(
+            CitationItem(
+                evidence_id="ev_tok_4",
+                source_id="src_allocations_doc",
+                location=DocumentLocation(page=1),
+                snippet="Portfolio allocations across equity and debt.",
+                source_version=1,
+            ),
+        ),
+        surviving_source_ids=("src_allocations_doc",),
+        tombstoned_source_ids=(),
+    )
+
+    test_cases = [
+        BenchmarkTestCase(
+            query_id="tc_provider_reported",
+            query="q_provider_tokens",
+            query_type="text",
+        ),
+        BenchmarkTestCase(
+            query_id="tc_deterministic_zero",
+            query="q_deterministic_math",
+            query_type="tabular_aggregate",
+        ),
+        BenchmarkTestCase(
+            query_id="tc_unavailable",
+            query="q_unavailable_tokens",
+            query_type="text",
+            allow_token_estimation=False,
+        ),
+        BenchmarkTestCase(
+            query_id="tc_estimated",
+            query="q_estimated_tokens",
+            query_type="text",
+            allow_token_estimation=True,
+        ),
+    ]
+
+    report = runner.run_suite(workspace_id="ws_adv_tok", test_cases=test_cases)
+    queries = {q["query_id"]: q for q in report.detailed_artifact["queries"]}
+
+    # 1. Provider reported tokens used exactly
+    assert queries["tc_provider_reported"]["prompt_tokens"] == 128
+    assert queries["tc_provider_reported"]["completion_tokens"] == 42
+    assert queries["tc_provider_reported"]["token_usage_source"] == "provider_reported"
+    assert queries["tc_provider_reported"]["is_estimated_tokens"] is False
+
+    # 2. Deterministic execution MUST NOT invent model usage (must be 0)
+    assert queries["tc_deterministic_zero"]["prompt_tokens"] == 0
+    assert queries["tc_deterministic_zero"]["completion_tokens"] == 0
+    assert queries["tc_deterministic_zero"]["token_usage_source"] == "deterministic_zero"
+    assert queries["tc_deterministic_zero"]["is_estimated_tokens"] is False
+
+    # 3. Unavailable tokens must be marked unavailable without invented estimates
+    assert queries["tc_unavailable"]["prompt_tokens"] == 0
+    assert queries["tc_unavailable"]["completion_tokens"] == 0
+    assert queries["tc_unavailable"]["token_usage_source"] == "unavailable"
+    assert queries["tc_unavailable"]["is_estimated_tokens"] is False
+
+    # 4. Estimated tokens explicitly identified as estimates
+    assert queries["tc_estimated"]["prompt_tokens"] > 0
+    assert queries["tc_estimated"]["completion_tokens"] > 0
+    assert queries["tc_estimated"]["token_usage_source"] == "estimated"
+    assert queries["tc_estimated"]["is_estimated_tokens"] is True
+
+    # 5. Summary breakdown reflects exact categories
+    breakdown = report.detailed_artifact["summary"]["token_usage_breakdown"]
+    assert breakdown["provider_reported"] == 1
+    assert breakdown["deterministic_zero"] == 1
+    assert breakdown["unavailable"] == 1
+    assert breakdown["estimated"] == 1
