@@ -299,7 +299,15 @@ def query_workspace_boundary_endpoint(
     _enforce_workspace_boundary(workspace_id, auth_context)
     # 1. Compute exact literal query hash and descriptor
     query_hash = CacheKeyDescriptor.compute_query_hash(payload.query)
-    source_version_hash = CacheKeyDescriptor.compute_source_version_set_hash(())
+    source_versions = ()
+    if hasattr(repo, "get_snapshot") and payload.snapshot_id:
+        snap = repo.get_snapshot(workspace_id, payload.snapshot_id)
+        if snap and snap.source_versions:
+            source_versions = snap.source_versions
+    if not source_versions and hasattr(repo, "list_sources"):
+        sources = repo.list_sources(workspace_id)
+        source_versions = tuple((s.source_id, 1) for s in sources)
+    source_version_hash = CacheKeyDescriptor.compute_source_version_set_hash(source_versions)
 
     descriptor = CacheKeyDescriptor(
         workspace_id=workspace_id,

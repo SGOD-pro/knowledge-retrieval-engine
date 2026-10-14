@@ -197,6 +197,7 @@ class CapabilityArtifact(BaseModel):
     artifact_version: str
     pipeline_version: str
     build_id: str
+    structured_operations: tuple[str, ...] = Field(default_factory=tuple)
     failure_state: ArtifactFailureState | None = None
 
     @field_validator(

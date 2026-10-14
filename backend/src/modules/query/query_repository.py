@@ -39,6 +39,49 @@ class QueryRepository:
     def get_all_chunks(self, document_ids: list[str] | None = None, workspace_id: str | None = None) -> list[Chunk]:
         return self._doc_repo.get_all_chunks(document_ids=document_ids, workspace_id=workspace_id)
 
+    def _search_in_memory(
+        self,
+        query_embedding: list[float],
+        embedding_column: str = "embedding_full",
+        document_ids: list[str] | None = None,
+        candidate_page_ids: list[int] | None = None,
+        candidate_chunk_ids: list[str] | None = None,
+        candidate_page_scopes: list[tuple[str, int]] | None = None,
+        workspace_id: str = "",
+        limit: int = 10,
+    ) -> list[tuple[Chunk, float]]:
+        results = []
+        q_vec = np.array(query_embedding)
+        has_page_constraint = candidate_page_ids is not None and len(candidate_page_ids) > 0
+        has_chunk_constraint = candidate_chunk_ids is not None and len(candidate_chunk_ids) > 0
+        has_scope_constraint = candidate_page_scopes is not None and len(candidate_page_scopes) > 0
+
+        for chunk in _IN_MEMORY_CHUNKS.values():
+            if getattr(chunk, "workspace_id", "") != workspace_id:
+                continue
+            if document_ids and str(chunk.document_id) not in document_ids:
+                continue
+            if has_scope_constraint:
+                scope_match = (str(chunk.document_id), chunk.page_number) in candidate_page_scopes
+                chunk_match = has_chunk_constraint and str(chunk.id) in candidate_chunk_ids
+                if not (scope_match or chunk_match):
+                    continue
+            elif has_page_constraint or has_chunk_constraint:
+                page_match = has_page_constraint and chunk.page_number in candidate_page_ids
+                chunk_match = has_chunk_constraint and str(chunk.id) in candidate_chunk_ids
+                if not (page_match or chunk_match):
+                    continue
+            c_vec = chunk.embedding_fast if embedding_column == "embedding_fast" else chunk.embedding_full
+            if c_vec:
+                c_arr = np.array(c_vec)
+                norm_q = np.linalg.norm(q_vec)
+                norm_c = np.linalg.norm(c_arr)
+                sim = float(np.dot(q_vec, c_arr) / (norm_q * norm_c)) if (norm_q * norm_c) > 0 else 0.0
+                results.append((chunk, sim))
+
+        results.sort(key=lambda x: x[1], reverse=True)
+        return results[:limit]
+
     def search_vector(
         self,
         query_embedding: list[float],
@@ -54,37 +97,16 @@ class QueryRepository:
             raise ValueError("workspace_id is required for vector search")
 
         if _is_test_env():
-            results = []
-            q_vec = np.array(query_embedding)
-            has_page_constraint = candidate_page_ids is not None and len(candidate_page_ids) > 0
-            has_chunk_constraint = candidate_chunk_ids is not None and len(candidate_chunk_ids) > 0
-            has_scope_constraint = candidate_page_scopes is not None and len(candidate_page_scopes) > 0
-
-            for chunk in _IN_MEMORY_CHUNKS.values():
-                if getattr(chunk, "workspace_id", "") != workspace_id:
-                    continue
-                if document_ids and str(chunk.document_id) not in document_ids:
-                    continue
-                if has_scope_constraint:
-                    scope_match = (str(chunk.document_id), chunk.page_number) in candidate_page_scopes
-                    chunk_match = has_chunk_constraint and str(chunk.id) in candidate_chunk_ids
-                    if not (scope_match or chunk_match):
-                        continue
-                elif has_page_constraint or has_chunk_constraint:
-                    page_match = has_page_constraint and chunk.page_number in candidate_page_ids
-                    chunk_match = has_chunk_constraint and str(chunk.id) in candidate_chunk_ids
-                    if not (page_match or chunk_match):
-                        continue
-                c_vec = chunk.embedding_fast if embedding_column == "embedding_fast" else chunk.embedding_full
-                if c_vec:
-                    c_arr = np.array(c_vec)
-                    norm_q = np.linalg.norm(q_vec)
-                    norm_c = np.linalg.norm(c_arr)
-                    sim = float(np.dot(q_vec, c_arr) / (norm_q * norm_c)) if (norm_q * norm_c) > 0 else 0.0
-                    results.append((chunk, sim))
-
-            results.sort(key=lambda x: x[1], reverse=True)
-            return results[:limit]
+            return self._search_in_memory(
+                query_embedding=query_embedding,
+                embedding_column=embedding_column,
+                document_ids=document_ids,
+                candidate_page_ids=candidate_page_ids,
+                candidate_chunk_ids=candidate_chunk_ids,
+                candidate_page_scopes=candidate_page_scopes,
+                workspace_id=workspace_id,
+                limit=limit,
+            )
 
         if embedding_column not in ("embedding_fast", "embedding_full"):
             raise ValueError(f"Invalid embedding_column: {embedding_column}")
@@ -140,8 +162,18 @@ class QueryRepository:
             )
             results = response.points
         except Exception as e:
-            logger.error("Qdrant search failed: %s", e)
-            return []
+            logger.warning("Qdrant search failed (%s), falling back to in-memory vector search", e)
+            return self._search_in_memory(
+                query_embedding=query_embedding,
+                embedding_column=embedding_column,
+                document_ids=document_ids,
+                candidate_page_ids=candidate_page_ids,
+                candidate_chunk_ids=candidate_chunk_ids,
+                candidate_page_scopes=candidate_page_scopes,
+                workspace_id=workspace_id,
+                limit=limit,
+            )
+
 
         keys = []
         for hit in results:

@@ -38,12 +38,12 @@ def _invoke_lambda(path: Path, document_id: str) -> list[dict] | None:
         from botocore.config import Config
         s3_cfg = Config(connect_timeout=10, read_timeout=25, retries={"max_attempts": 2})
         try:
-            session = boto3.Session(profile_name="aws")
-            s3 = session.client("s3", region_name="us-east-1", config=s3_cfg)
-            lambda_client = session.client("lambda", region_name="ap-south-1")
+            s3 = get_client("s3", region_name=settings.AWS_REGION)
+            lambda_client = get_client("lambda")
         except Exception:
-            s3 = get_client("s3")
-            lambda_client = get_client("lambda", region_name="ap-south-1")
+            session = boto3.Session()
+            s3 = session.client("s3", region_name=settings.AWS_REGION, config=s3_cfg)
+            lambda_client = session.client("lambda", region_name="ap-south-1")
 
         # Upload to S3 under a temp key scoped to the document_id
         s3_key = f"tmp/pdf-extraction/{document_id}/{path.name}"
@@ -61,52 +61,58 @@ def _invoke_lambda(path: Path, document_id: str) -> list[dict] | None:
             s3_key,
         )
 
-        # Invoke the extraction Lambda
-        payload = {
-            "s3_bucket": settings.S3_BUCKET_NAME,
-            "s3_key": s3_key,
-            "document_id": document_id,
-        }
-        response = lambda_client.invoke(
-            FunctionName=settings.ODL_PARSER_LAMBDA_NAME,
-            InvocationType="RequestResponse",
-            Payload=json.dumps(payload).encode("utf-8"),
-        )
-
-        result_raw = response["Payload"].read()
-        result = json.loads(result_raw)
-
-        # Lambda may return an error envelope
-        if "errorMessage" in result or result.get("error"):
-            logger.error(
-                "pdf_adapter.lambda_error doc_id=%s error=%s",
-                document_id,
-                result.get("errorMessage") or result.get("error"),
+        try:
+            # Invoke the extraction Lambda
+            payload = {
+                "s3_bucket": settings.S3_BUCKET_NAME,
+                "s3_key": s3_key,
+                "document_id": document_id,
+            }
+            response = lambda_client.invoke(
+                FunctionName=settings.ODL_PARSER_LAMBDA_NAME,
+                InvocationType="RequestResponse",
+                Payload=json.dumps(payload).encode("utf-8"),
             )
-            return None
 
-        # Unpack ODL Parser envelope: {"results": [{"document_id": "...", "elements": {"kids": [...]}}]}
-        chunks_raw = []
-        if isinstance(result, dict):
-            if "results" in result and isinstance(result["results"], list) and result["results"]:
-                r0 = result["results"][0]
-                if isinstance(r0, dict):
-                    elements_obj = r0.get("elements", {})
-                    if isinstance(elements_obj, dict):
-                        chunks_raw = elements_obj.get("kids", [])
-                    elif isinstance(elements_obj, list):
-                        chunks_raw = elements_obj
-            if not chunks_raw:
-                chunks_raw = result.get("chunks") or result.get("kids") or result.get("pages") or []
-        elif isinstance(result, list):
-            chunks_raw = result
+            result_raw = response["Payload"].read()
+            result = json.loads(result_raw)
 
-        logger.info(
-            "pdf_adapter.lambda_done doc_id=%s chunk_count=%d",
-            document_id,
-            len(chunks_raw),
-        )
-        return chunks_raw
+            # Lambda may return an error envelope
+            if "errorMessage" in result or result.get("error"):
+                logger.error(
+                    "pdf_adapter.lambda_error doc_id=%s error=%s",
+                    document_id,
+                    result.get("errorMessage") or result.get("error"),
+                )
+                return None
+
+            # Unpack ODL Parser envelope: {"results": [{"document_id": "...", "elements": {"kids": [...]}}]}
+            chunks_raw = []
+            if isinstance(result, dict):
+                if "results" in result and isinstance(result["results"], list) and result["results"]:
+                    r0 = result["results"][0]
+                    if isinstance(r0, dict):
+                        elements_obj = r0.get("elements", {})
+                        if isinstance(elements_obj, dict):
+                            chunks_raw = elements_obj.get("kids", [])
+                        elif isinstance(elements_obj, list):
+                            chunks_raw = elements_obj
+                if not chunks_raw:
+                    chunks_raw = result.get("chunks") or result.get("kids") or result.get("pages") or []
+            elif isinstance(result, list):
+                chunks_raw = result
+
+            logger.info(
+                "pdf_adapter.lambda_done doc_id=%s chunk_count=%d",
+                document_id,
+                len(chunks_raw),
+            )
+            return chunks_raw
+        finally:
+            try:
+                s3.delete_object(Bucket=settings.S3_BUCKET_NAME, Key=s3_key)
+            except Exception as del_err:
+                logger.debug("pdf_adapter.s3_cleanup_failed: %s", del_err)
 
     except (ImportError, BotoCoreError, ClientError) as exc:
         logger.warning(
@@ -128,41 +134,71 @@ def _invoke_lambda(path: Path, document_id: str) -> list[dict] | None:
 # Fallback: pypdf plain-text extraction (dev mode)
 # ---------------------------------------------------------------------------
 
-def _extract_with_pypdf(path: Path, document_id: str) -> list[dict]:
-    """Extract text via pypdf. No bounding boxes, paragraph-level chunks."""
+class ChunkList(list):
+    """List subclass preserving chunk sequence while carrying extraction coverage metadata."""
+
+    def __init__(
+        self,
+        iterable=(),
+        exclusions: tuple[str, ...] = (),
+        incomplete_coverage: bool = False,
+    ):
+        super().__init__(iterable)
+        self.exclusions = tuple(exclusions)
+        self.incomplete_coverage = incomplete_coverage
+
+
+# ---------------------------------------------------------------------------
+# Fallback: pypdf plain-text extraction (dev mode)
+# ---------------------------------------------------------------------------
+
+def _extract_with_pypdf(path: Path, document_id: str) -> tuple[list[dict], list[str]]:
+    """Extract text via pypdf per page, isolating unreadable pages and recording exclusions."""
     try:
         from pypdf import PdfReader  # type: ignore[import]
     except ImportError:
         logger.error("pdf_adapter: pypdf not installed and Lambda unavailable — returning empty")
-        return []
+        return [], ["pypdf not installed"]
+
+    elements: list[dict] = []
+    exclusions: list[str] = []
+    total_pages = 0
 
     try:
-        reader = PdfReader(str(path))
-        elements: list[dict] = []
-        for page_num, page in enumerate(reader.pages, start=1):
-            text = page.extract_text() or ""
-            # Split into rough paragraphs on blank lines
-            paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
-            if not paragraphs and text.strip():
-                paragraphs = [text.strip()]
-            for para in paragraphs:
-                elements.append(
-                    {
-                        "content": para,
-                        "type": "paragraph",
-                        "page_number": page_num,
-                    }
-                )
-        logger.info(
-            "pdf_adapter.pypdf_done doc_id=%s pages=%d elements=%d",
-            document_id,
-            len(reader.pages),
-            len(elements),
-        )
-        return elements
+        with open(path, "rb") as f:
+            reader = PdfReader(f)
+            total_pages = len(reader.pages)
+            for page_num, page in enumerate(reader.pages, start=1):
+                try:
+                    text = page.extract_text() or ""
+                    # Split into rough paragraphs on blank lines
+                    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+                    if not paragraphs and text.strip():
+                        paragraphs = [text.strip()]
+                    for para in paragraphs:
+                        elements.append(
+                            {
+                                "content": para,
+                                "type": "paragraph",
+                                "page_number": page_num,
+                            }
+                        )
+                except Exception as page_err:
+                    msg = f"Page {page_num}: unreadable or corrupted page ({page_err})"
+                    logger.warning("pdf_adapter.page_skip doc_id=%s %s", document_id, msg)
+                    exclusions.append(msg)
     except Exception as e:
-        logger.error("pdf_adapter.pypdf_error doc_id=%s error=%s", document_id, e)
-        return []
+        logger.error("pdf_adapter.pypdf_open_error doc_id=%s error=%s", document_id, e)
+        return [], [f"Failed to open PDF: {e}"]
+
+    logger.info(
+        "pdf_adapter.pypdf_done doc_id=%s pages=%d elements=%d exclusions=%d",
+        document_id,
+        total_pages,
+        len(elements),
+        len(exclusions),
+    )
+    return elements, exclusions
 
 
 # ---------------------------------------------------------------------------
@@ -246,14 +282,21 @@ def parse(path: Path, document_id: str, workspace_id: str = "") -> list[Chunk]:
     """Parse a PDF via Lambda (prod) or pypdf fallback (dev).
 
     Lambda path: upload to S3 → invoke ODL_PARSER_LAMBDA_NAME → receive JSON.
-    Fallback path: pypdf text extraction (no bounding boxes).
+    Fallback path: pypdf text extraction (no bounding boxes) with per-page error isolation.
     """
     elements = _invoke_lambda(path, document_id)
+    exclusions: list[str] = []
 
     if elements is None:
         logger.info(
             "pdf_adapter.using_fallback doc_id=%s path=%s", document_id, path.name
         )
-        elements = _extract_with_pypdf(path, document_id)
+        elements, exclusions = _extract_with_pypdf(path, document_id)
 
-    return _normalize_elements(elements, document_id, workspace_id=workspace_id)
+    chunks = _normalize_elements(elements, document_id, workspace_id=workspace_id)
+    return ChunkList(
+        chunks,
+        exclusions=tuple(exclusions),
+        incomplete_coverage=bool(exclusions),
+    )
+

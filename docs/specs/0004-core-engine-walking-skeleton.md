@@ -1,6 +1,6 @@
 # 0004: Core engine walking skeleton and benchmarks
 
-**Status**: Proposed
+**Status**: In Progress
 
 ## Summary
 This spec outlines the next milestone: a bounded core engine walking skeleton that proves the complete path works end to end. It establishes real document ingestion with provenance, structured data execution, hybrid retrieval, and evidence-backed answers, all validated by reproducible benchmarks for correctness and latency. Advanced distributed features are deferred.
@@ -79,13 +79,19 @@ All operations execute within the existing workspace boundary model. Benchmark a
 - **Benchmark runner**: A separate test suite using a fixed corpus/question set, fixed configuration versions, and real embedding/reranker/generation runs. Measures exact correctness/evidence metrics, timing boundaries, and token accounting. Ground truth is strictly segregated from engine inputs.
 
 ## Build plan
-- [ ] Data model: Implement `DocumentSnapshot` and `BenchmarkRunMetadata` DynamoDB models and S3 storage adapters. (AC-10)
-- [ ] API routes: Update `/documents` endpoint to process CSV/PDF, track provenance, and handle partial page skips. (AC-2, AC-3)
-- [ ] Core execution: Implement restricted lookup/filter/aggregation for structured data without truncation. (AC-4)
-- [ ] Retrieval: Wire BM25 and vector retrieval pipelines with bounded reranking. (AC-5)
-- [ ] Answer assembly: Implement evidence verification, citations, and the aggregate claim blocker for incomplete coverage. (AC-6, AC-7, AC-8)
-- [ ] Benchmarks: Build the reproducible benchmark runner capturing token usage, latency, and correctness. (AC-9, AC-11)
-- [ ] Cross-check boundaries: Verify that the walking skeleton does not bypass `Workspace` boundaries (test fixtures fixed). (AC-1)
+- [x] Data model:
+  - [x] Implement `DocumentSnapshot` model across DynamoDB, SQLite, and in-memory repositories (AC-10)
+  - [x] Implement `BenchmarkRunMetadata` DynamoDB model and S3 storage adapters (AC-10)
+- [x] API routes:
+  - [x] Ingest real CSV through `/documents` endpoint with provenance and malformed row exclusion tracking (AC-2, AC-3)
+  - [x] Ingest text PDF with page-level chunking and partial page skips (AC-2, AC-3)
+- [x] Core execution: Implement restricted lookup/filter/aggregation for structured data without truncation. (AC-4)
+- [x] Retrieval: Wire BM25 and vector retrieval pipelines with bounded reranking. (AC-5)
+- [x] Answer assembly:
+  - [x] Implement typed `TableLocation` citations and aggregate claim blocker for incomplete coverage (AC-7, AC-8)
+  - [x] Implement narrative evidence verification and chunk citations for text PDF retrieval (AC-6)
+- [x] Benchmarks: Build the reproducible benchmark runner capturing token usage, latency, and correctness. (AC-9, AC-11)
+- [x] Cross-check boundaries: Verify that the walking skeleton does not bypass `Workspace` boundaries (test fixtures fixed). (AC-1)
 
 ## Consequences
 - **Pros**: Proves the complete execution path end to end; isolates heavy benchmark data in S3; robustly handles dirty ingestion without failing completely.

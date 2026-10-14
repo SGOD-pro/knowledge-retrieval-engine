@@ -86,6 +86,7 @@ def ingest_csv_to_table_store(
     force_reingest: bool = False,
     allow_rejections: bool = False,
     exclusion_policy: str | None = None,
+    table_name: str | None = None,
 ) -> CsvIngestionResult:
     """Ingest CSV file into TableStore using streaming, checkpoints, and versioned keys."""
     if not workspace_id:
@@ -94,7 +95,7 @@ def ingest_csv_to_table_store(
     # 1. Streamed content hash
     content_hash = _compute_streamed_hash(path)
     document_version = content_hash[:32]
-    table_id = path.stem.lower()
+    table_id = (table_name or path.stem).lower()
 
     # 2. Sample file to infer schema
     sample_rows: list[list[str]] = []
@@ -215,34 +216,37 @@ def ingest_csv_to_table_store(
             # Parse TableRow
             cells = []
             parse_error = None
-            try:
-                for col_idx, col_def in enumerate(schema.columns):
-                    raw_val = row[col_idx] if col_idx < len(row) else ""
-                    raw_str = raw_val.strip()
+            if len(row) != len(schema.columns):
+                parse_error = f"Column count mismatch: row has {len(row)} values, schema expects {len(schema.columns)}"
+            else:
+                try:
+                    for col_idx, col_def in enumerate(schema.columns):
+                        raw_val = row[col_idx] if col_idx < len(row) else ""
+                        raw_str = raw_val.strip()
 
-                    norm_val = None
-                    if raw_str:
-                        if col_def.inferred_dtype in ("decimal", "integer"):
-                            try:
-                                clean_val = raw_str.replace(",", "")
-                                norm_val = Decimal(clean_val)
-                            except Exception:
+                        norm_val = None
+                        if raw_str:
+                            if col_def.inferred_dtype in ("decimal", "integer"):
+                                try:
+                                    clean_val = raw_str.replace(",", "")
+                                    norm_val = Decimal(clean_val)
+                                except Exception:
+                                    norm_val = raw_str
+                            else:
                                 norm_val = raw_str
-                        else:
-                            norm_val = raw_str
 
-                    cells.append(TableCell(
-                        cell_id=f"{table_id}:{source_row_count}:{col_idx}",
-                        row_index=source_row_count,
-                        col_index=col_idx,
-                        coordinate=f"R{source_row_count}C{col_idx + 1}",
-                        raw_value=raw_val if raw_val != "" else None,
-                        normalized_value=norm_val,
-                        inferred_dtype=col_def.inferred_dtype,
-                        unit=col_def.unit,
-                    ))
-            except Exception as e:
-                parse_error = str(e)
+                        cells.append(TableCell(
+                            cell_id=f"{table_id}:{source_row_count}:{col_idx}",
+                            row_index=source_row_count,
+                            col_index=col_idx,
+                            coordinate=f"R{source_row_count}C{col_idx + 1}",
+                            raw_value=raw_val if raw_val != "" else None,
+                            normalized_value=norm_val,
+                            inferred_dtype=col_def.inferred_dtype,
+                            unit=col_def.unit,
+                        ))
+                except Exception as e:
+                    parse_error = str(e)
 
             if parse_error:
                 rejected_rows += 1

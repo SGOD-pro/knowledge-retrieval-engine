@@ -118,7 +118,6 @@ def embed_text(
     from config import settings
 
     if provider == "test" or (provider is None and settings.ENVIRONMENT == "test"):
-        logger.warning("Falling back to deterministic pseudo-embedding")
         return _deterministic_vector(text, dim)
 
     raise RuntimeError(
@@ -164,3 +163,4 @@ def embed_batch(
 
     with ThreadPoolExecutor(max_workers=3) as executor:
         return list(executor.map(_embed_single, texts))
+

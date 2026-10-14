@@ -7,6 +7,7 @@ Parses a file into a Document, then:
 OKF extraction is fire-and-forget: failures are logged, never raised.
 """
 
+import concurrent.futures
 import logging
 import time
 import uuid
@@ -16,6 +17,12 @@ from ingestion.format_router import route
 from schemas.models import Document
 
 logger = logging.getLogger(__name__)
+
+# Bounded thread pool executor for background OKF extraction tasks
+_OKF_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=4,
+    thread_name_prefix="okf_builder",
+)
 
 
 def generate_deterministic_doc_id(
@@ -51,20 +58,26 @@ def parse_file(
         doc_filename, workspace_id=workspace_id
     )
     source_format, adapter = route(path)
-    chunks = tuple(adapter(path, document_id, workspace_id=workspace_id))
+    raw_chunks = adapter(path, document_id, workspace_id=workspace_id)
+    exclusions = tuple(getattr(raw_chunks, "exclusions", ()))
+    incomplete_cov = bool(getattr(raw_chunks, "incomplete_coverage", False))
+    chunks = tuple(raw_chunks)
     doc = Document(
         id=document_id,
         filename=doc_filename,
         source_format=source_format,
         chunks=chunks,
         workspace_id=workspace_id,
+        incomplete_coverage_flag=incomplete_cov,
+        exclusions=exclusions,
     )
     latency_ms = (time.perf_counter() - t0) * 1000.0
     logger.info(
-        "parse_service.done doc_id=%s format=%s chunks=%d latency_ms=%.2f",
+        "parse_service.done doc_id=%s format=%s chunks=%d exclusions=%d latency_ms=%.2f",
         document_id,
         source_format,
         len(chunks),
+        len(exclusions),
         latency_ms,
     )
     return doc
@@ -94,7 +107,8 @@ def ingest_document(
             from ingestion.csv_table_ingester import ingest_csv_to_table_store
 
             store = get_shared_table_store()
-            res = ingest_csv_to_table_store(path, doc.id, workspace_id, store)
+            t_name = Path(doc.filename).stem.lower() if doc.filename else None
+            res = ingest_csv_to_table_store(path, doc.id, workspace_id, store, table_name=t_name)
             logger.info(
                 "parse_service.structured_ingested doc_id=%s source=%d persisted=%d rejected=%d complete=%s",
                 doc.id,
@@ -124,15 +138,18 @@ def ingest_document(
             source_format=doc.source_format,
             chunks=tuple(embedded),
             workspace_id=doc.workspace_id,
+            incomplete_coverage_flag=doc.incomplete_coverage_flag,
+            exclusions=doc.exclusions,
         )
     except Exception as e:
         logger.error("parse_service.embed_failed doc_id=%s error=%s", doc.id, e)
 
-    # OKF — silent, never blocks ingestion
+
+    # OKF — silent, bounded thread pool execution, never blocks ingestion
     try:
         from ingestion.okf_builder import build_okf
 
-        build_okf(doc)
+        _OKF_EXECUTOR.submit(build_okf, doc)
     except Exception as e:
         logger.error("parse_service.okf_failed doc_id=%s error=%s", doc.id, e)
 

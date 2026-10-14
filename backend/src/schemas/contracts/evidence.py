@@ -67,6 +67,7 @@ class CanonicalEvidence(BaseModel):
     content: ContentPayload
     unit: str | None = None
     qualifiers: tuple[QualifierItem, ...] = Field(default_factory=tuple)
+    exclusion_flags: tuple[str, ...] = Field(default_factory=tuple)
     provenance: EvidenceProvenance
     quality: ExtractionQuality
 

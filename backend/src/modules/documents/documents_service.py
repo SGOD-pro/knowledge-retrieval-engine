@@ -1,6 +1,8 @@
+import hashlib
 import logging
 import tempfile
 import uuid
+import mimetypes
 from pathlib import Path
 from fastapi import BackgroundTasks, HTTPException, Response, UploadFile
 
@@ -12,24 +14,19 @@ from ingestion.parse_service import ingest_document, generate_deterministic_doc_
 logger = logging.getLogger(__name__)
 
 
-MIME_MAP = {
-    ".pdf": "application/pdf",
-    ".csv": "text/csv; charset=utf-8",
-    ".tsv": "text/tab-separated-values; charset=utf-8",
-    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    ".xls": "application/vnd.ms-excel",
-    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    ".doc": "application/msword",
-    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-    ".ppt": "application/vnd.ms-powerpoint",
-    ".md": "text/markdown; charset=utf-8",
-    ".markdown": "text/markdown; charset=utf-8",
-    ".txt": "text/plain; charset=utf-8",
-    ".json": "application/json; charset=utf-8",
-    ".py": "text/x-python; charset=utf-8",
-    ".ts": "text/typescript; charset=utf-8",
-    ".js": "text/javascript; charset=utf-8",
-}
+def _resolve_media_type(filename: str) -> str:
+    """Resolve media type using standard library mimetypes with utf-8 charset defaults for text."""
+    guessed, _ = mimetypes.guess_type(filename)
+    if guessed:
+        if guessed.startswith("text/") or guessed in ("application/json", "application/javascript"):
+            return f"{guessed}; charset=utf-8"
+        return guessed
+    suffix = Path(filename).suffix.lower()
+    if suffix in (".md", ".markdown"):
+        return "text/markdown; charset=utf-8"
+    if suffix == ".tsv":
+        return "text/tab-separated-values; charset=utf-8"
+    return "application/octet-stream"
 
 
 class DocumentsService:
@@ -54,24 +51,49 @@ class DocumentsService:
             ingest_fn = getattr(_api_routes, "ingest_document", ingest_document)
 
             # Re-ingestion guard: if the workspace-scoped doc_id already has a
-            # persisted document (same workspace + same filename → same ID), skip
-            # the expensive parse/embed/OKF pipeline and just update status to Ready.
-            # To force re-ingestion, the caller must delete the document first.
+            # persisted document (same workspace + same filename → same ID) with the
+            # exact same content hash version, skip the expensive pipeline.
+            # If the content hash differs (file content changed), proceed with re-ingestion
+            # and replace the document, table records, and snapshot.
+            incoming_version = hashlib.sha256(content).hexdigest()[:32]
             existing = self.repo.get(doc_id)
             if existing is not None:
-                self.repo.update_document_status(
-                    workspace_id=workspace_id,
-                    doc_id=doc_id,
-                    status="Ready",
-                    chunk_count=len(existing.chunks),
-                )
-                logger.info(
-                    "background_ingest.skipped_duplicate ws=%s doc_id=%s filename=%s",
-                    workspace_id,
-                    doc_id,
-                    filename,
-                )
-                return
+                existing_ver = None
+                try:
+                    from src.db.workspace_boundary_repo import get_workspace_boundary_repo
+                    boundary_repo = get_workspace_boundary_repo()
+                    if boundary_repo:
+                        snap = boundary_repo.get_document_snapshot(workspace_id, doc_id)
+                        if snap and snap.version:
+                            existing_ver = snap.version
+                except Exception:
+                    pass
+
+                if not existing_ver:
+                    try:
+                        from db.table_store import get_shared_table_store
+                        store = get_shared_table_store()
+                        manifest = store.get_ingestion_manifest(doc_id, workspace_id)
+                        if manifest and manifest.get("document_version"):
+                            existing_ver = manifest["document_version"]
+                    except Exception:
+                        pass
+
+                if existing_ver and existing_ver == incoming_version:
+                    self.repo.update_document_status(
+                        workspace_id=workspace_id,
+                        doc_id=doc_id,
+                        status="Ready",
+                        chunk_count=len(existing.chunks),
+                    )
+                    logger.info(
+                        "background_ingest.skipped_duplicate ws=%s doc_id=%s filename=%s ver=%s",
+                        workspace_id,
+                        doc_id,
+                        filename,
+                        incoming_version,
+                    )
+                    return
 
             document = ingest_fn(
                 temp_path,
@@ -99,6 +121,49 @@ class DocumentsService:
                 doc_id,
                 filename,
             )
+
+            # Record DocumentSnapshot and register source in boundary repo for 0004
+            try:
+                from datetime import datetime, timezone
+                from src.schemas.contracts.boundary import DocumentSnapshot
+                from src.db.workspace_boundary_repo import get_workspace_boundary_repo
+                from db.table_store import get_shared_table_store
+
+                boundary_repo = get_workspace_boundary_repo()
+                boundary_repo.create_source(workspace_id=workspace_id, title=filename, source_id=doc_id)
+
+                if getattr(document, "source_format", "").lower() == "csv":
+                    store = get_shared_table_store()
+                    manifest = store.get_ingestion_manifest(doc_id, workspace_id) or {}
+                    doc_ver = manifest.get("document_version") or hashlib.sha256(content).hexdigest()[:32]
+                    incomplete_cov = not bool(manifest.get("coverage_complete", True))
+                    exclusions = tuple(manifest.get("rejection_reasons", []))
+                    persisted = int(manifest.get("persisted_rows", 0))
+                    total = int(manifest.get("source_rows", 0))
+                else:
+                    doc_ver = hashlib.sha256(content).hexdigest()[:32]
+                    incomplete_cov = bool(getattr(document, "incomplete_coverage_flag", False))
+                    exclusions = tuple(getattr(document, "exclusions", ()))
+                    # For unstructured documents, persisted tracks indexed chunks and total tracks chunks plus excluded units
+                    persisted = len(document.chunks)
+                    total = len(document.chunks) + len(exclusions)
+
+                snapshot = DocumentSnapshot(
+                    workspace_id=workspace_id,
+                    document_id=doc_id,
+                    source=filename,
+                    version=doc_ver,
+                    format=Path(filename).suffix.lower().replace(".", ""),
+                    incomplete_coverage_flag=incomplete_cov,
+                    exclusions=exclusions,
+                    persisted_rows=persisted,
+                    total_rows=total,
+                    created_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                )
+                boundary_repo.save_document_snapshot(snapshot)
+            except Exception as snap_err:
+                logger.warning("Could not persist DocumentSnapshot for %s: %s", doc_id, snap_err)
+
         except Exception as exc:
             logger.exception(
                 "background_ingest.failed ws=%s doc_id=%s filename=%s error=%s",
@@ -165,18 +230,20 @@ class DocumentsService:
                 size_str,
             )
 
-            uploaded.append(
-                {
-                    "id": doc_id,
-                    "filename": filename,
-                    "format": suffix.replace(".", ""),
-                    "status": "processing",
-                }
-            )
+            doc_ver = hashlib.sha256(content).hexdigest()[:32]
+            item_info = {
+                "id": doc_id,
+                "document_id": doc_id,
+                "filename": filename,
+                "format": suffix.replace(".", ""),
+                "version": doc_ver,
+                "status": "processing",
+            }
+            uploaded.append(item_info)
 
-        return {"uploaded_documents": uploaded}
+        return {"uploaded_documents": uploaded, "items": uploaded}
 
-    async def ingest_direct(self, file: UploadFile) -> dict:
+    async def ingest_direct(self, file: UploadFile, workspace_id: str = "ws_001") -> dict:
         suffix = Path(file.filename or "").suffix.lower()
         if suffix not in SUPPORTED_FORMATS:
             raise HTTPException(
@@ -189,22 +256,76 @@ class DocumentsService:
             temporary.write(content)
             path = Path(temporary.name)
         try:
+            import asyncio
             import api.routes as _api_routes
 
             ingest_fn = getattr(_api_routes, "ingest_document", ingest_document)
-            document = ingest_fn(
-                path,
-                filename=file.filename,
-                provider=settings.MODEL_PROVIDER,
-                workspace_id="ws_001",
-            )
-            self.repo.save(document)
-            self.repo.add_document_to_workspace("ws_001", document, raw_bytes=content)
+
+
+            def _sync_ingest_and_save():
+                doc = ingest_fn(
+                    path,
+                    filename=file.filename,
+                    provider=settings.MODEL_PROVIDER,
+                    workspace_id=workspace_id,
+                )
+                self.repo.save(doc)
+                self.repo.add_document_to_workspace(workspace_id, doc, raw_bytes=content)
+
+                # Record DocumentSnapshot and register source in boundary repo
+                incomplete_cov = False
+                doc_ver = hashlib.sha256(content).hexdigest()[:32]
+                try:
+                    from datetime import datetime, timezone
+                    from src.schemas.contracts.boundary import DocumentSnapshot
+                    from src.db.workspace_boundary_repo import get_workspace_boundary_repo
+                    from db.table_store import get_shared_table_store
+
+                    boundary_repo = get_workspace_boundary_repo()
+                    boundary_repo.create_source(workspace_id=workspace_id, title=file.filename or "unknown", source_id=doc.id)
+
+                    if suffix.replace(".", "").lower() == "csv":
+                        store = get_shared_table_store()
+                        manifest = store.get_ingestion_manifest(doc.id, workspace_id) or {}
+                        doc_ver = manifest.get("document_version") or doc_ver
+                        incomplete_cov = not bool(manifest.get("coverage_complete", True))
+                        exclusions = tuple(manifest.get("rejection_reasons", []))
+                        persisted = int(manifest.get("persisted_rows", 0))
+                        total = int(manifest.get("source_rows", 0))
+                    else:
+                        incomplete_cov = bool(getattr(doc, "incomplete_coverage_flag", False))
+                        exclusions = tuple(getattr(doc, "exclusions", ()))
+                        persisted = len(doc.chunks)
+                        total = len(doc.chunks) + len(exclusions)
+
+                    snapshot = DocumentSnapshot(
+                        workspace_id=workspace_id,
+                        document_id=doc.id,
+                        source=file.filename or "unknown",
+                        version=doc_ver,
+                        format=suffix.replace(".", ""),
+                        incomplete_coverage_flag=incomplete_cov,
+                        exclusions=exclusions,
+                        persisted_rows=persisted,
+                        total_rows=total,
+                        created_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    )
+                    boundary_repo.save_document_snapshot(snapshot)
+                except Exception as snap_err:
+                    logger.warning("Could not persist DocumentSnapshot in direct ingest for %s: %s", doc.id, snap_err)
+
+                return doc, doc_ver, incomplete_cov
+
+            loop = asyncio.get_running_loop()
+            document, version, incomplete_flag = await loop.run_in_executor(None, _sync_ingest_and_save)
             return {
                 "id": document.id,
+                "document_id": document.id,
                 "filename": document.filename,
                 "source_format": document.source_format,
                 "chunk_count": len(document.chunks),
+                "version": version,
+                "incomplete_coverage_flag": incomplete_flag,
             }
         finally:
             path.unlink(missing_ok=True)
@@ -250,7 +371,7 @@ class DocumentsService:
                             break
 
             suffix = Path(target_filename).suffix.lower()
-            media_type = MIME_MAP.get(suffix, "text/plain; charset=utf-8")
+            media_type = _resolve_media_type(target_filename)
 
             if suffix in [".csv", ".tsv"]:
                 if not fallback_text:
@@ -275,9 +396,8 @@ class DocumentsService:
             )
 
         content, filename, media_type = file_info
-        suffix = Path(filename).suffix.lower()
-        if suffix in MIME_MAP:
-            media_type = MIME_MAP[suffix]
+        if not media_type or media_type == "application/octet-stream":
+            media_type = _resolve_media_type(filename)
 
         return Response(
             content=content,

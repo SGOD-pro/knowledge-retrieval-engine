@@ -24,6 +24,8 @@ class Settings(BaseSettings):
     # AWS Resources — Local services (DynamoDB, S3, SQS) route dev→LocalStack
     DYNAMODB_TABLE_NAME: str = "kre-table"
     S3_BUCKET_NAME: str = "kre-documents-prod"
+    S3_BENCHMARK_BUCKET: str = "kre-benchmarks"
+    BENCHMARK_RUNNER_ENABLED: bool = True
     ODL_PARSER_LAMBDA_NAME: str = "odl-parser-lambda-prod"
     REDIS_URL: str = "redis://localhost:6379/0"
 

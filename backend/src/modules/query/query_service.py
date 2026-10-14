@@ -32,18 +32,36 @@ class QueryService:
             ws_chunks = self.repo.get_all_chunks(workspace_id=req.workspace_id)
             ws_doc_ids = list({str(c.document_id) for c in ws_chunks if str(c.document_id)})
 
-        # Also include document IDs for structured tables in workspace (e.g. CSV table stores)
+        # Also include document IDs for structured tables and boundary sources in workspace
         try:
             from db.table_store import get_shared_table_store
+            from src.db.workspace_boundary_repo import get_workspace_boundary_repo
+            boundary_repo = get_workspace_boundary_repo()
+            if boundary_repo:
+                ws_doc_ids = [
+                    d_id for d_id in ws_doc_ids
+                    if not boundary_repo.has_tombstone(req.workspace_id, "source", d_id)
+                ]
+
             store = get_shared_table_store()
             tables = store.list_tables(req.workspace_id)
             for tid in tables:
                 ver = store.get_active_version(tid, req.workspace_id)
                 t_meta = store.get_table(tid, req.workspace_id, version=ver)
-                if t_meta and t_meta.document_id and t_meta.document_id not in ws_doc_ids:
-                    ws_doc_ids.append(t_meta.document_id)
+                if t_meta and t_meta.document_id:
+                    doc_id = t_meta.document_id
+                    if boundary_repo and (boundary_repo.has_tombstone(req.workspace_id, "source", doc_id) or boundary_repo.has_tombstone(req.workspace_id, "source", tid)):
+                        continue
+                    if doc_id not in ws_doc_ids:
+                        ws_doc_ids.append(doc_id)
+
+            if boundary_repo:
+                for src in boundary_repo.list_sources(req.workspace_id):
+                    if src.source_id not in ws_doc_ids and not boundary_repo.has_tombstone(req.workspace_id, "source", src.source_id):
+                        ws_doc_ids.append(src.source_id)
         except Exception:
             pass
+
 
         if req.document_ids is not None:
             # req.document_ids is an optional additional filter on top of workspace scope, not a replacement
@@ -155,6 +173,29 @@ class QueryService:
             response = pipeline.run(**kwargs)
         except Exception as e:
             logger.error("pipeline.run failed with error: %s", e, exc_info=True)
+            # Distinguish infrastructure/storage failure from insufficient evidence per AC-8
+            from src.schemas.contracts.boundary import StorageUnavailableError
+            try:
+                from botocore.exceptions import BotoCoreError, ClientError
+                boto_errs = (BotoCoreError, ClientError)
+            except ImportError:
+                boto_errs = ()
+
+            err_str = str(e).lower()
+            is_infra_failure = (
+                isinstance(e, (StorageUnavailableError, ConnectionError, OSError) + boto_errs)
+                or "storage" in err_str
+                or "connection refused" in err_str
+                or "unreachable" in err_str
+                or "endpointconnectionerror" in err_str
+            )
+            if is_infra_failure:
+                return {
+                    "status": "error",
+                    "error_code": "storage_failure",
+                    "error": str(e),
+                }
+
             total_ms = round((time.perf_counter() - t0) * 1000.0, 2)
             return {
                 "answer": "I couldn't find any relevant documents in this workspace to answer your query. Please upload documents to this workspace to enable grounded retrieval.",

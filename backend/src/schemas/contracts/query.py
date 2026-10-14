@@ -244,6 +244,7 @@ class QueryContract(BaseModel):
     query_id: str
     workspace_id: str
     snapshot_id: str
+    target_source_version: int | None = None
     requirements: tuple[RequirementItem, ...]
     requested_answer_mode: AnswerMode | None = None
     resolved_answer_mode: AnswerMode

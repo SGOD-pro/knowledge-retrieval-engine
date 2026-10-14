@@ -1,7 +1,9 @@
 from fastapi import APIRouter
 
 from db.database import CloudRepository
-from ingestion.parse_service import ingest_document
+def ingest_document(*args, **kwargs):
+    from ingestion.parse_service import ingest_document as _real_ingest
+    return _real_ingest(*args, **kwargs)
 from modules.auth import auth_router, auth_service
 from modules.documents import documents_router, documents_service
 from modules.graph import graph_router, graph_service
@@ -15,6 +17,7 @@ router = APIRouter()
 
 # Mount all modular sub-routers
 router.include_router(workspace_boundary_router)
+router.include_router(workspaces_router)
 router.include_router(system_router)
 router.include_router(auth_router)
 router.include_router(chat_router)

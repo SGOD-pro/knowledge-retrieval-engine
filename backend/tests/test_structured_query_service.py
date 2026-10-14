@@ -144,3 +144,15 @@ def test_duplicate_column_labels_raises_ambiguous():
     svc = StructuredQueryService(store)
     with pytest.raises(AmbiguousBindingError):
         svc.execute("What is the total Revenue in ambig_tab?", workspace_id=ws)
+
+
+def test_normalize_dtype_enum_and_string():
+    from schemas.structured_table import InferredDtype
+    from services.retrieval.structured_query_service import StructuredQueryService
+
+    assert StructuredQueryService._normalize_dtype(InferredDtype.INTEGER) == "integer"
+    assert StructuredQueryService._normalize_dtype(InferredDtype.DECIMAL) == "decimal"
+    assert StructuredQueryService._normalize_dtype("INTEGER") == "integer"
+    assert StructuredQueryService._normalize_dtype("decimal") == "decimal"
+    assert StructuredQueryService._normalize_dtype(InferredDtype.PERCENTAGE) == "percentage"
+

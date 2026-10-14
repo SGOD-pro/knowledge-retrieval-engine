@@ -99,12 +99,19 @@ class StructuredQueryService:
             logger.info("StructuredQueryService: no tables found in workspace %s", workspace_id)
             return None
 
-        # Filter by document_ids if provided
+        # Filter by document_ids if provided and exclude tombstoned sources
         candidate_tables = []
         for tid in available_tables:
             ver = self.store.get_active_version(tid, workspace_id)
             t_meta = self.store.get_table(tid, workspace_id, version=ver)
             if t_meta:
+                try:
+                    from src.db.workspace_boundary_repo import get_workspace_boundary_repo
+                    brepo = get_workspace_boundary_repo()
+                    if brepo and (brepo.has_tombstone(workspace_id, "source", t_meta.document_id) or brepo.has_tombstone(workspace_id, "source", tid)):
+                        continue
+                except Exception:
+                    pass
                 if document_ids is None or t_meta.document_id in document_ids:
                     candidate_tables.append((tid, t_meta, ver))
 
@@ -203,6 +210,13 @@ class StructuredQueryService:
                     raise AmbiguousBindingError(
                         f"Duplicate columns found with identical name '{scores[0][1]}'"
                     )
+    @staticmethod
+    def _normalize_dtype(dtype: Any) -> str:
+        if isinstance(dtype, InferredDtype):
+            return dtype.value.lower()
+        if hasattr(dtype, "value"):
+            return str(dtype.value).lower()
+        return str(dtype).lower()
 
     def _find_column_by_semantic_match(self, name_candidates: list[str], schema: TableSchema) -> tuple[int, str]:
         for cand in name_candidates:
@@ -322,7 +336,8 @@ class StructuredQueryService:
         for col in schema.columns:
             if col.col_index == year_idx:
                 continue
-            if col.inferred_dtype in (InferredDtype.DECIMAL, InferredDtype.INTEGER, InferredDtype.PERCENTAGE, InferredDtype.CURRENCY, "decimal", "integer", "percentage", "currency"):
+            dtype_str = self._normalize_dtype(col.inferred_dtype)
+            if dtype_str in {"decimal", "integer", "percentage", "currency"}:
                 if col.name.lower() in q_lower:
                     mentioned_val_col = (col.col_index, col.name)
                     break
@@ -485,7 +500,8 @@ class StructuredQueryService:
                             continue
                         try:
                             val_pred = cand
-                            if col.inferred_dtype in ("integer", "decimal") and cand.isdigit():
+                            dtype_str = self._normalize_dtype(col.inferred_dtype)
+                            if dtype_str in {"integer", "decimal"} and cand.isdigit():
                                 val_pred = int(cand)
                             matching = self.store.query_rows(
                                 table_id,

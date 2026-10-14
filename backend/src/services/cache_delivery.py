@@ -135,9 +135,32 @@ def evaluate_query_delivery_and_recomputation(
                 )
 
     # 4. Recompute over surviving sources in the pinned snapshot, preserving original query input
-    return engine.recompute_query(
+    outcome = engine.recompute_query(
         workspace_id=workspace_id,
         query=query_input,
         descriptor=cache_key_descriptor,
         table_store=table_store,
     )
+
+    if outcome.status == "SUCCESS" and cache_store is not None:
+        try:
+            from datetime import datetime, timezone
+            dep_sources = tuple((s_id, 1) for s_id in outcome.surviving_source_ids)
+            cached_result = CachedQueryResult(
+                cache_key=expected_cache_key,
+                execution_id=outcome.execution_id,
+                authorized_workspace_id=workspace_id,
+                authorized_principal_id=auth_context.principal_id,
+                access_policy_version=auth_context.access_policy_version,
+                snapshot_id=cache_key_descriptor.snapshot_id,
+                answer=outcome.answer,
+                citations=outcome.citations,
+                dependent_source_versions=dep_sources,
+                dependent_artifact_ids=(),
+                cached_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            )
+            cache_store.set_cached_query(expected_cache_key, cached_result)
+        except Exception as e:
+            logger.warning("Could not persist query outcome to cache: %s", e)
+
+    return outcome

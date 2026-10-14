@@ -39,6 +39,8 @@ class Document:
     source_format: str
     chunks: tuple[Chunk, ...]
     workspace_id: str = ""
+    incomplete_coverage_flag: bool = False
+    exclusions: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -47,6 +49,8 @@ class Document:
             "source_format": self.source_format,
             "chunks": [chunk.to_dict() for chunk in self.chunks],
             "workspace_id": self.workspace_id,
+            "incomplete_coverage_flag": self.incomplete_coverage_flag,
+            "exclusions": list(self.exclusions),
         }
 
 
@@ -252,5 +256,9 @@ class SaveChatMessageRequest(BaseModel):
     confidence: float | None = None
     latency_ms: float | None = None
     faithfulness: float | None = None
+
+
+# --- Benchmark Models (Spec 0004) ---
+from src.schemas.contracts.boundary import BenchmarkRunMetadata
 
 

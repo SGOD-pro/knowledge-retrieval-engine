@@ -89,6 +89,47 @@ class SnapshotRecord(BaseModel):
         return dict(self.source_versions)
 
 
+class DocumentSnapshot(BaseModel):
+    """Authoritative document snapshot recording provenance, version, and coverage.
+
+    For tabular files like CSV, persisted_rows and total_rows represent row counts.
+    For paginated or unstructured files like PDF, persisted_rows represents indexed text
+    chunks, and total_rows represents total parsed units including indexed chunks and excluded items.
+    """
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    workspace_id: str = Field(..., max_length=64)
+    document_id: str = Field(..., max_length=128)
+    source: str = Field(..., max_length=256)
+    version: str = Field(..., max_length=64)
+    format: str = Field(..., max_length=32)
+    incomplete_coverage_flag: bool = False
+    exclusions: tuple[str, ...] = Field(default_factory=tuple)
+    persisted_rows: int = Field(default=0, description="Persisted tabular rows or indexed chunks")
+    total_rows: int = Field(default=0, description="Total source rows or parsed units (chunks plus exclusions)")
+    created_at: str
+
+
+class BenchmarkRunMetadata(BaseModel):
+    """Compact benchmark run metadata persisted in DynamoDB scoped to workspace."""
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    benchmark_run_id: str = Field(..., max_length=128)
+    workspace_id: str = Field(..., max_length=64)
+    status: Literal["completed", "failed", "partial"] = "completed"
+    created_at: str
+    total_queries: int = 0
+    scored_queries: int = 0
+    correctness_score: float = 0.0
+    evidence_support_score: float = 0.0
+    coverage_score: float = 0.0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    avg_latency_ms: float = 0.0
+    p95_latency_ms: float = 0.0
+    ingestion_time_ms: float = 0.0
+    s3_artifact_key: str
+
+
 class JobRecord(BaseModel):
     """Authoritative background job record loaded by server."""
     model_config = ConfigDict(frozen=True, extra="forbid")

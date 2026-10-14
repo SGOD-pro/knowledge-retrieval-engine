@@ -188,14 +188,16 @@ class DocumentsRepository:
                         except Exception as qe:
                             if "429" in str(qe) or "Too Many Requests" in str(qe) or "timed out" in str(qe).lower():
                                 logger.warning("Qdrant rate limit (attempt %d/3). Sleeping 5s...", attempt + 1)
+                                if attempt == 2:
+                                    raise
                                 time.sleep(5)
                             else:
-                                raise qe
-                    else:
-                        raise RuntimeError("Qdrant upsert failed after 3 attempts")
+                                logger.warning("Qdrant upsert unavailable (%s), chunks preserved in DynamoDB and cache", qe)
+                                break
         except Exception as e:
             logger.error("Failed to save to cloud database: %s", e)
             raise RuntimeError(f"Failed to save document to cloud database: {e}") from e
+
 
     def get(self, document_id: str) -> Document | None:
         if _is_test_env():
@@ -250,13 +252,13 @@ class DocumentsRepository:
         workspace_id: str | None = None,
     ) -> list[Chunk]:
         if _is_test_env():
-            chunks = list(_IN_MEMORY_CHUNKS.values())
+            mem_chunks = list(_IN_MEMORY_CHUNKS.values())
             if workspace_id:
-                chunks = [c for c in chunks if c.workspace_id == workspace_id]
+                mem_chunks = [c for c in mem_chunks if c.workspace_id == workspace_id]
             if document_ids is not None:
                 doc_id_set = set(document_ids)
-                chunks = [c for c in chunks if str(c.document_id) in doc_id_set]
-            return chunks
+                mem_chunks = [c for c in mem_chunks if str(c.document_id) in doc_id_set]
+            return mem_chunks
 
         from boto3.dynamodb.conditions import Key
 

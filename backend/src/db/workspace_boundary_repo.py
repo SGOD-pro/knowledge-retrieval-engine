@@ -17,7 +17,9 @@ import uuid
 
 from config import settings
 from src.schemas.contracts.boundary import (
+    BenchmarkRunMetadata,
     CASConflictError,
+    DocumentSnapshot,
     JobRecord,
     PublicationManifestRecord,
     SnapshotRecord,
@@ -67,6 +69,12 @@ class WorkspaceBoundaryRepositoryBase(Protocol):
     ) -> PublicationManifestRecord: ...
     def get_job(self, job_id: str) -> JobRecord | None: ...
     def save_job(self, job: JobRecord) -> None: ...
+    def save_document_snapshot(self, snapshot: DocumentSnapshot) -> None: ...
+    def get_document_snapshot(self, workspace_id: str, document_id: str) -> DocumentSnapshot | None: ...
+    def list_document_snapshots(self, workspace_id: str) -> list[DocumentSnapshot]: ...
+    def save_benchmark_metadata(self, metadata: BenchmarkRunMetadata) -> None: ...
+    def get_benchmark_metadata(self, workspace_id: str, benchmark_run_id: str) -> BenchmarkRunMetadata | None: ...
+    def list_benchmark_metadata(self, workspace_id: str) -> list[BenchmarkRunMetadata]: ...
 
 
 class InMemoryWorkspaceBoundaryRepository:
@@ -79,6 +87,8 @@ class InMemoryWorkspaceBoundaryRepository:
         self._snapshots: dict[tuple[str, str], SnapshotRecord] = {}
         self._manifests: dict[str, PublicationManifestRecord] = {}
         self._jobs: dict[str, JobRecord] = {}
+        self._document_snapshots: dict[tuple[str, str], DocumentSnapshot] = {}
+        self._benchmark_metadata: dict[tuple[str, str], BenchmarkRunMetadata] = {}
         self._op_lock = threading.Lock()
         self._seed_fixtures()
 
@@ -91,6 +101,8 @@ class InMemoryWorkspaceBoundaryRepository:
             self._snapshots.clear()
             self._manifests.clear()
             self._jobs.clear()
+            self._document_snapshots.clear()
+            self._benchmark_metadata.clear()
             self._seed_fixtures()
 
     def _seed_fixtures(self) -> None:
@@ -330,6 +342,30 @@ class InMemoryWorkspaceBoundaryRepository:
         with self._op_lock:
             self._jobs[job.job_id] = job
 
+    def save_document_snapshot(self, snapshot: DocumentSnapshot) -> None:
+        with self._op_lock:
+            self._document_snapshots[(snapshot.workspace_id, snapshot.document_id)] = snapshot
+
+    def get_document_snapshot(self, workspace_id: str, document_id: str) -> DocumentSnapshot | None:
+        with self._op_lock:
+            return self._document_snapshots.get((workspace_id, document_id))
+
+    def list_document_snapshots(self, workspace_id: str) -> list[DocumentSnapshot]:
+        with self._op_lock:
+            return [snap for (ws_id, _), snap in self._document_snapshots.items() if ws_id == workspace_id]
+
+    def save_benchmark_metadata(self, metadata: BenchmarkRunMetadata) -> None:
+        with self._op_lock:
+            self._benchmark_metadata[(metadata.workspace_id, metadata.benchmark_run_id)] = metadata
+
+    def get_benchmark_metadata(self, workspace_id: str, benchmark_run_id: str) -> BenchmarkRunMetadata | None:
+        with self._op_lock:
+            return self._benchmark_metadata.get((workspace_id, benchmark_run_id))
+
+    def list_benchmark_metadata(self, workspace_id: str) -> list[BenchmarkRunMetadata]:
+        with self._op_lock:
+            return [meta for (ws_id, _), meta in self._benchmark_metadata.items() if ws_id == workspace_id]
+
 
 from functools import wraps
 from typing import Callable, TypeVar, Any, cast
@@ -464,6 +500,46 @@ class SQLiteWorkspaceBoundaryRepository:
                     )
                     """
                 )
+                self._conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS document_snapshots (
+                        workspace_id TEXT NOT NULL,
+                        document_id TEXT NOT NULL,
+                        source TEXT NOT NULL,
+                        version TEXT NOT NULL,
+                        format TEXT NOT NULL,
+                        incomplete_coverage_flag INTEGER NOT NULL,
+                        exclusions_json TEXT NOT NULL,
+                        persisted_rows INTEGER NOT NULL,
+                        total_rows INTEGER NOT NULL,
+                        created_at TEXT NOT NULL,
+                        PRIMARY KEY (workspace_id, document_id)
+                    )
+                    """
+                )
+                self._conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS benchmark_runs (
+                        workspace_id TEXT NOT NULL,
+                        benchmark_run_id TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        total_queries INTEGER NOT NULL,
+                        scored_queries INTEGER NOT NULL,
+                        correctness_score REAL NOT NULL,
+                        evidence_support_score REAL NOT NULL,
+                        coverage_score REAL NOT NULL,
+                        prompt_tokens INTEGER NOT NULL,
+                        completion_tokens INTEGER NOT NULL,
+                        total_tokens INTEGER NOT NULL,
+                        avg_latency_ms REAL NOT NULL,
+                        p95_latency_ms REAL NOT NULL,
+                        ingestion_time_ms REAL NOT NULL,
+                        s3_artifact_key TEXT NOT NULL,
+                        PRIMARY KEY (workspace_id, benchmark_run_id)
+                    )
+                    """
+                )
 
                 # Seed fixtures only if workspaces table is empty
                 cursor = self._conn.execute("SELECT count(*) as count FROM workspaces")
@@ -512,6 +588,8 @@ class SQLiteWorkspaceBoundaryRepository:
                 self._conn.execute("DELETE FROM snapshots")
                 self._conn.execute("DELETE FROM manifests")
                 self._conn.execute("DELETE FROM jobs")
+                self._conn.execute("DELETE FROM document_snapshots")
+                self._conn.execute("DELETE FROM benchmark_runs")
                 self._seed_fixtures_locked()
 
     def get_workspace(self, workspace_id: str) -> WorkspaceRecord | None:
@@ -921,6 +999,165 @@ class SQLiteWorkspaceBoundaryRepository:
                         job.updated_at,
                     ),
                 )
+
+    def save_document_snapshot(self, snapshot: DocumentSnapshot) -> None:
+        with self._lock:
+            with self._conn:
+                self._conn.execute(
+                    """
+                    INSERT OR REPLACE INTO document_snapshots (
+                        workspace_id, document_id, source, version, format,
+                        incomplete_coverage_flag, exclusions_json, persisted_rows, total_rows, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        snapshot.workspace_id,
+                        snapshot.document_id,
+                        snapshot.source,
+                        snapshot.version,
+                        snapshot.format,
+                        1 if snapshot.incomplete_coverage_flag else 0,
+                        json.dumps(list(snapshot.exclusions)),
+                        snapshot.persisted_rows,
+                        snapshot.total_rows,
+                        snapshot.created_at,
+                    ),
+                )
+
+    def get_document_snapshot(self, workspace_id: str, document_id: str) -> DocumentSnapshot | None:
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT * FROM document_snapshots WHERE workspace_id = ? AND document_id = ?",
+                (workspace_id, document_id),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return DocumentSnapshot(
+                workspace_id=row["workspace_id"],
+                document_id=row["document_id"],
+                source=row["source"],
+                version=row["version"],
+                format=row["format"],
+                incomplete_coverage_flag=bool(row["incomplete_coverage_flag"]),
+                exclusions=tuple(json.loads(row["exclusions_json"])),
+                persisted_rows=int(row["persisted_rows"]),
+                total_rows=int(row["total_rows"]),
+                created_at=row["created_at"],
+            )
+
+    def list_document_snapshots(self, workspace_id: str) -> list[DocumentSnapshot]:
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT * FROM document_snapshots WHERE workspace_id = ? ORDER BY created_at ASC",
+                (workspace_id,),
+            )
+            rows = cursor.fetchall()
+            return [
+                DocumentSnapshot(
+                    workspace_id=r["workspace_id"],
+                    document_id=r["document_id"],
+                    source=r["source"],
+                    version=r["version"],
+                    format=r["format"],
+                    incomplete_coverage_flag=bool(r["incomplete_coverage_flag"]),
+                    exclusions=tuple(json.loads(r["exclusions_json"])),
+                    persisted_rows=int(r["persisted_rows"]),
+                    total_rows=int(r["total_rows"]),
+                    created_at=r["created_at"],
+                )
+                for r in rows
+            ]
+
+    def save_benchmark_metadata(self, metadata: BenchmarkRunMetadata) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT OR REPLACE INTO benchmark_runs (
+                    workspace_id, benchmark_run_id, status, created_at,
+                    total_queries, scored_queries, correctness_score,
+                    evidence_support_score, coverage_score, prompt_tokens,
+                    completion_tokens, total_tokens, avg_latency_ms,
+                    p95_latency_ms, ingestion_time_ms, s3_artifact_key
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    metadata.workspace_id,
+                    metadata.benchmark_run_id,
+                    metadata.status,
+                    metadata.created_at,
+                    metadata.total_queries,
+                    metadata.scored_queries,
+                    metadata.correctness_score,
+                    metadata.evidence_support_score,
+                    metadata.coverage_score,
+                    metadata.prompt_tokens,
+                    metadata.completion_tokens,
+                    metadata.total_tokens,
+                    metadata.avg_latency_ms,
+                    metadata.p95_latency_ms,
+                    metadata.ingestion_time_ms,
+                    metadata.s3_artifact_key,
+                ),
+            )
+            self._conn.commit()
+
+    def get_benchmark_metadata(self, workspace_id: str, benchmark_run_id: str) -> BenchmarkRunMetadata | None:
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT * FROM benchmark_runs WHERE workspace_id = ? AND benchmark_run_id = ?",
+                (workspace_id, benchmark_run_id),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return BenchmarkRunMetadata(
+                workspace_id=row["workspace_id"],
+                benchmark_run_id=row["benchmark_run_id"],
+                status=row["status"],
+                created_at=row["created_at"],
+                total_queries=row["total_queries"],
+                scored_queries=row["scored_queries"],
+                correctness_score=float(row["correctness_score"]),
+                evidence_support_score=float(row["evidence_support_score"]),
+                coverage_score=float(row["coverage_score"]),
+                prompt_tokens=int(row["prompt_tokens"]),
+                completion_tokens=int(row["completion_tokens"]),
+                total_tokens=int(row["total_tokens"]),
+                avg_latency_ms=float(row["avg_latency_ms"]),
+                p95_latency_ms=float(row["p95_latency_ms"]),
+                ingestion_time_ms=float(row["ingestion_time_ms"]),
+                s3_artifact_key=row["s3_artifact_key"],
+            )
+
+    def list_benchmark_metadata(self, workspace_id: str) -> list[BenchmarkRunMetadata]:
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT * FROM benchmark_runs WHERE workspace_id = ? ORDER BY created_at ASC",
+                (workspace_id,),
+            )
+            rows = cursor.fetchall()
+            return [
+                BenchmarkRunMetadata(
+                    workspace_id=r["workspace_id"],
+                    benchmark_run_id=r["benchmark_run_id"],
+                    status=r["status"],
+                    created_at=r["created_at"],
+                    total_queries=r["total_queries"],
+                    scored_queries=r["scored_queries"],
+                    correctness_score=float(r["correctness_score"]),
+                    evidence_support_score=float(r["evidence_support_score"]),
+                    coverage_score=float(r["coverage_score"]),
+                    prompt_tokens=int(r["prompt_tokens"]),
+                    completion_tokens=int(r["completion_tokens"]),
+                    total_tokens=int(r["total_tokens"]),
+                    avg_latency_ms=float(r["avg_latency_ms"]),
+                    p95_latency_ms=float(r["p95_latency_ms"]),
+                    ingestion_time_ms=float(r["ingestion_time_ms"]),
+                    s3_artifact_key=r["s3_artifact_key"],
+                )
+                for r in rows
+            ]
 
 
 
@@ -1409,6 +1646,165 @@ class DynamoDBWorkspaceBoundaryRepository:
             )
         except Exception as err:
             raise StorageUnavailableError(f"DynamoDB error saving job: {err}") from err
+
+    def save_document_snapshot(self, snapshot: DocumentSnapshot) -> None:
+        try:
+            self.table.put_item(
+                Item={
+                    "PK": f"WORKSPACE#{snapshot.workspace_id}",
+                    "SK": f"DOC_SNAPSHOT#{snapshot.document_id}",
+                    "workspace_id": snapshot.workspace_id,
+                    "document_id": snapshot.document_id,
+                    "source": snapshot.source,
+                    "version": snapshot.version,
+                    "format": snapshot.format,
+                    "incomplete_coverage_flag": snapshot.incomplete_coverage_flag,
+                    "exclusions_json": json.dumps(list(snapshot.exclusions)),
+                    "persisted_rows": snapshot.persisted_rows,
+                    "total_rows": snapshot.total_rows,
+                    "created_at": snapshot.created_at,
+                }
+            )
+        except Exception as err:
+            raise StorageUnavailableError(f"DynamoDB error saving document snapshot: {err}") from err
+
+    def get_document_snapshot(self, workspace_id: str, document_id: str) -> DocumentSnapshot | None:
+        try:
+            resp = self.table.get_item(
+                Key={"PK": f"WORKSPACE#{workspace_id}", "SK": f"DOC_SNAPSHOT#{document_id}"}
+            )
+            item = resp.get("Item")
+            if not item:
+                return None
+            return DocumentSnapshot(
+                workspace_id=item["workspace_id"],
+                document_id=item["document_id"],
+                source=item["source"],
+                version=item["version"],
+                format=item["format"],
+                incomplete_coverage_flag=bool(item.get("incomplete_coverage_flag", False)),
+                exclusions=tuple(json.loads(item.get("exclusions_json", "[]"))),
+                persisted_rows=int(item.get("persisted_rows", 0)),
+                total_rows=int(item.get("total_rows", 0)),
+                created_at=item["created_at"],
+            )
+        except Exception as err:
+            raise StorageUnavailableError(f"DynamoDB error getting document snapshot: {err}") from err
+
+    def list_document_snapshots(self, workspace_id: str) -> list[DocumentSnapshot]:
+        try:
+            from boto3.dynamodb.conditions import Key
+            resp = self.table.query(
+                KeyConditionExpression=Key("PK").eq(f"WORKSPACE#{workspace_id}")
+                & Key("SK").begins_with("DOC_SNAPSHOT#")
+            )
+            items = resp.get("Items", [])
+            return [
+                DocumentSnapshot(
+                    workspace_id=item["workspace_id"],
+                    document_id=item["document_id"],
+                    source=item["source"],
+                    version=item["version"],
+                    format=item["format"],
+                    incomplete_coverage_flag=bool(item.get("incomplete_coverage_flag", False)),
+                    exclusions=tuple(json.loads(item.get("exclusions_json", "[]"))),
+                    persisted_rows=int(item.get("persisted_rows", 0)),
+                    total_rows=int(item.get("total_rows", 0)),
+                    created_at=item["created_at"],
+                )
+                for item in items
+            ]
+        except Exception as err:
+            raise StorageUnavailableError(f"DynamoDB error listing document snapshots: {err}") from err
+
+    def save_benchmark_metadata(self, metadata: BenchmarkRunMetadata) -> None:
+        from decimal import Decimal
+        try:
+            self.table.put_item(
+                Item={
+                    "PK": f"WORKSPACE#{metadata.workspace_id}",
+                    "SK": f"BENCHMARK#{metadata.benchmark_run_id}",
+                    "workspace_id": metadata.workspace_id,
+                    "benchmark_run_id": metadata.benchmark_run_id,
+                    "status": metadata.status,
+                    "created_at": metadata.created_at,
+                    "total_queries": metadata.total_queries,
+                    "scored_queries": metadata.scored_queries,
+                    "correctness_score": Decimal(str(round(metadata.correctness_score, 4))),
+                    "evidence_support_score": Decimal(str(round(metadata.evidence_support_score, 4))),
+                    "coverage_score": Decimal(str(round(metadata.coverage_score, 4))),
+                    "prompt_tokens": metadata.prompt_tokens,
+                    "completion_tokens": metadata.completion_tokens,
+                    "total_tokens": metadata.total_tokens,
+                    "avg_latency_ms": Decimal(str(round(metadata.avg_latency_ms, 2))),
+                    "p95_latency_ms": Decimal(str(round(metadata.p95_latency_ms, 2))),
+                    "ingestion_time_ms": Decimal(str(round(metadata.ingestion_time_ms, 2))),
+                    "s3_artifact_key": metadata.s3_artifact_key,
+                }
+            )
+        except Exception as err:
+            raise StorageUnavailableError(f"DynamoDB error saving benchmark metadata: {err}") from err
+
+    def get_benchmark_metadata(self, workspace_id: str, benchmark_run_id: str) -> BenchmarkRunMetadata | None:
+        try:
+            resp = self.table.get_item(
+                Key={"PK": f"WORKSPACE#{workspace_id}", "SK": f"BENCHMARK#{benchmark_run_id}"}
+            )
+            item = resp.get("Item")
+            if not item:
+                return None
+            return BenchmarkRunMetadata(
+                workspace_id=item["workspace_id"],
+                benchmark_run_id=item["benchmark_run_id"],
+                status=item["status"],
+                created_at=item["created_at"],
+                total_queries=int(item.get("total_queries", 0)),
+                scored_queries=int(item.get("scored_queries", 0)),
+                correctness_score=float(item.get("correctness_score", 0.0)),
+                evidence_support_score=float(item.get("evidence_support_score", 0.0)),
+                coverage_score=float(item.get("coverage_score", 0.0)),
+                prompt_tokens=int(item.get("prompt_tokens", 0)),
+                completion_tokens=int(item.get("completion_tokens", 0)),
+                total_tokens=int(item.get("total_tokens", 0)),
+                avg_latency_ms=float(item.get("avg_latency_ms", 0.0)),
+                p95_latency_ms=float(item.get("p95_latency_ms", 0.0)),
+                ingestion_time_ms=float(item.get("ingestion_time_ms", 0.0)),
+                s3_artifact_key=item["s3_artifact_key"],
+            )
+        except Exception as err:
+            raise StorageUnavailableError(f"DynamoDB error getting benchmark metadata: {err}") from err
+
+    def list_benchmark_metadata(self, workspace_id: str) -> list[BenchmarkRunMetadata]:
+        try:
+            from boto3.dynamodb.conditions import Key
+            resp = self.table.query(
+                KeyConditionExpression=Key("PK").eq(f"WORKSPACE#{workspace_id}")
+                & Key("SK").begins_with("BENCHMARK#")
+            )
+            items = resp.get("Items", [])
+            return [
+                BenchmarkRunMetadata(
+                    workspace_id=item["workspace_id"],
+                    benchmark_run_id=item["benchmark_run_id"],
+                    status=item["status"],
+                    created_at=item["created_at"],
+                    total_queries=int(item.get("total_queries", 0)),
+                    scored_queries=int(item.get("scored_queries", 0)),
+                    correctness_score=float(item.get("correctness_score", 0.0)),
+                    evidence_support_score=float(item.get("evidence_support_score", 0.0)),
+                    coverage_score=float(item.get("coverage_score", 0.0)),
+                    prompt_tokens=int(item.get("prompt_tokens", 0)),
+                    completion_tokens=int(item.get("completion_tokens", 0)),
+                    total_tokens=int(item.get("total_tokens", 0)),
+                    avg_latency_ms=float(item.get("avg_latency_ms", 0.0)),
+                    p95_latency_ms=float(item.get("p95_latency_ms", 0.0)),
+                    ingestion_time_ms=float(item.get("ingestion_time_ms", 0.0)),
+                    s3_artifact_key=item["s3_artifact_key"],
+                )
+                for item in items
+            ]
+        except Exception as err:
+            raise StorageUnavailableError(f"DynamoDB error listing benchmark metadata: {err}") from err
 
 
 _SHARED_BOUNDARY_REPO: WorkspaceBoundaryRepositoryBase | None = None
