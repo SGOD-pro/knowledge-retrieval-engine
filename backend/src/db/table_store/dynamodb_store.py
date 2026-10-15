@@ -298,7 +298,7 @@ class DynamoDBTableStore:
                         logger.error("DynamoDBTableStore transact_write_items failed after %d attempts: %s", max_retries, e)
                         raise
                     # Cap maximum single retry delay to 2.0s to avoid blocking worker threads for extended intervals
-                    sleep_time = min(2.0, (2 ** attempt) * 0.5)
+                    sleep_time = min(2.0, (2 ** attempt) * 0.5) + random.uniform(0.0, 0.1)
                     logger.warning("DynamoDBTableStore transact_write_items retry %d/%d after %.2fs error: %s", attempt + 1, max_retries, sleep_time, e)
                     time.sleep(sleep_time)
 

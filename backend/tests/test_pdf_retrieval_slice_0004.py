@@ -109,7 +109,12 @@ def test_real_pdf_ingestion_and_provenance_snapshot():
 
 
 def test_pdf_retrieval_query_with_cited_document_location():
-    """Execute text query against ingested PDF, returning verified cited answer with DocumentLocation."""
+    """Execute text query against ingested PDF, returning verified cited answer with DocumentLocation.
+
+    Mocked generation check: uses an explicit generic test double to verify
+    grounded synthesis, citation item extraction, and typed DocumentLocation binding.
+    Does not assert real model accuracy (which requires live Bedrock model invocation).
+    """
     # 1. Create workspace and upload PDF
     res_ws = client.post(
         "/workspaces",
@@ -141,7 +146,8 @@ def test_pdf_retrieval_query_with_cited_document_location():
     assert outcome["status"] == "SUCCESS"
     assert len(outcome["answer"]) > 0
     assert len(outcome["citations"]) > 0
-    # Strengthened verification: check the expected source supported fact
+    # Mocked generation verification: verify that the generic test double extracted
+    # the grounded source fact from the retrieved context snippet.
     assert "wealth creator" in outcome["answer"].lower()
 
     # 3. Verify citation contains typed DocumentLocation and fact snippet

@@ -106,6 +106,7 @@ Make the next milestone a bounded core engine walking skeleton that proves the c
    - [x] Benchmarks and cross check boundaries
 - [x] Verify it: `/check verify core engine walking skeleton and benchmarks`
 - [x] Test it: `/test core engine walking skeleton and benchmarks`
+- [x] Review it (fresh model): `/check review core engine walking skeleton and benchmarks`
 Spec [0004](../specs/0004-core-engine-walking-skeleton.md) · code in `backend/src/`
 
 ## Slice 2: PageIndex integration

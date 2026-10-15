@@ -59,17 +59,59 @@ def generate_completion(
         import re
         import json
         chunk_ids = re.findall(r"\[([a-zA-Z0-9_:.-]+)\]", user_prompt)
+
+        # Generic test double for test environments:
+        # Extracts grounded excerpts from provided context matching query tokens
+        # without hardcoded domain keywords or PDF-specific strings.
+        query_part = ""
+        context_part = ""
+        if "Query:" in user_prompt:
+            parts = user_prompt.split("Query:", 1)
+            query_part = parts[1].strip()
+            context_part = parts[0].replace("Context:", "", 1).strip()
+        else:
+            context_part = user_prompt.strip()
+
+        stop_words = {
+            "what", "is", "the", "in", "of", "and", "a", "an", "to", "for", "on", "with",
+            "at", "by", "from", "does", "state", "tell", "me", "about", "handbook", "pdf",
+            "document", "dataset", "workspace",
+        }
+        q_tokens = [w.lower() for w in re.findall(r"\w+", query_part) if len(w) > 2 and w.lower() not in stop_words]
+
+        # Extract non-empty candidate clauses from context
+        candidates = []
+        for line in context_part.splitlines():
+            clean = re.sub(r"^\[[a-zA-Z0-9_:.-]+\]\s*", "", line).strip()
+            if clean and len(clean) > 5 and not clean.startswith("["):
+                for part in re.split(r"(?<=[.!?])\s+", clean):
+                    p = part.strip()
+                    if len(p) > 5:
+                        candidates.append(p)
+
         factual_answer = "Verified factual answer based directly on context."
-        for line in user_prompt.splitlines():
-            if "Mission:" in line:
-                factual_answer = line.split("Mission:", 1)[1].strip()
-                break
-            elif "wealth creator" in line.lower():
-                factual_answer = "To be the wealth creator for every Indian."
-                break
+        if candidates:
+            ranked = []
+            for cand in candidates:
+                cand_lower = cand.lower()
+                cand_tokens = set(re.findall(r"\w+", cand_lower))
+                score = len(set(q_tokens) & cand_tokens)
+                for tok in q_tokens:
+                    if re.search(rf"\b{tok}\s*:", cand, re.IGNORECASE):
+                        score += 5
+                ranked.append((score, len(cand), cand))
+
+            ranked.sort(key=lambda x: (x[0], x[1]), reverse=True)
+            if ranked and ranked[0][0] > 0:
+                factual_answer = ranked[0][2]
+            else:
+                factual_answer = candidates[0]
+        elif not chunk_ids:
+            factual_answer = "NOT_FOUND"
+
         ans = {
             "answer": factual_answer,
-            "citations": chunk_ids[:1],
+            "citations": chunk_ids[:1] if factual_answer != "NOT_FOUND" else [],
         }
         return json.dumps(ans), {"input_tokens": 10, "output_tokens": 10}
 

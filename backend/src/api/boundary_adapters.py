@@ -9,14 +9,35 @@ logger = logging.getLogger(__name__)
 
 class ProductionExecutionEngine:
     """Production execution engine adapter for the boundary delivery gate."""
+    def __init__(self, query_service: Any = None):
+        self.query_service = query_service
+
+    def execute_query(
+        self,
+        workspace_id: str,
+        query_text: str,
+        is_aggregate: bool = False,
+        descriptor: Any = None,
+        table_store: Any = None,
+    ) -> QueryExecutionOutcome:
+        return self.recompute_query(
+            workspace_id=workspace_id,
+            query=query_text,
+            descriptor=descriptor,
+            table_store=table_store,
+        )
+
     def recompute_query(
         self,
         workspace_id: str,
         query: Any,
-        descriptor: Any,
-        table_store: Any,
+        descriptor: Any = None,
+        table_store: Any = None,
     ) -> QueryExecutionOutcome:
-        from src.modules.query.query_service import query_service
+        query_svc = self.query_service
+        if query_svc is None:
+            from src.modules.query.query_service import query_service
+            query_svc = query_service
         from src.schemas.contracts.boundary import (
             CitationItem,
             QueryExecutionOutcome,
@@ -126,6 +147,7 @@ class ProductionExecutionEngine:
                 citations=(),
                 surviving_source_ids=tuple(surviving),
                 tombstoned_source_ids=tuple(tombstoned),
+                token_usage={"input_tokens": 0, "output_tokens": 0},
             )
 
         # Cache is disabled here to bypass legacy query cache in query_service.
@@ -137,7 +159,7 @@ class ProductionExecutionEngine:
             cache=False,
         )
 
-        res = query_service.execute_query(req)
+        res = query_svc.execute_query(req)
 
         # Distinguish infrastructure failure from insufficient evidence
         if res.get("status") == "error" and res.get("error_code") == "storage_failure":
@@ -208,6 +230,12 @@ class ProductionExecutionEngine:
                 surviving.append(str(doc_id))
 
 
+        raw_usage = res.get("token_usage") or {}
+        usage_dict = {
+            "input_tokens": int(raw_usage.get("input_tokens") or raw_usage.get("prompt_tokens") or 0),
+            "output_tokens": int(raw_usage.get("output_tokens") or raw_usage.get("completion_tokens") or 0),
+        }
+
         return QueryExecutionOutcome(
             execution_id="exec_" + workspace_id,
             status=status,
@@ -215,6 +243,7 @@ class ProductionExecutionEngine:
             citations=tuple(citation_items),
             surviving_source_ids=tuple(surviving),
             tombstoned_source_ids=tuple(tombstoned),
+            token_usage=usage_dict,
         )
 
 class RedisCacheAdapter:

@@ -20,24 +20,25 @@ Specification 0003 remains Proposed and deferred.
 
 ## Working Tree State and Key Additions
 
-* [backend/src/schemas/contracts/boundary.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/schemas/contracts/boundary.py): Added `DocumentSnapshot` and `BenchmarkRunMetadata` models, `CitationItem` location bindings, and counting unit documentation.
+* [backend/src/schemas/contracts/boundary.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/schemas/contracts/boundary.py): Added `DocumentSnapshot` and `BenchmarkRunMetadata` models, declared `token_usage` on `QueryExecutionOutcome`, and documented counting units.
+* [backend/src/api/boundary_adapters.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/api/boundary_adapters.py): Traced observed token usage from `query_service` into `QueryExecutionOutcome.token_usage` without undeclared fields, and implemented `execute_query` delegation.
 * [backend/src/db/workspace_boundary_repo.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/db/workspace_boundary_repo.py): Added snapshot and benchmark metadata CRUD across SQLite, in memory, and DynamoDB repository implementations.
 * [backend/src/services/benchmark/artifact_store.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/services/benchmark/artifact_store.py): Implemented `S3BenchmarkArtifactStore` uploading full versioned JSON benchmark reports.
 * [backend/src/services/benchmark/persistence_service.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/services/benchmark/persistence_service.py): Implemented `BenchmarkPersistenceService` ensuring recoverable write sequencing (S3 first, then DynamoDB).
 * [backend/src/services/benchmark/benchmark_runner.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/services/benchmark/benchmark_runner.py): Implemented `BenchmarkRunner` with adversarial scoring protection:
-  * Fabricated positive answers with 0 citations fail insufficient evidence evaluation.
-  * Wrong source, wrong version, or unsupported citations fail evidence support evaluation.
+  * Infrastructure ERROR must fail partial-coverage correctness and coverage scoring; credit is given only to agreed explicit coverage refusal.
+  * Claim support is validated using existing evidence verification (`compute_faithfulness` and numeric grounding); matching citation identifiers alone do not earn support credit.
   * Complete dataset aggregates pass coverage scoring; incomplete dataset complete claims fail coverage scoring.
-  * Token accounting uses provider tokens when available, does not invent model tokens on deterministic execution (reports 0), and explicitly distinguishes estimated vs unavailable tokens.
-* [backend/src/providers/llm_provider.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/providers/llm_provider.py): Fast test environment check extracting factual context answers during tests.
-* [backend/tests/test_benchmark_runner_and_persistence_0004.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/tests/test_benchmark_runner_and_persistence_0004.py): 10 unit and integration tests covering S3 artifact storage, DynamoDB persistence, recoverable write ordering, orphan S3 tolerance, and the 4 adversarial scoring regression cases.
-* [backend/tests/test_pdf_retrieval_slice_0004.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/tests/test_pdf_retrieval_slice_0004.py): Strengthened PDF verification asserting the expected source supported fact ("wealth creator").
+  * Token accounting traces provider tokens when available, prefers observed usage over query-type assumptions, reports zero for deterministic execution, and explicitly distinguishes estimated vs unavailable tokens.
+* [backend/src/providers/llm_provider.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/providers/llm_provider.py): Explicit generic test double extracting grounded context excerpts without domain or PDF-specific logic.
+* [backend/tests/test_benchmark_runner_and_persistence_0004.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/tests/test_benchmark_runner_and_persistence_0004.py): 14 unit and integration tests covering S3 artifact storage, DynamoDB persistence, recoverable write ordering, orphan S3 tolerance, token tracing without undeclared fields, and focused adversarial scoring regression cases.
+* [backend/tests/test_pdf_retrieval_slice_0004.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/tests/test_pdf_retrieval_slice_0004.py): PDF verification labeled as mocked generation verifying pipeline grounding and DocumentLocation citations through generic test double.
 * [verify_0004_live.py](file:///home/swyra/projects/knowledge-retrieval-engine/verify_0004_live.py): 17 live HTTP integration checks driving real workspace creation, 250 row calculation, boundary denial, tombstoning, and factual PDF extraction against the running FastAPI service.
 
 ## Execution Environment Distinctions
 
 * Local HTTP checks: 17 live end to end requests executed over HTTP against local Uvicorn FastAPI server on port 8001 in `verify_0004_live.py`, verifying real document ingestion, 250 row calculation without truncation, cross workspace denial, and factual citation extraction.
-* Mocks: isolated LLM completion generation in unit tests (`MODEL_PROVIDER=test`), mock S3 artifact store, and mock DynamoDB table items in isolated repository unit tests.
+* Mocks and mocked generation: isolated LLM completion generation in unit tests via explicit generic test double without domain or PDF-specific logic (`MODEL_PROVIDER=test`), mock S3 artifact store, and mock DynamoDB table items in isolated repository unit tests; these checks verify pipeline contracts and do not assert real model accuracy.
 * Real model execution: local embedding computation (MiniLM-L6-v2 384d and BGE 1024d) and local BM25 ranking run real local algorithm execution; remote AWS Bedrock invocations bypassed during automated tests.
 * Live AWS verification: deferred; DynamoDB and S3 interactions verified through local SQLite, in memory substitutes, and botocore client mock structures; no active AWS cloud deployment performed.
 
@@ -45,14 +46,18 @@ Specification 0003 remains Proposed and deferred.
 
 * Full 0004 Test Suite:
   * Command: `uv run pytest tests/test_csv_vertical_slice_0004.py tests/test_pdf_retrieval_slice_0004.py tests/test_structured_query_service.py tests/test_fix1_async_ingestion.py tests/test_dynamodb_boundary_and_execution.py tests/test_benchmark_runner_and_persistence_0004.py`
-  * Outcome: 38 passed, 0 failed in 29.20s.
+  * Outcome: 42 passed, 0 failed in 26.50s.
+* Full Repository Test Suite:
+  * Command: `uv run pytest`
+  * Outcome: 362 passed, 0 failed, 3 skipped in 192.11s.
 * Live FastAPI Integration Verification:
-  * Command: `uv run python ../verify_0004_live.py`
+  * Command: `uv run --project backend python verify_0004_live.py`
   * Outcome: All behaviors passed (17 of 17).
 * Independent Senior Code Review:
   * Model: `gemini-2.5-pro` (author on `gemini 3.8 flash`)
   * Scope: 33 changed files across branch `re-factor` vs `main`
   * Verdict: Approve with nits (0 blockers, 0 majors, 0 minors, 2 nits resolved)
+
   * Report: [docs/reviews/2026-10-15-re-factor.md](file:///home/swyra/projects/knowledge-retrieval-engine/docs/reviews/2026-10-15-re-factor.md)
 
 ## Preserved Status and Deferred Work

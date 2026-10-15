@@ -16,12 +16,14 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import logging
 import math
+import re
 import time
 from typing import Any, Callable
 import uuid
 
 from src.schemas.contracts.boundary import BenchmarkRunMetadata
 from services.benchmark.persistence_service import BenchmarkPersistenceService
+from services.evaluation.benchmark_scorer import compute_faithfulness
 
 logger = logging.getLogger(__name__)
 
@@ -179,10 +181,26 @@ class BenchmarkRunner:
             # Provider token usage must be used when available.
             # Deterministic execution must not invent model usage;
             # unavailable usage and estimates must be explicitly distinguished.
+            # Prefer observed usage over query-type assumptions.
             prompt_tok = 0
             comp_tok = 0
             tok_source = "unavailable"
             is_estimated = False
+
+            tok_dict = None
+            if hasattr(outcome, "token_usage") and getattr(outcome, "token_usage") is not None:
+                tok_dict = getattr(outcome, "token_usage")
+            elif isinstance(outcome, dict) and outcome.get("token_usage") is not None:
+                tok_dict = outcome.get("token_usage")
+
+            obs_prompt = None
+            obs_comp = None
+            if isinstance(tok_dict, dict):
+                obs_prompt = tok_dict.get("prompt_tokens") if "prompt_tokens" in tok_dict else tok_dict.get("input_tokens")
+                obs_comp = tok_dict.get("completion_tokens") if "completion_tokens" in tok_dict else tok_dict.get("output_tokens")
+            elif hasattr(outcome, "prompt_tokens") and getattr(outcome, "prompt_tokens") is not None:
+                obs_prompt = getattr(outcome, "prompt_tokens")
+                obs_comp = getattr(outcome, "completion_tokens", 0)
 
             is_deterministic = (
                 case.query_type == "tabular_aggregate"
@@ -192,43 +210,27 @@ class BenchmarkRunner:
                 or (isinstance(outcome, dict) and outcome.get("execution_type") == "deterministic")
             )
 
-            if is_deterministic:
+            # 1. Prefer observed token usage over query-type assumptions
+            if obs_prompt is not None and obs_comp is not None and (int(obs_prompt) > 0 or int(obs_comp) > 0):
+                prompt_tok = int(obs_prompt)
+                comp_tok = int(obs_comp)
+                tok_source = "provider_reported"
+                is_estimated = False
+            elif is_deterministic or (obs_prompt == 0 and obs_comp == 0 and (tok_dict is not None or getattr(outcome, "is_deterministic", False))):
                 prompt_tok = 0
                 comp_tok = 0
                 tok_source = "deterministic_zero"
                 is_estimated = False
+            elif getattr(case, "allow_token_estimation", True):
+                prompt_tok = max(1, int(len(case.query) / 4))
+                comp_tok = max(1, int(len(answer) / 4)) if answer else 0
+                tok_source = "estimated"
+                is_estimated = True
             else:
-                tok_dict = None
-                if hasattr(outcome, "token_usage") and getattr(outcome, "token_usage"):
-                    tok_dict = getattr(outcome, "token_usage")
-                elif isinstance(outcome, dict) and outcome.get("token_usage"):
-                    tok_dict = outcome.get("token_usage")
-
-                if isinstance(tok_dict, dict) and (
-                    "prompt_tokens" in tok_dict
-                    or "input_tokens" in tok_dict
-                    or "completion_tokens" in tok_dict
-                    or "output_tokens" in tok_dict
-                ):
-                    prompt_tok = int(tok_dict.get("prompt_tokens") or tok_dict.get("input_tokens") or 0)
-                    comp_tok = int(tok_dict.get("completion_tokens") or tok_dict.get("output_tokens") or 0)
-                    tok_source = "provider_reported"
-                    is_estimated = False
-                elif hasattr(outcome, "prompt_tokens") and getattr(outcome, "prompt_tokens") is not None:
-                    prompt_tok = int(getattr(outcome, "prompt_tokens", 0))
-                    comp_tok = int(getattr(outcome, "completion_tokens", 0))
-                    tok_source = "provider_reported"
-                    is_estimated = False
-                elif getattr(case, "allow_token_estimation", True):
-                    prompt_tok = max(1, int(len(case.query) / 4))
-                    comp_tok = max(1, int(len(answer) / 4)) if answer else 0
-                    tok_source = "estimated"
-                    is_estimated = True
-                else:
-                    prompt_tok = 0
-                    comp_tok = 0
-                    tok_source = "unavailable"
-                    is_estimated = False
+                prompt_tok = 0
+                comp_tok = 0
+                tok_source = "unavailable"
+                is_estimated = False
 
             total_prompt_tokens += prompt_tok
             total_completion_tokens += comp_tok
@@ -236,6 +238,12 @@ class BenchmarkRunner:
             # 1. Correctness Evaluation
             is_correct = False
             notes = ""
+            is_infrastructure_error = (
+                status_val.upper() in ("ERROR", "INTERNAL_ERROR", "STORAGE_FAILURE", "STORAGE_ERROR")
+                or "execution error:" in answer.lower()
+                or (isinstance(outcome, dict) and outcome.get("error_code") == "storage_failure")
+            )
+
             refusal_indicators = (
                 "couldn't find",
                 "could not find",
@@ -255,18 +263,31 @@ class BenchmarkRunner:
                 or answer.strip() == ""
             )
 
-            if case.query_type == "insufficient_evidence":
+            if is_infrastructure_error:
+                # Infrastructure ERROR must fail partial-coverage correctness and all other checks
+                is_correct = False
+            elif case.query_type == "insufficient_evidence":
                 # Expect clean refusal without fabricated assertions AND with zero citations.
                 # A fabricated answer with empty citations must FAIL.
                 is_correct = is_refusal_answer and (len(serialized_citations) == 0)
             elif case.query_type == "partial_coverage":
-                # Expect explicit aggregate claim refusal due to incomplete coverage
+                # Expect explicit aggregate claim refusal due to incomplete coverage.
+                # Credit only the agreed explicit coverage refusal.
                 is_correct = (
                     status_val in ("INSUFFICIENT_COVERAGE", "REFUSAL")
-                    or "incomplete" in answer.lower()
-                    or "tombstoned" in answer.lower()
-                    or "aborted" in answer.lower()
-                    or status_val != "SUCCESS"
+                    or (
+                        not is_infrastructure_error
+                        and any(
+                            r in answer.lower()
+                            for r in (
+                                "incomplete coverage",
+                                "incomplete dataset",
+                                "supporting source was tombstoned",
+                                "aggregate calculation aborted",
+                                "insufficient coverage",
+                            )
+                        )
+                    )
                 )
             elif case.expected_answer is not None:
                 # Value or keyword match
@@ -286,11 +307,14 @@ class BenchmarkRunner:
 
             # 2. Evidence Support Evaluation
             # A wrong-source/version or unsupported citation must not earn evidence-support credit.
-            if case.query_type in ("insufficient_evidence", "partial_coverage"):
+            # Validate claim support using existing evidence verification; matching citation identifiers alone must not earn support credit.
+            if is_infrastructure_error:
+                evidence_supported = False
+            elif case.query_type in ("insufficient_evidence", "partial_coverage"):
                 if case.query_type == "insufficient_evidence":
                     evidence_supported = is_refusal_answer and (len(serialized_citations) == 0)
                 else:
-                    evidence_supported = (len(serialized_citations) == 0) if (status_val != "SUCCESS" or "incomplete" in answer.lower()) else False
+                    evidence_supported = (len(serialized_citations) == 0) if (status_val in ("INSUFFICIENT_COVERAGE", "REFUSAL") or "incomplete" in answer.lower()) else False
             else:
                 if not serialized_citations or answer in ("", "NOT_FOUND") or is_refusal_answer:
                     evidence_supported = False
@@ -347,28 +371,69 @@ class BenchmarkRunner:
                                 citations_valid = False
                                 break
 
-                    evidence_supported = citations_valid
+                    if citations_valid:
+                        # Validate claim support using existing evidence verification;
+                        # matching citation identifiers alone must not earn support credit.
+                        context_snippets = [
+                            str(c.get("snippet") or c.get("text") or c.get("text_snippet") or "").strip()
+                            for c in serialized_citations
+                        ]
+                        joined_context = " ".join(s for s in context_snippets if s).strip()
+                        if not joined_context:
+                            evidence_supported = False
+                        else:
+                            ans_nums = set(re.findall(r"\b\d+(?:\.\d+)?%?\b", answer))
+                            if ans_nums:
+                                # For answers making numeric claims, verify that at least one cited number supports it
+                                context_nums = set(re.findall(r"\b\d+(?:\.\d+)?%?\b", joined_context))
+                                if not (ans_nums & context_nums):
+                                    evidence_supported = False
+                                else:
+                                    evidence_supported = True
+                            else:
+                                faith_score = compute_faithfulness(answer, joined_context)
+                                if faith_score is None or faith_score < 0.25:
+                                    evidence_supported = False
+                                else:
+                                    evidence_supported = True
+                    else:
+                        evidence_supported = False
 
             # 3. Coverage Verification Evaluation
             # - A valid complete-dataset aggregate MUST pass coverage scoring
             # - An incomplete-dataset complete claim MUST fail coverage scoring
+            # - Infrastructure ERROR must fail coverage scoring
             if case.dataset_is_incomplete or case.query_type == "partial_coverage":
                 if case.requires_complete_coverage or case.query_type == "partial_coverage":
-                    coverage_valid = (
-                        status_val in ("INSUFFICIENT_COVERAGE", "REFUSAL", "ERROR")
-                        or "incomplete" in answer.lower()
-                        or "tombstoned" in answer.lower()
-                        or "aborted" in answer.lower()
-                        or status_val != "SUCCESS"
-                    )
+                    if is_infrastructure_error:
+                        coverage_valid = False
+                    else:
+                        coverage_valid = (
+                            status_val in ("INSUFFICIENT_COVERAGE", "REFUSAL")
+                            or any(
+                                r in answer.lower()
+                                for r in (
+                                    "incomplete coverage",
+                                    "incomplete dataset",
+                                    "supporting source was tombstoned",
+                                    "aggregate calculation aborted",
+                                    "insufficient coverage",
+                                )
+                            )
+                        )
                 else:
-                    coverage_valid = (status_val == "SUCCESS")
+                    coverage_valid = (status_val == "SUCCESS" and not is_infrastructure_error)
             else:
                 # Complete dataset
                 if case.requires_complete_coverage or case.query_type == "tabular_aggregate":
-                    coverage_valid = (status_val == "SUCCESS" and "incomplete" not in answer.lower())
+                    coverage_valid = (
+                        status_val == "SUCCESS"
+                        and not is_infrastructure_error
+                        and "incomplete" not in answer.lower()
+                    )
                 else:
-                    coverage_valid = True
+                    coverage_valid = not is_infrastructure_error
+
 
             if is_correct:
                 correct_count += 1

@@ -332,7 +332,7 @@ def test_reproducible_benchmark_runner_execution():
                         evidence_id="ev_handbook_1",
                         source_id="src_handbook_pdf",
                         location=DocumentLocation(page=1),
-                        snippet="Diversified asset management standards.",
+                        snippet="The fund policy guidelines require diversified asset management standards.",
                         source_version=1,
                     ),
                 ),
@@ -721,9 +721,8 @@ def test_adversarial_token_accounting_and_provenance_distinction():
         ),
         surviving_source_ids=("src_risk_doc",),
         tombstoned_source_ids=(),
+        token_usage={"prompt_tokens": 128, "completion_tokens": 42},
     )
-    # Attach provider token_usage dictionary
-    object.__setattr__(res_provider, "token_usage", {"prompt_tokens": 128, "completion_tokens": 42})
     responses["q_provider_tokens"] = res_provider
 
     # Query 2: Deterministic execution (tabular aggregate calculation, no model invoked)
@@ -838,3 +837,277 @@ def test_adversarial_token_accounting_and_provenance_distinction():
     assert breakdown["deterministic_zero"] == 1
     assert breakdown["unavailable"] == 1
     assert breakdown["estimated"] == 1
+
+
+def test_adversarial_infrastructure_error_fails_partial_coverage_correctness_and_coverage():
+    """Adversarial case: Infrastructure ERROR must fail partial-coverage correctness and coverage.
+
+    Verifies that only agreed explicit coverage refusals earn credit;
+    database or storage failures returning status="ERROR" or raising exceptions fail both.
+    """
+    mock_persistence = MagicMock()
+    mock_persistence.persist_benchmark_run.side_effect = lambda *args, **kwargs: kwargs.get("metadata", args[1] if len(args) > 1 else None)
+
+    responses = {}
+
+    def dynamic_executor(query: str, workspace_id: str):
+        return responses[query]
+
+    runner = BenchmarkRunner(query_executor=dynamic_executor, persistence_service=mock_persistence)
+
+    # 1. Infrastructure failure returning status="ERROR" via adapter envelope/dict
+    responses["q_error_status"] = {
+        "execution_id": "exec_err_1",
+        "status": "ERROR",
+        "answer": "Execution error: DynamoDB service connection timed out",
+        "citations": [],
+        "token_usage": {"input_tokens": 0, "output_tokens": 0},
+    }
+
+    # 2. Proper explicit coverage refusal
+    responses["q_proper_refusal"] = QueryExecutionOutcome(
+        execution_id="exec_ref_1",
+        status="INSUFFICIENT_COVERAGE",
+        answer="Aggregate calculation aborted: supporting source was tombstoned",
+        citations=(),
+        surviving_source_ids=(),
+        tombstoned_source_ids=("src_tombstoned",),
+        token_usage={"input_tokens": 0, "output_tokens": 0},
+    )
+
+    test_cases = [
+        BenchmarkTestCase(
+            query_id="tc_error_must_fail",
+            query="q_error_status",
+            query_type="partial_coverage",
+            requires_complete_coverage=True,
+            dataset_is_incomplete=True,
+        ),
+        BenchmarkTestCase(
+            query_id="tc_proper_refusal_must_pass",
+            query="q_proper_refusal",
+            query_type="partial_coverage",
+            requires_complete_coverage=True,
+            dataset_is_incomplete=True,
+        ),
+    ]
+
+    report = runner.run_suite(workspace_id="ws_adv_err", test_cases=test_cases)
+    queries = {q["query_id"]: q for q in report.detailed_artifact["queries"]}
+
+    # Infrastructure ERROR MUST FAIL correctness and coverage
+    assert queries["tc_error_must_fail"]["correctness"] is False
+    assert queries["tc_error_must_fail"]["coverage_valid"] is False
+    assert queries["tc_error_must_fail"]["evidence_supported"] is False
+
+    # Agreed explicit coverage refusal MUST PASS correctness and coverage
+    assert queries["tc_proper_refusal_must_pass"]["correctness"] is True
+    assert queries["tc_proper_refusal_must_pass"]["coverage_valid"] is True
+    assert queries["tc_proper_refusal_must_pass"]["evidence_supported"] is True
+
+
+def test_adversarial_matching_citation_identifiers_alone_fails_without_evidence_support():
+    """Adversarial case: Matching citation identifiers alone without factual support must FAIL evidence support.
+
+    Verifies that an answer citing a valid source, version, and page but with unrelated context
+    or ungrounded fabricated claims is rejected by existing evidence verification.
+    """
+    mock_persistence = MagicMock()
+    mock_persistence.persist_benchmark_run.side_effect = lambda *args, **kwargs: kwargs.get("metadata", args[1] if len(args) > 1 else None)
+
+    responses = {}
+
+    def dynamic_executor(query: str, workspace_id: str):
+        return responses[query]
+
+    runner = BenchmarkRunner(query_executor=dynamic_executor, persistence_service=mock_persistence)
+
+    # Citations have valid identifier, source, and version, but snippet does NOT support the claim
+    responses["q_unsupported_claim"] = QueryExecutionOutcome(
+        execution_id="exec_unsup_1",
+        status="SUCCESS",
+        answer="The fund guarantees a 45% return annually with zero downside risk.",
+        citations=(
+            CitationItem(
+                evidence_id="ev_valid_id",
+                source_id="src_policy_pdf",
+                location=DocumentLocation(page=1),
+                snippet="General disclaimer: past performance is no guarantee of future results.",
+                source_version=1,
+            ),
+        ),
+        surviving_source_ids=("src_policy_pdf",),
+        tombstoned_source_ids=(),
+    )
+
+    # Valid supported claim
+    responses["q_supported_claim"] = QueryExecutionOutcome(
+        execution_id="exec_sup_1",
+        status="SUCCESS",
+        answer="General disclaimer: past performance is no guarantee of future results.",
+        citations=(
+            CitationItem(
+                evidence_id="ev_valid_id_2",
+                source_id="src_policy_pdf",
+                location=DocumentLocation(page=1),
+                snippet="General disclaimer: past performance is no guarantee of future results.",
+                source_version=1,
+            ),
+        ),
+        surviving_source_ids=("src_policy_pdf",),
+        tombstoned_source_ids=(),
+    )
+
+    test_cases = [
+        BenchmarkTestCase(
+            query_id="tc_unsupported_citation",
+            query="q_unsupported_claim",
+            expected_source_id="src_policy_pdf",
+            expected_source_version=1,
+            query_type="text",
+        ),
+        BenchmarkTestCase(
+            query_id="tc_supported_citation",
+            query="q_supported_claim",
+            expected_source_id="src_policy_pdf",
+            expected_source_version=1,
+            query_type="text",
+        ),
+    ]
+
+    report = runner.run_suite(workspace_id="ws_adv_cit", test_cases=test_cases)
+    queries = {q["query_id"]: q for q in report.detailed_artifact["queries"]}
+
+    # Matching citation identifiers alone without factual support MUST FAIL
+    assert queries["tc_unsupported_citation"]["evidence_supported"] is False
+
+    # Supported citation passes
+    assert queries["tc_supported_citation"]["evidence_supported"] is True
+
+
+def test_production_execution_engine_token_trace_and_observed_preference():
+    """Trace actual token usage from provider/query_service through ProductionExecutionEngine into BenchmarkRunner.
+
+    Verifies that:
+    1. ProductionExecutionEngine populates declared token_usage field on QueryExecutionOutcome.
+    2. BenchmarkRunner observes provider reported usage without undeclared fields.
+    3. Observed token usage overrules query-type assumptions.
+    """
+    mock_persistence = MagicMock()
+    mock_persistence.persist_benchmark_run.side_effect = lambda *args, **kwargs: kwargs.get("metadata", args[1] if len(args) > 1 else None)
+
+    from src.api.boundary_adapters import ProductionExecutionEngine
+
+    # Mock query_service to return observed token counts
+    mock_query_service = MagicMock()
+    mock_query_service.execute_query.return_value = {
+        "answer": "Portfolio risk exposure across sectors.",
+        "citations": [
+            {
+                "evidence_id": "ev_p1",
+                "document_id": "doc_risk",
+                "document_version": 1,
+                "text": "Portfolio risk exposure details across sectors.",
+                "page_number": 1,
+            }
+        ],
+        "status": "success",
+        "token_usage": {"input_tokens": 145, "output_tokens": 62},
+        "document_ids": ["doc_risk"],
+    }
+
+    engine = ProductionExecutionEngine(query_service=mock_query_service)
+
+    # 1. Execute query through production execution engine
+    outcome = engine.execute_query(workspace_id="ws_prod_trace", query_text="What is portfolio risk exposure?")
+
+    # Contract check: token_usage is a declared field on QueryExecutionOutcome
+    assert isinstance(outcome, QueryExecutionOutcome)
+    assert outcome.token_usage == {"input_tokens": 145, "output_tokens": 62}
+
+    # 2. Run BenchmarkRunner with this execution engine
+    runner = BenchmarkRunner(
+        query_executor=lambda q, ws: outcome,
+        persistence_service=mock_persistence,
+    )
+    case_text = BenchmarkTestCase(
+        query_id="tc_traced_tokens",
+        query="What is portfolio risk exposure?",
+        query_type="text",
+    )
+    # Query with tabular_aggregate query_type but observed token usage from model
+    case_agg_with_model = BenchmarkTestCase(
+        query_id="tc_observed_overrules_assumption",
+        query="Aggregate calculation using LLM synthesis",
+        query_type="tabular_aggregate",
+    )
+
+    report = runner.run_suite(workspace_id="ws_prod_trace", test_cases=[case_text, case_agg_with_model])
+    queries = {q["query_id"]: q for q in report.detailed_artifact["queries"]}
+
+    # Traced tokens recorded accurately as provider_reported
+    assert queries["tc_traced_tokens"]["prompt_tokens"] == 145
+    assert queries["tc_traced_tokens"]["completion_tokens"] == 62
+    assert queries["tc_traced_tokens"]["token_usage_source"] == "provider_reported"
+    assert queries["tc_traced_tokens"]["is_estimated_tokens"] is False
+
+    # Observed usage overrules query-type assumption
+    assert queries["tc_observed_overrules_assumption"]["prompt_tokens"] == 145
+    assert queries["tc_observed_overrules_assumption"]["completion_tokens"] == 62
+    assert queries["tc_observed_overrules_assumption"]["token_usage_source"] == "provider_reported"
+
+
+def test_generic_test_double_extracts_grounded_excerpts_without_pdf_specific_logic():
+    """Verify that generic test double in test provider extracts grounded statements from context.
+
+    Mocked generation check: uses generic lexical matching against prompt context
+    without hardcoded PDF strings like "Mission:" or "wealth creator".
+    Does not assert real model accuracy.
+    """
+    from providers.llm_provider import generate_completion
+
+    # Case 1: Financial statements query and context
+    user_prompt_fin = (
+        "Context:\n"
+        "[chunk_fin_1] Q3 Financial Highlights\n"
+        "Net Operating Profit: $42.5 million for the quarter\n"
+        "Operating Margin: Expanded by 180 basis points\n\n"
+        "Query: What was the Net Operating Profit?"
+    )
+    raw_res, usage = generate_completion(
+        system_prompt="Return JSON",
+        user_prompt=user_prompt_fin,
+        provider="test",
+    )
+    parsed = json.loads(raw_res)
+    assert "42.5 million" in parsed["answer"]
+    assert parsed["citations"] == ["chunk_fin_1"]
+    assert usage["input_tokens"] > 0
+    assert usage["output_tokens"] > 0
+
+    # Case 2: Healthcare policy query and context
+    user_prompt_health = (
+        "Context:\n"
+        "[chunk_med_2] Clinical Protocols 2026\n"
+        "Emergency Admission Procedure: Immediate triage within 10 minutes of arrival\n"
+        "Discharge Procedure: Physician sign-off required\n\n"
+        "Query: What is the Emergency Admission Procedure?"
+    )
+    raw_res2, usage2 = generate_completion(
+        system_prompt="Return JSON",
+        user_prompt=user_prompt_health,
+        provider="test",
+    )
+    parsed2 = json.loads(raw_res2)
+    assert "10 minutes" in parsed2["answer"]
+    assert parsed2["citations"] == ["chunk_med_2"]
+
+    # Case 3: Empty context returns NOT_FOUND
+    raw_res3, usage3 = generate_completion(
+        system_prompt="Return JSON",
+        user_prompt="Context:\n\nQuery: What is the secret password?",
+        provider="test",
+    )
+    parsed3 = json.loads(raw_res3)
+    assert parsed3["answer"] == "NOT_FOUND"
+    assert parsed3["citations"] == []

@@ -234,7 +234,8 @@ def test_dynamodb_table_store_retry_behavior():
             content_hash="hash123",
         )
         assert mock_client.transact_write_items.call_count == 2
-        mock_sleep.assert_called_once_with(0.5)
+        assert mock_sleep.call_count == 1
+        assert 0.5 <= mock_sleep.call_args[0][0] <= 0.6
 
     # 2. Repeated failure exhausts retry budget and raises
     mock_client.transact_write_items.reset_mock()

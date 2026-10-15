@@ -318,6 +318,7 @@ class QueryExecutionOutcome(BaseModel):
     citations: tuple[CitationItem, ...]
     surviving_source_ids: tuple[str, ...]
     tombstoned_source_ids: tuple[str, ...]
+    token_usage: dict[str, int] = Field(default_factory=dict)
 
 
 class ErrorEnvelope(BaseModel):

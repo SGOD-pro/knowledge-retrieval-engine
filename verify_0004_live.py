@@ -203,7 +203,7 @@ passed_q10 = (
     and q10_json["citations"][0]["location"]["page"] == 1
     and "wealth creator" in q10_json["citations"][0].get("snippet", "").lower()
 )
-record("Text PDF query with DocumentLocation citation", f"POST /workspaces/{ws_pdf_id}/query", r10_query, passed_q10, f"Answer: {q10_json.get('answer')[:100]}...")
+record("Text PDF query with DocumentLocation citation (mocked generation in test mode)", f"POST /workspaces/{ws_pdf_id}/query", r10_query, passed_q10, f"Answer: {q10_json.get('answer')[:100]}...")
 
 # 11. Insufficient evidence on PDF returns 200 refusal with 0 citations
 r11_query = requests.post(

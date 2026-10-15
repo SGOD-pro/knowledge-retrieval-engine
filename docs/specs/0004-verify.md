@@ -7,11 +7,11 @@ _Steps derived from spec 0004 acceptance criteria. `/check verify` runs these; `
 - [x] `python verify_0004_live.py` → 17 passed live over HTTP (CSV and PDF ingestion, boundary denial, deterministic query, coverage blocking, DocumentLocation citations, verified source supported fact assertion, tombstoning)
 - [x] `uv run pytest tests/test_structured_query_service.py` → 7 passed (StructuredQueryService period comparison, normalization of InferredDtype enum and string dtypes) → AC-4, AC-11
 - [x] `uv run pytest tests/test_fix1_async_ingestion.py tests/test_dynamodb_boundary_and_execution.py` → 10 passed (Async upload execution, direct ingestion without test mock machinery in production code) → AC-1, AC-2
-- [x] `uv run pytest tests/test_benchmark_runner_and_persistence_0004.py` → 10 passed (BenchmarkRunner execution, recoverable persistence ordering S3 first then DynamoDB, failure handling, adversarial fabricated answer rejection, citation validation, coverage scoring, and token accounting) → AC-9, AC-10, AC-11
+- [x] `uv run pytest tests/test_benchmark_runner_and_persistence_0004.py` → 14 passed (BenchmarkRunner execution, recoverable persistence ordering S3 first then DynamoDB, failure handling, adversarial fabricated answer rejection, citation validation, coverage scoring, token accounting, infrastructure ERROR failure, claim support verification without identifier credit, production execution engine token trace without undeclared fields, and generic test double extraction) → AC-9, AC-10, AC-11
 
 ## Execution environment distinctions
 - Local HTTP checks: 17 live requests executed over HTTP against local Uvicorn FastAPI server on port 8001 in `verify_0004_live.py`, verifying real document ingestion, 250 row calculation without truncation, cross workspace denial, and factual citation extraction.
-- Mocks: isolated LLM completion generation in unit tests (`MODEL_PROVIDER=test`), mock S3 artifact store, and mock DynamoDB table items in isolated repository unit tests.
+- Mocks and mocked generation: isolated LLM completion generation via explicit generic test double without domain or PDF-specific logic (`MODEL_PROVIDER=test`), mock S3 artifact store, and mock DynamoDB table items in isolated repository unit tests; these checks verify pipeline contracts and do not assert real model accuracy.
 - Real model execution: local embedding computation (MiniLM-L6-v2 384d and BGE 1024d) and local BM25 ranking run real local algorithm execution; remote AWS Bedrock invocations bypassed during automated tests.
 - Live AWS verification: deferred; DynamoDB and S3 interactions verified through local SQLite, in memory substitutes, and botocore client mock structures; no active AWS cloud deployment performed.
 
