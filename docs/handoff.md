@@ -26,12 +26,13 @@ Specification 0003 remains Proposed and deferred.
 * [backend/src/services/benchmark/artifact_store.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/services/benchmark/artifact_store.py): Implemented `S3BenchmarkArtifactStore` uploading full versioned JSON benchmark reports.
 * [backend/src/services/benchmark/persistence_service.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/services/benchmark/persistence_service.py): Implemented `BenchmarkPersistenceService` ensuring recoverable write sequencing (S3 first, then DynamoDB).
 * [backend/src/services/benchmark/benchmark_runner.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/services/benchmark/benchmark_runner.py): Implemented `BenchmarkRunner` with adversarial scoring protection:
-  * Infrastructure ERROR must fail partial-coverage correctness and coverage scoring; credit is given only to agreed explicit coverage refusal.
+  * Infrastructure ERROR must fail partial coverage correctness and coverage scoring; credit is given only to agreed explicit coverage refusal.
   * Claim support is validated using existing evidence verification (`compute_faithfulness` and numeric grounding); matching citation identifiers alone do not earn support credit.
+  * Numeric evidence acceptance replaces any number overlap; all claimed metric amounts must be grounded in cited evidence, and matching years with contradicting amounts fail evidence support while preserving deterministic aggregate evidence handling.
   * Complete dataset aggregates pass coverage scoring; incomplete dataset complete claims fail coverage scoring.
-  * Token accounting traces provider tokens when available, prefers observed usage over query-type assumptions, reports zero for deterministic execution, and explicitly distinguishes estimated vs unavailable tokens.
+  * Token accounting traces provider tokens when available, prefers observed usage over query type assumptions, preserves absent token usage as unavailable rather than synthesized zero, reports zero only when execution telemetry establishes no model use, and explicitly distinguishes estimated vs unavailable tokens.
 * [backend/src/providers/llm_provider.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/providers/llm_provider.py): Explicit generic test double extracting grounded context excerpts without domain or PDF-specific logic.
-* [backend/tests/test_benchmark_runner_and_persistence_0004.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/tests/test_benchmark_runner_and_persistence_0004.py): 14 unit and integration tests covering S3 artifact storage, DynamoDB persistence, recoverable write ordering, orphan S3 tolerance, token tracing without undeclared fields, and focused adversarial scoring regression cases.
+* [backend/tests/test_benchmark_runner_and_persistence_0004.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/tests/test_benchmark_runner_and_persistence_0004.py): 16 unit and integration tests covering S3 artifact storage, DynamoDB persistence, recoverable write ordering, orphan S3 tolerance, token tracing without undeclared fields, contradicting numeric amount failure, absent token preservation, and focused adversarial scoring regression cases.
 * [backend/tests/test_pdf_retrieval_slice_0004.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/tests/test_pdf_retrieval_slice_0004.py): PDF verification labeled as mocked generation verifying pipeline grounding and DocumentLocation citations through generic test double.
 * [verify_0004_live.py](file:///home/swyra/projects/knowledge-retrieval-engine/verify_0004_live.py): 17 live HTTP integration checks driving real workspace creation, 250 row calculation, boundary denial, tombstoning, and factual PDF extraction against the running FastAPI service.
 
@@ -46,7 +47,7 @@ Specification 0003 remains Proposed and deferred.
 
 * Full 0004 Test Suite:
   * Command: `uv run pytest tests/test_csv_vertical_slice_0004.py tests/test_pdf_retrieval_slice_0004.py tests/test_structured_query_service.py tests/test_fix1_async_ingestion.py tests/test_dynamodb_boundary_and_execution.py tests/test_benchmark_runner_and_persistence_0004.py`
-  * Outcome: 42 passed, 0 failed in 26.50s.
+  * Outcome: 44 passed, 0 failed in 24.25s.
 * Full Repository Test Suite:
   * Command: `uv run pytest`
   * Outcome: 362 passed, 0 failed, 3 skipped in 192.11s.

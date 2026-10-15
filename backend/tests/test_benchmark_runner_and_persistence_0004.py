@@ -1111,3 +1111,242 @@ def test_generic_test_double_extracts_grounded_excerpts_without_pdf_specific_log
     parsed3 = json.loads(raw_res3)
     assert parsed3["answer"] == "NOT_FOUND"
     assert parsed3["citations"] == []
+
+
+def test_adversarial_year_matches_but_claimed_amount_contradicts_evidence():
+    """Adversarial case: Year matches but claimed amount contradicts the evidence.
+
+    Verifies that:
+    1. An answer where the year matches (2024) but claimed amount (45%) contradicts
+       the evidence (12%) FAILS evidence support. Matching year alone must not earn credit.
+    2. An answer where the year and claimed amount match the evidence (12%) PASSES.
+    3. Valid deterministic aggregate evidence handling is preserved.
+    """
+    mock_persistence = MagicMock()
+    mock_persistence.persist_benchmark_run.side_effect = lambda *args, **kwargs: kwargs.get("metadata", args[1] if len(args) > 1 else None)
+
+    responses = {}
+
+    def dynamic_executor(query: str, workspace_id: str):
+        return responses[query]
+
+    runner = BenchmarkRunner(query_executor=dynamic_executor, persistence_service=mock_persistence)
+
+    # Subcase A: Year matches (2024), but claimed margin (45%) contradicts the evidence (12%)
+    responses["q_contradicting_amount"] = QueryExecutionOutcome(
+        execution_id="exec_contra_1",
+        status="SUCCESS",
+        answer="In 2024, operating margin expanded to 45%.",
+        citations=(
+            CitationItem(
+                evidence_id="ev_contra_1",
+                source_id="src_annual_report_pdf",
+                location=DocumentLocation(page=1),
+                snippet="In 2024, operating margin expanded to 12% across all business segments.",
+                source_version=1,
+            ),
+        ),
+        surviving_source_ids=("src_annual_report_pdf",),
+        tombstoned_source_ids=(),
+    )
+
+    # Subcase B: Supported claim where both year (2024) and amount (12%) match evidence
+    responses["q_supported_amount"] = QueryExecutionOutcome(
+        execution_id="exec_supp_1",
+        status="SUCCESS",
+        answer="In 2024, operating margin expanded to 12%.",
+        citations=(
+            CitationItem(
+                evidence_id="ev_supp_1",
+                source_id="src_annual_report_pdf",
+                location=DocumentLocation(page=1),
+                snippet="In 2024, operating margin expanded to 12% across all business segments.",
+                source_version=1,
+            ),
+        ),
+        surviving_source_ids=("src_annual_report_pdf",),
+        tombstoned_source_ids=(),
+    )
+
+    # Subcase C: Valid deterministic aggregate query with table citation
+    responses["q_valid_deterministic_aggregate"] = QueryExecutionOutcome(
+        execution_id="exec_det_1",
+        status="SUCCESS",
+        answer="The total operating revenue is 154200.",
+        citations=(
+            CitationItem(
+                evidence_id="ev_table_agg_1",
+                source_id="src_financials_csv",
+                location=TableLocation(table_id="financials_data", row_id="aggregated_rows"),
+                snippet="Aggregated 250 rows from financials_data: sum=154200",
+                source_version=1,
+            ),
+        ),
+        surviving_source_ids=("src_financials_csv",),
+        tombstoned_source_ids=(),
+    )
+
+    test_cases = [
+        BenchmarkTestCase(
+            query_id="tc_contradicting_amount",
+            query="q_contradicting_amount",
+            expected_source_id="src_annual_report_pdf",
+            expected_source_version=1,
+            query_type="text",
+        ),
+        BenchmarkTestCase(
+            query_id="tc_supported_amount",
+            query="q_supported_amount",
+            expected_source_id="src_annual_report_pdf",
+            expected_source_version=1,
+            query_type="text",
+        ),
+        BenchmarkTestCase(
+            query_id="tc_valid_deterministic_aggregate",
+            query="q_valid_deterministic_aggregate",
+            expected_source_id="src_financials_csv",
+            expected_source_version=1,
+            query_type="tabular_aggregate",
+        ),
+    ]
+
+    report = runner.run_suite(workspace_id="ws_adv_numeric", test_cases=test_cases)
+    queries = {q["query_id"]: q for q in report.detailed_artifact["queries"]}
+
+    # Contradicting amount MUST FAIL evidence support despite matching year
+    assert queries["tc_contradicting_amount"]["evidence_supported"] is False
+
+    # Supported amount PASSES
+    assert queries["tc_supported_amount"]["evidence_supported"] is True
+
+    # Valid deterministic aggregate evidence handling is preserved
+    assert queries["tc_valid_deterministic_aggregate"]["evidence_supported"] is True
+
+
+def test_adapter_to_runner_token_usage_regressions_missing_observed_zero_and_provider_reported():
+    """Adapter-to-runner regressions: Missing, observed-zero, and provider-reported token usage.
+
+    Verifies that:
+    1. Missing token usage through ProductionExecutionEngine remains unavailable,
+       not becoming deterministic_zero.
+    2. Zero is reported only when execution telemetry establishes no model use.
+    3. Provider-reported usage passes through directly.
+    """
+    mock_persistence = MagicMock()
+    mock_persistence.persist_benchmark_run.side_effect = lambda *args, **kwargs: kwargs.get("metadata", args[1] if len(args) > 1 else None)
+
+    from src.api.boundary_adapters import ProductionExecutionEngine
+
+    mock_query_svc = MagicMock()
+    engine = ProductionExecutionEngine(query_service=mock_query_svc)
+
+    # 1. Missing token usage: query_service returns no token_usage key and no deterministic telemetry
+    mock_query_svc.execute_query.return_value = {
+        "answer": "General overview of liquidity metrics.",
+        "citations": [
+            {
+                "evidence_id": "ev_liq_1",
+                "document_id": "doc_liquidity",
+                "document_version": 1,
+                "text": "General overview of liquidity metrics.",
+                "page_number": 1,
+            }
+        ],
+        "status": "success",
+        # token_usage omitted / absent
+        "document_ids": ["doc_liquidity"],
+    }
+
+    outcome_missing = engine.execute_query(workspace_id="ws_adapter_tokens", query_text="Liquidity overview?")
+    assert outcome_missing.token_usage is None
+
+    runner_missing = BenchmarkRunner(
+        query_executor=lambda q, ws: outcome_missing,
+        persistence_service=mock_persistence,
+    )
+    case_missing_unavail = BenchmarkTestCase(
+        query_id="tc_missing_unavail",
+        query="Liquidity overview?",
+        query_type="text",
+        allow_token_estimation=False,
+    )
+    report_missing = runner_missing.run_suite(workspace_id="ws_adapter_tokens", test_cases=[case_missing_unavail])
+    q_missing = report_missing.detailed_artifact["queries"][0]
+    assert q_missing["token_usage_source"] == "unavailable"
+    assert q_missing["prompt_tokens"] == 0
+    assert q_missing["completion_tokens"] == 0
+    assert q_missing["is_estimated_tokens"] is False
+
+    # 2. Observed-zero usage: execution telemetry establishes no model use
+    mock_query_svc.execute_query.return_value = {
+        "answer": "The sum for amount is 4200.",
+        "citations": [
+            {
+                "evidence_id": "ev_table_1",
+                "table_id": "tbl_metrics",
+                "document_version": 1,
+                "text": "The sum for amount is 4200.",
+                "evidence_type": "structured_aggregate",
+            }
+        ],
+        "status": "success",
+        "structured_aggregate": True,
+        "token_usage": {"input_tokens": 0, "output_tokens": 0},
+        "telemetry": {"generation_calls": 0},
+        "document_ids": ["tbl_metrics"],
+    }
+
+    outcome_zero = engine.execute_query(workspace_id="ws_adapter_tokens", query_text="What is sum of amount?")
+    assert outcome_zero.token_usage == {"input_tokens": 0, "output_tokens": 0}
+
+    runner_zero = BenchmarkRunner(
+        query_executor=lambda q, ws: outcome_zero,
+        persistence_service=mock_persistence,
+    )
+    case_zero = BenchmarkTestCase(
+        query_id="tc_observed_zero",
+        query="What is sum of amount?",
+        query_type="tabular_aggregate",
+    )
+    report_zero = runner_zero.run_suite(workspace_id="ws_adapter_tokens", test_cases=[case_zero])
+    q_zero = report_zero.detailed_artifact["queries"][0]
+    assert q_zero["token_usage_source"] == "deterministic_zero"
+    assert q_zero["prompt_tokens"] == 0
+    assert q_zero["completion_tokens"] == 0
+    assert q_zero["is_estimated_tokens"] is False
+
+    # 3. Provider-reported usage: query_service returns observed model usage
+    mock_query_svc.execute_query.return_value = {
+        "answer": "Detailed macroeconomic forecast narrative.",
+        "citations": [
+            {
+                "evidence_id": "ev_macro_1",
+                "document_id": "doc_macro",
+                "document_version": 1,
+                "text": "Detailed macroeconomic forecast narrative.",
+                "page_number": 1,
+            }
+        ],
+        "status": "success",
+        "token_usage": {"input_tokens": 310, "output_tokens": 125},
+        "document_ids": ["doc_macro"],
+    }
+
+    outcome_provider = engine.execute_query(workspace_id="ws_adapter_tokens", query_text="Macro forecast?")
+    assert outcome_provider.token_usage == {"input_tokens": 310, "output_tokens": 125}
+
+    runner_provider = BenchmarkRunner(
+        query_executor=lambda q, ws: outcome_provider,
+        persistence_service=mock_persistence,
+    )
+    case_provider = BenchmarkTestCase(
+        query_id="tc_provider_usage",
+        query="Macro forecast?",
+        query_type="text",
+    )
+    report_provider = runner_provider.run_suite(workspace_id="ws_adapter_tokens", test_cases=[case_provider])
+    q_provider = report_provider.detailed_artifact["queries"][0]
+    assert q_provider["token_usage_source"] == "provider_reported"
+    assert q_provider["prompt_tokens"] == 310
+    assert q_provider["completion_tokens"] == 125
+    assert q_provider["is_estimated_tokens"] is False

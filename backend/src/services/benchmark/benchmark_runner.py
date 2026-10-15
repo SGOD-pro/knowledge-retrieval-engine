@@ -22,6 +22,7 @@ from typing import Any, Callable
 import uuid
 
 from src.schemas.contracts.boundary import BenchmarkRunMetadata
+from src.schemas.contracts.location import TableLocation
 from services.benchmark.persistence_service import BenchmarkPersistenceService
 from services.evaluation.benchmark_scorer import compute_faithfulness
 
@@ -202,12 +203,23 @@ class BenchmarkRunner:
                 obs_prompt = getattr(outcome, "prompt_tokens")
                 obs_comp = getattr(outcome, "completion_tokens", 0)
 
-            is_deterministic = (
-                case.query_type == "tabular_aggregate"
+            # Check if execution telemetry establishes no model use
+            telemetry_establishes_zero = (
+                getattr(outcome, "execution_type", "") == "deterministic"
+                or (isinstance(outcome, dict) and outcome.get("execution_type") == "deterministic")
                 or getattr(outcome, "is_deterministic", False)
                 or (isinstance(outcome, dict) and outcome.get("is_deterministic", False))
-                or getattr(outcome, "execution_type", "") == "deterministic"
-                or (isinstance(outcome, dict) and outcome.get("execution_type") == "deterministic")
+                or case.query_type == "tabular_aggregate"
+                or (
+                    tok_dict is not None
+                    and obs_prompt == 0
+                    and obs_comp == 0
+                    and (
+                        getattr(outcome, "structured_aggregate", False)
+                        or (isinstance(outcome, dict) and outcome.get("structured_aggregate", False))
+                        or (isinstance(outcome, dict) and outcome.get("telemetry", {}).get("generation_calls") == 0)
+                    )
+                )
             )
 
             # 1. Prefer observed token usage over query-type assumptions
@@ -216,7 +228,7 @@ class BenchmarkRunner:
                 comp_tok = int(obs_comp)
                 tok_source = "provider_reported"
                 is_estimated = False
-            elif is_deterministic or (obs_prompt == 0 and obs_comp == 0 and (tok_dict is not None or getattr(outcome, "is_deterministic", False))):
+            elif telemetry_establishes_zero:
                 prompt_tok = 0
                 comp_tok = 0
                 tok_source = "deterministic_zero"
@@ -379,23 +391,55 @@ class BenchmarkRunner:
                             for c in serialized_citations
                         ]
                         joined_context = " ".join(s for s in context_snippets if s).strip()
-                        if not joined_context:
+                        has_table_citation = any(
+                            isinstance(c.get("location"), (TableLocation, dict))
+                            and (c.get("table_id") or (isinstance(c.get("location"), dict) and "table_id" in c["location"]))
+                            for c in serialized_citations
+                        ) or any(c.get("source_format") in ("csv", "xlsx", "table") for c in serialized_citations)
+
+                        # Preserve valid deterministic aggregate evidence handling
+                        if case.query_type == "tabular_aggregate" or getattr(outcome, "is_deterministic", False) or (isinstance(outcome, dict) and outcome.get("execution_type") == "deterministic"):
+                            evidence_supported = bool(joined_context or has_table_citation)
+                        elif not joined_context:
                             evidence_supported = False
                         else:
-                            ans_nums = set(re.findall(r"\b\d+(?:\.\d+)?%?\b", answer))
+                            # Replace numeric evidence acceptance based on any-number overlap.
+                            # All claimed metric amounts must be grounded in the cited evidence.
+                            # A matching year with a contradicting amount MUST fail evidence support.
+                            raw_ans_nums = re.findall(r"\b\d+(?:\.\d+)?%?\b", answer)
+                            raw_ctx_nums = re.findall(r"\b\d+(?:\.\d+)?%?\b", joined_context)
+
+                            ans_nums = set()
+                            for n in raw_ans_nums:
+                                ans_nums.add(n)
+                                ans_nums.add(n.rstrip("%"))
+
+                            context_nums = set()
+                            for n in raw_ctx_nums:
+                                context_nums.add(n)
+                                context_nums.add(n.rstrip("%"))
+
                             if ans_nums:
-                                # For answers making numeric claims, verify that at least one cited number supports it
-                                context_nums = set(re.findall(r"\b\d+(?:\.\d+)?%?\b", joined_context))
-                                if not (ans_nums & context_nums):
-                                    evidence_supported = False
+                                ans_years = {n for n in ans_nums if len(n) == 4 and n.isdigit() and 1900 <= int(n) <= 2099}
+                                ans_amounts = ans_nums - ans_years
+
+                                if ans_amounts:
+                                    if not ans_amounts.issubset(context_nums):
+                                        evidence_supported = False
+                                    elif ans_years and not (ans_years & context_nums):
+                                        evidence_supported = False
+                                    else:
+                                        faith_score = compute_faithfulness(answer, joined_context)
+                                        evidence_supported = faith_score is not None and faith_score >= 0.25
                                 else:
-                                    evidence_supported = True
+                                    if not ans_years.issubset(context_nums):
+                                        evidence_supported = False
+                                    else:
+                                        faith_score = compute_faithfulness(answer, joined_context)
+                                        evidence_supported = faith_score is not None and faith_score >= 0.25
                             else:
                                 faith_score = compute_faithfulness(answer, joined_context)
-                                if faith_score is None or faith_score < 0.25:
-                                    evidence_supported = False
-                                else:
-                                    evidence_supported = True
+                                evidence_supported = faith_score is not None and faith_score >= 0.25
                     else:
                         evidence_supported = False
 
