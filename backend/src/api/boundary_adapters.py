@@ -231,13 +231,14 @@ class ProductionExecutionEngine:
 
 
         raw_usage = res.get("token_usage")
-        telemetry = res.get("telemetry") or {}
+        telemetry = res.get("telemetry") if isinstance(res.get("telemetry"), dict) else {}
         generation_calls = res.get("generation_calls") if "generation_calls" in res else telemetry.get("generation_calls")
+        has_gen_telemetry = generation_calls is not None
+
         is_deterministic_exec = (
             res.get("structured_aggregate") is True
             or res.get("is_deterministic") is True
             or res.get("execution_type") == "deterministic"
-            or is_aggregate
         )
 
         usage_dict = None
@@ -246,7 +247,7 @@ class ProductionExecutionEngine:
                 "input_tokens": int(raw_usage.get("input_tokens") or raw_usage.get("prompt_tokens") or 0),
                 "output_tokens": int(raw_usage.get("output_tokens") or raw_usage.get("completion_tokens") or 0),
             }
-        elif is_deterministic_exec and (generation_calls == 0 or generation_calls is None):
+        elif is_deterministic_exec and has_gen_telemetry and generation_calls == 0:
             usage_dict = {"input_tokens": 0, "output_tokens": 0}
         else:
             usage_dict = None
@@ -259,6 +260,8 @@ class ProductionExecutionEngine:
             surviving_source_ids=tuple(surviving),
             tombstoned_source_ids=tuple(tombstoned),
             token_usage=usage_dict,
+            execution_type="deterministic" if is_deterministic_exec else res.get("execution_type"),
+            generation_calls=generation_calls,
         )
 
 class RedisCacheAdapter:

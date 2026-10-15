@@ -20,19 +20,20 @@ Specification 0003 remains Proposed and deferred.
 
 ## Working Tree State and Key Additions
 
-* [backend/src/schemas/contracts/boundary.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/schemas/contracts/boundary.py): Added `DocumentSnapshot` and `BenchmarkRunMetadata` models, declared `token_usage` on `QueryExecutionOutcome`, and documented counting units.
-* [backend/src/api/boundary_adapters.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/api/boundary_adapters.py): Traced observed token usage from `query_service` into `QueryExecutionOutcome.token_usage` without undeclared fields, and implemented `execute_query` delegation.
+* [backend/src/schemas/contracts/boundary.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/schemas/contracts/boundary.py): Added `DocumentSnapshot` and `BenchmarkRunMetadata` models, declared `token_usage`, `execution_type`, and `generation_calls` on `QueryExecutionOutcome`, and documented counting units.
+* [backend/src/api/boundary_adapters.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/api/boundary_adapters.py): Traced observed token usage and execution telemetry from `query_service` into `QueryExecutionOutcome` without undeclared fields, removed query keyword assumptions from deterministic zero token evaluation, preserved missing generation telemetry as unknown, and implemented `execute_query` delegation.
 * [backend/src/db/workspace_boundary_repo.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/db/workspace_boundary_repo.py): Added snapshot and benchmark metadata CRUD across SQLite, in memory, and DynamoDB repository implementations.
 * [backend/src/services/benchmark/artifact_store.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/services/benchmark/artifact_store.py): Implemented `S3BenchmarkArtifactStore` uploading full versioned JSON benchmark reports.
 * [backend/src/services/benchmark/persistence_service.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/services/benchmark/persistence_service.py): Implemented `BenchmarkPersistenceService` ensuring recoverable write sequencing (S3 first, then DynamoDB).
 * [backend/src/services/benchmark/benchmark_runner.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/services/benchmark/benchmark_runner.py): Implemented `BenchmarkRunner` with adversarial scoring protection:
   * Infrastructure ERROR must fail partial coverage correctness and coverage scoring; credit is given only to agreed explicit coverage refusal.
   * Claim support is validated using existing evidence verification (`compute_faithfulness` and numeric grounding); matching citation identifiers alone do not earn support credit.
-  * Numeric evidence acceptance replaces any number overlap; all claimed metric amounts must be grounded in cited evidence, and matching years with contradicting amounts fail evidence support while preserving deterministic aggregate evidence handling.
+  * Numeric evidence acceptance replaces any number overlap; all claimed metric amounts must be grounded in cited evidence, and matching years with contradicting amounts fail evidence support.
+  * Removed unconditional aggregate evidence support credit: validates answers against deterministic execution results using the structured evidence contract; contradictory aggregate answers with valid table citations fail evidence support while correct computed results pass.
   * Complete dataset aggregates pass coverage scoring; incomplete dataset complete claims fail coverage scoring.
-  * Token accounting traces provider tokens when available, prefers observed usage over query type assumptions, preserves absent token usage as unavailable rather than synthesized zero, reports zero only when execution telemetry establishes no model use, and explicitly distinguishes estimated vs unavailable tokens.
+  * Token accounting traces provider tokens when available, prefers observed usage over query type or query keyword assumptions, preserves absent token usage and absent generation telemetry as unavailable rather than synthesized zero, reports zero only when execution telemetry explicitly establishes zero model generation (`generation_calls == 0`), and explicitly distinguishes estimated vs unavailable tokens.
 * [backend/src/providers/llm_provider.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/providers/llm_provider.py): Explicit generic test double extracting grounded context excerpts without domain or PDF-specific logic.
-* [backend/tests/test_benchmark_runner_and_persistence_0004.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/tests/test_benchmark_runner_and_persistence_0004.py): 16 unit and integration tests covering S3 artifact storage, DynamoDB persistence, recoverable write ordering, orphan S3 tolerance, token tracing without undeclared fields, contradicting numeric amount failure, absent token preservation, and focused adversarial scoring regression cases.
+* [backend/tests/test_benchmark_runner_and_persistence_0004.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/tests/test_benchmark_runner_and_persistence_0004.py): 16 unit and integration tests covering S3 artifact storage, DynamoDB persistence, recoverable write ordering, orphan S3 tolerance, token tracing without undeclared fields, contradicting numeric amount failure, contradictory aggregate answer failure, aggregate query with missing usage and missing telemetry remaining unavailable, absent token preservation, and focused adversarial scoring regression cases.
 * [backend/tests/test_pdf_retrieval_slice_0004.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/tests/test_pdf_retrieval_slice_0004.py): PDF verification labeled as mocked generation verifying pipeline grounding and DocumentLocation citations through generic test double.
 * [verify_0004_live.py](file:///home/swyra/projects/knowledge-retrieval-engine/verify_0004_live.py): 17 live HTTP integration checks driving real workspace creation, 250 row calculation, boundary denial, tombstoning, and factual PDF extraction against the running FastAPI service.
 
@@ -45,12 +46,13 @@ Specification 0003 remains Proposed and deferred.
 
 ## Checks Run and Verification Evidence
 
+* Tested State: Working tree on branch `re-factor`, base commit `f509028`
 * Full 0004 Test Suite:
   * Command: `uv run pytest tests/test_csv_vertical_slice_0004.py tests/test_pdf_retrieval_slice_0004.py tests/test_structured_query_service.py tests/test_fix1_async_ingestion.py tests/test_dynamodb_boundary_and_execution.py tests/test_benchmark_runner_and_persistence_0004.py`
-  * Outcome: 44 passed, 0 failed in 24.25s.
+  * Outcome: 44 passed, 0 failed in 22.24s.
 * Full Repository Test Suite:
   * Command: `uv run pytest`
-  * Outcome: 362 passed, 0 failed, 3 skipped in 192.11s.
+  * Outcome: 364 passed, 0 failed, 3 skipped in 70.21s.
 * Live FastAPI Integration Verification:
   * Command: `uv run --project backend python verify_0004_live.py`
   * Outcome: All behaviors passed (17 of 17).
@@ -58,7 +60,6 @@ Specification 0003 remains Proposed and deferred.
   * Model: `gemini-2.5-pro` (author on `gemini 3.8 flash`)
   * Scope: 33 changed files across branch `re-factor` vs `main`
   * Verdict: Approve with nits (0 blockers, 0 majors, 0 minors, 2 nits resolved)
-
   * Report: [docs/reviews/2026-10-15-re-factor.md](file:///home/swyra/projects/knowledge-retrieval-engine/docs/reviews/2026-10-15-re-factor.md)
 
 ## Preserved Status and Deferred Work

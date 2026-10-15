@@ -741,6 +741,9 @@ def test_adversarial_token_accounting_and_provenance_distinction():
         ),
         surviving_source_ids=("src_math_csv",),
         tombstoned_source_ids=(),
+        token_usage={"input_tokens": 0, "output_tokens": 0},
+        execution_type="deterministic",
+        generation_calls=0,
     )
 
     # Query 3: Text query where provider token usage is unavailable and estimation is disabled
@@ -1186,6 +1189,25 @@ def test_adversarial_year_matches_but_claimed_amount_contradicts_evidence():
         tombstoned_source_ids=(),
     )
 
+    # Subcase D: Contradictory deterministic aggregate answer with valid table citation
+    # Must FAIL evidence support; unconditional table citation credit must not be granted
+    responses["q_contradictory_deterministic_aggregate"] = QueryExecutionOutcome(
+        execution_id="exec_det_contradict",
+        status="SUCCESS",
+        answer="The total operating revenue is 999999.",
+        citations=(
+            CitationItem(
+                evidence_id="ev_table_agg_contradict",
+                source_id="src_financials_csv",
+                location=TableLocation(table_id="financials_data", row_id="aggregated_rows"),
+                snippet="Aggregated 250 rows from financials_data: sum=154200",
+                source_version=1,
+            ),
+        ),
+        surviving_source_ids=("src_financials_csv",),
+        tombstoned_source_ids=(),
+    )
+
     test_cases = [
         BenchmarkTestCase(
             query_id="tc_contradicting_amount",
@@ -1208,6 +1230,13 @@ def test_adversarial_year_matches_but_claimed_amount_contradicts_evidence():
             expected_source_version=1,
             query_type="tabular_aggregate",
         ),
+        BenchmarkTestCase(
+            query_id="tc_contradictory_deterministic_aggregate",
+            query="q_contradictory_deterministic_aggregate",
+            expected_source_id="src_financials_csv",
+            expected_source_version=1,
+            query_type="tabular_aggregate",
+        ),
     ]
 
     report = runner.run_suite(workspace_id="ws_adv_numeric", test_cases=test_cases)
@@ -1219,8 +1248,11 @@ def test_adversarial_year_matches_but_claimed_amount_contradicts_evidence():
     # Supported amount PASSES
     assert queries["tc_supported_amount"]["evidence_supported"] is True
 
-    # Valid deterministic aggregate evidence handling is preserved
+    # Valid deterministic aggregate with correct computed result PASSES
     assert queries["tc_valid_deterministic_aggregate"]["evidence_supported"] is True
+
+    # Contradictory deterministic aggregate with valid table citation MUST FAIL evidence support
+    assert queries["tc_contradictory_deterministic_aggregate"]["evidence_supported"] is False
 
 
 def test_adapter_to_runner_token_usage_regressions_missing_observed_zero_and_provider_reported():
@@ -1350,3 +1382,47 @@ def test_adapter_to_runner_token_usage_regressions_missing_observed_zero_and_pro
     assert q_provider["prompt_tokens"] == 310
     assert q_provider["completion_tokens"] == 125
     assert q_provider["is_estimated_tokens"] is False
+
+    # 4. Aggregate case with missing usage AND missing telemetry:
+    # Query is an aggregate (query_type="tabular_aggregate", structured_aggregate=True,
+    # or query containing "sum"), but usage is absent (None) and generation telemetry is absent (None).
+    # Missing generation telemetry must remain unknown; it MUST NOT report deterministic_zero.
+    mock_query_svc.execute_query.return_value = {
+        "answer": "The sum for amount is 4200.",
+        "citations": [
+            {
+                "evidence_id": "ev_table_agg_missing",
+                "table_id": "tbl_metrics",
+                "document_version": 1,
+                "text": "The sum for amount is 4200.",
+                "evidence_type": "structured_aggregate",
+            }
+        ],
+        "status": "success",
+        "structured_aggregate": True,
+        # token_usage omitted (None)
+        # telemetry omitted / generation_calls omitted (None)
+        "document_ids": ["tbl_metrics"],
+    }
+
+    outcome_agg_missing = engine.execute_query(workspace_id="ws_adapter_tokens", query_text="What is sum of amount?")
+    assert outcome_agg_missing.token_usage is None
+    assert outcome_agg_missing.generation_calls is None
+
+    runner_agg_missing = BenchmarkRunner(
+        query_executor=lambda q, ws: outcome_agg_missing,
+        persistence_service=mock_persistence,
+    )
+    case_agg_missing = BenchmarkTestCase(
+        query_id="tc_agg_missing_telemetry",
+        query="What is sum of amount?",
+        query_type="tabular_aggregate",
+        allow_token_estimation=False,
+    )
+    report_agg_missing = runner_agg_missing.run_suite(workspace_id="ws_adapter_tokens", test_cases=[case_agg_missing])
+    q_agg_missing = report_agg_missing.detailed_artifact["queries"][0]
+    # MUST NOT report deterministic_zero
+    assert q_agg_missing["token_usage_source"] != "deterministic_zero"
+    assert q_agg_missing["token_usage_source"] == "unavailable"
+    assert q_agg_missing["prompt_tokens"] == 0
+    assert q_agg_missing["completion_tokens"] == 0

@@ -319,6 +319,8 @@ class QueryExecutionOutcome(BaseModel):
     surviving_source_ids: tuple[str, ...]
     tombstoned_source_ids: tuple[str, ...]
     token_usage: dict[str, int] | None = None
+    execution_type: str | None = None
+    generation_calls: int | None = None
 
 
 class ErrorEnvelope(BaseModel):

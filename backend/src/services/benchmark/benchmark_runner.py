@@ -103,13 +103,30 @@ class BenchmarkRunner:
         self.query_executor = query_executor
         self.persistence_service = persistence_service or BenchmarkPersistenceService()
 
+    @staticmethod
+    def _extract_numbers_normalized(text: str) -> set[str]:
+        raw_nums = re.findall(r"\b\d+(?:\.\d+)?%?\b", text)
+        nums = set()
+        for n in raw_nums:
+            nums.add(n)
+            clean = n.rstrip("%")
+            nums.add(clean)
+            try:
+                f = float(clean)
+                if f.is_integer():
+                    nums.add(str(int(f)))
+                else:
+                    nums.add(str(f))
+            except ValueError:
+                pass
+        return nums
+
     def _default_executor(self, query_text: str, workspace_id: str) -> Any:
         from src.api.boundary_adapters import ProductionExecutionEngine
         engine = ProductionExecutionEngine()
         return engine.execute_query(
             workspace_id=workspace_id,
             query_text=query_text,
-            is_aggregate=any(k in query_text.lower() for k in ("earliest", "latest", "sum", "average", "total", "count", "min", "max")),
         )
 
     def run_suite(
@@ -203,22 +220,39 @@ class BenchmarkRunner:
                 obs_prompt = getattr(outcome, "prompt_tokens")
                 obs_comp = getattr(outcome, "completion_tokens", 0)
 
-            # Check if execution telemetry establishes no model use
-            telemetry_establishes_zero = (
+            # Check if execution telemetry establishes no model use.
+            # Missing generation telemetry must remain unknown.
+            # Do NOT infer zero from query-type, keywords, or aggregate flags without generation telemetry.
+            telemetry_dict = (
+                getattr(outcome, "telemetry", None)
+                or (outcome.get("telemetry") if isinstance(outcome, dict) else None)
+                or {}
+            )
+            generation_calls = (
+                getattr(outcome, "generation_calls", None)
+                if hasattr(outcome, "generation_calls")
+                else None
+            )
+            if generation_calls is None and isinstance(outcome, dict) and "generation_calls" in outcome:
+                generation_calls = outcome["generation_calls"]
+            if generation_calls is None and isinstance(telemetry_dict, dict) and "generation_calls" in telemetry_dict:
+                generation_calls = telemetry_dict["generation_calls"]
+
+            is_exec_deterministic = (
                 getattr(outcome, "execution_type", "") == "deterministic"
                 or (isinstance(outcome, dict) and outcome.get("execution_type") == "deterministic")
                 or getattr(outcome, "is_deterministic", False)
                 or (isinstance(outcome, dict) and outcome.get("is_deterministic", False))
-                or case.query_type == "tabular_aggregate"
-                or (
-                    tok_dict is not None
-                    and obs_prompt == 0
-                    and obs_comp == 0
-                    and (
-                        getattr(outcome, "structured_aggregate", False)
-                        or (isinstance(outcome, dict) and outcome.get("structured_aggregate", False))
-                        or (isinstance(outcome, dict) and outcome.get("telemetry", {}).get("generation_calls") == 0)
-                    )
+                or getattr(outcome, "structured_aggregate", False)
+                or (isinstance(outcome, dict) and outcome.get("structured_aggregate", False))
+            )
+
+            telemetry_establishes_zero = (
+                generation_calls is not None
+                and generation_calls == 0
+                and (
+                    is_exec_deterministic
+                    or (tok_dict is not None and obs_prompt == 0 and obs_comp == 0)
                 )
             )
 
@@ -392,37 +426,97 @@ class BenchmarkRunner:
                         ]
                         joined_context = " ".join(s for s in context_snippets if s).strip()
                         has_table_citation = any(
-                            isinstance(c.get("location"), (TableLocation, dict))
-                            and (c.get("table_id") or (isinstance(c.get("location"), dict) and "table_id" in c["location"]))
+                            (
+                                isinstance(c.get("location"), TableLocation)
+                                or (isinstance(c.get("location"), dict) and c.get("location").get("type") == "table")
+                                or (isinstance(c.get("location"), dict) and "table_id" in c["location"])
+                                or c.get("table_id") is not None
+                                or c.get("source_format") in ("csv", "xlsx", "table")
+                                or c.get("evidence_type") == "structured_aggregate"
+                            )
                             for c in serialized_citations
-                        ) or any(c.get("source_format") in ("csv", "xlsx", "table") for c in serialized_citations)
+                        )
 
-                        # Preserve valid deterministic aggregate evidence handling
-                        if case.query_type == "tabular_aggregate" or getattr(outcome, "is_deterministic", False) or (isinstance(outcome, dict) and outcome.get("execution_type") == "deterministic"):
-                            evidence_supported = bool(joined_context or has_table_citation)
+                        is_tabular_aggregate = (
+                            case.query_type == "tabular_aggregate"
+                            or getattr(outcome, "is_deterministic", False)
+                            or (isinstance(outcome, dict) and outcome.get("execution_type") == "deterministic")
+                            or (isinstance(outcome, dict) and outcome.get("structured_aggregate") is True)
+                            or getattr(outcome, "structured_aggregate", False)
+                            or has_table_citation
+                        )
+
+                        # Extract numbers from structured evidence contract
+                        context_nums = set()
+                        for c in serialized_citations:
+                            snip = str(c.get("snippet") or c.get("text") or c.get("text_snippet") or "").strip()
+                            if snip:
+                                context_nums.update(self._extract_numbers_normalized(snip))
+
+                            # Structured evidence contract: payload or result_value
+                            sp = c.get("structured_payload") or c.get("structured_execution_result")
+                            if isinstance(sp, dict):
+                                for k in ("result_value", "secondary_value", "selection_count", "total_rows_in_table"):
+                                    val = sp.get(k)
+                                    if val is not None:
+                                        context_nums.update(self._extract_numbers_normalized(str(val)))
+                            for k in ("result_value", "secondary_value"):
+                                if c.get(k) is not None:
+                                    context_nums.update(self._extract_numbers_normalized(str(c[k])))
+
+                        if isinstance(outcome, dict):
+                            for k in ("result_value", "secondary_value"):
+                                if outcome.get(k) is not None:
+                                    context_nums.update(self._extract_numbers_normalized(str(outcome[k])))
+                            sp = outcome.get("structured_payload") or outcome.get("structured_execution_result")
+                            if isinstance(sp, dict):
+                                for k in ("result_value", "secondary_value"):
+                                    if sp.get(k) is not None:
+                                        context_nums.update(self._extract_numbers_normalized(str(sp[k])))
+                        else:
+                            for k in ("result_value", "secondary_value"):
+                                val = getattr(outcome, k, None)
+                                if val is not None:
+                                    context_nums.update(self._extract_numbers_normalized(str(val)))
+
+                        ans_nums = self._extract_numbers_normalized(answer)
+                        ans_years = {n for n in ans_nums if len(n) == 4 and n.isdigit() and 1900 <= int(n) <= 2099}
+                        ans_amounts = ans_nums - ans_years
+
+                        if is_tabular_aggregate:
+                            # 2. Validate the answer against the deterministic execution result
+                            # using the existing structured evidence contract.
+                            # Unconditional aggregate evidence-support credit is removed:
+                            # a contradictory aggregate answer with a valid table citation must fail,
+                            # and the correct computed result must pass.
+                            if not has_table_citation and not joined_context:
+                                evidence_supported = False
+                            elif ans_nums:
+                                if ans_amounts:
+                                    if not ans_amounts.issubset(context_nums):
+                                        evidence_supported = False
+                                    elif ans_years and not (ans_years & context_nums):
+                                        evidence_supported = False
+                                    else:
+                                        evidence_supported = True
+                                else:
+                                    # Only year numbers claimed
+                                    if not (ans_years & context_nums):
+                                        evidence_supported = False
+                                    else:
+                                        evidence_supported = True
+                            elif not context_nums and joined_context:
+                                # Non-numeric structured result; verify faithfulness
+                                faith_score = compute_faithfulness(answer, joined_context)
+                                evidence_supported = faith_score is not None and faith_score >= 0.25
+                            else:
+                                # Contradictory or missing numeric claim on structured aggregate
+                                evidence_supported = False
                         elif not joined_context:
                             evidence_supported = False
                         else:
-                            # Replace numeric evidence acceptance based on any-number overlap.
-                            # All claimed metric amounts must be grounded in the cited evidence.
-                            # A matching year with a contradicting amount MUST fail evidence support.
-                            raw_ans_nums = re.findall(r"\b\d+(?:\.\d+)?%?\b", answer)
-                            raw_ctx_nums = re.findall(r"\b\d+(?:\.\d+)?%?\b", joined_context)
-
-                            ans_nums = set()
-                            for n in raw_ans_nums:
-                                ans_nums.add(n)
-                                ans_nums.add(n.rstrip("%"))
-
-                            context_nums = set()
-                            for n in raw_ctx_nums:
-                                context_nums.add(n)
-                                context_nums.add(n.rstrip("%"))
-
+                            # Non-aggregate text queries
                             if ans_nums:
-                                ans_years = {n for n in ans_nums if len(n) == 4 and n.isdigit() and 1900 <= int(n) <= 2099}
-                                ans_amounts = ans_nums - ans_years
-
                                 if ans_amounts:
                                     if not ans_amounts.issubset(context_nums):
                                         evidence_supported = False
@@ -432,7 +526,7 @@ class BenchmarkRunner:
                                         faith_score = compute_faithfulness(answer, joined_context)
                                         evidence_supported = faith_score is not None and faith_score >= 0.25
                                 else:
-                                    if not ans_years.issubset(context_nums):
+                                    if not (ans_years & context_nums):
                                         evidence_supported = False
                                     else:
                                         faith_score = compute_faithfulness(answer, joined_context)
