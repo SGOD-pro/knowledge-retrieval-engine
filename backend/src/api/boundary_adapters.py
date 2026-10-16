@@ -207,6 +207,11 @@ class ProductionExecutionEngine:
                         element_id=c.get("chunk_id"),
                     )
 
+                sp = c.get("structured_payload") or c.get("structured_execution_result")
+                res_val = c.get("result_value") or (sp.get("result_value") if isinstance(sp, dict) else None)
+                sec_val = c.get("secondary_value") or (sp.get("secondary_value") if isinstance(sp, dict) else None)
+                op_val = c.get("operator") or (sp.get("operator") if isinstance(sp, dict) else None)
+
                 citation_items.append(
                     CitationItem(
                         evidence_id=ev_id,
@@ -214,6 +219,10 @@ class ProductionExecutionEngine:
                         source_version=s_ver,
                         snippet=snippet,
                         location=loc,
+                        structured_payload=sp if isinstance(sp, dict) else None,
+                        result_value=str(res_val) if res_val is not None else None,
+                        secondary_value=str(sec_val) if sec_val is not None else None,
+                        operator=str(op_val) if op_val is not None else None,
                     )
                 )
             except Exception as cit_err:
@@ -252,6 +261,11 @@ class ProductionExecutionEngine:
         else:
             usage_dict = None
 
+        outcome_sp = res.get("structured_payload") or res.get("structured_execution_result")
+        outcome_res_val = res.get("result_value") or (outcome_sp.get("result_value") if isinstance(outcome_sp, dict) else None)
+        outcome_sec_val = res.get("secondary_value") or (outcome_sp.get("secondary_value") if isinstance(outcome_sp, dict) else None)
+        outcome_op = res.get("operator") or (outcome_sp.get("operator") if isinstance(outcome_sp, dict) else None)
+
         return QueryExecutionOutcome(
             execution_id="exec_" + workspace_id,
             status=status,
@@ -262,6 +276,10 @@ class ProductionExecutionEngine:
             token_usage=usage_dict,
             execution_type="deterministic" if is_deterministic_exec else res.get("execution_type"),
             generation_calls=generation_calls,
+            result_value=str(outcome_res_val) if outcome_res_val is not None else None,
+            secondary_value=str(outcome_sec_val) if outcome_sec_val is not None else None,
+            operator=str(outcome_op) if outcome_op is not None else None,
+            structured_payload=outcome_sp if isinstance(outcome_sp, dict) else None,
         )
 
 class RedisCacheAdapter:

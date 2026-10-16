@@ -72,7 +72,15 @@ large_csv = b"\n".join(large_lines) + b"\n"
 files_large = {"files": ("large_series.csv", io.BytesIO(large_csv), "text/csv")}
 r4_upload = requests.post(f"{BASE_URL}/workspaces/{ws_id}/documents", files=files_large, headers=ALICE_HEADERS)
 record("Ingest large CSV (250 rows) beyond 99-row batch size", f"POST /workspaces/{ws_id}/documents", r4_upload, r4_upload.status_code == 201)
-time.sleep(1.5)  # Allow 250 rows to ingest and persist
+large_doc_id = r4_upload.json()["items"][0]["id"]
+for _ in range(20):
+    time.sleep(0.5)
+    r_chk = requests.get(f"{BASE_URL}/workspaces/{ws_id}/documents", headers=ALICE_HEADERS)
+    if r_chk.status_code == 200:
+        docs_list = r_chk.json().get("documents", [])
+        matched = [d for d in docs_list if d.get("id") == large_doc_id]
+        if matched and matched[0].get("status") in ("Ready", "Failed"):
+            break
 
 # Query aggregate over 250 rows
 r4_query = requests.post(

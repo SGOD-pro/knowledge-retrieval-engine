@@ -17,6 +17,7 @@ FastAPI service providing parsing, structural indexing, retrieval orchestration,
 | `src/db/database.py` | Database access repository for DynamoDB and related data stores |
 | `src/db/workspace_boundary_repo.py` | Workspace boundary repository for DynamoDB, SQLite, and memory stores |
 | `src/schemas/contracts/` | Shared frozen Pydantic contracts and identity envelopes |
+| `src/services/benchmark/` | Benchmark runner, S3 artifact store, and recoverable metric persistence |
 
 ## Commands
 ```bash
@@ -48,6 +49,7 @@ uv run pytest tests/test_contracts_and_identity.py
 ## Related specs
 * [docs/specs/0001-contracts-and-identity-envelope.md](../docs/specs/0001-contracts-and-identity-envelope.md)
 * [docs/specs/0002-workspace-authorization-and-boundary-isolation.md](../docs/specs/0002-workspace-authorization-and-boundary-isolation.md)
+* [docs/specs/0004-core-engine-walking-skeleton.md](../docs/specs/0004-core-engine-walking-skeleton.md)
 * [docs/TECHNICAL_SPEC.md](../docs/TECHNICAL_SPEC.md)
 * [docs/ARCHITECTURE.md](../docs/ARCHITECTURE.md)
 * [docs/REQUIREMENTS.md](../docs/REQUIREMENTS.md)

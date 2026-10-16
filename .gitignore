@@ -20,4 +20,6 @@ tmp/
 backend/tmp/
 backend/reports/
 *.log
+*.db-wal
+*.db-shm
 .agents

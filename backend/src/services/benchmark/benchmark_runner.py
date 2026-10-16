@@ -105,7 +105,8 @@ class BenchmarkRunner:
 
     @staticmethod
     def _extract_numbers_normalized(text: str) -> set[str]:
-        raw_nums = re.findall(r"\b\d+(?:\.\d+)?%?\b", text)
+        cleaned = re.sub(r"(?<=\d),(?=\d)", "", text)
+        raw_nums = re.findall(r"\b\d+(?:\.\d+)?%?\b", cleaned)
         nums = set()
         for n in raw_nums:
             nums.add(n)
@@ -446,71 +447,143 @@ class BenchmarkRunner:
                             or has_table_citation
                         )
 
-                        # Extract numbers from structured evidence contract
+                        # Extract operation-specific computed results and metadata from structured evidence contracts.
+                        # Validate the claimed aggregate against its operation-specific computed result.
+                        # Do not treat selection_count, total_rows, years, or unrelated snippet numbers
+                        # as interchangeable with result_value.
+                        # Preserve valid count and min/max results using their corresponding computed values.
+                        operators = set()
+                        computed_results = set()
+                        metadata_counts = set()
                         context_nums = set()
-                        for c in serialized_citations:
-                            snip = str(c.get("snippet") or c.get("text") or c.get("text_snippet") or "").strip()
-                            if snip:
-                                context_nums.update(self._extract_numbers_normalized(snip))
 
-                            # Structured evidence contract: payload or result_value
+                        def _inspect_dict(d: dict):
+                            op = d.get("operator") or d.get("operation")
+                            if op:
+                                operators.add(str(op).lower())
+                            rv = d.get("result_value")
+                            if rv is not None:
+                                computed_results.update(self._extract_numbers_normalized(str(rv)))
+                            sv = d.get("secondary_value")
+                            if sv is not None:
+                                computed_results.update(self._extract_numbers_normalized(str(sv)))
+                            sc = d.get("selection_count") or d.get("records_matched")
+                            if sc is not None:
+                                metadata_counts.update(self._extract_numbers_normalized(str(sc)))
+                            tr = d.get("total_rows_in_table") or d.get("total_rows") or d.get("records_examined")
+                            if tr is not None:
+                                metadata_counts.update(self._extract_numbers_normalized(str(tr)))
+
+                        # 1. Inspect outcome
+                        if isinstance(outcome, dict):
+                            _inspect_dict(outcome)
+                            for k in ("structured_payload", "structured_execution_result", "execution_result"):
+                                sp = outcome.get(k)
+                                if isinstance(sp, dict):
+                                    _inspect_dict(sp)
+                                elif sp is not None and hasattr(sp, "__dict__"):
+                                    _inspect_dict(vars(sp))
+                        else:
+                            op = getattr(outcome, "operator", None) or getattr(outcome, "operation", None)
+                            if op:
+                                operators.add(str(op).lower())
+                            rv = getattr(outcome, "result_value", None)
+                            if rv is not None:
+                                computed_results.update(self._extract_numbers_normalized(str(rv)))
+                            sv = getattr(outcome, "secondary_value", None)
+                            if sv is not None:
+                                computed_results.update(self._extract_numbers_normalized(str(sv)))
+                            for k in ("structured_payload", "structured_execution_result", "execution_result"):
+                                sp = getattr(outcome, k, None)
+                                if isinstance(sp, dict):
+                                    _inspect_dict(sp)
+                                elif sp is not None and hasattr(sp, "__dict__"):
+                                    _inspect_dict(vars(sp))
+
+                        # 2. Inspect citations
+                        for c in serialized_citations:
+                            _inspect_dict(c)
                             sp = c.get("structured_payload") or c.get("structured_execution_result")
                             if isinstance(sp, dict):
-                                for k in ("result_value", "secondary_value", "selection_count", "total_rows_in_table"):
-                                    val = sp.get(k)
-                                    if val is not None:
-                                        context_nums.update(self._extract_numbers_normalized(str(val)))
-                            for k in ("result_value", "secondary_value"):
-                                if c.get(k) is not None:
-                                    context_nums.update(self._extract_numbers_normalized(str(c[k])))
+                                _inspect_dict(sp)
+                            elif sp is not None and hasattr(sp, "__dict__"):
+                                _inspect_dict(vars(sp))
 
-                        if isinstance(outcome, dict):
-                            for k in ("result_value", "secondary_value"):
-                                if outcome.get(k) is not None:
-                                    context_nums.update(self._extract_numbers_normalized(str(outcome[k])))
-                            sp = outcome.get("structured_payload") or outcome.get("structured_execution_result")
-                            if isinstance(sp, dict):
-                                for k in ("result_value", "secondary_value"):
-                                    if sp.get(k) is not None:
-                                        context_nums.update(self._extract_numbers_normalized(str(sp[k])))
+                            snip = str(c.get("snippet") or c.get("text") or c.get("text_snippet") or "").strip()
+                            if snip:
+                                s_nums = self._extract_numbers_normalized(snip)
+                                context_nums.update(s_nums)
+
+                                for m in re.finditer(r"\b(?:result_value)\s*[:=]\s*([0-9]+(?:\.[0-9]+)?%?)", snip, re.I):
+                                    computed_results.update(self._extract_numbers_normalized(m.group(1)))
+                                for m in re.finditer(r"\b(?:sum|avg|average|min|max|count)\s+result_value\s*[:=]\s*([0-9]+(?:\.[0-9]+)?%?)", snip, re.I):
+                                    computed_results.update(self._extract_numbers_normalized(m.group(1)))
+                                for m in re.finditer(r"\b(?:sum|avg|average|min|max|count|total\s+sum)\s*[:=]\s*([0-9]+(?:\.[0-9]+)?%?)", snip, re.I):
+                                    computed_results.update(self._extract_numbers_normalized(m.group(1)))
+                                for m in re.finditer(r"\bselection_count\s*[:=]\s*(\d+)", snip, re.I):
+                                    metadata_counts.update(self._extract_numbers_normalized(m.group(1)))
+                                for m in re.finditer(r"\btotal_rows(?:_in_table)?\s*[:=]\s*(\d+)", snip, re.I):
+                                    metadata_counts.update(self._extract_numbers_normalized(m.group(1)))
+                                for m in re.finditer(r"\b(?:aggregated|examined|matched)\s*(\d+)\s*rows?\b", snip, re.I):
+                                    metadata_counts.update(self._extract_numbers_normalized(m.group(1)))
+                                for op_name in ("sum", "count", "min", "max", "avg", "average", "range", "compare"):
+                                    if re.search(rf"\b{op_name}\b", snip, re.I):
+                                        operators.add(op_name)
+
+                        is_count_op = (
+                            "count" in operators
+                            or (case.query and "how many" in case.query.lower())
+                            or (case.query and bool(re.search(r"\bcount\b", case.query.lower())))
+                        )
+
+                        if is_count_op:
+                            # For count operations, row count is the computed result value
+                            if not computed_results and metadata_counts:
+                                computed_results.update(metadata_counts)
                         else:
-                            for k in ("result_value", "secondary_value"):
-                                val = getattr(outcome, k, None)
-                                if val is not None:
-                                    context_nums.update(self._extract_numbers_normalized(str(val)))
+                            # For sum, avg, min, max, range, etc.
+                            # selection_count and total_rows are metadata and NOT interchangeable with result_value
+                            computed_results = computed_results - metadata_counts
+
+                        if not computed_results:
+                            computed_results = context_nums - metadata_counts
 
                         ans_nums = self._extract_numbers_normalized(answer)
                         ans_years = {n for n in ans_nums if len(n) == 4 and n.isdigit() and 1900 <= int(n) <= 2099}
                         ans_amounts = ans_nums - ans_years
 
                         if is_tabular_aggregate:
-                            # 2. Validate the answer against the deterministic execution result
-                            # using the existing structured evidence contract.
-                            # Unconditional aggregate evidence-support credit is removed:
-                            # a contradictory aggregate answer with a valid table citation must fail,
-                            # and the correct computed result must pass.
+                            # Validate the answer against the operation-specific computed result
+                            # using the structured evidence contract.
                             if not has_table_citation and not joined_context:
                                 evidence_supported = False
-                            elif ans_nums:
-                                if ans_amounts:
-                                    if not ans_amounts.issubset(context_nums):
-                                        evidence_supported = False
-                                    elif ans_years and not (ans_years & context_nums):
-                                        evidence_supported = False
-                                    else:
-                                        evidence_supported = True
+                            elif not ans_nums:
+                                if joined_context:
+                                    faith_score = compute_faithfulness(answer, joined_context)
+                                    evidence_supported = faith_score is not None and faith_score >= 0.25
                                 else:
-                                    # Only year numbers claimed
-                                    if not (ans_years & context_nums):
-                                        evidence_supported = False
+                                    evidence_supported = False
+                            elif computed_results:
+                                # The answer must assert the operation-specific computed result.
+                                # Do not treat selection_count, total_rows, years, or unrelated snippet numbers
+                                # as interchangeable with result_value.
+                                if not (ans_nums & computed_results):
+                                    evidence_supported = False
+                                else:
+                                    if ans_amounts:
+                                        if not (ans_amounts & computed_results):
+                                            evidence_supported = False
+                                        elif not ans_amounts.issubset(computed_results | context_nums | metadata_counts):
+                                            evidence_supported = False
+                                        else:
+                                            evidence_supported = True
                                     else:
-                                        evidence_supported = True
-                            elif not context_nums and joined_context:
-                                # Non-numeric structured result; verify faithfulness
-                                faith_score = compute_faithfulness(answer, joined_context)
-                                evidence_supported = faith_score is not None and faith_score >= 0.25
+                                        # Only year numbers claimed (e.g. min/max year range)
+                                        if not (ans_years & (computed_results | context_nums)):
+                                            evidence_supported = False
+                                        else:
+                                            evidence_supported = True
                             else:
-                                # Contradictory or missing numeric claim on structured aggregate
                                 evidence_supported = False
                         elif not joined_context:
                             evidence_supported = False

@@ -214,6 +214,10 @@ class CitationItem(BaseModel):
     source_version: int = Field(..., ge=1)
     snippet: str = Field(..., max_length=2048)
     location: Location
+    structured_payload: dict[str, Any] | None = None
+    result_value: str | int | float | None = None
+    secondary_value: str | int | float | None = None
+    operator: str | None = None
 
 
 class CachedQueryResult(BaseModel):
@@ -321,6 +325,10 @@ class QueryExecutionOutcome(BaseModel):
     token_usage: dict[str, int] | None = None
     execution_type: str | None = None
     generation_calls: int | None = None
+    result_value: str | int | float | None = None
+    secondary_value: str | int | float | None = None
+    operator: str | None = None
+    structured_payload: dict[str, Any] | None = None
 
 
 class ErrorEnvelope(BaseModel):

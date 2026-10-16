@@ -1426,3 +1426,408 @@ def test_adapter_to_runner_token_usage_regressions_missing_observed_zero_and_pro
     assert q_agg_missing["token_usage_source"] == "unavailable"
     assert q_agg_missing["prompt_tokens"] == 0
     assert q_agg_missing["completion_tokens"] == 0
+
+
+def test_aggregate_evidence_scoring_operation_specific_computed_result_regression():
+    """Verify aggregate evidence scoring validates claimed aggregate against its
+    operation-specific computed result.
+
+    Regression requirements:
+    1. selection_count=250, sum result_value=1000:
+       - answer "sum is 250" MUST fail evidence support.
+       - answer "sum is 1000" MUST pass evidence support.
+    2. Preserve valid count results using corresponding computed values:
+       - selection_count=250, count result_value=250:
+         - answer "count is 250" MUST pass evidence support.
+         - answer "count is 500" MUST fail evidence support.
+    3. Preserve valid min/max results using corresponding computed values:
+       - selection_count=250, min result_value=2020, max secondary_value=2024:
+         - answer "earliest is 2020 and latest is 2024" MUST pass evidence support.
+         - answer "earliest is 250 and latest is 250" MUST fail evidence support.
+    4. Reuse existing structured execution contracts:
+       - QueryExecutionOutcome, CitationItem, TableLocation, structured_payload.
+    """
+    mock_persistence = MagicMock()
+    mock_persistence.persist_benchmark_run.side_effect = lambda workspace_id, metadata, detailed_artifact: metadata
+
+    responses = {}
+
+    # Case 1: Sum operation with selection_count=250 and result_value=1000
+    # Answer "sum is 250" uses selection_count instead of result_value -> MUST FAIL
+    responses["q_sum_contradictory_selection_count"] = QueryExecutionOutcome(
+        execution_id="exec_sum_contra",
+        status="SUCCESS",
+        answer="sum is 250",
+        citations=(
+            CitationItem(
+                evidence_id="ev_sum_1",
+                source_id="src_financials_csv",
+                location=TableLocation(table_id="financials_data", row_id="aggregated_rows"),
+                snippet="selection_count=250, sum result_value=1000",
+                source_version=1,
+                result_value="1000",
+                operator="sum",
+                structured_payload={"selection_count": 250, "result_value": 1000, "operator": "sum"},
+            ),
+        ),
+        surviving_source_ids=("src_financials_csv",),
+        tombstoned_source_ids=(),
+        result_value="1000",
+        operator="sum",
+        structured_payload={"selection_count": 250, "result_value": 1000, "operator": "sum"},
+    )
+
+    # Case 2: Sum operation with selection_count=250 and result_value=1000
+    # Answer "sum is 1000" matches computed result_value -> MUST PASS
+    responses["q_sum_correct_result_value"] = QueryExecutionOutcome(
+        execution_id="exec_sum_correct",
+        status="SUCCESS",
+        answer="sum is 1000",
+        citations=(
+            CitationItem(
+                evidence_id="ev_sum_2",
+                source_id="src_financials_csv",
+                location=TableLocation(table_id="financials_data", row_id="aggregated_rows"),
+                snippet="selection_count=250, sum result_value=1000",
+                source_version=1,
+                result_value="1000",
+                operator="sum",
+                structured_payload={"selection_count": 250, "result_value": 1000, "operator": "sum"},
+            ),
+        ),
+        surviving_source_ids=("src_financials_csv",),
+        tombstoned_source_ids=(),
+        result_value="1000",
+        operator="sum",
+        structured_payload={"selection_count": 250, "result_value": 1000, "operator": "sum"},
+    )
+
+    # Case 3: Count operation with selection_count=250 and result_value=250
+    # Answer "count is 250" matches count computed value -> MUST PASS
+    responses["q_count_correct"] = QueryExecutionOutcome(
+        execution_id="exec_count_correct",
+        status="SUCCESS",
+        answer="count is 250",
+        citations=(
+            CitationItem(
+                evidence_id="ev_count_1",
+                source_id="src_financials_csv",
+                location=TableLocation(table_id="financials_data", row_id="aggregated_rows"),
+                snippet="selection_count=250, count result_value=250",
+                source_version=1,
+                result_value="250",
+                operator="count",
+                structured_payload={"selection_count": 250, "result_value": 250, "operator": "count"},
+            ),
+        ),
+        surviving_source_ids=("src_financials_csv",),
+        tombstoned_source_ids=(),
+        result_value="250",
+        operator="count",
+        structured_payload={"selection_count": 250, "result_value": 250, "operator": "count"},
+    )
+
+    # Case 4: Count operation with selection_count=250 and result_value=250
+    # Answer "count is 500" contradicts computed count -> MUST FAIL
+    responses["q_count_contradictory"] = QueryExecutionOutcome(
+        execution_id="exec_count_contra",
+        status="SUCCESS",
+        answer="count is 500",
+        citations=(
+            CitationItem(
+                evidence_id="ev_count_2",
+                source_id="src_financials_csv",
+                location=TableLocation(table_id="financials_data", row_id="aggregated_rows"),
+                snippet="selection_count=250, count result_value=250",
+                source_version=1,
+                result_value="250",
+                operator="count",
+                structured_payload={"selection_count": 250, "result_value": 250, "operator": "count"},
+            ),
+        ),
+        surviving_source_ids=("src_financials_csv",),
+        tombstoned_source_ids=(),
+        result_value="250",
+        operator="count",
+        structured_payload={"selection_count": 250, "result_value": 250, "operator": "count"},
+    )
+
+    # Case 5: Min/Max operation with selection_count=250, min=2020, max=2024
+    # Answer "earliest is 2020 and latest is 2024" matches min/max computed values -> MUST PASS
+    responses["q_min_max_correct"] = QueryExecutionOutcome(
+        execution_id="exec_min_max_correct",
+        status="SUCCESS",
+        answer="earliest is 2020 and latest is 2024",
+        citations=(
+            CitationItem(
+                evidence_id="ev_min_max_1",
+                source_id="src_financials_csv",
+                location=TableLocation(table_id="financials_data", row_id="aggregated_rows"),
+                snippet="selection_count=250, min=2020, max=2024",
+                source_version=1,
+                result_value="2020",
+                secondary_value="2024",
+                operator="range",
+                structured_payload={"selection_count": 250, "result_value": 2020, "secondary_value": 2024, "operator": "range"},
+            ),
+        ),
+        surviving_source_ids=("src_financials_csv",),
+        tombstoned_source_ids=(),
+        result_value="2020",
+        secondary_value="2024",
+        operator="range",
+        structured_payload={"selection_count": 250, "result_value": 2020, "secondary_value": 2024, "operator": "range"},
+    )
+
+    # Case 6: Min/Max operation with selection_count=250, min=2020, max=2024
+    # Answer "earliest is 250 and latest is 250" uses selection_count instead of min/max -> MUST FAIL
+    responses["q_min_max_contradictory"] = QueryExecutionOutcome(
+        execution_id="exec_min_max_contra",
+        status="SUCCESS",
+        answer="earliest is 250 and latest is 250",
+        citations=(
+            CitationItem(
+                evidence_id="ev_min_max_2",
+                source_id="src_financials_csv",
+                location=TableLocation(table_id="financials_data", row_id="aggregated_rows"),
+                snippet="selection_count=250, min=2020, max=2024",
+                source_version=1,
+                result_value="2020",
+                secondary_value="2024",
+                operator="range",
+                structured_payload={"selection_count": 250, "result_value": 2020, "secondary_value": 2024, "operator": "range"},
+            ),
+        ),
+        surviving_source_ids=("src_financials_csv",),
+        tombstoned_source_ids=(),
+        result_value="2020",
+        secondary_value="2024",
+        operator="range",
+        structured_payload={"selection_count": 250, "result_value": 2020, "secondary_value": 2024, "operator": "range"},
+    )
+
+    runner = BenchmarkRunner(
+        query_executor=lambda q, ws: responses[q],
+        persistence_service=mock_persistence,
+    )
+
+    test_cases = [
+        BenchmarkTestCase(
+            query_id="tc_sum_contradictory",
+            query="q_sum_contradictory_selection_count",
+            expected_source_id="src_financials_csv",
+            expected_source_version=1,
+            query_type="tabular_aggregate",
+        ),
+        BenchmarkTestCase(
+            query_id="tc_sum_correct",
+            query="q_sum_correct_result_value",
+            expected_source_id="src_financials_csv",
+            expected_source_version=1,
+            query_type="tabular_aggregate",
+        ),
+        BenchmarkTestCase(
+            query_id="tc_count_correct",
+            query="q_count_correct",
+            expected_source_id="src_financials_csv",
+            expected_source_version=1,
+            query_type="tabular_aggregate",
+        ),
+        BenchmarkTestCase(
+            query_id="tc_count_contradictory",
+            query="q_count_contradictory",
+            expected_source_id="src_financials_csv",
+            expected_source_version=1,
+            query_type="tabular_aggregate",
+        ),
+        BenchmarkTestCase(
+            query_id="tc_min_max_correct",
+            query="q_min_max_correct",
+            expected_source_id="src_financials_csv",
+            expected_source_version=1,
+            query_type="tabular_aggregate",
+        ),
+        BenchmarkTestCase(
+            query_id="tc_min_max_contradictory",
+            query="q_min_max_contradictory",
+            expected_source_id="src_financials_csv",
+            expected_source_version=1,
+            query_type="tabular_aggregate",
+        ),
+    ]
+
+    report = runner.run_suite(workspace_id="ws_adv_aggregate", test_cases=test_cases)
+    queries = {q["query_id"]: q for q in report.detailed_artifact["queries"]}
+
+    # 1. selection_count=250, sum result_value=1000
+    # answer "sum is 250" must fail evidence support
+    assert queries["tc_sum_contradictory"]["evidence_supported"] is False
+    # answer "sum is 1000" must pass evidence support
+    assert queries["tc_sum_correct"]["evidence_supported"] is True
+
+    # 2. Preserve valid count results using corresponding computed values
+    assert queries["tc_count_correct"]["evidence_supported"] is True
+    assert queries["tc_count_contradictory"]["evidence_supported"] is False
+
+    # 3. Preserve valid min/max results using corresponding computed values
+    assert queries["tc_min_max_correct"]["evidence_supported"] is True
+    assert queries["tc_min_max_contradictory"]["evidence_supported"] is False
+
+
+def test_boundary_contract_declarations_and_production_adapter_mapping():
+    """Verify declared boundary contract fields on CitationItem and QueryExecutionOutcome.
+
+    Covers: AC-1, AC-4, AC-9, AC-11.
+    Tests:
+    1. Direct instantiation and model_dump serialization of CitationItem with result_value,
+       secondary_value, operator, and structured_payload.
+    2. Direct instantiation and model_dump serialization of QueryExecutionOutcome with
+       declared execution telemetry and structured execution contracts.
+    3. ProductionExecutionEngine mapping of structured query results into declared
+       CitationItem and QueryExecutionOutcome fields.
+    4. Default initialization with None values preserves valid Pydantic models.
+    5. Direct execution through BenchmarkRunner asserting evidence support via mapped contracts.
+    """
+    from src.api.boundary_adapters import ProductionExecutionEngine
+
+    # 1. Direct CitationItem instantiation with declared contract fields
+    cit = CitationItem(
+        evidence_id="ev_contract_01",
+        source_id="src_doc_csv",
+        source_version=1,
+        snippet="sum is 1000 across 250 rows",
+        location=TableLocation(table_id="financials", row_id="agg_row"),
+        structured_payload={"selection_count": 250, "result_value": 1000, "operator": "sum"},
+        result_value="1000",
+        secondary_value=None,
+        operator="sum",
+    )
+    dumped_cit = cit.model_dump()
+    assert dumped_cit["result_value"] == "1000"
+    assert dumped_cit["secondary_value"] is None
+    assert dumped_cit["operator"] == "sum"
+    assert dumped_cit["structured_payload"] == {"selection_count": 250, "result_value": 1000, "operator": "sum"}
+
+    # 2. Direct QueryExecutionOutcome instantiation with declared contract fields
+    outcome = QueryExecutionOutcome(
+        execution_id="exec_contract_01",
+        status="SUCCESS",
+        answer="The total sum is 1000.",
+        citations=(cit,),
+        surviving_source_ids=("src_doc_csv",),
+        tombstoned_source_ids=(),
+        token_usage={"input_tokens": 0, "output_tokens": 0},
+        execution_type="deterministic",
+        generation_calls=0,
+        result_value="1000",
+        secondary_value=None,
+        operator="sum",
+        structured_payload={"selection_count": 250, "result_value": 1000, "operator": "sum"},
+    )
+    dumped_outcome = outcome.model_dump()
+    assert dumped_outcome["token_usage"] == {"input_tokens": 0, "output_tokens": 0}
+    assert dumped_outcome["execution_type"] == "deterministic"
+    assert dumped_outcome["generation_calls"] == 0
+    assert dumped_outcome["result_value"] == "1000"
+    assert dumped_outcome["operator"] == "sum"
+    assert dumped_outcome["structured_payload"]["selection_count"] == 250
+
+    # 3. Default initialization with None fields
+    minimal_cit = CitationItem(
+        evidence_id="ev_min",
+        source_id="src_min",
+        source_version=1,
+        snippet="snippet",
+        location=DocumentLocation(page=1),
+    )
+    assert minimal_cit.result_value is None
+    assert minimal_cit.secondary_value is None
+    assert minimal_cit.operator is None
+    assert minimal_cit.structured_payload is None
+
+    minimal_outcome = QueryExecutionOutcome(
+        execution_id="exec_min",
+        status="SUCCESS",
+        answer="answer",
+        citations=(minimal_cit,),
+        surviving_source_ids=("src_min",),
+        tombstoned_source_ids=(),
+    )
+    assert minimal_outcome.token_usage is None
+    assert minimal_outcome.execution_type is None
+    assert minimal_outcome.generation_calls is None
+    assert minimal_outcome.result_value is None
+    assert minimal_outcome.secondary_value is None
+    assert minimal_outcome.operator is None
+    assert minimal_outcome.structured_payload is None
+
+    # 4. ProductionExecutionEngine mapping from query_service output
+    mock_qs = MagicMock()
+    mock_qs.execute_query.return_value = {
+        "answer": "The sum is 1000.",
+        "citations": [
+            {
+                "id": 1,
+                "table_id": "financials",
+                "document_id": "doc_fin_01",
+                "document_version": 1,
+                "text": "sum is 1000",
+                "source_format": "csv",
+                "result_value": "1000",
+                "secondary_value": None,
+                "operator": "sum",
+                "structured_payload": {"selection_count": 250, "result_value": 1000, "operator": "sum"},
+            }
+        ],
+        "status": "success",
+        "structured_aggregate": True,
+        "generation_calls": 0,
+        "result_value": "1000",
+        "secondary_value": None,
+        "operator": "sum",
+        "structured_payload": {"selection_count": 250, "result_value": 1000, "operator": "sum"},
+        "document_ids": ["doc_fin_01"],
+    }
+
+    engine = ProductionExecutionEngine(query_service=mock_qs)
+    engine_outcome = engine.execute_query(workspace_id="ws_adapter_contract", query_text="What is the sum?")
+
+    assert isinstance(engine_outcome, QueryExecutionOutcome)
+    assert engine_outcome.result_value == "1000"
+    assert engine_outcome.secondary_value is None
+    assert engine_outcome.operator == "sum"
+    assert engine_outcome.structured_payload == {"selection_count": 250, "result_value": 1000, "operator": "sum"}
+    assert engine_outcome.execution_type == "deterministic"
+    assert engine_outcome.generation_calls == 0
+    assert engine_outcome.token_usage == {"input_tokens": 0, "output_tokens": 0}
+
+    assert len(engine_outcome.citations) == 1
+    engine_cit = engine_outcome.citations[0]
+    assert isinstance(engine_cit, CitationItem)
+    assert engine_cit.result_value == "1000"
+    assert engine_cit.secondary_value is None
+    assert engine_cit.operator == "sum"
+    assert engine_cit.structured_payload == {"selection_count": 250, "result_value": 1000, "operator": "sum"}
+
+    # 5. Direct execution through BenchmarkRunner
+    mock_persistence = MagicMock()
+    mock_persistence.persist_benchmark_run.side_effect = lambda *args, **kwargs: kwargs.get("metadata", args[1] if len(args) > 1 else None)
+    runner = BenchmarkRunner(
+        query_executor=lambda q, ws: engine_outcome,
+        persistence_service=mock_persistence,
+    )
+    test_case = BenchmarkTestCase(
+        query_id="tc_contract_mapping",
+        query="What is the sum?",
+        expected_source_id="doc_fin_01",
+        expected_source_version=1,
+        query_type="tabular_aggregate",
+    )
+    report = runner.run_suite(workspace_id="ws_adapter_contract", test_cases=[test_case])
+    query_res = report.detailed_artifact["queries"][0]
+    assert query_res["evidence_supported"] is True
+    assert query_res["token_usage_source"] == "deterministic_zero"
+    assert query_res["prompt_tokens"] == 0
+    assert query_res["completion_tokens"] == 0
+    assert query_res["is_estimated_tokens"] is False
+
