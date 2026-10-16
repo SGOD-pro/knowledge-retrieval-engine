@@ -18,7 +18,7 @@ def test_fast_path_confidence_varies_with_match_strength():
     weak_chunk = Chunk(
         id="c_weak",
         document_id="doc2",
-        text="Miscellaneous unrelated information regarding corporate travel expenses.",
+        text="Brief notes mention the attention mechanism among general corporate items.",
         source_format="pdf",
         page_number=2,
         element_type="paragraph",

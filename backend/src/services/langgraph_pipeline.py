@@ -687,14 +687,15 @@ def run_llm(state: PipelineState):
 
 
 def end_fast_path(state: PipelineState):
-    """Verified factual fast-path answer (Component 3). No LLM.
+    """Verified factual fast path answer (Component 3). No LLM.
     Supports deterministic verified factual extraction as well as
-    extractive sentence-to-chunk provenance selection.
+    extractive sentence to chunk provenance selection.
     """
     from services.retrieval.response_builder import build_citation
 
     t0 = time.perf_counter()
     query = state["query"]
+    existing = state.get("stage_timings", {})
     verified_ans = state.get("verified_answer")
     verified_chunk = state.get("verified_chunk")
 
@@ -716,6 +717,7 @@ def end_fast_path(state: PipelineState):
     non_heading_chunks = [c for c in all_top if getattr(c, "element_type", "") != "heading"]
     if not non_heading_chunks and not (verified_ans and verified_chunk):
         latency_ms = (time.perf_counter() - t0) * 1000.0
+        logger.info("fast_path.no_candidate_chunks escalating_to_full_path latency_ms=%.2f", latency_ms)
         return {
             "final_answer": "NOT_FOUND",
             "confidence_score": 0.0,
@@ -724,7 +726,8 @@ def end_fast_path(state: PipelineState):
             "usage": {"input_tokens": 0, "output_tokens": 0},
             "top_chunks": [],
             "citations": [],
-            "stage_timings": {**state.get("stage_timings", {}), "fast_path_ms": latency_ms},
+            "executed_path": "full",
+            "stage_timings": {**existing, "fast_path_ms": latency_ms},
         }
 
     if verified_ans and verified_chunk:
@@ -785,10 +788,6 @@ def end_fast_path(state: PipelineState):
         if chunk_matched:
             contributing_chunks.append(c)
 
-    if not selected_sentences and non_heading_chunks:
-        selected_sentences = [non_heading_chunks[0].text.strip()[:500]]
-        contributing_chunks = [non_heading_chunks[0]]
-
     if selected_sentences and contributing_chunks:
         answer = " ".join(selected_sentences)[:800]
         top_chunks = contributing_chunks
@@ -799,7 +798,6 @@ def end_fast_path(state: PipelineState):
             conf = 1.0
 
         latency_ms = (time.perf_counter() - t0) * 1000.0
-        existing = state.get("stage_timings", {})
         from services.retrieval.evidence_contract import evidence_item_from_chunk
         retained_evidence_items = [
             evidence_item_from_chunk(c, workspace_id=state.get("workspace_id", ""), strategy="vector_rerank")
@@ -824,7 +822,9 @@ def end_fast_path(state: PipelineState):
             "stage_timings": {**existing, "fast_path_ms": latency_ms},
         }
 
+    # If extraction finds no supported answer, escalate to full path without fabricating confidence or chunk
     latency_ms = (time.perf_counter() - t0) * 1000.0
+    logger.info("fast_path.no_supported_answer escalating_to_full_path latency_ms=%.2f", latency_ms)
     return {
         "final_answer": "NOT_FOUND",
         "confidence_score": 0.0,
@@ -833,8 +833,8 @@ def end_fast_path(state: PipelineState):
         "usage": {"input_tokens": 0, "output_tokens": 0},
         "top_chunks": [],
         "citations": [],
-        "executed_path": "fast",
-        "stage_timings": {**state.get("stage_timings", {}), "fast_path_ms": latency_ms},
+        "executed_path": "full",
+        "stage_timings": {**existing, "fast_path_ms": latency_ms},
     }
 
 
@@ -888,6 +888,14 @@ def route_after_extraction(state: PipelineState):
             return "end_fast_path"
 
     # Escalate to full generation path
+    return "run_okf_router_post"
+
+
+def route_after_fast_path(state: PipelineState) -> str:
+    """If fast path found a supported answer, terminate at END.
+    Otherwise escalate to full retrieval path via run_okf_router_post."""
+    if state.get("executed_path") == "fast" and state.get("final_answer") and state.get("final_answer") != "NOT_FOUND":
+        return END
     return "run_okf_router_post"
 
 
@@ -1032,7 +1040,14 @@ workflow.add_conditional_edges(
 workflow.add_edge("run_compressor", "run_fidelity")
 workflow.add_edge("run_fidelity", "run_llm")
 workflow.add_edge("run_llm", END)
-workflow.add_edge("end_fast_path", END)
+workflow.add_conditional_edges(
+    "end_fast_path",
+    route_after_fast_path,
+    {
+        END: END,
+        "run_okf_router_post": "run_okf_router_post",
+    },
+)
 
 app = workflow.compile()
 
@@ -1131,10 +1146,10 @@ class Pipeline:
                         cit["strategy"] = retained_map.get(cid) or retained_map.get(tid) or "vector_rerank"
 
                 plan = state.get("plan")
-                self.fast_path = plan.fast_path if plan else False
+                self.executed_path = state.get("executed_path", "full")
+                self.fast_path = (self.executed_path == "fast")
                 self.stages = plan.stages if plan else []
-                self.planned_path = state.get("planned_path", "fast" if self.fast_path else "full")
-                self.executed_path = state.get("executed_path", "fast" if self.fast_path else "full")
+                self.planned_path = state.get("planned_path", "fast" if (plan and plan.fast_path) else "full")
                 self.structured_aggregate = (self.executed_path == "structured_aggregate")
                 self.reranker_mode = state.get("reranker_mode", "remote_success")
                 self.retrieval_candidates = state.get("retrieval_candidates", {})

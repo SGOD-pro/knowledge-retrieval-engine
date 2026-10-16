@@ -80,7 +80,53 @@ Specification 0003 remains Proposed and deferred.
 * Canonical 60 Question Baseline Command:
   * Command: `cd backend && uv run python scripts/run_canonical_60_benchmark.py --workspace-id ws_fresh_benchmark` (add `--allow-dirty` when evaluating a modified working tree).
 
+## Fast Path Fallback Resolution and Q167 Fix (October 17 2026)
+
+### Core Changes
+
+* Resolved Q167 `UnboundLocalError`: defined `existing = state.get("stage_timings", {})` at the top of [`end_fast_path`](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/services/langgraph_pipeline.py#L689) before verified fact returns.
+* Removed arbitrary first chunk and first CSV row fallback: removed arbitrary selection of first non heading chunk and fabricated confidence. When fast path sentence extraction fails to find a supported answer, it refuses to fabricate an answer and marks `executed_path = "full"`.
+* Escalated to full retrieval path: added [`route_after_fast_path`](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/services/langgraph_pipeline.py#L894) conditional routing edge from `end_fast_path`. Supported fast path extractions terminate at `END`, while unsupported attempts route into `run_okf_router_post` for full candidate retrieval, neural reranking, context compression, fidelity scoring, and at most one model generation.
+* Structured refusal on insufficient evidence: when the full path also lacks evidence, returns structured HTTP 200 refusal with empty citations and zero confidence.
+* Accurate pipeline telemetry: derived `self.fast_path = (self.executed_path == "fast")` in [`Pipeline.run`](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/services/langgraph_pipeline.py#L1139) to preserve true execution path telemetry.
+
+### Focused Regressions in [`backend/tests/test_fast_path_fallback_regressions.py`](file:///home/swyra/projects/knowledge-retrieval-engine/backend/tests/test_fast_path_fallback_regressions.py)
+
+* `test_q167_no_longer_crashes_with_unbound_local_error`: verifies verified fact extraction completes cleanly on fast path without error.
+* `test_failed_extraction_cannot_return_unrelated_first_csv_row`: verifies unsupported extraction rejects unrelated first CSV rows and escalates.
+* `test_escalation_executes_existing_full_retrieval_path`: verifies escalation runs full retrieval and executes exactly one model generation call.
+* `test_supported_fast_extraction_still_works_without_generation`: verifies supported fast extraction succeeds with zero model generation calls and zero tokens.
+* `test_unsupported_evidence_produces_refusal_with_empty_citations`: verifies query service returns structured refusal and empty citations when neither path finds evidence.
+
+### Separate Pending Findings (Not Claimed Resolved)
+
+* Q152 TableStore coverage: `survay.csv` in TableStore holds only 5000 rows (all year 2025), missing years 2013 through 2024 present in the raw corpus.
+* Q153 router misbinding: question text lacks explicit table name "survay", causing router to misbind to `rs_status_bill_passed_assent_1952_2016` where filter columns fail.
+
+### Verification Evidence
+
+* Tested Commit: `c44a478` (`c44a47857fa45d1610c21c2cda83670c43272c11`) on branch `re-factor`
+* Uncommitted files in working tree:
+  * [`backend/src/services/langgraph_pipeline.py`](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/services/langgraph_pipeline.py)
+  * [`backend/tests/test_fix4_fast_path_confidence.py`](file:///home/swyra/projects/knowledge-retrieval-engine/backend/tests/test_fix4_fast_path_confidence.py)
+  * [`backend/tests/test_fast_path_fallback_regressions.py`](file:///home/swyra/projects/knowledge-retrieval-engine/backend/tests/test_fast_path_fallback_regressions.py)
+  * [`docs/handoff.md`](file:///home/swyra/projects/knowledge-retrieval-engine/docs/handoff.md)
+* Focused Regressions:
+  * Command: `uv run pytest tests/test_fast_path_fallback_regressions.py`
+  * Outcome: 5 passed in 3.94s.
+* Fast Path plus 0004 Test Suite:
+  * Command: `uv run pytest tests/test_fast_path_fallback_regressions.py tests/test_benchmark_runner_and_persistence_0004.py tests/test_csv_vertical_slice_0004.py tests/test_pdf_retrieval_slice_0004.py tests/test_structured_query_service.py tests/test_dynamodb_boundary_and_execution.py tests/test_fix4_fast_path_confidence.py`
+  * Outcome: 50 passed in 32.68s.
+* Full Repository Test Suite:
+  * Command: `uv run pytest`
+  * Outcome: 371 passed, 0 failed, 3 skipped in 358.46s.
+  * Skipped Test Reasons:
+    1. `tests/test_api_endpoints.py:test_workspaces_crud_endpoints`: marked skip because it was obsoleted by specification 0002 boundary tests in `test_workspace_boundary_isolation.py`.
+    2. `tests/test_end_to_end_structured.py:test_localstack_dynamodb_e2e`: marked skip because the local LocalStack emulator on port 4566 is unavailable in the automated test environment.
+    3. `tests/test_fix5_workspace_isolation_and_deletion.py:test_workspace_deletion_and_isolation`: marked skip because it was obsoleted by specification 0002 boundary tests in `test_workspace_boundary_isolation.py`.
+
 ## Preserved Status and Deferred Work
 
 * Specification 0003: Snapshot registry, publication, and atomic deletion remains Proposed and deferred.
 * Specification 0004: Core engine walking skeleton and benchmarks is fully accepted and closed with all checks passing.
+* Paid benchmark evaluation runs were not re executed during this slice.
