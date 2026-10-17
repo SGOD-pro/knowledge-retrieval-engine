@@ -568,7 +568,15 @@ def run_fidelity(state: PipelineState):
     query = state.get("query", "")
     compressed = state.get("compressed_text", "")
     if not compressed:
-        return {"error": "No context available"}
+        latency_ms = (time.perf_counter() - t0) * 1000.0
+        existing = state.get("stage_timings", {})
+        return {
+            "error": "No context available",
+            "final_answer": "NOT_FOUND",
+            "citations": [],
+            "confidence_score": 0.0,
+            "stage_timings": {**existing, "fidelity_ms": latency_ms},
+        }
     try:
         check_fidelity(
             query,
@@ -838,6 +846,83 @@ def end_fast_path(state: PipelineState):
     }
 
 
+def escalate_to_full_retrieval(state: PipelineState):
+    """Transition from failed fast path into full retrieval policy.
+    Refreshes candidate dependent state, updates plan to fast_path=False,
+    and executes genuine full vector retrieval (top_k=40, candidate scoping,
+    full embeddings).
+    """
+    t0 = time.perf_counter()
+    logger.info(
+        "escalate_to_full_retrieval.started query='%s' workspace_id='%s'",
+        state.get("query", "")[:50],
+        state.get("workspace_id", ""),
+    )
+
+    plan = state.get("plan")
+    full_plan = None
+    if plan:
+        from dataclasses import replace
+        full_plan = replace(plan, fast_path=False)
+
+    # Reuse compatible query embedding if already computed (1024-dim), else generate via provider
+    query_embedding = state.get("query_embedding")
+    repo = _get_repo()
+    if not query_embedding or len(query_embedding) != 1024:
+        from providers.embedding_provider import embed_text
+        from providers.provider_client import get_active_provider
+        active_provider = get_active_provider()
+        query_embedding = (
+            repo.generate_query_embedding(state["query"])
+            if hasattr(repo, "generate_query_embedding")
+            else embed_text(state["query"], provider=active_provider)
+        )
+
+    retriever = VectorRetriever(repository=repo)
+    chunks = retriever.search(
+        query=state["query"],
+        query_embedding=query_embedding,
+        fast_path=False,
+        document_ids=state.get("document_ids"),
+        candidate_page_ids=state.get("candidate_page_ids"),
+        candidate_chunk_ids=state.get("candidate_chunk_ids"),
+        candidate_page_scopes=state.get("candidate_page_scopes"),
+        workspace_id=state.get("workspace_id", ""),
+        top_k=40,
+    )
+
+    vector_chunks = [replace(c, similarity_score=float(s)) for c, s in chunks]
+    avg_sim = sum(s for _, s in chunks) / max(1, len(chunks)) if chunks else 0.0
+    latency_ms = (time.perf_counter() - t0) * 1000.0
+    logger.info(
+        "full_vector.latency_ms=%.2f full_vector.result_count=%d full_vector.avg_sim=%.4f",
+        latency_ms,
+        len(vector_chunks),
+        avg_sim,
+    )
+    existing = state.get("stage_timings", {})
+
+    return {
+        "plan": full_plan,
+        "executed_path": "full",
+        "query_embedding": query_embedding,
+        "candidate_chunks": vector_chunks,
+        "retrieval_candidates": {**dict(state.get("retrieval_candidates", {})), "vector": [c.id for c in vector_chunks]},
+        "top_chunks": [],
+        "verified_answer": None,
+        "verified_chunk": None,
+        "compressed_text": "",
+        "context_snippet": "",
+        "final_answer": "NOT_FOUND",
+        "confidence_score": 0.0,
+        "citations": [],
+        "usage": {"input_tokens": 0, "output_tokens": 0},
+        "faithfulness": None,
+        "citation_utilization_rate": None,
+        "stage_timings": {**existing, "full_vector_ms": latency_ms},
+    }
+
+
 # ---------------------------------------------------------------------------
 # Routing functions
 # ---------------------------------------------------------------------------
@@ -873,8 +958,8 @@ def route_after_vector(state: PipelineState):
 
 
 def route_after_extraction(state: PipelineState):
-    """If verified extraction succeeded, end fast-path.
-    If high-confidence top chunk exists (similarity >= 0.40), end fast-path via extractive fallback.
+    """If verified extraction succeeded, end fast path.
+    If high confidence top chunk exists (similarity >= 0.40), end fast path via extractive fallback.
     Otherwise escalate to full path."""
     if state.get("verified_answer") and state.get("verified_chunk"):
         return "end_fast_path"
@@ -888,15 +973,15 @@ def route_after_extraction(state: PipelineState):
             return "end_fast_path"
 
     # Escalate to full generation path
-    return "run_okf_router_post"
+    return "escalate_to_full_retrieval"
 
 
 def route_after_fast_path(state: PipelineState) -> str:
     """If fast path found a supported answer, terminate at END.
-    Otherwise escalate to full retrieval path via run_okf_router_post."""
+    Otherwise escalate to full retrieval path via escalate_to_full_retrieval."""
     if state.get("executed_path") == "fast" and state.get("final_answer") and state.get("final_answer") != "NOT_FOUND":
         return END
-    return "run_okf_router_post"
+    return "escalate_to_full_retrieval"
 
 
 def route_after_reranker_or_graph(state: PipelineState):
@@ -977,6 +1062,7 @@ workflow.add_node("run_compressor", run_compressor)
 workflow.add_node("run_fidelity", run_fidelity)
 workflow.add_node("run_llm", run_llm)
 workflow.add_node("end_fast_path", end_fast_path)
+workflow.add_node("escalate_to_full_retrieval", escalate_to_full_retrieval)
 
 # Edge order: route_query → structured_aggregate / OKF → BM25 → PageIndex → vector → branch
 workflow.add_edge(START, "route_query")
@@ -1014,7 +1100,7 @@ workflow.add_conditional_edges(
     route_after_extraction,
     {
         "end_fast_path": "end_fast_path",
-        "run_okf_router_post": "run_okf_router_post",
+        "escalate_to_full_retrieval": "escalate_to_full_retrieval",
     },
 )
 
@@ -1045,9 +1131,10 @@ workflow.add_conditional_edges(
     route_after_fast_path,
     {
         END: END,
-        "run_okf_router_post": "run_okf_router_post",
+        "escalate_to_full_retrieval": "escalate_to_full_retrieval",
     },
 )
+workflow.add_edge("escalate_to_full_retrieval", "run_okf_router_post")
 
 app = workflow.compile()
 

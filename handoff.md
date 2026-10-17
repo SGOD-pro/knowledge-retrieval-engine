@@ -55,7 +55,49 @@ Specification 0003 remains Proposed and deferred.
   * Verdict: Approve with nits (0 blockers, 0 majors, 0 minors, 2 nits resolved)
   * Report: [docs/reviews/2026-10-15-re-factor.md](file:///home/swyra/projects/knowledge-retrieval-engine/docs/reviews/2026-10-15-re-factor.md)
 
-## Preserved Status and Deferred Work
-
 * Specification 0003: Snapshot registry, publication, and atomic deletion remains Proposed and deferred.
 * Specification 0004: Core engine walking skeleton and benchmarks is fully accepted and marked done.
+
+## Fast to Full Escalation Repair Verification (October 17 2026)
+
+* Base commit: `d665e4afb7d53ca9ea6ed993741c4f3813f7d3be`
+* Working tree changes:
+  * [backend/src/services/langgraph_pipeline.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/services/langgraph_pipeline.py): Implemented `escalate_to_full_retrieval` node, transitioning failed fast extractions to genuine full retrieval (`fast_path=False`, `top_k=40`, candidate scoping, 1024 dimension embedding), refreshing candidate dependent state to prevent stale fast candidate contamination. Empty context in fidelity returns structured refusal. Fixed Q167 `UnboundLocalError`.
+  * [backend/src/providers/embedding_provider.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/providers/embedding_provider.py): Strictly test scoped fallback to deterministic vector in test environment.
+  * [backend/tests/test_fast_path_fallback_regressions.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/tests/test_fast_path_fallback_regressions.py): Added 10 passing regressions covering Q167 repair, full escalation routing, adversarial evidence recovery outside fast top 10, cross workspace exclusion, source version isolation, zero generation on fast extraction, and single generation on escalation.
+  * [backend/tests/test_pipeline_structured_path.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/tests/test_pipeline_structured_path.py): Guaranteed manifest coverage complete idempotency across test executions.
+  * [docs/specs/0004-verify.md](file:///home/swyra/projects/knowledge-retrieval-engine/docs/specs/0004-verify.md): Recorded fast path fallback regression verification steps and execution environment distinctions.
+  * [docs/reviews/2026-10-17-re-factor.md](file:///home/swyra/projects/knowledge-retrieval-engine/docs/reviews/2026-10-17-re-factor.md): Independent senior review report.
+
+* Executed Commands and Verification Outcomes:
+  * Fast path fallback regressions: `uv run pytest tests/test_fast_path_fallback_regressions.py` (10 passed in 6.14s).
+  * Core 0004 suite: `uv run pytest tests/test_benchmark_runner_and_persistence_0004.py tests/test_csv_vertical_slice_0004.py tests/test_dynamodb_boundary_and_execution.py tests/test_pdf_retrieval_slice_0004.py tests/test_structured_query_service.py tests/test_fast_path_fallback_regressions.py` (54 passed in 37.70s).
+  * Repository wide pytest suite: `uv run pytest` (376 passed, 3 documented skips, 0 failed in 49.33s).
+  * Live HTTP checks: 17 passed in `verify_0004_live.py`.
+
+* Independent Code Review and Post Review Nit Fixes:
+  * Model: `gemini-2.5-pro` (author on `gemini 3.8 flash`).
+  * Scope: 37 files on branch `re-factor` vs `main`.
+  * Verdict: Approve with nits (0 blockers, 0 majors, 0 minors, 2 nits resolved).
+  * Report: [docs/reviews/2026-10-17-re-factor.md](file:///home/swyra/projects/knowledge-retrieval-engine/docs/reviews/2026-10-17-re-factor.md).
+  * Nit 1 resolved: Consolidated duplicate `replace` import in `backend/src/services/langgraph_pipeline.py:894`.
+  * Nit 2 resolved: Removed redundant `from config import settings` import in `backend/src/providers/embedding_provider.py:124`.
+
+* Embedding Compatibility Distinction:
+  * In `escalate_to_full_retrieval`, vector length check validates the 1024 vector dimension, rejecting 384 dimension embeddings.
+  * Floating point vectors in state carry no attached model or provider metadata envelope attributes.
+  * Dimension validation alone cannot establish model or provider provenance.
+  * Model provenance compatibility remains unresolved in code rather than verified.
+
+* Pending Diagnostic Findings Preserved:
+  * Q152: Incomplete `survay.csv` partition coverage in DynamoDB TableStore remains a pending correctness finding.
+  * Q153: Table binding and year delta column mapping remains a pending correctness finding.
+  * Q159: Missing filter handling remains a pending correctness finding.
+  * Preserved original canonical 60 question baseline artifacts (`manifest.json`, `query_details.json`, `summary.md`) and mixed reranker baseline description (remote Cohere reranker with local lexical fallback mode).
+
+* Scope and Status Boundaries:
+  * Specification 0004 remains locally Accepted.
+  * Specification 0003 remains Proposed and deferred.
+  * No claims of independent live AWS readiness or benchmark accuracy improvements.
+  * Paid canonical 60 question benchmark was not rerun.
+

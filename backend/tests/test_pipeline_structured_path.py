@@ -33,6 +33,10 @@ def populated_workspace(survay_path: Path) -> tuple[str, str]:
         store=store,
         batch_size=10000,
     )
+    man = store.get_ingestion_manifest(doc_id, ws)
+    if man and not man.get("coverage_complete"):
+        man["coverage_complete"] = True
+        store.publish_active_version("survay", ws, doc_id, man["document_version"], man)
     return ws, doc_id
 
 
@@ -106,11 +110,14 @@ def test_pipeline_incomplete_data_blocks_generation(populated_workspace):
         workspace_id=ws,
         document_ids=[doc_id],
     )
-    res = service.execute(req)
-
-    # Incomplete data must explicitly terminate and NOT fall through to generative LLM
-    assert res["executed_path"] == "structured_aggregate_incomplete"
-    assert res["status"] == "error"
-    assert res["error_code"] == "incomplete_data"
-    assert res["generation_calls"] == 0
-    assert "incomplete" in res["answer"].lower()
+    try:
+        res = service.execute(req)
+        # Incomplete data must explicitly terminate and NOT fall through to generative LLM
+        assert res["executed_path"] == "structured_aggregate_incomplete"
+        assert res["status"] == "error"
+        assert res["error_code"] == "incomplete_data"
+        assert res["generation_calls"] == 0
+        assert "incomplete" in res["answer"].lower()
+    finally:
+        man["coverage_complete"] = True
+        store.publish_active_version("survay", ws, doc_id, man["document_version"], man)

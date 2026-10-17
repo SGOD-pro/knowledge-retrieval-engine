@@ -40,11 +40,13 @@ uv run pytest tests/test_contracts_and_identity.py
 * Structured query results produce mandatory evidence and never compete in reciprocal rank fusion.
 * Ingestion pipelines produce source backed representations without assuming source truth.
 * Keep query time model work bounded and track token or call budgets across steps.
+* Failed fast path extractions escalate to full retrieval with refreshed candidate state, single generation limits, and structured refusal when evidence is absent.
 
 ## Gotchas
 * Local development defaults to SQLite or in memory TableStore and LocalStack DynamoDB, while Qdrant runs via local container or cloud.
 * Setting `MODEL_PROVIDER` determines whether Bedrock or external test providers are called.
 * Table retrieval requires fidelity checks, so lower fidelity thresholds when working with dense tabular data.
+* Query embedding reuse during escalation checks the 1024 vector dimension; vector dimension alone does not verify model provenance.
 
 ## Related specs
 * [docs/specs/0001-contracts-and-identity-envelope.md](../docs/specs/0001-contracts-and-identity-envelope.md)

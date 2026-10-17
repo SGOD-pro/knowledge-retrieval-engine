@@ -51,6 +51,12 @@ def embed_text(
     """
     dim = FULL_EMBEDDING_DIM
 
+    from config import settings
+    import os
+
+    if provider == "test" or getattr(settings, "ENVIRONMENT", "") == "test" or os.environ.get("ENVIRONMENT") == "test":
+        return _deterministic_vector(text, dim)
+
     last_err = None
     import time
 
@@ -115,8 +121,6 @@ def embed_text(
                 logger.error("Embedding request failed: %s", str(e))
                 break
 
-    from config import settings
-
     if provider == "test" or (provider is None and settings.ENVIRONMENT == "test"):
         return _deterministic_vector(text, dim)
 
@@ -152,8 +156,9 @@ def embed_batch(
     texts: Sequence[str], provider: str | None = None, max_retries: int = 3
 ) -> list[list[float]]:
     from config import settings
+    import os
 
-    if provider == "test" or (provider is None and settings.ENVIRONMENT == "test"):
+    if provider == "test" or (provider is None and (getattr(settings, "ENVIRONMENT", "") == "test" or os.environ.get("ENVIRONMENT") == "test")):
         return [_deterministic_vector(t, FULL_EMBEDDING_DIM) for t in texts]
 
     from concurrent.futures import ThreadPoolExecutor
