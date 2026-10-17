@@ -60,34 +60,22 @@ Specification 0003 remains Proposed and deferred.
 
 ## Fast to Full Escalation Repair Verification (October 17 2026)
 
-* Base commit: `d665e4afb7d53ca9ea6ed993741c4f3813f7d3be`
+* Base commit: `e86d30b050c77fc8e411ea21a603953aa1e5aa9a`
 * Working tree changes:
-  * [backend/src/services/langgraph_pipeline.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/services/langgraph_pipeline.py): Implemented `escalate_to_full_retrieval` node, transitioning failed fast extractions to genuine full retrieval (`fast_path=False`, `top_k=40`, candidate scoping, 1024 dimension embedding), refreshing candidate dependent state to prevent stale fast candidate contamination. Empty context in fidelity returns structured refusal. Fixed Q167 `UnboundLocalError`.
-  * [backend/src/providers/embedding_provider.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/providers/embedding_provider.py): Strictly test scoped fallback to deterministic vector in test environment.
-  * [backend/tests/test_fast_path_fallback_regressions.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/tests/test_fast_path_fallback_regressions.py): Added 10 passing regressions covering Q167 repair, full escalation routing, adversarial evidence recovery outside fast top 10, cross workspace exclusion, source version isolation, zero generation on fast extraction, and single generation on escalation.
-  * [backend/tests/test_pipeline_structured_path.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/tests/test_pipeline_structured_path.py): Guaranteed manifest coverage complete idempotency across test executions.
-  * [docs/specs/0004-verify.md](file:///home/swyra/projects/knowledge-retrieval-engine/docs/specs/0004-verify.md): Recorded fast path fallback regression verification steps and execution environment distinctions.
-  * [docs/reviews/2026-10-17-re-factor.md](file:///home/swyra/projects/knowledge-retrieval-engine/docs/reviews/2026-10-17-re-factor.md): Independent senior review report.
+  * [backend/src/services/langgraph_pipeline.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/services/langgraph_pipeline.py): Enforced model provenance validation in `escalate_to_full_retrieval`. Untrusted 1024 dimensional vectors lacking reliable provenance are replaced through the configured full embedding path. Preserved single generation limits and refreshed candidate state.
+  * [backend/tests/test_fast_path_fallback_regressions.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/tests/test_fast_path_fallback_regressions.py): Added 3 regressions (13 total) asserting that untrusted 1024 dimensional state vectors are replaced through the configured full embedding path in unit and pipeline executions, and verifying that legitimate vectors with matching model provenance are reused.
+  * [backend/AGENTS.md](file:///home/swyra/projects/knowledge-retrieval-engine/backend/AGENTS.md): Updated gotcha regarding model provenance requirement for escalation query embedding reuse.
+  * [docs/specs/0004-verify.md](file:///home/swyra/projects/knowledge-retrieval-engine/docs/specs/0004-verify.md): Recorded updated fast path regression verification steps and execution environment distinctions (57 core tests passed).
 
 * Executed Commands and Verification Outcomes:
-  * Fast path fallback regressions: `uv run pytest tests/test_fast_path_fallback_regressions.py` (10 passed in 6.14s).
-  * Core 0004 suite: `uv run pytest tests/test_benchmark_runner_and_persistence_0004.py tests/test_csv_vertical_slice_0004.py tests/test_dynamodb_boundary_and_execution.py tests/test_pdf_retrieval_slice_0004.py tests/test_structured_query_service.py tests/test_fast_path_fallback_regressions.py` (54 passed in 37.70s).
-  * Repository wide pytest suite: `uv run pytest` (376 passed, 3 documented skips, 0 failed in 49.33s).
-  * Live HTTP checks: 17 passed in `verify_0004_live.py`.
+  * Fast path fallback regressions: `uv run pytest tests/test_fast_path_fallback_regressions.py` (13 passed in 3.77s).
+  * Core 0004 suite: `uv run pytest tests/test_benchmark_runner_and_persistence_0004.py tests/test_csv_vertical_slice_0004.py tests/test_dynamodb_boundary_and_execution.py tests/test_pdf_retrieval_slice_0004.py tests/test_structured_query_service.py tests/test_fast_path_fallback_regressions.py` (57 passed in 34.52s).
 
-* Independent Code Review and Post Review Nit Fixes:
-  * Model: `gemini-2.5-pro` (author on `gemini 3.8 flash`).
-  * Scope: 37 files on branch `re-factor` vs `main`.
-  * Verdict: Approve with nits (0 blockers, 0 majors, 0 minors, 2 nits resolved).
-  * Report: [docs/reviews/2026-10-17-re-factor.md](file:///home/swyra/projects/knowledge-retrieval-engine/docs/reviews/2026-10-17-re-factor.md).
-  * Nit 1 resolved: Consolidated duplicate `replace` import in `backend/src/services/langgraph_pipeline.py:894`.
-  * Nit 2 resolved: Removed redundant `from config import settings` import in `backend/src/providers/embedding_provider.py:124`.
-
-* Embedding Compatibility Distinction:
-  * In `escalate_to_full_retrieval`, vector length check validates the 1024 vector dimension, rejecting 384 dimension embeddings.
-  * Floating point vectors in state carry no attached model or provider metadata envelope attributes.
-  * Dimension validation alone cannot establish model or provider provenance.
-  * Model provenance compatibility remains unresolved in code rather than verified.
+* Embedding Compatibility Resolution:
+  * In `escalate_to_full_retrieval`, query vector reuse is no longer permitted solely because an existing vector has 1024 dimensions.
+  * Reuse requires verified model provenance matching the configured full retrieval model (`get_embedding_model()`).
+  * Any vector with missing, null, or mismatched provenance is replaced with a fresh compatible query embedding from the configured full embedding provider (`embed_text(query, provider=active_provider)` or `repo.generate_query_embedding(query)`).
+  * Document re embedding was not performed and no new metadata framework was introduced.
 
 * Pending Diagnostic Findings Preserved:
   * Q152: Incomplete `survay.csv` partition coverage in DynamoDB TableStore remains a pending correctness finding.

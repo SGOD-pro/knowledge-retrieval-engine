@@ -46,7 +46,7 @@ uv run pytest tests/test_contracts_and_identity.py
 * Local development defaults to SQLite or in memory TableStore and LocalStack DynamoDB, while Qdrant runs via local container or cloud.
 * Setting `MODEL_PROVIDER` determines whether Bedrock or external test providers are called.
 * Table retrieval requires fidelity checks, so lower fidelity thresholds when working with dense tabular data.
-* Query embedding reuse during escalation checks the 1024 vector dimension; vector dimension alone does not verify model provenance.
+* Query embedding reuse during escalation requires verified model provenance matching the full index; vectors without reliable provenance are replaced through the configured full embedding path.
 
 ## Related specs
 * [docs/specs/0001-contracts-and-identity-envelope.md](../docs/specs/0001-contracts-and-identity-envelope.md)

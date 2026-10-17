@@ -45,6 +45,7 @@ class PipelineState(TypedDict):
     query: str
     workspace_id: str
     query_embedding: list[float] | None
+    query_embedding_provenance: str | None
     document_ids: list[str] | None
     plan: Plan | None
     bm25_candidates: list[Chunk]  # preserved BM25 results for RRF
@@ -135,12 +136,15 @@ def route_query(state: PipelineState):
     is_structured = getattr(plan, "use_structured_aggregate", False) or ("structured_table" in selected_strategies.primary)
 
     # 2. Re-use existing query_embedding if provided by query_service;
-    # only embed via Titan if full path is chosen (not structured and not fast-path)
+    # only embed via Titan if full path is chosen (not structured and not fast path)
     # and embedding not yet computed
     query_embedding = state.get("query_embedding")
+    provenance = state.get("query_embedding_provenance")
     if not plan.fast_path and not is_structured and query_embedding is None:
         from providers.embedding_provider import embed_text
+        from providers.bedrock_models import get_embedding_model
         query_embedding = embed_text(state["query"])
+        provenance = get_embedding_model()
 
     latency_ms = (time.perf_counter() - t0) * 1000.0
     if is_structured:
@@ -151,6 +155,7 @@ def route_query(state: PipelineState):
     logger.info("route_query.latency_ms=%.2f fast_path=%s planned=%s primary_strategies=%s", latency_ms, plan.fast_path, planned, selected_strategies.primary)
     return {
         "query_embedding": query_embedding,
+        "query_embedding_provenance": provenance,
         "plan": plan,
         "planned_path": planned,
         "executed_path": planned,
@@ -865,18 +870,35 @@ def escalate_to_full_retrieval(state: PipelineState):
         from dataclasses import replace
         full_plan = replace(plan, fast_path=False)
 
-    # Reuse compatible query embedding if already computed (1024-dim), else generate via provider
-    query_embedding = state.get("query_embedding")
+    # Do not reuse an existing query vector solely because it has 1024 dimensions.
+    # Use the established full retrieval embedding provider model matching the full index.
+    # If the existing vector has no reliable model provenance, generate a fresh compatible query embedding.
     repo = _get_repo()
-    if not query_embedding or len(query_embedding) != 1024:
-        from providers.embedding_provider import embed_text
-        from providers.provider_client import get_active_provider
-        active_provider = get_active_provider()
+    from providers.bedrock_models import get_embedding_model
+    from providers.embedding_provider import embed_text
+    from providers.provider_client import get_active_provider
+
+    active_provider = get_active_provider()
+    expected_model = get_embedding_model()
+
+    existing_embedding = state.get("query_embedding")
+    provenance = state.get("query_embedding_provenance") or state.get("query_embedding_model")
+
+    trusted_provenance = (
+        provenance in (expected_model, f"{active_provider}:{expected_model}")
+        if (provenance and isinstance(provenance, str))
+        else False
+    )
+
+    if existing_embedding and len(existing_embedding) == 1024 and trusted_provenance:
+        query_embedding = existing_embedding
+    else:
         query_embedding = (
             repo.generate_query_embedding(state["query"])
             if hasattr(repo, "generate_query_embedding")
             else embed_text(state["query"], provider=active_provider)
         )
+        provenance = expected_model
 
     retriever = VectorRetriever(repository=repo)
     chunks = retriever.search(
@@ -906,6 +928,7 @@ def escalate_to_full_retrieval(state: PipelineState):
         "plan": full_plan,
         "executed_path": "full",
         "query_embedding": query_embedding,
+        "query_embedding_provenance": provenance,
         "candidate_chunks": vector_chunks,
         "retrieval_candidates": {**dict(state.get("retrieval_candidates", {})), "vector": [c.id for c in vector_chunks]},
         "top_chunks": [],
@@ -1014,7 +1037,9 @@ def run_structured_aggregate(state: PipelineState):
         q_emb = state.get("query_embedding")
         if q_emb is None:
             from providers.embedding_provider import embed_text
+            from providers.bedrock_models import get_embedding_model
             res["query_embedding"] = embed_text(state["query"])
+            res["query_embedding_provenance"] = get_embedding_model()
     return res
 
 
@@ -1152,6 +1177,7 @@ class Pipeline:
         workspace_id: str = "",
         force_full_path: bool = False,
         query_embedding: list[float] | None = None,
+        query_embedding_provenance: str | None = None,
         benchmark_mode: bool = False,
     ):
         if not workspace_id:
@@ -1161,6 +1187,7 @@ class Pipeline:
             "query": query,
             "workspace_id": workspace_id,
             "query_embedding": query_embedding,
+            "query_embedding_provenance": query_embedding_provenance,
             "document_ids": document_ids,
             "force_full_path": force_full_path,
             "plan": None,
@@ -1240,6 +1267,8 @@ class Pipeline:
                 self.structured_aggregate = (self.executed_path == "structured_aggregate")
                 self.reranker_mode = state.get("reranker_mode", "remote_success")
                 self.retrieval_candidates = state.get("retrieval_candidates", {})
+                self.query_embedding = state.get("query_embedding")
+                self.query_embedding_provenance = state.get("query_embedding_provenance")
 
                 # Expose internal state for tests
                 class LLMInput:

@@ -625,3 +625,164 @@ def test_escalation_telemetry_correctness(monkeypatch):
     assert "fast_path_ms" in response.stage_timings
     assert "full_vector_ms" in response.stage_timings
 
+
+def test_untrusted_1024_dimensional_vector_replaced_in_escalation(monkeypatch):
+    """An untrusted 1024 dimensional vector in state must NOT be reused solely because of dimension.
+    escalate_to_full_retrieval must replace it using the configured full embedding path."""
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    from providers.bedrock_models import get_embedding_model
+    from providers.embedding_provider import embed_text
+    from services.langgraph_pipeline import escalate_to_full_retrieval
+
+    query = "What does quantum key distribution guarantee?"
+    untrusted_vector = [999.0] * 1024
+    expected_fresh_vector = embed_text(query)
+
+    # Case 1: Untrusted vector with no provenance
+    state_no_prov = {
+        "query": query,
+        "workspace_id": "ws_untrusted_emb_unit",
+        "query_embedding": untrusted_vector,
+        "query_embedding_provenance": None,
+        "candidate_chunks": [],
+        "stage_timings": {},
+    }
+
+    res_no_prov = escalate_to_full_retrieval(state_no_prov)
+    assert res_no_prov["query_embedding"] != untrusted_vector
+    assert res_no_prov["query_embedding"] == expected_fresh_vector
+    assert res_no_prov["query_embedding_provenance"] == get_embedding_model()
+
+    # Case 2: Untrusted vector with mismatched or untrusted provenance
+    state_bad_prov = {
+        "query": query,
+        "workspace_id": "ws_untrusted_emb_unit",
+        "query_embedding": untrusted_vector,
+        "query_embedding_provenance": "untrusted_arbitrary_model",
+        "candidate_chunks": [],
+        "stage_timings": {},
+    }
+
+    res_bad_prov = escalate_to_full_retrieval(state_bad_prov)
+    assert res_bad_prov["query_embedding"] != untrusted_vector
+    assert res_bad_prov["query_embedding"] == expected_fresh_vector
+    assert res_bad_prov["query_embedding_provenance"] == get_embedding_model()
+
+
+def test_untrusted_1024_dimensional_vector_replaced_in_pipeline_escalation(monkeypatch):
+    """End to end pipeline regression: an untrusted 1024 dimensional vector passed to pipeline
+    must be replaced through the configured full embedding path upon escalation, allowing
+    correct evidence recovery and single generation without loops."""
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    from providers.bedrock_models import get_embedding_model
+    from providers.embedding_provider import embed_text
+
+    repo = CloudRepository()
+    ws_id = "ws_untrusted_pipeline_test"
+    query = "What does quantum key distribution guarantee for communication?"
+
+    # Distractor document matching fast path but failing fast extraction
+    doc_distractor = Document(
+        id="doc_qkd_distractor",
+        filename="distractor.pdf",
+        source_format="pdf",
+        chunks=(
+            Chunk(
+                id="doc_qkd_distractor:c1",
+                document_id="doc_qkd_distractor",
+                text="Standard administrative procedures for laboratory network administration.",
+                source_format="pdf",
+                page_number=1,
+                element_type="paragraph",
+                section_path=("Admin",),
+                embedding_fast=embed_fast_local(query),
+                embedding_full=_deterministic_vector("administrative procedures for laboratory", 1024),
+                workspace_id=ws_id,
+                similarity_score=0.9,
+            ),
+        ),
+        workspace_id=ws_id,
+    )
+    repo.save(doc_distractor)
+
+    target_text = "Quantum key distribution guarantees information theoretic security based on quantum mechanics."
+    doc_target = Document(
+        id="doc_qkd_target",
+        filename="qkd_science.pdf",
+        source_format="pdf",
+        chunks=(
+            Chunk(
+                id="doc_qkd_target:c1",
+                document_id="doc_qkd_target",
+                text=target_text,
+                source_format="pdf",
+                page_number=1,
+                element_type="paragraph",
+                section_path=("Science",),
+                embedding_fast=embed_fast_local("physics principles"),
+                embedding_full=_deterministic_vector(target_text, 1024),
+                workspace_id=ws_id,
+                similarity_score=0.9,
+            ),
+        ),
+        workspace_id=ws_id,
+    )
+    repo.save(doc_target)
+
+    # Pass an untrusted 1024 dimensional vector without provenance
+    untrusted_vector = [999.0] * 1024
+    reset_llm_counter()
+
+    response = pipeline.run(
+        query=query,
+        workspace_id=ws_id,
+        query_embedding=untrusted_vector,
+    )
+
+    assert response.planned_path == "fast"
+    assert response.executed_path == "full"
+
+    # Untrusted vector was replaced through configured full embedding path
+    assert response.query_embedding != untrusted_vector
+    assert response.query_embedding == embed_text(query)
+    assert response.query_embedding_provenance == get_embedding_model()
+
+    # Evidence recovered and answer generated
+    assert len(response.citations) >= 1
+    assert any(c["chunk_id"] == "doc_qkd_target:c1" for c in response.citations)
+    assert "information theoretic security" in response.answer.lower()
+
+    # Preserves single generation limit
+    assert get_llm_counter()["generation_calls"] == 1
+
+
+def test_trusted_1024_dimensional_vector_with_model_provenance_is_reused(monkeypatch):
+    """When a 1024 dimensional vector carries verified model provenance matching the full index,
+    escalation reuses it rather than making duplicate provider calls."""
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    from providers.bedrock_models import get_embedding_model
+    from providers.embedding_provider import embed_text
+    from services.langgraph_pipeline import escalate_to_full_retrieval
+
+    query = "What does quantum key distribution guarantee?"
+    verified_vector = embed_text(query)
+    expected_model = get_embedding_model()
+
+    state = {
+        "query": query,
+        "workspace_id": "ws_trusted_emb_unit",
+        "query_embedding": verified_vector,
+        "query_embedding_provenance": expected_model,
+        "candidate_chunks": [],
+        "stage_timings": {},
+    }
+
+    # Patch embed_text to prove it is NOT called when provenance is trusted
+    with patch("providers.embedding_provider.embed_text") as mock_embed:
+        result = escalate_to_full_retrieval(state)
+        mock_embed.assert_not_called()
+
+    assert result["query_embedding"] is verified_vector
+    assert result["query_embedding_provenance"] == expected_model
+
+
