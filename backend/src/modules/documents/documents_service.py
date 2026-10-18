@@ -135,11 +135,18 @@ class DocumentsService:
                 if getattr(document, "source_format", "").lower() == "csv":
                     store = get_shared_table_store()
                     manifest = store.get_ingestion_manifest(doc_id, workspace_id) or {}
-                    doc_ver = manifest.get("document_version") or hashlib.sha256(content).hexdigest()[:32]
-                    incomplete_cov = not bool(manifest.get("coverage_complete", True))
-                    exclusions = tuple(manifest.get("rejection_reasons", []))
-                    persisted = int(manifest.get("persisted_rows", 0))
-                    total = int(manifest.get("source_rows", 0))
+                    if manifest:
+                        doc_ver = manifest.get("document_version") or hashlib.sha256(content).hexdigest()[:32]
+                        incomplete_cov = not bool(manifest.get("coverage_complete", False))
+                        exclusions = tuple(manifest.get("rejection_reasons", []))
+                        persisted = int(manifest.get("persisted_rows", 0))
+                        total = int(manifest.get("source_rows", 0))
+                    else:
+                        doc_ver = hashlib.sha256(content).hexdigest()[:32]
+                        incomplete_cov = bool(getattr(document, "incomplete_coverage_flag", False))
+                        exclusions = tuple(getattr(document, "exclusions", ()))
+                        persisted = len(document.chunks)
+                        total = len(document.chunks) + len(exclusions)
                 else:
                     doc_ver = hashlib.sha256(content).hexdigest()[:32]
                     incomplete_cov = bool(getattr(document, "incomplete_coverage_flag", False))
@@ -287,11 +294,17 @@ class DocumentsService:
                     if suffix.replace(".", "").lower() == "csv":
                         store = get_shared_table_store()
                         manifest = store.get_ingestion_manifest(doc.id, workspace_id) or {}
-                        doc_ver = manifest.get("document_version") or doc_ver
-                        incomplete_cov = not bool(manifest.get("coverage_complete", True))
-                        exclusions = tuple(manifest.get("rejection_reasons", []))
-                        persisted = int(manifest.get("persisted_rows", 0))
-                        total = int(manifest.get("source_rows", 0))
+                        if manifest:
+                            doc_ver = manifest.get("document_version") or doc_ver
+                            incomplete_cov = not bool(manifest.get("coverage_complete", False))
+                            exclusions = tuple(manifest.get("rejection_reasons", []))
+                            persisted = int(manifest.get("persisted_rows", 0))
+                            total = int(manifest.get("source_rows", 0))
+                        else:
+                            incomplete_cov = bool(getattr(doc, "incomplete_coverage_flag", False))
+                            exclusions = tuple(getattr(doc, "exclusions", ()))
+                            persisted = len(doc.chunks)
+                            total = len(doc.chunks) + len(exclusions)
                     else:
                         incomplete_cov = bool(getattr(doc, "incomplete_coverage_flag", False))
                         exclusions = tuple(getattr(doc, "exclusions", ()))

@@ -280,7 +280,7 @@ class MemoryTableStore:
         limit: int | None = None,
         version: str | None = None,
     ) -> tuple[Decimal | None, int, list[str], list[int], str]:
-        val, count, row_ids, _, digest = self._execute_pass(
+        val, count, row_ids, rows_matched, digest = self._execute_pass(
             table_id=table_id,
             workspace_id=workspace_id,
             column_index=column_index,
@@ -289,17 +289,7 @@ class MemoryTableStore:
             limit=limit,
             version=version,
         )
-        row_indices = []
-        ver = version or self.get_active_version(table_id, workspace_id)
-        candidate_rows = []
-        if ver and (workspace_id, table_id, ver) in self._versioned_rows:
-            candidate_rows = self._versioned_rows[(workspace_id, table_id, ver)]
-        elif (workspace_id, table_id) in self._tables:
-            candidate_rows = self._tables[(workspace_id, table_id)].rows
-        row_id_set = set(row_ids)
-        for r in candidate_rows:
-            if r.row_id in row_id_set:
-                row_indices.append(r.row_index)
+        row_indices = [r.row_index for r in rows_matched]
         return val, count, row_ids, row_indices, digest
 
     def _execute_pass(

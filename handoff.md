@@ -89,3 +89,69 @@ Specification 0003 remains Proposed and deferred.
   * No claims of independent live AWS readiness or benchmark accuracy improvements.
   * Paid canonical 60 question benchmark was not rerun.
 
+## TableStore Multiyear Coverage Investigation and Verification (October 17 2026)
+
+* Base commit: `5da60942cd52be201b66c8599736e70d056d395e`
+* Working tree changes:
+  * [backend/src/db/table_store/memory_store.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/db/table_store/memory_store.py): Streamlined [`execute_single_pass_query`](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/db/table_store/memory_store.py#L273) to extract row indices directly from matched rows rather than executing an extra scan over candidate rows.
+  * [backend/src/modules/documents/documents_service.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/modules/documents/documents_service.py): Hardened [`DocumentSnapshot`](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/schemas/contracts/boundary.py#L38) construction to safely inspect TableStore manifest coverage when present, falling back accurately to document chunks when absent.
+  * [backend/tests/test_tablestore_multiyear_coverage_regressions.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/tests/test_tablestore_multiyear_coverage_regressions.py): Added offline regression suite with 9 passing tests covering datasets above 5000 rows across multiple years, complete range and sum calculations, temporal metric deltas, rejection tracking, failure on incomplete coverage, boundary isolation, DynamoDB paginated reads over multiple pages via `LastEvaluatedKey`, and complete `survay.csv` validation.
+  * [backend/AGENTS.md](file:///home/swyra/projects/knowledge-retrieval-engine/backend/AGENTS.md): Recorded the distinction between TableStore full row persistence and the 5000 chunk cap for vector search.
+  * [docs/specs/0004-verify.md](file:///home/swyra/projects/knowledge-retrieval-engine/docs/specs/0004-verify.md): Updated acceptance criteria verification records (66 core tests passed).
+  * [docs/reviews/2026-10-17-re-factor.md](file:///home/swyra/projects/knowledge-retrieval-engine/docs/reviews/2026-10-17-re-factor.md): Recorded senior code review findings.
+
+* Investigation and Disproof Findings:
+  * Raw source data inspection: [`data/non_pdf_formats/survay.csv`](file:///home/swyra/projects/knowledge-retrieval-engine/data/non_pdf_formats/survay.csv) and [`backend/tests/data/survay.csv`](file:///home/swyra/projects/knowledge-retrieval-engine/backend/tests/data/survay.csv) contain exactly 60255 data rows and 1 header row, with 13 distinct years from 2013 through 2025, having exactly 4635 rows per year in reverse chronological order (rows 1 to 4635 are year 2025, rows 4636 to 9270 are year 2024, down to rows 55621 to 60255 for year 2013).
+  * Disproved row cap in TableStore code: [`backend/src/ingestion/csv_table_ingester.py`](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/ingestion/csv_table_ingester.py) streams all rows in batches of at most 99 rows without any 5000 row cap or year filter. Full ingestion supports all 60255 rows across 2013 through 2025.
+  * Structured coverage distinction: Vector chunk counts cannot establish structured TableStore coverage. The vector adapter caps at `VECTOR_MAX_CHUNKS = 5000`, so `DocumentSnapshot` records 5000 persisted chunks for vector indexing; TableStore streams and persists the complete 60255 row dataset independently.
+  * Root cause of the reported 5000 row or all 2025 discrepancy:
+    1. Vector parser cap: [`backend/src/ingestion/adapters/csv_adapter.py`](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/ingestion/adapters/csv_adapter.py#L46) took the first 5000 rows (4635 rows of 2025 and 365 rows of 2024), recorded as `persisted_rows: 5000` on the vector snapshot.
+    2. Stale benchmark workspace data: in workspace `ws_fresh_benchmark`, TableStore held an earlier 4 row mock test fixture `test_doc` from year 2025 (`1db813afd34f9410a818de3aeb9d3133`). That explains why Q152 answered "2025 and 2025." during the benchmark run.
+    3. Proof of complete TableStore storage: in workspace `ws_survay_verify_3797a7b9`, `survay.csv` was ingested into DynamoDB TableStore with all 60255 rows across all 13 years (2013 to 2025), and query execution answered `2013 and 2025.` with selection count 60255.
+
+* Comparison Workspace Procedure (Pending):
+  * Historical preservation: `ws_fresh_benchmark` and its existing document versions remain preserved intact. In place recovery, version pruning, and deletion of existing data are prohibited.
+  * Isolated comparison procedure:
+    * Workspace identifier: dedicated comparison workspace such as `ws_survay_compare` or `ws_benchmark_compare`
+    * Source document path: `data/non_pdf_formats/survay.csv`
+    * Target incoming version: `c029d234eefd3fee2563b9c0929946ca`
+    * Table name: `survay`
+    * Target manifest: `coverage_complete=True, source_rows=60255, persisted_rows=60255, rejected_rows=0`
+  * Execution status: Kept strictly pending as a recommended comparison procedure. Do not execute recovery, in place mutation, or deletion of existing data.
+
+* Canonical Baseline Artifacts and Reconciliation:
+  * Exact artifact paths:
+    * Manifest: [`backend/reports/c44a47857fa45d1610c21c2cda83670c43272c11/20261017_001258/manifest.json`](file:///home/swyra/projects/knowledge-retrieval-engine/backend/reports/c44a47857fa45d1610c21c2cda83670c43272c11/20261017_001258/manifest.json)
+    * Per query details: [`backend/reports/c44a47857fa45d1610c21c2cda83670c43272c11/20261017_001258/query_details.json`](file:///home/swyra/projects/knowledge-retrieval-engine/backend/reports/c44a47857fa45d1610c21c2cda83670c43272c11/20261017_001258/query_details.json)
+    * Summary markdown: [`backend/reports/c44a47857fa45d1610c21c2cda83670c43272c11/20261017_001258/summary.md`](file:///home/swyra/projects/knowledge-retrieval-engine/backend/reports/c44a47857fa45d1610c21c2cda83670c43272c11/20261017_001258/summary.md)
+  * Tested commit: `c44a47857fa45d1610c21c2cda83670c43272c11` (timestamp `20261017_001258`, cold benchmark, workspace `ws_fresh_benchmark`)
+  * Test suite SHA256: `233bbd9dd19d02c0055453e9bcc40a878a8398bfd4a274b263b19dc11f194058` (`data/test.json`, `RAG_Evaluation_Suite_New_60_Q136_Q195`)
+  * Corpus manifest SHA256: `ac193bc5bea7bfcc547e39924118fdd469385ceb528d14d5528f0464f74c959d`
+  * Accuracy reconciliation (23 of 60 versus 24 of 60):
+    * The machine artifact records report `overall_accuracy: 0.3833` in [`manifest.json`](file:///home/swyra/projects/knowledge-retrieval-engine/backend/reports/c44a47857fa45d1610c21c2cda83670c43272c11/20261017_001258/manifest.json) and `38.3%` in [`summary.md`](file:///home/swyra/projects/knowledge-retrieval-engine/backend/reports/c44a47857fa45d1610c21c2cda83670c43272c11/20261017_001258/summary.md).
+    * Inspection of [`query_details.json`](file:///home/swyra/projects/knowledge-retrieval-engine/backend/reports/c44a47857fa45d1610c21c2cda83670c43272c11/20261017_001258/query_details.json) confirms exactly 23 passing queries where `is_correct` is true out of 60 questions (23 of 60 equals 0.383333).
+    * The earlier mention of 24 of 60 (0.400) was an informal narrative count in preliminary notes that conflicted with the machine artifact.
+    * The true canonical benchmark score recorded in the original baseline artifacts is 23 of 60 (0.3833). Offline regression results must not be substituted for historical benchmark evidence.
+    * Per query diagnoses remain explicitly unverified unless verified by focused test.
+
+* Executed Test Commands and Outcomes:
+  * Multiyear coverage regressions: `uv run pytest tests/test_tablestore_multiyear_coverage_regressions.py` (9 passed in 10.50s, post review nit fix confirmed 9 passed in 12.74s).
+  * Full 0004 test suite: `uv run pytest tests/test_tablestore_multiyear_coverage_regressions.py tests/test_benchmark_runner_and_persistence_0004.py tests/test_csv_vertical_slice_0004.py tests/test_dynamodb_boundary_and_execution.py tests/test_pdf_retrieval_slice_0004.py tests/test_structured_query_service.py tests/test_fast_path_fallback_regressions.py` (66 passed in 48.13s).
+  * Live HTTP verification: `uv run python ../verify_0004_live.py` (17 of 17 passed).
+
+* Independent Senior Code Review:
+  * Reviewer model: `gemini-2.5-pro` (author on `gemini 3.8 flash`).
+  * Scope: 38 files on branch `re-factor` vs `main`.
+  * Verdict: Approve with nits (0 blockers, 0 majors, 0 minors, 1 nit).
+  * Post review nit resolution: Aligned import style in `test_tablestore_multiyear_coverage_regressions.py` to direct package style.
+  * Report: [`docs/reviews/2026-10-17-re-factor.md`](file:///home/swyra/projects/knowledge-retrieval-engine/docs/reviews/2026-10-17-re-factor.md).
+
+* Scope and Status Boundaries:
+  * Q153 (table binding and year delta column mapping) remains a separate pending finding.
+  * Q159 (missing filter handling) remains a separate pending finding.
+  * Specification 0004 remains locally Accepted.
+  * Specification 0003 remains Proposed and deferred.
+  * No claims of independent live AWS cloud readiness or benchmark accuracy improvements.
+  * Paid canonical 60 question benchmark was not rerun.
+
+
