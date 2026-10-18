@@ -120,34 +120,139 @@ class StructuredQueryService:
             return None
 
         # 2. Select matching table
-        selected_tid = None
-        selected_meta = None
-        selected_ver = None
-
-        # Check explicit table name or file in query (sort by length descending to match more specific names first)
+        explicit_candidate = None
         candidate_tables_sorted = sorted(candidate_tables, key=lambda x: len(x[0]), reverse=True)
         for tid, meta, ver in candidate_tables_sorted:
             if tid in q_lower or (tid + ".csv") in q_lower or (tid + ".xlsx") in q_lower:
-                selected_tid, selected_meta, selected_ver = tid, meta, ver
+                explicit_candidate = (tid, meta, ver)
                 break
 
-        # Fallback to single candidate or first candidate
-        if not selected_tid and candidate_tables:
-            selected_tid, selected_meta, selected_ver = candidate_tables[0]
+        if explicit_candidate:
+            candidates_to_try = [explicit_candidate]
+            is_explicit = True
+        else:
+            candidates_to_try = self._rank_candidate_tables(candidate_tables, query, workspace_id)
+            is_explicit = False
 
-        # 3. Completeness check — require coverage_complete
-        if not self.store.has_coverage_complete_table(selected_tid, workspace_id):
-            manifest = self.store.get_ingestion_manifest(selected_meta.document_id, workspace_id, selected_ver)
-            logger.error("StructuredQueryService: table %s is not coverage_complete", selected_tid)
-            raise IncompleteDataError(selected_tid, manifest)
+        last_error = None
+        for tid, meta, ver in candidates_to_try:
+            # Completeness check — require coverage_complete
+            if not self.store.has_coverage_complete_table(tid, workspace_id):
+                manifest = self.store.get_ingestion_manifest(meta.document_id, workspace_id, ver)
+                logger.error("StructuredQueryService: table %s is not coverage_complete", tid)
+                if is_explicit or len(candidates_to_try) == 1:
+                    raise IncompleteDataError(tid, manifest)
+                last_error = IncompleteDataError(tid, manifest)
+                continue
 
-        schema = selected_meta.schema
-        if not schema or not schema.columns:
-            return None
+            schema = meta.schema
+            if not schema or not schema.columns:
+                continue
 
-        # Manifest row count
-        manifest = self.store.get_ingestion_manifest(selected_meta.document_id, workspace_id, selected_ver) or {}
-        total_rows_in_table = int(manifest.get("persisted_rows", 0))
+            manifest = self.store.get_ingestion_manifest(meta.document_id, workspace_id, ver) or {}
+            total_rows_in_table = int(manifest.get("persisted_rows", 0))
+
+            try:
+                return self._execute_on_table(
+                    query=query,
+                    table_id=tid,
+                    workspace_id=workspace_id,
+                    document_id=meta.document_id,
+                    version=ver,
+                    schema=schema,
+                    total_rows=total_rows_in_table,
+                )
+            except (UnresolvedFilterError, UnsupportedQueryError) as e:
+                last_error = e
+                if is_explicit:
+                    raise
+                logger.info(
+                    "StructuredQueryService: candidate table %s could not satisfy query filters (%s), trying remaining candidates",
+                    tid, e
+                )
+                continue
+
+        if last_error:
+            raise last_error
+        return None
+
+    def _rank_candidate_tables(
+        self,
+        candidate_tables: list[tuple[str, Any, str]],
+        query: str,
+        workspace_id: str,
+    ) -> list[tuple[str, Any, str]]:
+        q_lower = query.lower()
+        q_words = [
+            w for w in re.findall(r"\b[a-zA-Z0-9_]{2,}\b", q_lower)
+            if w not in {
+                "how", "did", "change", "from", "to", "what", "is", "the", "for", "give", "and", "in", "of", "between",
+                "table", "csv", "xlsx", "rows", "records", "data"
+            }
+        ]
+        explicit_terms: list[str] = []
+        explicit_terms += re.findall(r"\(([^)]+)\)", query)
+        explicit_terms += re.findall(r'["\']([^"\']+)["\']', query)
+        for m in re.finditer(r"\bfor\s+([A-Za-z0-9_]+(?:\s+[A-Za-z0-9_]+)?)\b", query, re.IGNORECASE):
+            explicit_terms.append(m.group(1).strip())
+
+        scored: list[tuple[float, tuple[str, Any, str]]] = []
+        for item in candidate_tables:
+            tid, meta, ver = item
+            score = 0.0
+            schema = meta.schema if meta else None
+            if not schema or not schema.columns:
+                scored.append((score, item))
+                continue
+
+            for col in schema.columns:
+                c_name = col.name.lower()
+                for w in q_words:
+                    if w in c_name or c_name in w:
+                        score += 3.0
+                    elif w.endswith("ies") and w[:-3] + "y" in c_name:
+                        score += 3.0
+                    elif w.endswith("s") and w[:-1] in c_name:
+                        score += 3.0
+
+                dtype = self._normalize_dtype(col.inferred_dtype)
+                if dtype in {"decimal", "integer", "percentage", "currency"}:
+                    score += 2.0
+
+            if explicit_terms:
+                try:
+                    probe_rows = self.store.query_rows(tid, workspace_id, predicates=[], limit=50, version=ver)
+                    for exp in explicit_terms:
+                        exp_lower = exp.lower().strip()
+                        found = False
+                        for r in probe_rows:
+                            for cell in r.cells:
+                                val = str(cell.normalized_value or "").lower().strip()
+                                if exp_lower == val or exp_lower in val:
+                                    score += 10.0
+                                    found = True
+                                    break
+                            if found:
+                                break
+                except Exception:
+                    pass
+
+            scored.append((score, item))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [item for _, item in scored]
+
+    def _execute_on_table(
+        self,
+        query: str,
+        table_id: str,
+        workspace_id: str,
+        document_id: str,
+        version: str,
+        schema: TableSchema,
+        total_rows: int,
+    ) -> StructuredQueryResult:
+        q_lower = query.lower()
 
         # Check for Ambiguous Binding
         self._check_ambiguous_binding(query, schema)
@@ -156,36 +261,36 @@ class StructuredQueryService:
         if bool(re.search(r'\b(?:earliest|latest|min|max|minimum|maximum)\b', q_lower)):
             return self._execute_min_max_range(
                 query=query,
-                table_id=selected_tid,
+                table_id=table_id,
                 workspace_id=workspace_id,
-                document_id=selected_meta.document_id,
-                version=selected_ver,
+                document_id=document_id,
+                version=version,
                 schema=schema,
-                total_rows=total_rows_in_table,
+                total_rows=total_rows,
             )
 
         # 5. Pattern 2: Entity Metric Delta / Change between two periods
         if bool(re.search(r'\b(?:how did .* change|change from \d{4} to \d{4})\b', q_lower)):
             return self._execute_metric_delta(
                 query=query,
-                table_id=selected_tid,
+                table_id=table_id,
                 workspace_id=workspace_id,
-                document_id=selected_meta.document_id,
-                version=selected_ver,
+                document_id=document_id,
+                version=version,
                 schema=schema,
-                total_rows=total_rows_in_table,
+                total_rows=total_rows,
             )
 
         # 6. Pattern 3: Standard Aggregates (sum, avg, count)
         if any(w in q_lower for w in ("total ", "sum of", "average", "count")):
             return self._execute_aggregate(
                 query=query,
-                table_id=selected_tid,
+                table_id=table_id,
                 workspace_id=workspace_id,
-                document_id=selected_meta.document_id,
-                version=selected_ver,
+                document_id=document_id,
+                version=version,
                 schema=schema,
-                total_rows=total_rows_in_table,
+                total_rows=total_rows,
             )
 
         raise UnsupportedQueryError(f"Query '{query[:60]}' could not be resolved to structured operator")

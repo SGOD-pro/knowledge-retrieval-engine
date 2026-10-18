@@ -156,3 +156,145 @@ def test_normalize_dtype_enum_and_string():
     assert StructuredQueryService._normalize_dtype("decimal") == "decimal"
     assert StructuredQueryService._normalize_dtype(InferredDtype.PERCENTAGE) == "percentage"
 
+
+def test_multi_table_workspace_binds_correct_table_for_metric_delta(survay_path: Path):
+    store = MemoryTableStore()
+    ws = "ws_multi_table_test"
+
+    # Ingest distractor table first so it appears first in list_tables
+    rs_path = Path(__file__).parent.parent.parent / "data" / "non_pdf_formats" / "rs_status_bill_passed_assent-1952-2016.csv"
+    if rs_path.exists():
+        ingest_csv_to_table_store(
+            path=rs_path,
+            table_name="rs_status_bill_passed_assent_1952_2016",
+            document_id="doc_rs_distractor",
+            workspace_id=ws,
+            store=store,
+            batch_size=10000,
+        )
+    else:
+        cols = (
+            ColumnDefinition(col_index=0, name="Year", inferred_dtype=InferredDtype.INTEGER),
+            ColumnDefinition(col_index=1, name="Bill_Title", inferred_dtype=InferredDtype.STRING),
+        )
+        schema = TableSchema(columns=cols, header_rows=(0,), header_topology=HeaderTopology.SINGLE_ROW, confidence=1.0)
+        table = StructuredTable(table_id="rs_status_bill_passed_assent_1952_2016", document_id="doc_rs_distractor", sheet_name=None, page_number=None, schema=schema, rows=())
+        store.store_table(table, ws)
+        store.publish_active_version("rs_status_bill_passed_assent_1952_2016", ws, "doc_rs_distractor", "v1", {"coverage_complete": True, "source_rows": 0, "persisted_rows": 0})
+
+    # Ingest survay second
+    ingest_csv_to_table_store(
+        path=survay_path,
+        table_name="survay",
+        document_id="doc_survay",
+        workspace_id=ws,
+        store=store,
+        batch_size=10000,
+    )
+
+    # Verify tables in workspace
+    tables = store.list_tables(ws)
+    assert tables[0] == "rs_status_bill_passed_assent_1952_2016"
+    assert "survay" in tables
+
+    svc = StructuredQueryService(store)
+    # Query Q153 does NOT name survay.csv
+    query = "For All industries (99999), how did total income change from 2024 to 2025? Give the amount and percentage change."
+    result = svc.execute(query, workspace_id=ws)
+
+    assert result is not None
+    assert result.table_id == "survay"
+    assert result.result_value == Decimal("4191")
+    assert abs(result.secondary_value - Decimal("0.43")) <= Decimal("0.02")
+    assert "4,191" in result.answer_text
+    assert "0.43%" in result.answer_text
+
+
+def test_explicit_table_binding_does_not_switch_to_other_tables_on_filter_failure(survay_path: Path):
+    store = MemoryTableStore()
+    ws = "ws_explicit_test"
+
+    # Ingest both distractor and survay
+    rs_path = Path(__file__).parent.parent.parent / "data" / "non_pdf_formats" / "rs_status_bill_passed_assent-1952-2016.csv"
+    if rs_path.exists():
+        ingest_csv_to_table_store(
+            path=rs_path,
+            table_name="rs_status_bill_passed_assent_1952_2016",
+            document_id="doc_rs_distractor",
+            workspace_id=ws,
+            store=store,
+            batch_size=10000,
+        )
+    else:
+        cols = (
+            ColumnDefinition(col_index=0, name="Year", inferred_dtype=InferredDtype.INTEGER),
+            ColumnDefinition(col_index=1, name="Bill_Title", inferred_dtype=InferredDtype.STRING),
+        )
+        schema = TableSchema(columns=cols, header_rows=(0,), header_topology=HeaderTopology.SINGLE_ROW, confidence=1.0)
+        table = StructuredTable(table_id="rs_status_bill_passed_assent_1952_2016", document_id="doc_rs_distractor", sheet_name=None, page_number=None, schema=schema, rows=())
+        store.store_table(table, ws)
+        store.publish_active_version("rs_status_bill_passed_assent_1952_2016", ws, "doc_rs_distractor", "v1", {"coverage_complete": True, "source_rows": 0, "persisted_rows": 0})
+
+    ingest_csv_to_table_store(
+        path=survay_path,
+        table_name="survay",
+        document_id="doc_survay",
+        workspace_id=ws,
+        store=store,
+        batch_size=10000,
+    )
+
+    svc = StructuredQueryService(store)
+    from services.retrieval.structured_query_service import UnresolvedFilterError
+
+    # Explicit query naming the distractor table must not switch to survay
+    query = "For All industries (99999) in rs_status_bill_passed_assent_1952_2016, how did total income change from 2024 to 2025?"
+    with pytest.raises(UnresolvedFilterError) as exc_info:
+        svc.execute(query, workspace_id=ws)
+
+    assert exc_info.value.table_id == "rs_status_bill_passed_assent_1952_2016"
+
+
+def test_multi_table_unresolved_filter_in_all_candidates_raises_error(survay_path: Path):
+    store = MemoryTableStore()
+    ws = "ws_unresolved_all_test"
+
+    rs_path = Path(__file__).parent.parent.parent / "data" / "non_pdf_formats" / "rs_status_bill_passed_assent-1952-2016.csv"
+    if rs_path.exists():
+        ingest_csv_to_table_store(
+            path=rs_path,
+            table_name="rs_status_bill_passed_assent_1952_2016",
+            document_id="doc_rs_distractor",
+            workspace_id=ws,
+            store=store,
+            batch_size=10000,
+        )
+    else:
+        cols = (
+            ColumnDefinition(col_index=0, name="Year", inferred_dtype=InferredDtype.INTEGER),
+            ColumnDefinition(col_index=1, name="Bill_Title", inferred_dtype=InferredDtype.STRING),
+        )
+        schema = TableSchema(columns=cols, header_rows=(0,), header_topology=HeaderTopology.SINGLE_ROW, confidence=1.0)
+        table = StructuredTable(table_id="rs_status_bill_passed_assent_1952_2016", document_id="doc_rs_distractor", sheet_name=None, page_number=None, schema=schema, rows=())
+        store.store_table(table, ws)
+        store.publish_active_version("rs_status_bill_passed_assent_1952_2016", ws, "doc_rs_distractor", "v1", {"coverage_complete": True, "source_rows": 0, "persisted_rows": 0})
+
+    ingest_csv_to_table_store(
+        path=survay_path,
+        table_name="survay",
+        document_id="doc_survay",
+        workspace_id=ws,
+        store=store,
+        batch_size=10000,
+    )
+
+    svc = StructuredQueryService(store)
+    from services.retrieval.structured_query_service import UnresolvedFilterError
+
+    # Entity not present in any table in workspace raises UnresolvedFilterError
+    query = "For NonexistentEntity (00000), how did total income change from 2024 to 2025? Give the amount and percentage change."
+    with pytest.raises(UnresolvedFilterError):
+        svc.execute(query, workspace_id=ws)
+
+
+

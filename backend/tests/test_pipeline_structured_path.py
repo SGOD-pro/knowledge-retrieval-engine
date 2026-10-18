@@ -121,3 +121,54 @@ def test_pipeline_incomplete_data_blocks_generation(populated_workspace):
     finally:
         man["coverage_complete"] = True
         store.publish_active_version("survay", ws, doc_id, man["document_version"], man)
+
+
+def test_pipeline_multi_table_workspace_q153_without_document_ids(survay_path: Path):
+    ws = "ws_pipeline_multi_table"
+    store = get_shared_table_store()
+
+    # Ingest distractor table first
+    rs_path = Path(__file__).parent.parent.parent / "data" / "non_pdf_formats" / "rs_status_bill_passed_assent-1952-2016.csv"
+    if rs_path.exists():
+        ingest_csv_to_table_store(
+            path=rs_path,
+            table_name="rs_status_bill_passed_assent_1952_2016",
+            document_id="doc_pipeline_rs",
+            workspace_id=ws,
+            store=store,
+            batch_size=10000,
+        )
+
+    # Ingest survay second
+    ingest_csv_to_table_store(
+        path=survay_path,
+        table_name="survay",
+        document_id="doc_pipeline_survay_multi",
+        workspace_id=ws,
+        store=store,
+        batch_size=10000,
+    )
+    man = store.get_ingestion_manifest("doc_pipeline_survay_multi", ws)
+    if man and not man.get("coverage_complete"):
+        man["coverage_complete"] = True
+        store.publish_active_version("survay", ws, "doc_pipeline_survay_multi", man["document_version"], man)
+
+    init_request_telemetry()
+    service = QueryService()
+    # Query without document_ids: table binding must resolve to survay
+    req = QueryRequest(
+        query="For All industries (99999), how did total income change from 2024 to 2025? Give the amount and percentage change.",
+        workspace_id=ws,
+        document_ids=None,
+    )
+    res = service.execute(req)
+
+    assert res["executed_path"] == "structured_aggregate"
+    assert res["structured_aggregate"] is True
+    assert res["generation_calls"] == 0
+    assert res["structured_aggregate_calls"] >= 1
+    assert "4,191" in res["answer"]
+    assert "0.43%" in res["answer"]
+    assert len(res["citations"]) >= 1
+    assert res["citations"][0]["table_id"] == "survay"
+
