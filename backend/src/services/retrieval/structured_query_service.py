@@ -119,69 +119,95 @@ class StructuredQueryService:
             logger.info("StructuredQueryService: no candidate tables match document scope %s", document_ids)
             return None
 
-        # 2. Select matching table
-        explicit_candidate = None
-        candidate_tables_sorted = sorted(candidate_tables, key=lambda x: len(x[0]), reverse=True)
-        for tid, meta, ver in candidate_tables_sorted:
-            if tid in q_lower or (tid + ".csv") in q_lower or (tid + ".xlsx") in q_lower:
-                explicit_candidate = (tid, meta, ver)
-                break
+        # 2. Defensible table binding before execution
+        bound_candidate = self._bind_table(candidate_tables, query, workspace_id)
+        if not bound_candidate:
+            return None
 
-        if explicit_candidate:
-            candidates_to_try = [explicit_candidate]
-            is_explicit = True
-        else:
-            candidates_to_try = self._rank_candidate_tables(candidate_tables, query, workspace_id)
-            is_explicit = False
+        selected_tid, selected_meta, selected_ver = bound_candidate
 
-        last_error = None
-        for tid, meta, ver in candidates_to_try:
-            # Completeness check — require coverage_complete
-            if not self.store.has_coverage_complete_table(tid, workspace_id):
-                manifest = self.store.get_ingestion_manifest(meta.document_id, workspace_id, ver)
-                logger.error("StructuredQueryService: table %s is not coverage_complete", tid)
-                if is_explicit or len(candidates_to_try) == 1:
-                    raise IncompleteDataError(tid, manifest)
-                last_error = IncompleteDataError(tid, manifest)
-                continue
+        # 3. Completeness check on bound table — require coverage_complete
+        if not self.store.has_coverage_complete_table(selected_tid, workspace_id):
+            manifest = self.store.get_ingestion_manifest(selected_meta.document_id, workspace_id, selected_ver)
+            logger.error("StructuredQueryService: bound table %s is not coverage_complete", selected_tid)
+            raise IncompleteDataError(selected_tid, manifest)
 
-            schema = meta.schema
-            if not schema or not schema.columns:
-                continue
+        schema = selected_meta.schema
+        if not schema or not schema.columns:
+            return None
 
-            manifest = self.store.get_ingestion_manifest(meta.document_id, workspace_id, ver) or {}
-            total_rows_in_table = int(manifest.get("persisted_rows", 0))
+        manifest = self.store.get_ingestion_manifest(selected_meta.document_id, workspace_id, selected_ver) or {}
+        total_rows_in_table = int(manifest.get("persisted_rows", 0))
 
-            try:
-                return self._execute_on_table(
-                    query=query,
-                    table_id=tid,
-                    workspace_id=workspace_id,
-                    document_id=meta.document_id,
-                    version=ver,
-                    schema=schema,
-                    total_rows=total_rows_in_table,
-                )
-            except (UnresolvedFilterError, UnsupportedQueryError) as e:
-                last_error = e
-                if is_explicit:
-                    raise
-                logger.info(
-                    "StructuredQueryService: candidate table %s could not satisfy query filters (%s), trying remaining candidates",
-                    tid, e
-                )
-                continue
+        # 4. Execute on bound table (never switches to another table)
+        return self._execute_on_table(
+            query=query,
+            table_id=selected_tid,
+            workspace_id=workspace_id,
+            document_id=selected_meta.document_id,
+            version=selected_ver,
+            schema=schema,
+            total_rows=total_rows_in_table,
+        )
 
-        if last_error:
-            raise last_error
-        return None
-
-    def _rank_candidate_tables(
+    def _bind_table(
         self,
         candidate_tables: list[tuple[str, Any, str]],
         query: str,
         workspace_id: str,
-    ) -> list[tuple[str, Any, str]]:
+    ) -> tuple[str, Any, str] | None:
+        q_lower = query.lower()
+
+        # 1. Explicit table name or file in query
+        candidate_tables_sorted = sorted(candidate_tables, key=lambda x: len(x[0]), reverse=True)
+        for tid, meta, ver in candidate_tables_sorted:
+            pattern = rf"(?:\b|_){re.escape(tid)}(?:\.csv|\.xlsx)?(?:\b|_)"
+            if re.search(pattern, q_lower):
+                return (tid, meta, ver)
+
+        # 2. Single candidate in scope
+        if len(candidate_tables) == 1:
+            return candidate_tables[0]
+
+        # 3. Multiple candidate tables: score and disambiguate
+        scored = self._score_candidate_tables(candidate_tables, query, workspace_id)
+        # Sort by score descending; break ties deterministically by table_id
+        scored.sort(key=lambda x: (x[0], x[1][0]), reverse=True)
+
+        if not scored:
+            return None
+
+        s1, top_item = scored[0]
+        s2, second_item = scored[1]
+
+        # Check for ambiguity: multiple tables remain plausibly compatible without sufficient disambiguation
+        if s1 == s2 and s1 > 0:
+            competing = [item[0] for s, item in scored if s == s1]
+            raise AmbiguousBindingError(
+                f"Ambiguous table binding: multiple equally compatible tables found in workspace ({', '.join(competing)}) "
+                f"for query '{query[:60]}'. Please specify table name in query."
+            )
+
+        if s1 > 0 and s2 > 0 and (s1 - s2) < 2.0:
+            raise AmbiguousBindingError(
+                f"Ambiguous table binding: multiple compatible tables ({top_item[0]}, {second_item[0]}) "
+                f"without sufficient disambiguation (scores {s1:.1f} vs {s2:.1f}). Please specify table name in query."
+            )
+
+        if s1 == 0:
+            raise AmbiguousBindingError(
+                f"Ambiguous table binding: multiple tables exist in workspace ({', '.join(t[0] for t in candidate_tables)}) "
+                f"but none match query '{query[:60]}'."
+            )
+
+        return top_item
+
+    def _score_candidate_tables(
+        self,
+        candidate_tables: list[tuple[str, Any, str]],
+        query: str,
+        workspace_id: str,
+    ) -> list[tuple[float, tuple[str, Any, str]]]:
         q_lower = query.lower()
         q_words = [
             w for w in re.findall(r"\b[a-zA-Z0-9_]{2,}\b", q_lower)
@@ -195,6 +221,7 @@ class StructuredQueryService:
         explicit_terms += re.findall(r'["\']([^"\']+)["\']', query)
         for m in re.finditer(r"\bfor\s+([A-Za-z0-9_]+(?:\s+[A-Za-z0-9_]+)?)\b", query, re.IGNORECASE):
             explicit_terms.append(m.group(1).strip())
+        explicit_terms = [t.strip() for t in explicit_terms if len(t.strip()) >= 2]
 
         scored: list[tuple[float, tuple[str, Any, str]]] = []
         for item in candidate_tables:
@@ -239,8 +266,7 @@ class StructuredQueryService:
 
             scored.append((score, item))
 
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [item for _, item in scored]
+        return scored
 
     def _execute_on_table(
         self,

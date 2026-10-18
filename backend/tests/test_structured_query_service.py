@@ -297,4 +297,107 @@ def test_multi_table_unresolved_filter_in_all_candidates_raises_error(survay_pat
         svc.execute(query, workspace_id=ws)
 
 
+def _create_sample_metric_table(store: MemoryTableStore, ws: str, table_id: str, doc_id: str, delta_val: int = 100):
+    cols = (
+        ColumnDefinition(col_index=0, name="Year", inferred_dtype=InferredDtype.INTEGER),
+        ColumnDefinition(col_index=1, name="Value", inferred_dtype=InferredDtype.DECIMAL),
+    )
+    schema = TableSchema(columns=cols, header_rows=(0,), header_topology=HeaderTopology.SINGLE_ROW, confidence=1.0)
+    rows = (
+        TableRow(
+            row_index=0,
+            row_id=f"{table_id}_r1",
+            cells=(
+                TableCell(cell_id=f"{table_id}_c1_1", row_index=0, col_index=0, coordinate="A1", raw_value="2024", normalized_value=2024),
+                TableCell(cell_id=f"{table_id}_c1_2", row_index=0, col_index=1, coordinate="B1", raw_value="1000", normalized_value=Decimal("1000")),
+            ),
+        ),
+        TableRow(
+            row_index=1,
+            row_id=f"{table_id}_r2",
+            cells=(
+                TableCell(cell_id=f"{table_id}_c2_1", row_index=1, col_index=0, coordinate="A2", raw_value="2025", normalized_value=2025),
+                TableCell(cell_id=f"{table_id}_c2_2", row_index=1, col_index=1, coordinate="B2", raw_value=str(1000 + delta_val), normalized_value=Decimal(str(1000 + delta_val))),
+            ),
+        ),
+    )
+    table = StructuredTable(table_id=table_id, document_id=doc_id, sheet_name=None, page_number=None, schema=schema, rows=rows)
+    store.store_table(table, ws)
+    store.publish_active_version(table_id, ws, doc_id, "v1", {"coverage_complete": True, "source_rows": 2, "persisted_rows": 2, "rejected_rows": 0})
+
+
+def test_two_equally_compatible_tables_raise_ambiguity():
+    store = MemoryTableStore()
+    ws = "ws_ambig_pair"
+    _create_sample_metric_table(store, ws, "table_alpha", "doc_alpha", delta_val=100)
+    _create_sample_metric_table(store, ws, "table_beta", "doc_beta", delta_val=200)
+
+    svc = StructuredQueryService(store)
+    query = "how did Value change from 2024 to 2025?"
+    with pytest.raises(AmbiguousBindingError):
+        svc.execute(query, workspace_id=ws)
+
+
+def test_reverse_table_insertion_order_preserves_ambiguity():
+    store = MemoryTableStore()
+    ws = "ws_ambig_reverse"
+    # Insert beta first, then alpha
+    _create_sample_metric_table(store, ws, "table_beta", "doc_beta", delta_val=200)
+    _create_sample_metric_table(store, ws, "table_alpha", "doc_alpha", delta_val=100)
+
+    svc = StructuredQueryService(store)
+    query = "how did Value change from 2024 to 2025?"
+    with pytest.raises(AmbiguousBindingError):
+        svc.execute(query, workspace_id=ws)
+
+
+def test_intended_source_incomplete_raises_incomplete_data_error_without_fallback(survay_path: Path):
+    store = MemoryTableStore()
+    ws = "ws_incomplete_intended"
+
+    rs_path = Path(__file__).parent.parent.parent / "data" / "non_pdf_formats" / "rs_status_bill_passed_assent-1952-2016.csv"
+    if rs_path.exists():
+        ingest_csv_to_table_store(
+            path=rs_path,
+            table_name="rs_status_bill_passed_assent_1952_2016",
+            document_id="doc_rs_distractor",
+            workspace_id=ws,
+            store=store,
+            batch_size=10000,
+        )
+    else:
+        cols = (
+            ColumnDefinition(col_index=0, name="Year", inferred_dtype=InferredDtype.INTEGER),
+            ColumnDefinition(col_index=1, name="Bill_Title", inferred_dtype=InferredDtype.STRING),
+        )
+        schema = TableSchema(columns=cols, header_rows=(0,), header_topology=HeaderTopology.SINGLE_ROW, confidence=1.0)
+        table = StructuredTable(table_id="rs_status_bill_passed_assent_1952_2016", document_id="doc_rs_distractor", sheet_name=None, page_number=None, schema=schema, rows=())
+        store.store_table(table, ws)
+        store.publish_active_version("rs_status_bill_passed_assent_1952_2016", ws, "doc_rs_distractor", "v1", {"coverage_complete": True, "source_rows": 0, "persisted_rows": 0})
+
+    ingest_csv_to_table_store(
+        path=survay_path,
+        table_name="survay",
+        document_id="doc_survay",
+        workspace_id=ws,
+        store=store,
+        batch_size=10000,
+    )
+
+    # Mark intended table (survay) as coverage_complete=False
+    man = store.get_ingestion_manifest("doc_survay", ws)
+    man["coverage_complete"] = False
+    store.publish_active_version("survay", ws, "doc_survay", man["document_version"], man)
+
+    svc = StructuredQueryService(store)
+    query = "For All industries (99999), how did total income change from 2024 to 2025? Give the amount and percentage change."
+
+    # Intended source is survay, but it is incomplete: must raise IncompleteDataError on survay, not fall back to rs table
+    with pytest.raises(IncompleteDataError) as exc_info:
+        svc.execute(query, workspace_id=ws)
+
+    assert exc_info.value.table_id == "survay"
+
+
+
 

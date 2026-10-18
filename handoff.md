@@ -147,11 +147,50 @@ Specification 0003 remains Proposed and deferred.
   * Report: [`docs/reviews/2026-10-17-re-factor.md`](file:///home/swyra/projects/knowledge-retrieval-engine/docs/reviews/2026-10-17-re-factor.md).
 
 * Scope and Status Boundaries:
-  * Q153 (table binding and year delta column mapping) remains a separate pending finding.
+  * Q153 (table binding and metric delta computation) is resolved with defensible source binding and ambiguity error handling.
   * Q159 (missing filter handling) remains a separate pending finding.
   * Specification 0004 remains locally Accepted.
   * Specification 0003 remains Proposed and deferred.
   * No claims of independent live AWS cloud readiness or benchmark accuracy improvements.
   * Paid canonical 60 question benchmark was not rerun.
+
+## Table Binding Ambiguity Closure (October 18 2026)
+
+* Base commit: `96d9d67c134cab831f05e921fb4a41e96030d28f`
+* Working tree changes:
+  * [backend/src/services/retrieval/structured_query_service.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/services/retrieval/structured_query_service.py): Replaced candidate retry iteration loop with defensible source binding via `_bind_table`. Enforced completeness check on the bound candidate before execution: raises `IncompleteDataError` immediately without skipping to competing tables. In `_bind_table`, explicit table names bind directly, single candidates bind directly, and multiple candidates are scored via `_score_candidate_tables`. If top two candidates have equal positive scores, or score gap is under 2.0, or all candidates score zero, raises `AmbiguousBindingError`. Preserved explicit table and document scoping so explicit selection never switches tables upon filter failure.
+  * [backend/tests/test_structured_query_service.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/tests/test_structured_query_service.py): Added offline regressions covering two equally compatible tables raising `AmbiguousBindingError`, table insertion order invariance, incomplete intended source raising `IncompleteDataError` without fallback, Q153 table binding without filename selecting `survay` and computing 4,191 and 0.43%, explicit table binding retention on filter failure, and unresolved filter error across all candidates.
+  * [backend/tests/test_pipeline_structured_path.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/tests/test_pipeline_structured_path.py): Added fallback synthetic distractor table and verified structured pipeline execution without generative fallthrough.
+  * [docs/specs/0004-verify.md](file:///home/swyra/projects/knowledge-retrieval-engine/docs/specs/0004-verify.md): Updated acceptance criteria verification records (72 core tests passed).
+  * [docs/reviews/2026-10-18-re-factor.md](file:///home/swyra/projects/knowledge-retrieval-engine/docs/reviews/2026-10-18-re-factor.md): Recorded senior code review findings (Approve with nits; 1 minor and 2 nits resolved).
+
+* Table Binding Ambiguity and Defensible Binding Resolution:
+  * Defensible binding before execution: Table binding is completed as a discrete step prior to completeness checks or query execution. Candidate retry loops that return the first candidate that executes successfully are removed.
+  * Ambiguity rejection contract: When multiple tables remain plausibly compatible without sufficient disambiguation (equal positive scores or score gap under 2.0), the engine raises `AmbiguousBindingError`. The pipeline translates this into `executed_path="structured_aggregate_ambiguous"` and `status="clarification_needed"`.
+  * Insertion order invariance: Listing or insertion order does not affect ambiguity outcomes. Equal ranked compatible tables raise ambiguity regardless of order.
+  * Completeness enforcement: If the bound intended source is incomplete (`coverage_complete=False`), the engine raises `IncompleteDataError` on that table immediately and does not silently fall back to an unintended complete table.
+  * Scoping preservation: Explicit table names or document filters bind only to the requested table and never switch to another table on filter failure.
+  * Q153 resolution: For the query "For All industries (99999), how did total income change from 2024 to 2025? Give the amount and percentage change.", scoring assigns 36.0 points to `survay` and 2.0 points to distractor tables based on column matches and probe rows, binding `survay` deterministically and computing `4,191` and `0.43%`.
+
+* Executed Test Commands and Outcomes:
+  * Core 0004 test suite: `uv run pytest tests/test_structured_query_service.py tests/test_tablestore_multiyear_coverage_regressions.py tests/test_benchmark_runner_and_persistence_0004.py tests/test_csv_vertical_slice_0004.py tests/test_dynamodb_boundary_and_execution.py tests/test_pdf_retrieval_slice_0004.py tests/test_fast_path_fallback_regressions.py` (72 passed in 120.44s).
+  * Pipeline structured path tests: `uv run pytest tests/test_pipeline_structured_path.py` (5 passed).
+  * Live HTTP verification: `uv --directory backend run python ../verify_0004_live.py` (17 of 17 passed).
+
+* Independent Senior Code Review:
+  * Reviewer model: `gemini-2.5-pro` (author on `gemini 3.8 flash`).
+  * Scope: 42 files on branch `re-factor` vs `main`.
+  * Verdict: Approve with nits (0 blockers, 0 majors, 1 minor resolved, 2 nits resolved).
+  * Resolved findings: Guarded probe matching against empty string inflation, applied word boundary matching for explicit table identifiers, and added fallback synthetic distractor table in pipeline tests.
+  * Report: [`docs/reviews/2026-10-18-re-factor.md`](file:///home/swyra/projects/knowledge-retrieval-engine/docs/reviews/2026-10-18-re-factor.md).
+
+* Remaining Limitations and Scope Boundaries:
+  * Q153 table binding ambiguity is resolved.
+  * Q159 missing filter handling remains a separate pending finding.
+  * Isolated comparison workspace procedure for `ws_fresh_benchmark` remains pending; no in place mutation or deletion executed.
+  * Specification 0004 remains locally Accepted.
+  * Specification 0003 remains Proposed and deferred.
+  * Paid canonical 60 question benchmark was not rerun.
+
 
 

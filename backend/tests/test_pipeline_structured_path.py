@@ -8,6 +8,7 @@ import pytest
 from db.table_store import get_shared_table_store
 from ingestion.csv_table_ingester import ingest_csv_to_table_store
 from modules.query.query_service import QueryRequest, QueryService
+from schemas.structured_table import ColumnDefinition, HeaderTopology, InferredDtype, StructuredTable, TableSchema
 from services.langgraph_pipeline import pipeline
 from services.retrieval.planner import planner
 from services.telemetry import init_request_telemetry
@@ -130,28 +131,40 @@ def test_pipeline_multi_table_workspace_q153_without_document_ids(survay_path: P
     # Ingest distractor table first
     rs_path = Path(__file__).parent.parent.parent / "data" / "non_pdf_formats" / "rs_status_bill_passed_assent-1952-2016.csv"
     if rs_path.exists():
+        if not store.has_coverage_complete_table("rs_status_bill_passed_assent_1952_2016", ws):
+            ingest_csv_to_table_store(
+                path=rs_path,
+                table_name="rs_status_bill_passed_assent_1952_2016",
+                document_id="doc_pipeline_rs",
+                workspace_id=ws,
+                store=store,
+                batch_size=10000,
+            )
+    else:
+        if not store.has_coverage_complete_table("rs_status_bill_passed_assent_1952_2016", ws):
+            cols = (
+                ColumnDefinition(col_index=0, name="Year", inferred_dtype=InferredDtype.INTEGER),
+                ColumnDefinition(col_index=1, name="Bill_Title", inferred_dtype=InferredDtype.STRING),
+            )
+            schema = TableSchema(columns=cols, header_rows=(0,), header_topology=HeaderTopology.SINGLE_ROW, confidence=1.0)
+            table = StructuredTable(table_id="rs_status_bill_passed_assent_1952_2016", document_id="doc_pipeline_rs", sheet_name=None, page_number=None, schema=schema, rows=())
+            store.store_table(table, ws)
+            store.publish_active_version("rs_status_bill_passed_assent_1952_2016", ws, "doc_pipeline_rs", "v1", {"coverage_complete": True, "source_rows": 0, "persisted_rows": 0})
+
+    # Ingest survay second
+    if not store.has_coverage_complete_table("survay", ws):
         ingest_csv_to_table_store(
-            path=rs_path,
-            table_name="rs_status_bill_passed_assent_1952_2016",
-            document_id="doc_pipeline_rs",
+            path=survay_path,
+            table_name="survay",
+            document_id="doc_pipeline_survay_multi",
             workspace_id=ws,
             store=store,
             batch_size=10000,
         )
-
-    # Ingest survay second
-    ingest_csv_to_table_store(
-        path=survay_path,
-        table_name="survay",
-        document_id="doc_pipeline_survay_multi",
-        workspace_id=ws,
-        store=store,
-        batch_size=10000,
-    )
-    man = store.get_ingestion_manifest("doc_pipeline_survay_multi", ws)
-    if man and not man.get("coverage_complete"):
-        man["coverage_complete"] = True
-        store.publish_active_version("survay", ws, "doc_pipeline_survay_multi", man["document_version"], man)
+        man = store.get_ingestion_manifest("doc_pipeline_survay_multi", ws)
+        if man and not man.get("coverage_complete"):
+            man["coverage_complete"] = True
+            store.publish_active_version("survay", ws, "doc_pipeline_survay_multi", man["document_version"], man)
 
     init_request_telemetry()
     service = QueryService()
