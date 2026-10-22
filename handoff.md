@@ -192,5 +192,55 @@ Specification 0003 remains Proposed and deferred.
   * Specification 0003 remains Proposed and deferred.
   * Paid canonical 60 question benchmark was not rerun.
 
+## Structured Aggregate Filter Binding Repair (October 18 2026 / October 22 2026)
+
+* Base commit: `5082b30754c9e525813c8fdbb124756ac4ac2904`
+* Defect resolved: `_execute_aggregate` previously passed `predicates=[]` ignoring year and entity filters, computing unconstrained whole table totals when constrained aggregates were requested.
+* Working tree changes:
+  * [backend/src/services/retrieval/structured_query_service.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/services/retrieval/structured_query_service.py):
+    * Added `_find_target_metric_column`: identifies numeric metric columns with word boundary matching while excluding temporal columns.
+    * Added `_extract_and_bind_predicates`: binds direct column value pairs (`where <col> is <val>`, `<col> = <val>`), four digit year constraints (using equality for single year and `PredicateOp.IN` for multiple years), and explicit entity requirements (`for <target>`, quoted phrases, parenthesized codes) against table schema and actual stored rows (probe rows first, then single pass store query).
+    * Error handling / clarification contract: if an explicitly requested filter entity or unknown column cannot be resolved in schema or data, raises `UnresolvedFilterError` immediately; never silently computes an unconstrained whole table aggregate.
+    * Preserves legitimate unfiltered aggregates: returns empty predicates when query requests no filters.
+    * Distinguishes valid filter matching zero rows (`selection_count=0`, `result_value=Decimal(0)`) from binding failure (which raises `UnresolvedFilterError`).
+    * Populates `predicate_columns` and `predicate_values` on `StructuredQueryResult` and citation evidence payloads.
+    * Updated `_execute_min_max_range` to bind requested predicates and populate predicate evidence.
+    * Updated `_execute_on_table` pattern 3 regex to match word boundaries for standard aggregates (`\b(?:total|sum|average|avg|count)\b`).
+  * [backend/src/services/retrieval/planner.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/services/retrieval/planner.py): Added `\b(?:total|sum|average|avg|count)\b` to `is_structured_candidate` in `route()`, routing table aggregate queries to the deterministic zero generation path.
+  * [backend/tests/test_structured_query_service.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/tests/test_structured_query_service.py): Added 6 offline regressions:
+    * `test_filtered_and_whole_table_totals_differ_and_filtered_answer_correct`: verifies whole table sum produces 600.00 while filtered tech sum produces 300.00.
+    * `test_multiple_requested_filters_applied_together`: verifies multiple filters (tech and 2024) apply conjunctively and produce 200.00.
+    * `test_unsupported_filters_cannot_produce_whole_table_totals`: verifies unknown entities and unknown columns raise `UnresolvedFilterError` and never compute whole table aggregates.
+    * `test_valid_filter_matching_zero_rows_distinguished_from_binding_failure`: verifies valid filters matching zero rows return count 0 and total 0 without error, preserving predicate evidence.
+    * `test_result_evidence_records_applied_predicates_and_selected_rows`: verifies citation evidence records predicate columns, typed values, selection count, and row identifiers.
+    * `test_multiple_years_bind_with_in_predicate`: verifies multi year filters bind with `PredicateOp.IN` and compute correct sums across multiple years.
+  * [docs/specs/0004-verify.md](file:///home/swyra/projects/knowledge-retrieval-engine/docs/specs/0004-verify.md): Updated acceptance criteria verification records (78 core tests passed).
+  * [docs/reviews/2026-10-18-re-factor.md](file:///home/swyra/projects/knowledge-retrieval-engine/docs/reviews/2026-10-18-re-factor.md): Recorded senior code review findings (Approve with nits; all 3 minors and 1 nit resolved).
+
+* Executed Test Commands and Outcomes:
+  * Core 0004 test suite: `uv run pytest tests/test_csv_vertical_slice_0004.py tests/test_pdf_retrieval_slice_0004.py tests/test_structured_query_service.py tests/test_dynamodb_boundary_and_execution.py tests/test_benchmark_runner_and_persistence_0004.py tests/test_fast_path_fallback_regressions.py tests/test_tablestore_multiyear_coverage_regressions.py` (78 passed).
+  * Structured query service tests: `uv run pytest tests/test_structured_query_service.py` (19 passed in 26.46s).
+  * Pipeline structured path tests: `uv run pytest tests/test_pipeline_structured_path.py` (5 passed).
+  * Live HTTP verification: `uv run --project backend python verify_0004_live.py` (17 of 17 passed).
+
+* Independent Senior Code Review:
+  * Reviewer model: `gemini-2.5-pro` (author on `gemini 3.8 flash`).
+  * Scope: 42 files on branch `re-factor` vs `main`.
+  * Verdict: Approve with nits (0 blockers, 0 majors, 3 minors resolved, 1 nit resolved).
+  * Resolved findings:
+    1. Replaced substring checks in aggregate operator selection with word boundary regexes (`\bcount\b`, `\b(?:sum|total)\b`, etc.).
+    2. Enforced word boundary regular expression matching for column name resolution in `_find_target_metric_column`.
+    3. Conjoined multiple year predicates using `PredicateOp.IN` rather than conflicting equality predicates.
+    4. Excluded all temporal columns from metric candidates using set comprehension.
+  * Report: [`docs/reviews/2026-10-18-re-factor.md`](file:///home/swyra/projects/knowledge-retrieval-engine/docs/reviews/2026-10-18-re-factor.md).
+
+* Scope Boundaries and Remaining State:
+  * Q159 structured aggregate filter binding defect is resolved.
+  * Q153 table binding ambiguity remains resolved.
+  * Specification 0004 remains locally Accepted.
+  * Specification 0003 remains Proposed and deferred.
+  * No claims of independent live AWS cloud readiness or benchmark accuracy improvements.
+  * Paid canonical 60 question benchmark was not rerun.
+
 
 

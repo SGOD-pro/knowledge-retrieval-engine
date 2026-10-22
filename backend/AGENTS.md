@@ -49,6 +49,7 @@ uv run pytest tests/test_contracts_and_identity.py
 * Query embedding reuse during escalation requires verified model provenance matching the full index; vectors without reliable provenance are replaced through the configured full embedding path.
 * TableStore streams and persists all rows without row truncation; vector chunking caps at 5000 chunks for vector search, so vector chunk count in snapshots or vector storage must not be confused with TableStore completeness.
 * Structured TableStore query execution requires defensible source binding before execution; if multiple tables remain equally compatible or without sufficient score separation (gap under 2.0), the engine raises AmbiguousBindingError instead of returning the first candidate that runs successfully.
+* Structured aggregate queries bind requested entity and temporal constraints to typed store predicates before execution. If a requested filter cannot be resolved in schema or stored rows, the engine raises UnresolvedFilterError rather than computing an unconstrained whole table total, while valid filters matching zero rows return zero count and zero total distinct from binding failures.
 
 ## Related specs
 * [docs/specs/0001-contracts-and-identity-envelope.md](../docs/specs/0001-contracts-and-identity-envelope.md)

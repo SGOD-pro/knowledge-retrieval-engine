@@ -308,7 +308,7 @@ class StructuredQueryService:
             )
 
         # 6. Pattern 3: Standard Aggregates (sum, avg, count)
-        if any(w in q_lower for w in ("total ", "sum of", "average", "count")):
+        if bool(re.search(r'\b(?:total|sum|average|avg|count)\b', q_lower)):
             return self._execute_aggregate(
                 query=query,
                 table_id=table_id,
@@ -363,6 +363,292 @@ class StructuredQueryService:
                     return col.col_index, col.name
         return 0, schema.columns[0].name
 
+    def _find_target_metric_column(
+        self,
+        query: str,
+        schema: TableSchema,
+        exclude_col_indices: set[int] | None = None,
+    ) -> tuple[int, str]:
+        exclude = exclude_col_indices or set()
+        q_lower = query.lower()
+
+        # 1. Prioritize numeric columns whose name is mentioned in query
+        for col in schema.columns:
+            if col.col_index in exclude:
+                continue
+            dtype_str = self._normalize_dtype(col.inferred_dtype)
+            if dtype_str in {"decimal", "integer", "percentage", "currency"}:
+                if bool(re.search(rf"\b{re.escape(col.name.lower())}\b", q_lower)):
+                    return col.col_index, col.name
+
+        # 2. Any non-excluded column whose name is mentioned in query
+        for col in schema.columns:
+            if col.col_index in exclude:
+                continue
+            if bool(re.search(rf"\b{re.escape(col.name.lower())}\b", q_lower)):
+                return col.col_index, col.name
+
+        # 3. Numeric column matching typical metric names
+        metric_candidates = [
+            "value", "amount", "total", "sum", "count", "metric", "sales", "revenue", "income", "price"
+        ]
+        for cand in metric_candidates:
+            cand_clean = cand.lower().strip()
+            for col in schema.columns:
+                if col.col_index in exclude:
+                    continue
+                if col.name.lower().strip() == cand_clean:
+                    return col.col_index, col.name
+        for cand in metric_candidates:
+            cand_clean = cand.lower().strip()
+            for col in schema.columns:
+                if col.col_index in exclude:
+                    continue
+                if cand_clean in col.name.lower().strip():
+                    return col.col_index, col.name
+
+        # 4. Any numeric column
+        for col in schema.columns:
+            if col.col_index in exclude:
+                continue
+            dtype_str = self._normalize_dtype(col.inferred_dtype)
+            if dtype_str in {"decimal", "integer", "percentage", "currency"}:
+                return col.col_index, col.name
+
+        # 5. Fallback to first non-excluded column
+        for col in schema.columns:
+            if col.col_index not in exclude:
+                return col.col_index, col.name
+        return 0, schema.columns[0].name
+
+    def _extract_and_bind_predicates(
+        self,
+        query: str,
+        table_id: str,
+        workspace_id: str,
+        version: str,
+        schema: TableSchema,
+        target_col_idx: int | None = None,
+    ) -> tuple[list[Predicate], list[str], list[Any]]:
+        predicates: list[Predicate] = []
+        pred_cols: list[str] = []
+        pred_vals: list[Any] = []
+        already_bound: set[int] = set()
+        if target_col_idx is not None:
+            already_bound.add(target_col_idx)
+
+        skip_words = {
+            "from", "between", "table", "rows", "records", "year", "years", "month",
+            "how", "did", "change", "what", "the", "and", "for", "all", "give",
+            "amount", "percentage", "to", "in", "of", "on", "at", "by", "with",
+            "sum", "total", "average", "avg", "count", "min", "max", "minimum", "maximum",
+            "value", "is", "are", "was", "were", "where", "which", "present", "actually",
+            "does", "do", "calculate", "compute", "find", "get", "show", "tell",
+        }
+
+        explicit_requirements: list[str] = []
+        q_lower = query.lower()
+
+        # 1. Direct column-value pair matching (e.g. "where Industry is tech", "Year = 2024", "for Industry Agriculture")
+        for col in schema.columns:
+            if col.col_index in already_bound:
+                continue
+            c_name_lower = col.name.lower()
+            patterns = [
+                rf"\b(?:where\s+)?{re.escape(c_name_lower)}\s*(?:is|=|==|:)\s*(?:['\"]([^'\"]+)['\"]|([A-Za-z0-9_.]+(?:\s+[A-Za-z0-9_.]+)*?))(?:\s+(?:\b(?:in|and|where|for|from|with)\b|\.csv|\.xlsx|\?|$)|$)",
+                rf"\bfor\s+{re.escape(c_name_lower)}\s+(?:['\"]([^'\"]+)['\"]|([A-Za-z0-9_.]+(?:\s+[A-Za-z0-9_.]+)*?))(?:\s+(?:\b(?:in|and|where|for|from|with)\b|\.csv|\.xlsx|\?|$)|$)",
+            ]
+            for pat in patterns:
+                m = re.search(pat, q_lower)
+                if m:
+                    raw_val = (m.group(1) or m.group(2) or "").strip().strip("\"' ")
+                    if raw_val and raw_val.lower() not in skip_words:
+                        dtype_str = self._normalize_dtype(col.inferred_dtype)
+                        if dtype_str in {"integer", "decimal"} and raw_val.isdigit():
+                            typed_val: Any = int(raw_val)
+                        elif dtype_str == "decimal":
+                            try:
+                                typed_val = Decimal(raw_val)
+                            except Exception:
+                                typed_val = raw_val
+                        else:
+                            typed_val = raw_val
+                        predicates.append(Predicate(column_index=col.col_index, op=PredicateOp.EQ, value=typed_val))
+                        pred_cols.append(col.name)
+                        pred_vals.append(typed_val)
+                        already_bound.add(col.col_index)
+                        break
+
+        # 2. Year-based filter extraction
+        years = sorted(list(set(int(y) for y in re.findall(r'\b(20\d{2}|19\d{2})\b', query))))
+        if years:
+            year_col = next(
+                (c for c in schema.columns if c.name.lower() in ("year", "date", "period", "time") or "year" in c.name.lower()),
+                None,
+            )
+            if year_col:
+                if year_col.col_index not in already_bound:
+                    dtype_str = self._normalize_dtype(year_col.inferred_dtype)
+                    y_vals = [y if dtype_str in {"integer", "decimal"} else str(y) for y in years]
+                    if len(y_vals) == 1:
+                        predicates.append(Predicate(column_index=year_col.col_index, op=PredicateOp.EQ, value=y_vals[0]))
+                        pred_cols.append(year_col.name)
+                        pred_vals.append(y_vals[0])
+                    else:
+                        predicates.append(Predicate(column_index=year_col.col_index, op=PredicateOp.IN, value=set(y_vals)))
+                        pred_cols.append(year_col.name)
+                        pred_vals.append(y_vals)
+                    already_bound.add(year_col.col_index)
+            else:
+                for y in years:
+                    explicit_requirements.append(str(y))
+
+        # 3. Explicit filter entity requirements from query keywords (e.g. "for <target>", quotes, parentheses)
+        for m in re.finditer(r'\bfor\s+([A-Za-z0-9_]+(?:\s+[A-Za-z0-9_]+)?)\b', query, re.IGNORECASE):
+            target = m.group(1).strip()
+            tokens = target.split()
+            if len(tokens) > 1 and tokens[-1].lower() in skip_words:
+                target = " ".join(tokens[:-1]).strip()
+            if len(tokens) > 1 and tokens[0].lower() in skip_words:
+                target = " ".join(tokens[1:]).strip()
+            if target.lower() not in skip_words and not re.fullmatch(r'20\d{2}|19\d{2}', target):
+                if target.lower() != table_id.lower() and target.lower() not in (table_id.lower() + ".csv", table_id.lower() + ".xlsx"):
+                    explicit_requirements.append(target)
+        for q_str in re.findall(r'["\']([^"\']+)["\']', query):
+            q_clean = q_str.strip()
+            if q_clean.lower() not in skip_words and not re.fullmatch(r'20\d{2}|19\d{2}', q_clean):
+                if q_clean.lower() != table_id.lower() and q_clean.lower() not in (table_id.lower() + ".csv", table_id.lower() + ".xlsx"):
+                    explicit_requirements.append(q_clean)
+        for p_str in re.findall(r'\(([^)]+)\)', query):
+            p_clean = p_str.strip()
+            if p_clean.lower() not in skip_words and not re.fullmatch(r'20\d{2}|19\d{2}', p_clean):
+                if p_clean.lower() != table_id.lower() and p_clean.lower() not in (table_id.lower() + ".csv", table_id.lower() + ".xlsx"):
+                    explicit_requirements.append(p_clean)
+
+        where_matches = re.findall(r'\bwhere\s+([A-Za-z0-9_]+)\b', query, re.IGNORECASE)
+        for wm in where_matches:
+            wm_clean = wm.strip()
+            if wm_clean.lower() not in skip_words and not re.fullmatch(r'20\d{2}|19\d{2}', wm_clean):
+                col_found = any(c.name.lower() == wm_clean.lower() for c in schema.columns)
+                if not col_found:
+                    explicit_requirements.append(wm_clean)
+
+        # 4. Probe-based candidate terms extraction
+        candidates: list[str] = list(explicit_requirements)
+        candidates += re.findall(r'\b([A-Z][a-z]+(?: [a-z]* ?[A-Z]?[a-z]+){1,3})\b', query)
+        candidates += [
+            w for w in re.findall(r'\b[A-Za-z0-9_]{2,}\b', query)
+            if w.lower() not in skip_words
+            and not re.fullmatch(r'20\d{2}|19\d{2}', w)
+            and w.lower() != table_id.lower()
+            and w.lower() not in (table_id.lower() + ".csv", table_id.lower() + ".xlsx")
+            and not any(c.name.lower() == w.lower() for c in schema.columns)
+        ]
+
+        words = re.findall(r'\b[a-zA-Z0-9_]+\b', query)
+        for i in range(len(words) - 1):
+            w1, w2 = words[i], words[i + 1]
+            if w1.lower() not in skip_words and w2.lower() not in skip_words:
+                candidates.append(f"{w1} {w2}")
+        for i in range(len(words) - 2):
+            w1, w2, w3 = words[i], words[i + 1], words[i + 2]
+            if w1.lower() not in skip_words and w3.lower() not in skip_words:
+                candidates.append(f"{w1} {w2} {w3}")
+
+        seen: set[str] = set()
+        unique_candidates: list[str] = []
+        for c in candidates:
+            c = c.strip()
+            if not c or c.lower() in skip_words or re.fullmatch(r'20\d{2}|19\d{2}', c):
+                continue
+            if c.lower() not in seen:
+                seen.add(c.lower())
+                unique_candidates.append(c)
+
+        # 5. Bind candidate terms against table data (probe rows first, then store query)
+        try:
+            probe_rows = self.store.query_rows(
+                table_id, workspace_id, predicates=[], limit=200, version=version
+            )
+        except Exception:
+            probe_rows = []
+
+        for cand in unique_candidates:
+            cand_lower = cand.lower().strip()
+            bound = False
+            for col in schema.columns:
+                if col.col_index in already_bound:
+                    continue
+                for row in probe_rows:
+                    try:
+                        cell_val = str(row.cells[col.col_index].normalized_value).strip()
+                    except (IndexError, AttributeError):
+                        continue
+                    if cell_val.lower() == cand_lower or cell_val == cand:
+                        typed_val = row.cells[col.col_index].normalized_value
+                        predicates.append(Predicate(column_index=col.col_index, op=PredicateOp.EQ, value=typed_val))
+                        pred_cols.append(col.name)
+                        pred_vals.append(typed_val)
+                        already_bound.add(col.col_index)
+                        bound = True
+                        break
+                if bound:
+                    break
+
+            if not bound and explicit_requirements:
+                is_explicit = any(cand_lower == req.lower() for req in explicit_requirements)
+                is_table_name = (
+                    cand_lower == table_id.lower()
+                    or cand_lower in (f"{table_id.lower()}.csv", f"{table_id.lower()}.xlsx")
+                )
+                if is_explicit and not is_table_name:
+                    for col in schema.columns:
+                        if col.col_index in already_bound:
+                            continue
+                        try:
+                            val_pred: Any = cand
+                            dtype_str = self._normalize_dtype(col.inferred_dtype)
+                            if dtype_str in {"integer", "decimal"} and cand.isdigit():
+                                val_pred = int(cand)
+                            matching = self.store.query_rows(
+                                table_id,
+                                workspace_id,
+                                predicates=[Predicate(column_index=col.col_index, op=PredicateOp.EQ, value=val_pred)],
+                                limit=1,
+                                version=version,
+                            )
+                            if matching:
+                                matched_val = matching[0].cells[col.col_index].normalized_value
+                                predicates.append(Predicate(column_index=col.col_index, op=PredicateOp.EQ, value=matched_val))
+                                pred_cols.append(col.name)
+                                pred_vals.append(matched_val)
+                                already_bound.add(col.col_index)
+                                bound = True
+                                break
+                        except Exception:
+                            pass
+
+        # 6. Verify that all explicit filter requirements were resolved
+        if explicit_requirements:
+            unbound_requirements: list[str] = []
+            for req in explicit_requirements:
+                req_lower = req.lower()
+                matched = any(
+                    req_lower == str(pv).lower()
+                    or req_lower in str(pv).lower()
+                    or str(pv).lower() in req_lower
+                    for pv in pred_vals
+                )
+                if not matched:
+                    unbound_requirements.append(req)
+            if unbound_requirements:
+                raise UnresolvedFilterError(
+                    table_id=table_id,
+                    filter_values=unbound_requirements,
+                )
+
+        return predicates, pred_cols, pred_vals
+
     def _execute_min_max_range(
         self,
         query: str,
@@ -388,13 +674,22 @@ class StructuredQueryService:
                 ["year", "date", "period", "time", "value", "amount", "score", "count"], schema
             )
 
+        predicates, pred_cols, pred_vals = self._extract_and_bind_predicates(
+            query=query,
+            table_id=table_id,
+            workspace_id=workspace_id,
+            version=version,
+            schema=schema,
+            target_col_idx=target_col_idx,
+        )
+
         try:
             min_val, count, min_ids, min_idx, digest_min = self.store.execute_single_pass_query(
                 table_id=table_id,
                 workspace_id=workspace_id,
                 column_index=target_col_idx,
                 op=AggregateOp.MIN,
-                predicates=[],
+                predicates=predicates,
                 version=version,
             )
             max_val, _, max_ids, max_idx, digest_max = self.store.execute_single_pass_query(
@@ -402,29 +697,36 @@ class StructuredQueryService:
                 workspace_id=workspace_id,
                 column_index=target_col_idx,
                 op=AggregateOp.MAX,
-                predicates=[],
+                predicates=predicates,
                 version=version,
             )
         except Exception as e:
             raise StorageFailureError(f"Failed to query table store: {e}") from e
 
         if min_val is None or max_val is None:
-            raise StorageFailureError(f"No valid numeric data found in column '{target_col_name}'")
-
-        int_min = int(min_val) if min_val == int(min_val) else min_val
-        int_max = int(max_val) if max_val == int(max_val) else max_val
-
-        answer_text = f"{int_min} and {int_max}."
-        combined_ids = sorted(list(set(min_ids + max_ids)))
-        combined_idx = sorted(list(set(min_idx + max_idx)))
-        selection_hash = hashlib.sha256(",".join(combined_ids).encode()).hexdigest()[:16]
+            if count == 0:
+                answer_text = f"No rows matched the requested filters in table '{table_id}'."
+                combined_ids = []
+                combined_idx = []
+                selection_hash = digest_min
+                int_min = 0
+                int_max = 0
+            else:
+                raise StorageFailureError(f"No valid numeric data found in column '{target_col_name}'")
+        else:
+            int_min = int(min_val) if min_val == int(min_val) else min_val
+            int_max = int(max_val) if max_val == int(max_val) else max_val
+            answer_text = f"{int_min} and {int_max}."
+            combined_ids = sorted(list(set(min_ids + max_ids)))
+            combined_idx = sorted(list(set(min_idx + max_idx)))
+            selection_hash = hashlib.sha256(",".join(combined_ids).encode()).hexdigest()[:16]
 
         return StructuredQueryResult(
             answer_text=answer_text,
             operator="range",
             target_column=target_col_name,
-            predicate_columns=[],
-            predicate_values=[],
+            predicate_columns=pred_cols,
+            predicate_values=pred_vals,
             selection_count=count,
             total_rows_in_table=total_rows,
             result_value=int_min,
@@ -792,37 +1094,64 @@ class StructuredQueryService:
         total_rows: int,
     ) -> StructuredQueryResult:
         q_lower = query.lower()
-        if "count" in q_lower:
+        if bool(re.search(r'\bcount\b', q_lower)):
             op = AggregateOp.COUNT
-        elif "sum" in q_lower or "total" in q_lower:
+        elif bool(re.search(r'\b(?:sum|total)\b', q_lower)):
             op = AggregateOp.SUM
-        elif "average" in q_lower or "avg" in q_lower:
+        elif bool(re.search(r'\b(?:average|avg)\b', q_lower)):
             op = AggregateOp.AVG
-        elif "min" in q_lower:
+        elif bool(re.search(r'\b(?:min|minimum)\b', q_lower)):
             op = AggregateOp.MIN
-        else:
+        elif bool(re.search(r'\b(?:max|maximum)\b', q_lower)):
             op = AggregateOp.MAX
+        else:
+            op = AggregateOp.SUM
 
-        col_idx, col_name = self._find_column_by_semantic_match(["value", "amount", "total"], schema)
+        # Temporal columns excluded from target metric selection to prevent aggregating year/date values
+        exclude_metric_cols = {
+            c.col_index for c in schema.columns
+            if c.name.lower() in ("year", "date", "period", "time") or "year" in c.name.lower()
+        }
+
+        col_idx, col_name = self._find_target_metric_column(
+            query=query,
+            schema=schema,
+            exclude_col_indices=exclude_metric_cols,
+        )
+
+        predicates, pred_cols, pred_vals = self._extract_and_bind_predicates(
+            query=query,
+            table_id=table_id,
+            workspace_id=workspace_id,
+            version=version,
+            schema=schema,
+            target_col_idx=col_idx,
+        )
+
         val, count, r_ids, r_idx, digest = self.store.execute_single_pass_query(
             table_id=table_id,
             workspace_id=workspace_id,
             column_index=col_idx,
             op=op,
-            predicates=[],
+            predicates=predicates,
             version=version,
         )
 
-        answer_text = f"The {op.value} for {col_name} is {val}."
+        res_val = val if val is not None else Decimal(0)
+        if count == 0:
+            answer_text = f"The {op.value} for {col_name} is 0 (0 matching rows)."
+        else:
+            answer_text = f"The {op.value} for {col_name} is {res_val}."
+
         return StructuredQueryResult(
             answer_text=answer_text,
             operator=op.value,
             target_column=col_name,
-            predicate_columns=[],
-            predicate_values=[],
+            predicate_columns=pred_cols,
+            predicate_values=pred_vals,
             selection_count=count,
             total_rows_in_table=total_rows,
-            result_value=val or 0,
+            result_value=res_val,
             secondary_value=None,
             row_ids=r_ids,
             row_indices=r_idx,

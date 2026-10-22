@@ -20,6 +20,7 @@ from services.retrieval.structured_query_service import (
     IncompleteDataError,
     StructuredQueryResult,
     StructuredQueryService,
+    UnresolvedFilterError,
     UnsupportedQueryError,
 )
 
@@ -397,6 +398,202 @@ def test_intended_source_incomplete_raises_incomplete_data_error_without_fallbac
         svc.execute(query, workspace_id=ws)
 
     assert exc_info.value.table_id == "survay"
+
+
+def _create_sample_sales_table(
+    store: MemoryTableStore,
+    ws: str,
+    table_id: str = "sales_data",
+    doc_id: str = "doc_sales",
+) -> None:
+    cols = (
+        ColumnDefinition(col_index=0, name="Year", inferred_dtype=InferredDtype.INTEGER),
+        ColumnDefinition(col_index=1, name="Industry", inferred_dtype=InferredDtype.STRING),
+        ColumnDefinition(col_index=2, name="Amount", inferred_dtype=InferredDtype.DECIMAL),
+    )
+    schema = TableSchema(columns=cols, header_rows=(0,), header_topology=HeaderTopology.SINGLE_ROW, confidence=1.0)
+    rows = (
+        TableRow(
+            row_index=0,
+            row_id=f"{table_id}_r0",
+            cells=(
+                TableCell(cell_id=f"{table_id}_c0_0", row_index=0, col_index=0, coordinate="A1", raw_value="2023", normalized_value=2023),
+                TableCell(cell_id=f"{table_id}_c0_1", row_index=0, col_index=1, coordinate="B1", raw_value="tech", normalized_value="tech"),
+                TableCell(cell_id=f"{table_id}_c0_2", row_index=0, col_index=2, coordinate="C1", raw_value="100.00", normalized_value=Decimal("100.00")),
+            ),
+        ),
+        TableRow(
+            row_index=1,
+            row_id=f"{table_id}_r1",
+            cells=(
+                TableCell(cell_id=f"{table_id}_c1_0", row_index=1, col_index=0, coordinate="A2", raw_value="2024", normalized_value=2024),
+                TableCell(cell_id=f"{table_id}_c1_1", row_index=1, col_index=1, coordinate="B2", raw_value="tech", normalized_value="tech"),
+                TableCell(cell_id=f"{table_id}_c1_2", row_index=1, col_index=2, coordinate="C2", raw_value="200.00", normalized_value=Decimal("200.00")),
+            ),
+        ),
+        TableRow(
+            row_index=2,
+            row_id=f"{table_id}_r2",
+            cells=(
+                TableCell(cell_id=f"{table_id}_c2_0", row_index=2, col_index=0, coordinate="A3", raw_value="2024", normalized_value=2024),
+                TableCell(cell_id=f"{table_id}_c2_1", row_index=2, col_index=1, coordinate="B3", raw_value="agriculture", normalized_value="agriculture"),
+                TableCell(cell_id=f"{table_id}_c2_2", row_index=2, col_index=2, coordinate="C3", raw_value="300.00", normalized_value=Decimal("300.00")),
+            ),
+        ),
+    )
+    table = StructuredTable(table_id=table_id, document_id=doc_id, sheet_name=None, page_number=None, schema=schema, rows=rows)
+    store.store_table(table, ws)
+    store.publish_active_version(
+        table_id,
+        ws,
+        doc_id,
+        "v1",
+        {"coverage_complete": True, "source_rows": 3, "persisted_rows": 3, "rejected_rows": 0},
+    )
+
+
+def test_filtered_and_whole_table_totals_differ_and_filtered_answer_correct():
+    store = MemoryTableStore()
+    ws = "ws_filter_differ"
+    _create_sample_sales_table(store, ws)
+    svc = StructuredQueryService(store)
+
+    # Whole table sum query (unfiltered)
+    whole_res = svc.execute("What is the total Amount in sales_data.csv?", workspace_id=ws)
+    assert whole_res is not None
+    assert whole_res.result_value == Decimal("600.00")
+    assert whole_res.selection_count == 3
+    assert whole_res.predicate_columns == []
+    assert whole_res.predicate_values == []
+
+    # Filtered query for tech (should sum 100.00 in 2023 + 200.00 in 2024 = 300.00)
+    filtered_res = svc.execute("What is the total Amount for tech in sales_data.csv?", workspace_id=ws)
+    assert filtered_res is not None
+    assert filtered_res.result_value == Decimal("300.00")
+    assert filtered_res.selection_count == 2
+    assert "Industry" in filtered_res.predicate_columns
+    assert "tech" in filtered_res.predicate_values
+
+    # Filtered and whole table totals must differ and the filtered answer is correct
+    assert filtered_res.result_value != whole_res.result_value
+    assert filtered_res.result_value == Decimal("300.00")
+
+
+def test_multiple_requested_filters_applied_together():
+    store = MemoryTableStore()
+    ws = "ws_multiple_filters"
+    _create_sample_sales_table(store, ws)
+    svc = StructuredQueryService(store)
+
+    # Query requesting both tech and 2024
+    res = svc.execute("What is the total Amount for tech in 2024 in sales_data.csv?", workspace_id=ws)
+    assert res is not None
+    assert res.result_value == Decimal("200.00")
+    assert res.selection_count == 1
+    assert "Year" in res.predicate_columns
+    assert "Industry" in res.predicate_columns
+    assert 2024 in res.predicate_values
+    assert "tech" in res.predicate_values
+    assert res.row_ids == ["sales_data_r1"]
+    assert res.row_indices == [1]
+
+
+def test_unsupported_filters_cannot_produce_whole_table_totals():
+    store = MemoryTableStore()
+    ws = "ws_unsupported_filter"
+    _create_sample_sales_table(store, ws)
+    svc = StructuredQueryService(store)
+
+    # 1. Unknown entity that cannot be resolved in any column
+    with pytest.raises(UnresolvedFilterError) as exc_info:
+        svc.execute("What is the total Amount for NonExistentSector in sales_data.csv?", workspace_id=ws)
+    assert "NonExistentSector" in exc_info.value.filter_values
+
+    # 2. Unknown column specified in filter condition
+    with pytest.raises(UnresolvedFilterError) as exc_info_col:
+        svc.execute("What is the total Amount where FakeColumn is 100 in sales_data.csv?", workspace_id=ws)
+    assert "FakeColumn" in exc_info_col.value.filter_values
+
+
+def test_valid_filter_matching_zero_rows_distinguished_from_binding_failure():
+    store = MemoryTableStore()
+    ws = "ws_zero_rows_filter"
+    _create_sample_sales_table(store, ws)
+    svc = StructuredQueryService(store)
+
+    # 1. Filter on valid column 'Year' with non-existent year 2099
+    res_year = svc.execute("What is the total Amount where Year = 2099 in sales_data.csv?", workspace_id=ws)
+    assert res_year is not None
+    assert res_year.selection_count == 0
+    assert res_year.result_value == Decimal(0)
+    assert res_year.row_ids == []
+    assert res_year.row_indices == []
+    assert "Year" in res_year.predicate_columns
+    assert 2099 in res_year.predicate_values
+    assert "0" in res_year.answer_text
+
+    # 2. Filter on valid column 'Industry' with non-existent industry 'aerospace'
+    res_ind = svc.execute("What is the total Amount where Industry is aerospace in sales_data.csv?", workspace_id=ws)
+    assert res_ind is not None
+    assert res_ind.selection_count == 0
+    assert res_ind.result_value == Decimal(0)
+    assert res_ind.row_ids == []
+    assert res_ind.row_indices == []
+    assert "Industry" in res_ind.predicate_columns
+    assert "aerospace" in res_ind.predicate_values
+
+
+def test_result_evidence_records_applied_predicates_and_selected_rows():
+    from services.retrieval.run_structured_aggregate import build_structured_evidence_ref
+
+    store = MemoryTableStore()
+    ws = "ws_evidence_records"
+    _create_sample_sales_table(store, ws)
+    svc = StructuredQueryService(store)
+
+    res = svc.execute("What is the total Amount for tech in 2024 in sales_data.csv?", workspace_id=ws)
+    assert res is not None
+
+    # Verify StructuredQueryResult fields
+    assert "Year" in res.predicate_columns
+    assert "Industry" in res.predicate_columns
+    assert 2024 in res.predicate_values
+    assert "tech" in res.predicate_values
+    assert res.selection_count == 1
+    assert res.row_ids == ["sales_data_r1"]
+    assert res.row_indices == [1]
+    assert len(res.selection_hash) == 16
+
+    # Verify citation reference payload
+    citation = build_structured_evidence_ref(res, ws)
+    assert citation["evidence_type"] == "structured_aggregate"
+    assert citation["table_id"] == "sales_data"
+    assert "Year" in citation["predicate_columns"]
+    assert "Industry" in citation["predicate_columns"]
+    assert "2024" in citation["predicate_values"]
+    assert "tech" in citation["predicate_values"]
+    assert citation["selection_count"] == 1
+    assert citation["selection_hash"] == res.selection_hash
+    assert citation["result_value"] == "200.00"
+    assert "1 row(s) from sales_data" in citation["location_reference"]
+
+
+def test_multiple_years_bind_with_in_predicate():
+    store = MemoryTableStore()
+    ws = "ws_multi_year_in"
+    _create_sample_sales_table(store, ws)
+    svc = StructuredQueryService(store)
+
+    res = svc.execute("What is the total Amount for tech in 2023 and 2024 in sales_data.csv?", workspace_id=ws)
+    assert res is not None
+    assert res.result_value == Decimal("300.00")
+    assert res.selection_count == 2
+    assert "Year" in res.predicate_columns
+    assert "Industry" in res.predicate_columns
+    assert [2023, 2024] in res.predicate_values
+    assert "tech" in res.predicate_values
+    assert res.row_ids == ["sales_data_r0", "sales_data_r1"]
+    assert res.row_indices == [0, 1]
 
 
 

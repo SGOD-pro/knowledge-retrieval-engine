@@ -293,6 +293,7 @@ class Planner:
             bool(re.search(r'\b(?:earliest|latest|min|max|minimum|maximum)\b', q_lower))
             or bool(re.search(r'\bhow did (?:total )?\w+ change from \d{4} to \d{4}\b', q_lower))
             or bool(re.search(r'\b(?:change from \d{4} to \d{4}|total income change)\b', q_lower))
+            or bool(re.search(r'\b(?:total|sum|average|avg|count)\b', q_lower))
         )
         has_table_or_file = (
             flags["format_flag"]
