@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 import pytest
 
+from config import settings
 from db.table_store import get_shared_table_store
 from ingestion.csv_table_ingester import ingest_csv_to_table_store
 from modules.query.query_service import QueryRequest, QueryService
@@ -12,6 +13,16 @@ from schemas.structured_table import ColumnDefinition, HeaderTopology, InferredD
 from services.langgraph_pipeline import pipeline
 from services.retrieval.planner import planner
 from services.telemetry import init_request_telemetry
+
+
+@pytest.fixture(autouse=True)
+def configure_test_environment(monkeypatch):
+    """Ensure clean in-memory test substitutes and test mode settings."""
+    monkeypatch.setattr(settings, "ENVIRONMENT", "test")
+    monkeypatch.setattr(settings, "MODEL_PROVIDER", "test")
+    store = get_shared_table_store(reset=True)
+    yield store
+    get_shared_table_store(reset=True)
 
 
 @pytest.fixture
