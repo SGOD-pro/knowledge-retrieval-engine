@@ -226,17 +226,18 @@ Specification 0003 remains Proposed and deferred.
 * Independent Senior Code Review:
   * Reviewer model: `gemini-2.5-pro` (author on `gemini 3.8 flash`).
   * Scope: 42 files on branch `re-factor` vs `main`.
-  * Verdict: Approve with nits (0 blockers, 0 majors, 3 minors resolved, 1 nit resolved).
+  * Verdict: Approve with nits (0 blockers, 0 majors, 1 minor resolved, 1 nit resolved).
   * Resolved findings:
-    1. Replaced substring checks in aggregate operator selection with word boundary regexes (`\bcount\b`, `\b(?:sum|total)\b`, etc.).
-    2. Enforced word boundary regular expression matching for column name resolution in `_find_target_metric_column`.
-    3. Conjoined multiple year predicates using `PredicateOp.IN` rather than conflicting equality predicates.
-    4. Excluded all temporal columns from metric candidates using set comprehension.
-  * Report: [`docs/reviews/2026-10-18-re-factor.md`](file:///home/swyra/projects/knowledge-retrieval-engine/docs/reviews/2026-10-18-re-factor.md).
+    1. Replaced substring containment column matching in `_execute_metric_delta` with `_find_target_metric_column`, enforcing word boundary regular expressions and eliminating substring false positives on short column names. Also standardized word boundary regular expressions in `_execute_min_max_range`.
+    2. Factored shared candidate phrase extraction and explicit filter requirement parsing into `_extract_candidate_filter_terms` and `_extract_explicit_filter_requirements`, eliminating over 80 lines of duplicated regex logic between `_execute_metric_delta` and `_extract_and_bind_predicates`.
+    3. Added 2 new offline regressions: `test_metric_delta_word_boundary_column_matching` and `test_min_max_range_word_boundary_column_matching`. All 21 tests in `test_structured_query_service.py` pass and all 85 tests across 0004 suites pass.
+  * Report: [`docs/reviews/2026-10-22-re-factor.md`](file:///home/swyra/projects/knowledge-retrieval-engine/docs/reviews/2026-10-22-re-factor.md).
 
 * Scope Boundaries and Remaining State:
   * Q159 structured aggregate filter binding defect is resolved.
   * Q153 table binding ambiguity remains resolved.
+  * Metric delta and min/max range column resolution word boundary matching is verified.
+  * Candidate extraction duplication is eliminated.
   * Specification 0004 remains locally Accepted.
   * Specification 0003 remains Proposed and deferred.
   * No claims of independent live AWS cloud readiness or benchmark accuracy improvements.

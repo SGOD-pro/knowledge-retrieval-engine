@@ -74,6 +74,16 @@ class StorageFailureError(StructuredExecutionError):
     """DynamoDB or store raised an error."""
 
 
+SKIP_FILTER_WORDS: set[str] = {
+    "from", "between", "table", "rows", "records", "year", "years", "month",
+    "how", "did", "change", "what", "the", "and", "for", "all", "give",
+    "amount", "percentage", "to", "in", "of", "on", "at", "by", "with",
+    "sum", "total", "average", "avg", "count", "min", "max", "minimum", "maximum",
+    "value", "is", "are", "was", "were", "where", "which", "present", "actually",
+    "does", "do", "calculate", "compute", "find", "get", "show", "tell",
+}
+
+
 class StructuredQueryService:
     def __init__(self, store: TableStore) -> None:
         self.store = store
@@ -421,6 +431,127 @@ class StructuredQueryService:
                 return col.col_index, col.name
         return 0, schema.columns[0].name
 
+    def _extract_explicit_filter_requirements(
+        self,
+        query: str,
+        table_id: str | None = None,
+        schema: TableSchema | None = None,
+    ) -> list[str]:
+        explicit_requirements: list[str] = []
+        table_name = table_id.lower() if table_id else ""
+        table_csv = f"{table_name}.csv" if table_name else ""
+        table_xlsx = f"{table_name}.xlsx" if table_name else ""
+
+        # 1. "for <target>"
+        for m in re.finditer(r'\bfor\s+([A-Za-z0-9_]+(?:\s+[A-Za-z0-9_]+)?)\b', query, re.IGNORECASE):
+            target = m.group(1).strip()
+            tokens = target.split()
+            if len(tokens) > 1 and tokens[-1].lower() in SKIP_FILTER_WORDS:
+                target = " ".join(tokens[:-1]).strip()
+            if len(tokens) > 1 and tokens[0].lower() in SKIP_FILTER_WORDS:
+                target = " ".join(tokens[1:]).strip()
+            t_lower = target.lower()
+            if t_lower not in SKIP_FILTER_WORDS and not re.fullmatch(r'20\d{2}|19\d{2}', target):
+                if not table_name or (t_lower != table_name and t_lower not in (table_csv, table_xlsx)):
+                    explicit_requirements.append(target)
+
+        # 2. Quoted strings
+        for q_str in re.findall(r'["\']([^"\']+)["\']', query):
+            q_clean = q_str.strip()
+            q_lower = q_clean.lower()
+            if q_lower not in SKIP_FILTER_WORDS and not re.fullmatch(r'20\d{2}|19\d{2}', q_clean):
+                if not table_name or (q_lower != table_name and q_lower not in (table_csv, table_xlsx)):
+                    explicit_requirements.append(q_clean)
+
+        # 3. Parenthesized terms
+        for p_str in re.findall(r'\(([^)]+)\)', query):
+            p_clean = p_str.strip()
+            p_lower = p_clean.lower()
+            if p_lower not in SKIP_FILTER_WORDS and not re.fullmatch(r'20\d{2}|19\d{2}', p_clean):
+                if not table_name or (p_lower != table_name and p_lower not in (table_csv, table_xlsx)):
+                    explicit_requirements.append(p_clean)
+
+        # 4. "where <target>" if target is not a known schema column name
+        if schema:
+            where_matches = re.findall(r'\bwhere\s+([A-Za-z0-9_]+)\b', query, re.IGNORECASE)
+            for wm in where_matches:
+                wm_clean = wm.strip()
+                wm_lower = wm_clean.lower()
+                if wm_lower not in SKIP_FILTER_WORDS and not re.fullmatch(r'20\d{2}|19\d{2}', wm_clean):
+                    col_found = any(c.name.lower() == wm_lower for c in schema.columns)
+                    if not col_found:
+                        if not table_name or (wm_lower != table_name and wm_lower not in (table_csv, table_xlsx)):
+                            explicit_requirements.append(wm_clean)
+
+        seen: set[str] = set()
+        unique_reqs: list[str] = []
+        for req in explicit_requirements:
+            if req.lower() not in seen:
+                seen.add(req.lower())
+                unique_reqs.append(req)
+        return unique_reqs
+
+    def _extract_candidate_filter_terms(
+        self,
+        query: str,
+        table_id: str | None = None,
+        schema: TableSchema | None = None,
+    ) -> list[str]:
+        candidates: list[str] = []
+        table_name = table_id.lower() if table_id else ""
+        table_csv = f"{table_name}.csv" if table_name else ""
+        table_xlsx = f"{table_name}.xlsx" if table_name else ""
+
+        # 1. Phrases between intent verbs
+        candidates += re.findall(
+            r'(?:how did|what did|change in|measure of|value of)\s+([a-zA-Z0-9_ ]+?)\s+(?:change|from|between)',
+            query,
+            re.IGNORECASE,
+        )
+
+        # 2. Capitalized multi-word noun phrases
+        candidates += re.findall(r'\b([A-Z][a-z]+(?: [a-z]* ?[A-Z]?[a-z]+){1,3})\b', query)
+
+        # 3. Single identifier tokens (capitalized, alphanumeric, or leading-zero codes)
+        candidates += [
+            w for w in re.findall(r'\b[A-Za-z0-9_]{2,}\b', query)
+            if w.lower() not in SKIP_FILTER_WORDS
+            and not re.fullmatch(r'20\d{2}|19\d{2}', w)
+            and (not table_name or (w.lower() != table_name and w.lower() not in (table_csv, table_xlsx)))
+            and (not schema or not any(c.name.lower() == w.lower() for c in schema.columns))
+        ]
+
+        # 4. Non-stopword bi-grams and tri-grams
+        words = re.findall(r'\b[a-zA-Z0-9_]+\b', query)
+        for i in range(len(words) - 1):
+            w1, w2 = words[i], words[i + 1]
+            if w1.lower() not in SKIP_FILTER_WORDS and w2.lower() not in SKIP_FILTER_WORDS:
+                candidates.append(f"{w1} {w2}")
+        for i in range(len(words) - 2):
+            w1, w2, w3 = words[i], words[i + 1], words[i + 2]
+            if w1.lower() not in SKIP_FILTER_WORDS and w3.lower() not in SKIP_FILTER_WORDS:
+                candidates.append(f"{w1} {w2} {w3}")
+
+        # Deduplicate, longer phrases first
+        seen: set[str] = set()
+        filtered_candidates: list[str] = []
+        for c in sorted(candidates, key=lambda x: -len(x)):
+            c_clean = c.strip()
+            c_lower = c_clean.lower()
+            if not c_clean or c_lower in SKIP_FILTER_WORDS:
+                continue
+            if re.fullmatch(r'20\d{2}|19\d{2}', c_clean):
+                continue
+            if table_name and (c_lower == table_name or c_lower in (table_csv, table_xlsx)):
+                continue
+            if schema and any(col.name.lower() == c_lower for col in schema.columns):
+                continue
+            if c_lower not in seen:
+                seen.add(c_lower)
+                filtered_candidates.append(c_clean)
+
+        return filtered_candidates
+
     def _extract_and_bind_predicates(
         self,
         query: str,
@@ -436,15 +567,6 @@ class StructuredQueryService:
         already_bound: set[int] = set()
         if target_col_idx is not None:
             already_bound.add(target_col_idx)
-
-        skip_words = {
-            "from", "between", "table", "rows", "records", "year", "years", "month",
-            "how", "did", "change", "what", "the", "and", "for", "all", "give",
-            "amount", "percentage", "to", "in", "of", "on", "at", "by", "with",
-            "sum", "total", "average", "avg", "count", "min", "max", "minimum", "maximum",
-            "value", "is", "are", "was", "were", "where", "which", "present", "actually",
-            "does", "do", "calculate", "compute", "find", "get", "show", "tell",
-        }
 
         explicit_requirements: list[str] = []
         q_lower = query.lower()
@@ -462,7 +584,7 @@ class StructuredQueryService:
                 m = re.search(pat, q_lower)
                 if m:
                     raw_val = (m.group(1) or m.group(2) or "").strip().strip("\"' ")
-                    if raw_val and raw_val.lower() not in skip_words:
+                    if raw_val and raw_val.lower() not in SKIP_FILTER_WORDS:
                         dtype_str = self._normalize_dtype(col.inferred_dtype)
                         if dtype_str in {"integer", "decimal"} and raw_val.isdigit():
                             typed_val: Any = int(raw_val)
@@ -504,65 +626,17 @@ class StructuredQueryService:
                     explicit_requirements.append(str(y))
 
         # 3. Explicit filter entity requirements from query keywords (e.g. "for <target>", quotes, parentheses)
-        for m in re.finditer(r'\bfor\s+([A-Za-z0-9_]+(?:\s+[A-Za-z0-9_]+)?)\b', query, re.IGNORECASE):
-            target = m.group(1).strip()
-            tokens = target.split()
-            if len(tokens) > 1 and tokens[-1].lower() in skip_words:
-                target = " ".join(tokens[:-1]).strip()
-            if len(tokens) > 1 and tokens[0].lower() in skip_words:
-                target = " ".join(tokens[1:]).strip()
-            if target.lower() not in skip_words and not re.fullmatch(r'20\d{2}|19\d{2}', target):
-                if target.lower() != table_id.lower() and target.lower() not in (table_id.lower() + ".csv", table_id.lower() + ".xlsx"):
-                    explicit_requirements.append(target)
-        for q_str in re.findall(r'["\']([^"\']+)["\']', query):
-            q_clean = q_str.strip()
-            if q_clean.lower() not in skip_words and not re.fullmatch(r'20\d{2}|19\d{2}', q_clean):
-                if q_clean.lower() != table_id.lower() and q_clean.lower() not in (table_id.lower() + ".csv", table_id.lower() + ".xlsx"):
-                    explicit_requirements.append(q_clean)
-        for p_str in re.findall(r'\(([^)]+)\)', query):
-            p_clean = p_str.strip()
-            if p_clean.lower() not in skip_words and not re.fullmatch(r'20\d{2}|19\d{2}', p_clean):
-                if p_clean.lower() != table_id.lower() and p_clean.lower() not in (table_id.lower() + ".csv", table_id.lower() + ".xlsx"):
-                    explicit_requirements.append(p_clean)
-
-        where_matches = re.findall(r'\bwhere\s+([A-Za-z0-9_]+)\b', query, re.IGNORECASE)
-        for wm in where_matches:
-            wm_clean = wm.strip()
-            if wm_clean.lower() not in skip_words and not re.fullmatch(r'20\d{2}|19\d{2}', wm_clean):
-                col_found = any(c.name.lower() == wm_clean.lower() for c in schema.columns)
-                if not col_found:
-                    explicit_requirements.append(wm_clean)
+        explicit_requirements.extend(
+            self._extract_explicit_filter_requirements(query, table_id=table_id, schema=schema)
+        )
 
         # 4. Probe-based candidate terms extraction
-        candidates: list[str] = list(explicit_requirements)
-        candidates += re.findall(r'\b([A-Z][a-z]+(?: [a-z]* ?[A-Z]?[a-z]+){1,3})\b', query)
-        candidates += [
-            w for w in re.findall(r'\b[A-Za-z0-9_]{2,}\b', query)
-            if w.lower() not in skip_words
-            and not re.fullmatch(r'20\d{2}|19\d{2}', w)
-            and w.lower() != table_id.lower()
-            and w.lower() not in (table_id.lower() + ".csv", table_id.lower() + ".xlsx")
-            and not any(c.name.lower() == w.lower() for c in schema.columns)
-        ]
-
-        words = re.findall(r'\b[a-zA-Z0-9_]+\b', query)
-        for i in range(len(words) - 1):
-            w1, w2 = words[i], words[i + 1]
-            if w1.lower() not in skip_words and w2.lower() not in skip_words:
-                candidates.append(f"{w1} {w2}")
-        for i in range(len(words) - 2):
-            w1, w2, w3 = words[i], words[i + 1], words[i + 2]
-            if w1.lower() not in skip_words and w3.lower() not in skip_words:
-                candidates.append(f"{w1} {w2} {w3}")
-
-        seen: set[str] = set()
+        candidate_terms = self._extract_candidate_filter_terms(query, table_id=table_id, schema=schema)
+        seen_cand: set[str] = set()
         unique_candidates: list[str] = []
-        for c in candidates:
-            c = c.strip()
-            if not c or c.lower() in skip_words or re.fullmatch(r'20\d{2}|19\d{2}', c):
-                continue
-            if c.lower() not in seen:
-                seen.add(c.lower())
+        for c in list(explicit_requirements) + candidate_terms:
+            if c.lower() not in seen_cand:
+                seen_cand.add(c.lower())
                 unique_candidates.append(c)
 
         # 5. Bind candidate terms against table data (probe rows first, then store query)
@@ -663,7 +737,7 @@ class StructuredQueryService:
         q_lower = query.lower()
         mentioned_col = None
         for col in schema.columns:
-            if col.name.lower() in q_lower:
+            if bool(re.search(rf"\b{re.escape(col.name.lower())}\b", q_lower)):
                 mentioned_col = (col.col_index, col.name)
                 break
 
@@ -762,31 +836,12 @@ class StructuredQueryService:
         # Map columns
         year_idx, _ = self._find_column_by_semantic_match(["year", "date", "period"], schema)
 
-        # Check if query mentions a specific metric column name
-        q_lower = query.lower()
-        mentioned_val_col = None
-        # Prioritize numeric columns (decimal, integer, percentage, currency) mentioned in the query
-        for col in schema.columns:
-            if col.col_index == year_idx:
-                continue
-            dtype_str = self._normalize_dtype(col.inferred_dtype)
-            if dtype_str in {"decimal", "integer", "percentage", "currency"}:
-                if col.name.lower() in q_lower:
-                    mentioned_val_col = (col.col_index, col.name)
-                    break
-
-        if not mentioned_val_col:
-            for col in schema.columns:
-                if col.col_index == year_idx:
-                    continue
-                if col.name.lower() in q_lower:
-                    mentioned_val_col = (col.col_index, col.name)
-                    break
-
-        if mentioned_val_col:
-            val_idx, val_col_name = mentioned_val_col
-        else:
-            val_idx, val_col_name = self._find_column_by_semantic_match(["value", "amount", "total"], schema)
+        # Resolve target metric column using word boundary matching and semantic fallback
+        val_idx, val_col_name = self._find_target_metric_column(
+            query=query,
+            schema=schema,
+            exclude_col_indices={year_idx},
+        )
 
         # Year-based predicates (always required)
         predicates_start: list[Predicate] = [Predicate(column_index=year_idx, op=PredicateOp.EQ, value=year_start)]
@@ -794,94 +849,15 @@ class StructuredQueryService:
         pred_cols = ["Year"]
         pred_vals = [f"{year_start},{year_end}"]
 
-        # Probe-based filter extraction: collect candidate filter terms from the query, then
-        # verify each against actual stored column values.  No hardcoded column names or values.
-        #
-        # Candidates come from:
-        #   a) Terms inside parentheses: "All industries (99999)" → "99999"
-        #   b) Quoted strings: '"Total income"' → "Total income"
-        #   c) Capitalized multi-word noun phrases
-        #   d) Phrases between query intent verbs ("how did X change")
-        #   e) Non-stopword n-grams and single identifier tokens (e.g. "total income", "StationDeep")
-        candidates: list[str] = []
-
-        # a) Parenthesized terms
-        candidates += re.findall(r'\(([^)]+)\)', query)
-
-        # b) Quoted phrases
-        candidates += re.findall(r'"([^"]+)"', query)
-        candidates += re.findall(r"'([^']+)'", query)
-
-        # c) Capitalized multi-word noun phrases
-        candidates += re.findall(r'\b([A-Z][a-z]+(?: [a-z]* ?[A-Z]?[a-z]+){1,3})\b', query)
-
-        # d) Phrases between intent verbs
-        candidates += re.findall(
-            r'(?:how did|what did|change in|measure of|value of)\s+([a-zA-Z0-9_ ]+?)\s+(?:change|from|between)',
-            query,
-            re.IGNORECASE,
-        )
-
-        # Filter: skip year tokens, pure punctuation, and single-word stopwords
-        skip_words = {
-            "from", "between", "table", "rows", "records", "year", "years", "month",
-            "how", "did", "change", "what", "the", "and", "for", "all", "give",
-            "amount", "percentage", "to", "in", "of", "on", "at", "by", "with",
-        }
-
-        # e) Single identifier tokens (capitalized, alphanumeric, or leading-zero codes)
-        candidates += [
-            w for w in re.findall(r'\b[A-Za-z0-9_]{2,}\b', query)
-            if w.lower() not in skip_words and not re.fullmatch(r'20\d{2}|19\d{2}', w)
-        ]
-
-        # f) Non-stopword bi-grams and tri-grams
-        words = re.findall(r'\b[a-zA-Z0-9_]+\b', query)
-        for i in range(len(words) - 1):
-            w1, w2 = words[i], words[i + 1]
-            if w1.lower() not in skip_words and w2.lower() not in skip_words:
-                candidates.append(f"{w1} {w2}")
-        for i in range(len(words) - 2):
-            w1, w2, w3 = words[i], words[i + 1], words[i + 2]
-            if w1.lower() not in skip_words and w3.lower() not in skip_words:
-                candidates.append(f"{w1} {w2} {w3}")
-        filtered_candidates = []
-        for c in candidates:
-            c = c.strip()
-            if not c:
-                continue
-            # Skip if it's a year already captured
-            if re.fullmatch(r'20\d{2}|19\d{2}', c):
-                continue
-            if c.lower() in skip_words:
-                continue
-            filtered_candidates.append(c)
-
-        # Remove duplicates while preserving order
-        seen: set[str] = set()
+        # Extract explicit filter requirements and candidate filter terms
+        explicit_requirements = self._extract_explicit_filter_requirements(query, table_id=table_id, schema=schema)
+        candidate_terms = self._extract_candidate_filter_terms(query, table_id=table_id, schema=schema)
+        seen_cand: set[str] = set()
         unique_candidates: list[str] = []
-        for c in filtered_candidates:
-            if c.lower() not in seen:
-                seen.add(c.lower())
+        for c in list(explicit_requirements) + candidate_terms:
+            if c.lower() not in seen_cand:
+                seen_cand.add(c.lower())
                 unique_candidates.append(c)
-
-        # Collect explicitly requested filter entities (e.g. "For <target>", quoted phrases, parenthesized terms)
-        explicit_requirements: list[str] = []
-        for m in re.finditer(r'\bfor\s+([A-Za-z0-9_]+(?:\s+[A-Za-z0-9_]+)?)\b', query, re.IGNORECASE):
-            target = m.group(1).strip()
-            if target.lower() not in skip_words and not re.fullmatch(r'20\d{2}|19\d{2}', target):
-                if target.lower() != table_id.lower() and target.lower() not in (table_id.lower() + ".csv", table_id.lower() + ".xlsx"):
-                    explicit_requirements.append(target)
-        for q_str in re.findall(r'["\']([^"\']+)["\']', query):
-            q_clean = q_str.strip()
-            if q_clean.lower() not in skip_words and not re.fullmatch(r'20\d{2}|19\d{2}', q_clean):
-                if q_clean.lower() != table_id.lower() and q_clean.lower() not in (table_id.lower() + ".csv", table_id.lower() + ".xlsx"):
-                    explicit_requirements.append(q_clean)
-        for p_str in re.findall(r'\(([^)]+)\)', query):
-            p_clean = p_str.strip()
-            if p_clean.lower() not in skip_words and not re.fullmatch(r'20\d{2}|19\d{2}', p_clean):
-                if p_clean.lower() != table_id.lower() and p_clean.lower() not in (table_id.lower() + ".csv", table_id.lower() + ".xlsx"):
-                    explicit_requirements.append(p_clean)
 
         # Check probe rows first (fast in-memory check)
         try:

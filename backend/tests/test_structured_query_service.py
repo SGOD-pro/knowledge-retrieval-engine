@@ -596,5 +596,109 @@ def test_multiple_years_bind_with_in_predicate():
     assert res.row_indices == [0, 1]
 
 
+def test_metric_delta_word_boundary_column_matching():
+    """Verify that short column names (e.g. 'id') are not selected by substring containment in conversational words (e.g. 'provided')."""
+    store = MemoryTableStore()
+    ws = "ws_metric_word_boundary"
+    table_id = "finance_summary"
+    doc_id = "doc_finance"
+
+    cols = (
+        ColumnDefinition(col_index=0, name="Year", inferred_dtype=InferredDtype.INTEGER),
+        ColumnDefinition(col_index=1, name="id", inferred_dtype=InferredDtype.INTEGER),
+        ColumnDefinition(col_index=2, name="revenue", inferred_dtype=InferredDtype.DECIMAL),
+    )
+    schema = TableSchema(
+        columns=cols,
+        header_rows=(0,),
+        header_topology=HeaderTopology.SINGLE_ROW,
+        confidence=1.0,
+    )
+    rows = (
+        TableRow(
+            row_index=0,
+            row_id=f"{table_id}_r0",
+            cells=(
+                TableCell(cell_id="c0_0", row_index=0, col_index=0, coordinate="A1", raw_value="2024", normalized_value=2024),
+                TableCell(cell_id="c0_1", row_index=0, col_index=1, coordinate="B1", raw_value="1", normalized_value=1),
+                TableCell(cell_id="c0_2", row_index=0, col_index=2, coordinate="C1", raw_value="100.00", normalized_value=Decimal("100.00")),
+            ),
+        ),
+        TableRow(
+            row_index=1,
+            row_id=f"{table_id}_r1",
+            cells=(
+                TableCell(cell_id="c1_0", row_index=1, col_index=0, coordinate="A2", raw_value="2025", normalized_value=2025),
+                TableCell(cell_id="c1_1", row_index=1, col_index=1, coordinate="B2", raw_value="1", normalized_value=1),
+                TableCell(cell_id="c1_2", row_index=1, col_index=2, coordinate="C2", raw_value="150.00", normalized_value=Decimal("150.00")),
+            ),
+        ),
+    )
+    table = StructuredTable(table_id=table_id, document_id=doc_id, sheet_name=None, page_number=None, schema=schema, rows=rows)
+    store.store_table(table, ws)
+    store.publish_active_version(table_id, ws, doc_id, "v1", {"coverage_complete": True, "source_rows": 2, "persisted_rows": 2, "rejected_rows": 0})
+
+    svc = StructuredQueryService(store)
+    # The word "provided" contains "id" as a substring.
+    # If substring containment were used, column 'id' would be selected and delta would be 0.
+    # With word boundary regex matching, column 'revenue' is correctly selected and delta is 50.00.
+    query = "how did revenue change from 2024 to 2025 in the provided report for finance_summary?"
+    res = svc.execute(query, workspace_id=ws)
+    assert res is not None
+    assert res.result_value == Decimal("50.00")
+    assert res.secondary_value == Decimal("50.0")
+    assert "from 100.00 to 150.00" in res.answer_text
+
+
+def test_min_max_range_word_boundary_column_matching():
+    """Verify that min/max range column resolution does not match short column names by substring."""
+    store = MemoryTableStore()
+    ws = "ws_min_max_word_boundary"
+    table_id = "inventory"
+    doc_id = "doc_inv"
+
+    cols = (
+        ColumnDefinition(col_index=0, name="id", inferred_dtype=InferredDtype.INTEGER),
+        ColumnDefinition(col_index=1, name="Year", inferred_dtype=InferredDtype.INTEGER),
+    )
+    schema = TableSchema(
+        columns=cols,
+        header_rows=(0,),
+        header_topology=HeaderTopology.SINGLE_ROW,
+        confidence=1.0,
+    )
+    rows = (
+        TableRow(
+            row_index=0,
+            row_id="inv_r0",
+            cells=(
+                TableCell(cell_id="i0_0", row_index=0, col_index=0, coordinate="A1", raw_value="10", normalized_value=10),
+                TableCell(cell_id="i0_1", row_index=0, col_index=1, coordinate="B1", raw_value="2010", normalized_value=2010),
+            ),
+        ),
+        TableRow(
+            row_index=1,
+            row_id="inv_r1",
+            cells=(
+                TableCell(cell_id="i1_0", row_index=1, col_index=0, coordinate="A2", raw_value="20", normalized_value=20),
+                TableCell(cell_id="i1_1", row_index=1, col_index=1, coordinate="B2", raw_value="2020", normalized_value=2020),
+            ),
+        ),
+    )
+    table = StructuredTable(table_id=table_id, document_id=doc_id, sheet_name=None, page_number=None, schema=schema, rows=rows)
+    store.store_table(table, ws)
+    store.publish_active_version(table_id, ws, doc_id, "v1", {"coverage_complete": True, "source_rows": 2, "persisted_rows": 2, "rejected_rows": 0})
+
+    svc = StructuredQueryService(store)
+    # The word "valid" contains "id" as a substring.
+    # Query mentions Year explicitly, but also has "valid".
+    # With word boundary regex, "Year" is matched as the target column.
+    query = "What is the earliest and latest Year in the valid inventory table?"
+    res = svc.execute(query, workspace_id=ws)
+    assert res is not None
+    assert res.result_value == 2010
+    assert res.secondary_value == 2020
+
+
 
 
