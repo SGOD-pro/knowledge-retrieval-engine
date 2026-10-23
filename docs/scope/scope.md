@@ -111,10 +111,14 @@ Spec [0004](../specs/0004-core-engine-walking-skeleton.md) · code in `backend/s
 
 ## Slice 2: PageIndex integration
 
-### 5. PageIndex integration · needs a decision
+### 5. PageIndex integration · planned
 Plan PageIndex integration as a subsequent, independently verifiable slice after the baseline works.
 **Done when:** PageIndex is integrated into the retrieval pipeline and independently verified.
-- [ ] Design it (spec): `/architect PageIndex integration`
+- [x] Design it (spec): `/architect PageIndex integration`
+- [ ] Build it: `/develop PageIndex integration`
+- [ ] Verify it: `/check verify PageIndex integration`
+- [ ] Test it: `/test PageIndex integration`
+Spec [0005](../specs/0005-pageindex-structural-retrieval.md) · code in `backend/src/`
 
 ## Slice 3: OKF integration
 
