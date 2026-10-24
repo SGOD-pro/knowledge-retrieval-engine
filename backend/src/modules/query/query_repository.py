@@ -36,8 +36,17 @@ class QueryRepository:
     def get_workspace_documents(self, workspace_id: str, page: int = 1, limit: int = 10) -> dict:
         return self._ws_repo.get_workspace_documents(workspace_id, page=page, limit=limit)
 
-    def get_all_chunks(self, document_ids: list[str] | None = None, workspace_id: str | None = None) -> list[Chunk]:
-        return self._doc_repo.get_all_chunks(document_ids=document_ids, workspace_id=workspace_id)
+    def get_all_chunks(
+        self,
+        document_ids: list[str] | None = None,
+        workspace_id: str | None = None,
+        page_numbers: list[int] | tuple[int, ...] | None = None,
+    ) -> list[Chunk]:
+        return self._doc_repo.get_all_chunks(
+            document_ids=document_ids,
+            workspace_id=workspace_id,
+            page_numbers=page_numbers,
+        )
 
     def _search_in_memory(
         self,

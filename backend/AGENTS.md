@@ -17,6 +17,12 @@ FastAPI service providing parsing, structural indexing, retrieval orchestration,
 | `src/db/database.py` | Database access repository for DynamoDB and related data stores |
 | `src/db/workspace_boundary_repo.py` | Workspace boundary repository for DynamoDB, SQLite, and memory stores |
 | `src/schemas/contracts/` | Shared frozen Pydantic contracts and identity envelopes |
+| `src/schemas/contracts/page_index.py` | Typed structural layout hierarchy, element location, and lookup contracts |
+| `src/db/page_index_repo.py` | PageIndex summary repository and S3 artifact store with S3 first write ordering |
+| `src/ingestion/page_index_extractor.py` | Deterministic PDF layout and structural hierarchy extractor |
+| `src/services/retrieval/page_index_lookup.py` | Bounded concurrent structural lookup service with capacity retention and timeout handling |
+| `src/services/retrieval/page_index_retriever.py` | Synchronous and asynchronous PageIndex structural lookup adapter |
+| `src/services/retrieval/strategies/page_index.py` | PageIndex structural evidence strategy with targeted label extraction and snapshot chunk retrieval |
 | `src/services/benchmark/` | Benchmark runner, S3 artifact store, and recoverable metric persistence |
 
 ## Commands
@@ -50,11 +56,16 @@ uv run pytest tests/test_contracts_and_identity.py
 * TableStore streams and persists all rows without row truncation; vector chunking caps at 5000 chunks for vector search, so vector chunk count in snapshots or vector storage must not be confused with TableStore completeness.
 * Structured TableStore query execution requires defensible source binding before execution; if multiple tables remain equally compatible or without sufficient score separation (gap under 2.0), the engine raises AmbiguousBindingError instead of returning the first candidate that runs successfully.
 * Structured aggregate queries bind requested entity and temporal constraints to typed store predicates before execution. If a requested filter cannot be resolved in schema or stored rows, the engine raises UnresolvedFilterError rather than computing an unconstrained whole table total, while valid filters matching zero rows return zero count and zero total distinct from binding failures.
+* PageIndex structural extraction operates as an enrichment pass; enrichment errors preserve baseline chunks and snapshots without blocking ingestion.
+* PageIndex lookup bounds admission capacity and retains worker capacity until background storage calls finish, distinguishing caller timeouts from storage cancellation and disabling SDK retries explicitly.
+* PageIndex candidates are soft pooled into reciprocal rank fusion with a calibrated weight of 1.1 (divided by 2 for ambiguous definitions); candidate page scopes and chunk exclusions remain unconstrained so vector and BM25 discovery search across the full active workspace without hard gating.
+* Benchmark accuracy comparison claims remain strictly blocked by validate_benchmark_comparison_preconditions until controlled comparison runs execute on ws_canonical_comparison_0004. Requiring ws_canonical_comparison_0004 is an additional guard, not proof of comparability or a replacement for manifest and configuration validation; post repair canonical evaluation remains pending, with zero measured accuracy improvement or live AWS readiness claimed.
 
 ## Related specs
 * [docs/specs/0001-contracts-and-identity-envelope.md](../docs/specs/0001-contracts-and-identity-envelope.md)
 * [docs/specs/0002-workspace-authorization-and-boundary-isolation.md](../docs/specs/0002-workspace-authorization-and-boundary-isolation.md)
 * [docs/specs/0004-core-engine-walking-skeleton.md](../docs/specs/0004-core-engine-walking-skeleton.md)
+* [docs/specs/0005-pageindex-structural-retrieval.md](../docs/specs/0005-pageindex-structural-retrieval.md)
 * [docs/TECHNICAL_SPEC.md](../docs/TECHNICAL_SPEC.md)
 * [docs/ARCHITECTURE.md](../docs/ARCHITECTURE.md)
 * [docs/REQUIREMENTS.md](../docs/REQUIREMENTS.md)

@@ -6,6 +6,7 @@ import logging
 import time
 from typing import Any
 
+from config import settings
 from db.database import CloudRepository
 from schemas.models import Chunk
 from services.retrieval.evidence_contract import (
@@ -30,9 +31,13 @@ class PageIndexStrategy:
 
     name: str = "page_index"
 
-    def __init__(self, repository: CloudRepository | None = None) -> None:
+    def __init__(
+        self,
+        repository: CloudRepository | None = None,
+        retriever: PageIndexRetriever | None = None,
+    ) -> None:
         self.repository = repository or CloudRepository()
-        self.retriever = PageIndexRetriever()
+        self.retriever = retriever or PageIndexRetriever()
 
     async def retrieve(
         self,
@@ -41,6 +46,7 @@ class PageIndexStrategy:
         plan: QueryPlan | None = None,
         limits: RetrievalLimits | None = None,
         telemetry: RequestTelemetry | None = None,
+        document_ids: list[str] | None = None,
     ) -> RetrievalStrategyResult:
         if not workspace_id:
             raise ValueError("workspace_id is required for PageIndexStrategy")
@@ -49,29 +55,54 @@ class PageIndexStrategy:
         limits = limits or RetrievalLimits(top_k=10)
         top_k = limits.top_k
 
-        # 1. Fetch chunks in workspace
-        all_chunks = self.repository.get_all_chunks(workspace_id=workspace_id)
-
-        # 2. PageIndex filter and structural score
-        selected_chunks, pages, chunk_ids = self.retriever.filter_and_rank(
-            query=query,
-            candidates=all_chunks,
-            top_k=top_k,
-        )
+        # 1. Extract structural target labels from query
+        target_labels = self.retriever.lookup_service.extract_target_labels(query)
 
         evidence_items: list[EvidenceItem] = []
-        for c in selected_chunks:
-            source_type = "page_region" if c.page_number is not None else "chunk"
-            ev = evidence_item_from_chunk(
-                chunk=c,
-                workspace_id=workspace_id,
-                strategy=self.name,
-                score=getattr(c, "structural_weight", 1.0) or 1.0,
-            )
-            # Override source_type to page_region if page is present
-            ev.source_type = source_type
-            ev.locator["candidate_pages"] = pages
-            evidence_items.append(ev)
+        candidate_pages: list[int] = []
+        chunk_ids: list[str] = []
+
+        if target_labels:
+            from src.db.workspace_boundary_repo import get_workspace_boundary_repo
+            b_repo = get_workspace_boundary_repo()
+            snaps = b_repo.list_document_snapshots(workspace_id)
+            pdf_snaps = [s for s in snaps if s.format.lower() == "pdf"]
+            if document_ids:
+                doc_set = set(str(d) for d in document_ids)
+                pdf_snaps = [s for s in pdf_snaps if s.document_id in doc_set]
+
+            for snap in pdf_snaps:
+                doc_id = snap.document_id
+                doc_ver = snap.version
+                for t_label in target_labels:
+                    res, status = await self.retriever.lookup(
+                        workspace_id=workspace_id,
+                        document_id=doc_id,
+                        document_version=doc_ver,
+                        target_label=t_label,
+                        deadline_ms=50.0,
+                    )
+                    if res and (res.candidate_pages or res.cross_reference_pages):
+                        matched_p = res.candidate_pages if res.candidate_pages else res.cross_reference_pages
+                        candidate_pages.extend(matched_p)
+                        doc_chunks = self.repository.get_all_chunks(
+                            document_ids=[doc_id],
+                            workspace_id=workspace_id,
+                            page_numbers=matched_p,
+                        )
+                        matching_chunks = [c for c in doc_chunks if c.page_number in matched_p]
+                        for c in matching_chunks[:top_k]:
+                            source_type = "page_region" if c.page_number is not None else "chunk"
+                            ev = evidence_item_from_chunk(
+                                chunk=c,
+                                workspace_id=workspace_id,
+                                strategy=self.name,
+                                score=getattr(settings, "PAGEINDEX_STRUCTURAL_WEIGHT", 1.1),
+                            )
+                            ev.source_type = source_type
+                            ev.locator["candidate_pages"] = list(matched_p)
+                            evidence_items.append(ev)
+                            chunk_ids.append(str(c.id))
 
         latency_ms = (time.perf_counter() - start_time) * 1000.0
 
@@ -90,7 +121,7 @@ class PageIndexStrategy:
             failure_reason=None if evidence_items else "no_page_matches",
             debug_trace={
                 "retrieval_llm_calls_used": False,
-                "candidate_pages": pages,
+                "candidate_pages": candidate_pages,
                 "candidate_chunk_ids": chunk_ids,
                 "final_retained_evidence_ids": [ev.evidence_id for ev in evidence_items],
             },

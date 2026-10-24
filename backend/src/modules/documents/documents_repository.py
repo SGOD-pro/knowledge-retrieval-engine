@@ -250,6 +250,7 @@ class DocumentsRepository:
         self,
         document_ids: list[str] | None = None,
         workspace_id: str | None = None,
+        page_numbers: list[int] | tuple[int, ...] | None = None,
     ) -> list[Chunk]:
         if _is_test_env():
             mem_chunks = list(_IN_MEMORY_CHUNKS.values())
@@ -258,6 +259,9 @@ class DocumentsRepository:
             if document_ids is not None:
                 doc_id_set = set(document_ids)
                 mem_chunks = [c for c in mem_chunks if str(c.document_id) in doc_id_set]
+            if page_numbers is not None:
+                page_set = set(page_numbers)
+                mem_chunks = [c for c in mem_chunks if c.page_number in page_set]
             return mem_chunks
 
         from boto3.dynamodb.conditions import Key
@@ -304,6 +308,9 @@ class DocumentsRepository:
             if document_ids is not None:
                 doc_id_set = set(document_ids)
                 chunks = [c for c in chunks if str(c.document_id) in doc_id_set]
+            if page_numbers is not None:
+                page_set = set(page_numbers)
+                chunks = [c for c in chunks if c.page_number in page_set]
             return chunks
         elif document_ids is not None:
             chunks = []
@@ -311,6 +318,9 @@ class DocumentsRepository:
                 doc = self.get(d)
                 if doc:
                     chunks.extend(doc.chunks)
+            if page_numbers is not None:
+                page_set = set(page_numbers)
+                chunks = [c for c in chunks if c.page_number in page_set]
             return chunks
         else:
             raise ValueError("workspace_id or document_ids is required to retrieve chunks")

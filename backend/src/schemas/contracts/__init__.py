@@ -22,6 +22,7 @@ from src.schemas.contracts.boundary import (
     CacheKeyDescriptor,
     CachedQueryResult,
     CitationItem,
+    DocumentSnapshot,
     ErrorEnvelope,
     JobRecord,
     PrincipalRecord,
@@ -34,6 +35,14 @@ from src.schemas.contracts.boundary import (
     WorkerExecutionContext,
     WorkspaceAccessDeniedError,
     WorkspaceRecord,
+)
+from src.schemas.contracts.page_index import (
+    CrossReference,
+    ElementLocation,
+    PageIndexDetail,
+    PageIndexSummary,
+    SectionSummary,
+    StructuralLookupResult,
 )
 from src.schemas.contracts.evidence import (
     CanonicalEvidence,
@@ -160,4 +169,12 @@ __all__ = [
     "PublicationManifestRecord",
     "QueryExecutionOutcome",
     "ErrorEnvelope",
+    "DocumentSnapshot",
+    # PageIndex Structural Records
+    "SectionSummary",
+    "ElementLocation",
+    "CrossReference",
+    "PageIndexDetail",
+    "PageIndexSummary",
+    "StructuralLookupResult",
 ]

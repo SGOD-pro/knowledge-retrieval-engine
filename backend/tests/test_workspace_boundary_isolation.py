@@ -56,7 +56,7 @@ def setup_dependency_overrides():
     app.dependency_overrides[get_cache_store] = lambda: InMemoryCacheStore()
     app.dependency_overrides[get_execution_engine] = lambda: ControlledFixtureExecutionEngine()
     yield
-    # We could clear them here, but we leave them since this module owns these tests.
+    app.dependency_overrides.clear()
 
 @pytest.fixture(autouse=True)
 def reset_repo_state():

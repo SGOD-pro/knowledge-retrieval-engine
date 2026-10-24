@@ -6,6 +6,7 @@ from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
+from config import settings
 from schemas.models import Chunk
 from services.llm.llm_service import call as call_llm
 from services.retrieval.bm25_retriever import BM25Retriever
@@ -82,6 +83,11 @@ class PipelineState(TypedDict):
     error_code: str | None
     selected_strategies: dict[str, Any] | None
     retained_evidence_items: list[Any]
+    structural_candidates: list[Chunk]
+    structural_candidate_ids: list[str]
+    structural_match_count: int
+    page_index_latency_ms: float
+    structural_target_state: str
 
 
 # ---------------------------------------------------------------------------
@@ -93,10 +99,12 @@ def _rrf_merge(
     bm25_chunks: list,
     vector_chunks: list,
     graph_chunks: list | None = None,
+    structural_chunks: list | None = None,
     k: int = 60,
     graph_weight: float = 1.2,
+    structural_weight: float = 1.1,
 ) -> list:
-    """Reciprocal Rank Fusion with graph evidence signal.
+    """Reciprocal Rank Fusion with graph and structural PageIndex evidence signals.
     k=60 per Cormack et al. 2009.
     Returns deduplicated list of Chunk objects ordered by descending RRF score."""
     scores: dict[str, float] = {}
@@ -110,6 +118,11 @@ def _rrf_merge(
     if graph_chunks:
         for rank, chunk in enumerate(graph_chunks):
             scores[chunk.id] = scores.get(chunk.id, 0.0) + (graph_weight / (k + rank + 1))
+            by_id[chunk.id] = chunk
+    if structural_chunks:
+        for rank, chunk in enumerate(structural_chunks):
+            w = getattr(chunk, "structural_weight", None) or structural_weight
+            scores[chunk.id] = scores.get(chunk.id, 0.0) + (float(w) / (k + rank + 1))
             by_id[chunk.id] = chunk
     return [by_id[cid] for cid in sorted(scores, key=scores.__getitem__, reverse=True)]
 
@@ -261,39 +274,119 @@ def run_bm25(state: PipelineState):
 
 
 def run_page_index(state: PipelineState):
-    """PageIndex narrowing (Component 1 / Rule 5). Narrows candidate pages
-    based on headings/footnotes retrieved by BM25 with document-scoped constraints."""
+    """PageIndex structural candidate extraction (Slice 2 / AC-3).
+    Evaluates query for structural targets (Table N, Figure N), resolves candidate
+    pages via isolated lookup against durable PageIndex summaries, and returns
+    structural candidates for reciprocal rank fusion without hard page gating."""
     t0 = time.perf_counter()
-    retriever = PageIndexRetriever()
-    bm25_cands = state.get("bm25_candidates")
-    if bm25_cands:
-        chunks, pages, c_ids = retriever.filter_and_rank(
-            state["query"], bm25_cands, top_k=20
-        )
-        page_scopes = [
-            (str(c.document_id), c.page_number)
-            for c in chunks
-            if c.page_number is not None and getattr(c, "document_id", None)
-        ]
-        # Include all selected chunk IDs
-        all_selected_ids = [str(c.id) for c in chunks]
-        c_ids = list(set((c_ids or []) + all_selected_ids))
-    else:
-        # When BM25 is skipped (e.g. fast path), do not restrict page/chunk IDs
-        pages, c_ids, page_scopes = None, None, None
+    existing = state.get("stage_timings", {})
 
-    avg_score = 1.0 if pages else 0.0
+    if not getattr(settings, "PAGEINDEX_ENABLED", True):
+        retrieval_cands = dict(state.get("retrieval_candidates", {}))
+        retrieval_cands.update({
+            "structural_candidate_ids": [],
+            "structural_match_count": 0,
+            "page_index_latency_ms": 0.0,
+            "structural_target_state": "none",
+        })
+        return {
+            "structural_candidates": [],
+            "structural_candidate_ids": [],
+            "structural_match_count": 0,
+            "page_index_latency_ms": 0.0,
+            "structural_target_state": "none",
+            "candidate_page_ids": None,
+            "candidate_chunk_ids": None,
+            "candidate_page_scopes": None,
+            "retrieval_candidates": retrieval_cands,
+            "stage_timings": {**existing, "page_index_ms": 0.0},
+        }
+
+    ws_id = state.get("workspace_id", "")
+    query = state.get("query", "")
+    target_docs = state.get("document_ids")
+
+    retriever = PageIndexRetriever()
+    target_labels = retriever.lookup_service.extract_target_labels(query)
+
+    structural_chunks = []
+    matched_pages: list[int] = []
+    structural_target_state = "none"
+
+    if target_labels and ws_id:
+        repo = _get_repo()
+        from src.db.workspace_boundary_repo import get_workspace_boundary_repo
+        b_repo = get_workspace_boundary_repo()
+        try:
+            snaps = b_repo.list_document_snapshots(ws_id)
+            if target_docs:
+                target_set = set(target_docs)
+                snaps = [s for s in snaps if s.document_id in target_set]
+
+            pdf_snaps = [s for s in snaps if s.format.lower() == "pdf"]
+
+            for snap in pdf_snaps:
+                doc_id = snap.document_id
+                doc_ver = snap.version
+                for t_label in target_labels:
+                    res = retriever.lookup_sync(
+                        workspace_id=ws_id,
+                        document_id=doc_id,
+                        document_version=doc_ver,
+                        target_label=t_label,
+                        deadline_ms=float(getattr(settings, "PAGEINDEX_TIMEOUT_MS", 50)),
+                    )
+                    if res and (res.candidate_pages or res.cross_reference_pages):
+                        pages_to_fetch = res.candidate_pages if res.candidate_pages else res.cross_reference_pages
+                        matched_pages.extend(pages_to_fetch)
+                        structural_target_state = res.state
+
+                        doc_chunks = repo.get_all_chunks(
+                            document_ids=[doc_id],
+                            workspace_id=ws_id,
+                            page_numbers=pages_to_fetch,
+                        )
+                        for c in doc_chunks:
+                            if c.page_number in pages_to_fetch:
+                                from dataclasses import replace
+                                weight_div = 0.5 if res.state == "ambiguous" else 1.0
+                                s_weight = float(getattr(settings, "PAGEINDEX_STRUCTURAL_WEIGHT", 1.1)) * weight_div
+                                c_meta = dict(c.metadata) if isinstance(c.metadata, dict) else {}
+                                c_meta["strategy"] = "page_index"
+                                c_struct = replace(
+                                    c,
+                                    structural_weight=s_weight,
+                                    metadata=c_meta,
+                                )
+                                structural_chunks.append(c_struct)
+        except Exception as exc:
+            logger.warning("page_index.lookup_failed error=%s (preserving baseline)", exc)
+
     latency_ms = (time.perf_counter() - t0) * 1000.0
     logger.info(
-        "page_index.latency_ms=%.2f page_index.confidence_score=%.2f",
+        "page_index.latency_ms=%.2f targets=%s match_count=%d state=%s",
         latency_ms,
-        avg_score,
+        target_labels,
+        len(structural_chunks),
+        structural_target_state,
     )
-    existing = state.get("stage_timings", {})
+    retrieval_cands = dict(state.get("retrieval_candidates", {}))
+    retrieval_cands.update({
+        "structural_candidate_ids": [str(c.id) for c in structural_chunks],
+        "structural_match_count": len(structural_chunks),
+        "page_index_latency_ms": latency_ms,
+        "structural_target_state": structural_target_state,
+    })
     return {
-        "candidate_page_ids": pages,
-        "candidate_chunk_ids": c_ids,
-        "candidate_page_scopes": page_scopes,
+        "structural_candidates": structural_chunks,
+        "structural_candidate_ids": [str(c.id) for c in structural_chunks],
+        "structural_match_count": len(structural_chunks),
+        "page_index_latency_ms": latency_ms,
+        "structural_target_state": structural_target_state,
+        "candidate_page_ids": None,
+        "candidate_chunk_ids": None,
+        "candidate_page_scopes": None,
+        "retrieval_candidates": retrieval_cands,
         "stage_timings": {**existing, "page_index_ms": latency_ms},
     }
 
@@ -402,17 +495,36 @@ def run_graph(state: PipelineState):
 
 
 def run_reranker(state: PipelineState):
-    """RRF merge of bm25_candidates + candidate_chunks (vector) + graph_chunks, then neural rerank.
+    """RRF merge of bm25_candidates + candidate_chunks (vector) + graph_chunks + structural_candidates, then neural rerank.
     Tracks raw retrieval candidates per stage for honest evaluation."""
     t0 = time.perf_counter()
     bm25 = state.get("bm25_candidates", [])
     vector = state.get("candidate_chunks", [])
     graph = state.get("graph_chunks", [])
+    structural = state.get("structural_candidates", [])
 
-    merged = _rrf_merge(bm25, vector, graph_chunks=graph, k=60, graph_weight=1.2)
+    structural_weight = float(getattr(settings, "PAGEINDEX_STRUCTURAL_WEIGHT", 1.1))
+    merged = _rrf_merge(
+        bm25,
+        vector,
+        graph_chunks=graph,
+        structural_chunks=structural,
+        k=60,
+        graph_weight=1.2,
+        structural_weight=structural_weight,
+    )
     if not merged:
         logger.warning("run_reranker: no chunks to rerank — returning empty")
-        return {"top_chunks": [], "retrieval_candidates": {}, "reranker_mode": "remote_success"}
+        cands = dict(state.get("retrieval_candidates", {}))
+        cands.update({
+            "bm25": [],
+            "vector": [],
+            "graph": [],
+            "structural": [],
+            "rrf": [],
+            "reranked": [],
+        })
+        return {"top_chunks": [], "retrieval_candidates": cands, "reranker_mode": "remote_success"}
 
     from providers.reranker_provider import _is_circuit_open
     circuit_open = _is_circuit_open()
@@ -433,8 +545,13 @@ def run_reranker(state: PipelineState):
         "bm25": [str(c.id) for c in bm25],
         "vector": [str(c.id) for c in vector],
         "graph": [str(c.id) for c in graph],
+        "structural": [str(c.id) for c in structural],
         "rrf": [str(c.id) for c in merged],
         "reranked": [str(c.id) for c in top_chunks],
+        "structural_candidate_ids": [str(c.id) for c in structural],
+        "structural_match_count": len(structural),
+        "page_index_latency_ms": state.get("page_index_latency_ms", 0.0),
+        "structural_target_state": state.get("structural_target_state", "none"),
     }
 
     from services.retrieval.evidence_contract import evidence_item_from_chunk
@@ -443,7 +560,9 @@ def run_reranker(state: PipelineState):
     for c in top_chunks:
         strat = getattr(c, "strategy", None) or (c.metadata.get("strategy") if isinstance(getattr(c, "metadata", None), dict) else None)
         if not strat:
-            if c in vector:
+            if c in structural:
+                strat = "page_index"
+            elif c in vector:
                 strat = "vector_rerank"
             elif c in bm25:
                 strat = "bm25"
@@ -771,6 +890,7 @@ def end_fast_path(state: PipelineState):
             "executed_path": "fast",
             "status": "success",
             "retrieval_candidates": {
+                **dict(state.get("retrieval_candidates", {})),
                 "reranked": [str(c.id) for c in top_chunks],
                 "compressed_context": [str(c.id) for c in top_chunks],
                 "llm_citations": [str(citation.get("chunk_id", ""))],
@@ -828,6 +948,7 @@ def end_fast_path(state: PipelineState):
             "executed_path": "fast",
             "status": "success",
             "retrieval_candidates": {
+                **dict(state.get("retrieval_candidates", {})),
                 "reranked": [str(c.id) for c in top_chunks],
                 "compressed_context": [str(c.id) for c in top_chunks],
                 "llm_citations": [str(c.get("chunk_id", "")) for c in citations if c.get("chunk_id")],
@@ -1222,6 +1343,11 @@ class Pipeline:
             "error_code": None,
             "selected_strategies": None,
             "retained_evidence_items": [],
+            "structural_candidates": [],
+            "structural_candidate_ids": [],
+            "structural_match_count": 0,
+            "page_index_latency_ms": 0.0,
+            "structural_target_state": "none",
         }
 
         final_state = app.invoke(initial_state)
@@ -1267,6 +1393,11 @@ class Pipeline:
                 self.structured_aggregate = (self.executed_path == "structured_aggregate")
                 self.reranker_mode = state.get("reranker_mode", "remote_success")
                 self.retrieval_candidates = state.get("retrieval_candidates", {})
+                self.structural_candidates = state.get("structural_candidates", [])
+                self.structural_candidate_ids = state.get("structural_candidate_ids", [])
+                self.structural_match_count = state.get("structural_match_count", 0)
+                self.page_index_latency_ms = state.get("page_index_latency_ms", 0.0)
+                self.structural_target_state = state.get("structural_target_state", "none")
                 self.query_embedding = state.get("query_embedding")
                 self.query_embedding_provenance = state.get("query_embedding_provenance")
 

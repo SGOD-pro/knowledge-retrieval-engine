@@ -29,6 +29,11 @@ from src.schemas.contracts.boundary import (
     WorkspaceAccessDeniedError,
     WorkspaceRecord,
 )
+from src.schemas.contracts.page_index import (
+    ElementLocation,
+    PageIndexSummary,
+    SectionSummary,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +80,14 @@ class WorkspaceBoundaryRepositoryBase(Protocol):
     def save_benchmark_metadata(self, metadata: BenchmarkRunMetadata) -> None: ...
     def get_benchmark_metadata(self, workspace_id: str, benchmark_run_id: str) -> BenchmarkRunMetadata | None: ...
     def list_benchmark_metadata(self, workspace_id: str) -> list[BenchmarkRunMetadata]: ...
+    def save_page_index_summary(self, summary: PageIndexSummary) -> None: ...
+    def get_page_index_summary(
+        self, workspace_id: str, document_id: str, document_version: str
+    ) -> PageIndexSummary | None: ...
+    def list_page_index_summaries(self, workspace_id: str) -> list[PageIndexSummary]: ...
+    def delete_page_index_summary(
+        self, workspace_id: str, document_id: str, document_version: str
+    ) -> None: ...
 
 
 class InMemoryWorkspaceBoundaryRepository:
@@ -89,6 +102,7 @@ class InMemoryWorkspaceBoundaryRepository:
         self._jobs: dict[str, JobRecord] = {}
         self._document_snapshots: dict[tuple[str, str], DocumentSnapshot] = {}
         self._benchmark_metadata: dict[tuple[str, str], BenchmarkRunMetadata] = {}
+        self._page_index_summaries: dict[tuple[str, str, str], PageIndexSummary] = {}
         self._op_lock = threading.Lock()
         self._seed_fixtures()
 
@@ -103,6 +117,7 @@ class InMemoryWorkspaceBoundaryRepository:
             self._jobs.clear()
             self._document_snapshots.clear()
             self._benchmark_metadata.clear()
+            self._page_index_summaries.clear()
             self._seed_fixtures()
 
     def _seed_fixtures(self) -> None:
@@ -366,6 +381,26 @@ class InMemoryWorkspaceBoundaryRepository:
         with self._op_lock:
             return [meta for (ws_id, _), meta in self._benchmark_metadata.items() if ws_id == workspace_id]
 
+    def save_page_index_summary(self, summary: PageIndexSummary) -> None:
+        with self._op_lock:
+            self._page_index_summaries[(summary.workspace_id, summary.document_id, summary.document_version)] = summary
+
+    def get_page_index_summary(
+        self, workspace_id: str, document_id: str, document_version: str
+    ) -> PageIndexSummary | None:
+        with self._op_lock:
+            return self._page_index_summaries.get((workspace_id, document_id, document_version))
+
+    def list_page_index_summaries(self, workspace_id: str) -> list[PageIndexSummary]:
+        with self._op_lock:
+            return [s for (ws_id, _, _), s in self._page_index_summaries.items() if ws_id == workspace_id]
+
+    def delete_page_index_summary(
+        self, workspace_id: str, document_id: str, document_version: str
+    ) -> None:
+        with self._op_lock:
+            self._page_index_summaries.pop((workspace_id, document_id, document_version), None)
+
 
 from functools import wraps
 from typing import Callable, TypeVar, Any, cast
@@ -513,10 +548,49 @@ class SQLiteWorkspaceBoundaryRepository:
                         persisted_rows INTEGER NOT NULL,
                         total_rows INTEGER NOT NULL,
                         created_at TEXT NOT NULL,
+                        page_index_status TEXT,
+                        page_index_elements_count INTEGER DEFAULT 0,
                         PRIMARY KEY (workspace_id, document_id)
                     )
                     """
                 )
+                # Check for schema migration on document_snapshots
+                snap_cols = {
+                    row["name"]
+                    for row in self._conn.execute("PRAGMA table_info(document_snapshots)").fetchall()
+                }
+                if "page_index_status" not in snap_cols:
+                    self._conn.execute("ALTER TABLE document_snapshots ADD COLUMN page_index_status TEXT")
+                if "page_index_elements_count" not in snap_cols:
+                    self._conn.execute("ALTER TABLE document_snapshots ADD COLUMN page_index_elements_count INTEGER DEFAULT 0")
+
+                self._conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS page_index_summaries (
+                        workspace_id TEXT NOT NULL,
+                        document_id TEXT NOT NULL,
+                        document_version TEXT NOT NULL,
+                        total_pages INTEGER NOT NULL,
+                        layout_status TEXT NOT NULL,
+                        root_sections_json TEXT NOT NULL,
+                        has_s3_overflow INTEGER NOT NULL,
+                        s3_overflow_key TEXT,
+                        inline_definitions_json TEXT NOT NULL,
+                        inline_cross_references_json TEXT DEFAULT '{}',
+                        created_at TEXT NOT NULL,
+                        structural_elements_count INTEGER NOT NULL,
+                        raw_payload_bytes INTEGER,
+                        sections_overflowed INTEGER NOT NULL,
+                        PRIMARY KEY (workspace_id, document_id, document_version)
+                    )
+                    """
+                )
+                pi_cols = {
+                    row["name"]
+                    for row in self._conn.execute("PRAGMA table_info(page_index_summaries)").fetchall()
+                }
+                if "inline_cross_references_json" not in pi_cols:
+                    self._conn.execute("ALTER TABLE page_index_summaries ADD COLUMN inline_cross_references_json TEXT DEFAULT '{}'")
                 self._conn.execute(
                     """
                     CREATE TABLE IF NOT EXISTS benchmark_runs (
@@ -1007,8 +1081,9 @@ class SQLiteWorkspaceBoundaryRepository:
                     """
                     INSERT OR REPLACE INTO document_snapshots (
                         workspace_id, document_id, source, version, format,
-                        incomplete_coverage_flag, exclusions_json, persisted_rows, total_rows, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        incomplete_coverage_flag, exclusions_json, persisted_rows, total_rows, created_at,
+                        page_index_status, page_index_elements_count
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         snapshot.workspace_id,
@@ -1021,6 +1096,8 @@ class SQLiteWorkspaceBoundaryRepository:
                         snapshot.persisted_rows,
                         snapshot.total_rows,
                         snapshot.created_at,
+                        snapshot.page_index_status,
+                        snapshot.page_index_elements_count,
                     ),
                 )
 
@@ -1044,6 +1121,8 @@ class SQLiteWorkspaceBoundaryRepository:
                 persisted_rows=int(row["persisted_rows"]),
                 total_rows=int(row["total_rows"]),
                 created_at=row["created_at"],
+                page_index_status=row["page_index_status"] if "page_index_status" in row.keys() else None,
+                page_index_elements_count=int(row["page_index_elements_count"] or 0) if "page_index_elements_count" in row.keys() else 0,
             )
 
     def list_document_snapshots(self, workspace_id: str) -> list[DocumentSnapshot]:
@@ -1065,9 +1144,137 @@ class SQLiteWorkspaceBoundaryRepository:
                     persisted_rows=int(r["persisted_rows"]),
                     total_rows=int(r["total_rows"]),
                     created_at=r["created_at"],
+                    page_index_status=r["page_index_status"] if "page_index_status" in r.keys() else None,
+                    page_index_elements_count=int(r["page_index_elements_count"] or 0) if "page_index_elements_count" in r.keys() else 0,
                 )
                 for r in rows
             ]
+
+    def save_page_index_summary(self, summary: PageIndexSummary) -> None:
+        with self._lock:
+            with self._conn:
+                self._conn.execute(
+                    """
+                    INSERT OR REPLACE INTO page_index_summaries (
+                        workspace_id, document_id, document_version, total_pages,
+                        layout_status, root_sections_json, has_s3_overflow, s3_overflow_key,
+                        inline_definitions_json, inline_cross_references_json, created_at, structural_elements_count,
+                        raw_payload_bytes, sections_overflowed
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        summary.workspace_id,
+                        summary.document_id,
+                        summary.document_version,
+                        summary.total_pages,
+                        summary.layout_status,
+                        json.dumps([s.model_dump() for s in summary.root_sections]),
+                        1 if summary.has_s3_overflow else 0,
+                        summary.s3_overflow_key,
+                        json.dumps({k: [loc.model_dump() for loc in locs] for k, locs in summary.inline_definitions.items()}),
+                        json.dumps({k: list(v) for k, v in summary.inline_cross_references.items()}),
+                        summary.created_at,
+                        summary.structural_elements_count,
+                        summary.raw_payload_bytes,
+                        1 if summary.sections_overflowed else 0,
+                    ),
+                )
+
+    def get_page_index_summary(
+        self, workspace_id: str, document_id: str, document_version: str
+    ) -> PageIndexSummary | None:
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                SELECT * FROM page_index_summaries
+                WHERE workspace_id = ? AND document_id = ? AND document_version = ?
+                """,
+                (workspace_id, document_id, document_version),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            root_sections = tuple(
+                SectionSummary(**s) for s in json.loads(row["root_sections_json"])
+            )
+            inline_defs_raw = json.loads(row["inline_definitions_json"])
+            inline_defs = {
+                k: tuple(ElementLocation(**loc) for loc in locs)
+                for k, locs in inline_defs_raw.items()
+            }
+            raw_crs = json.loads(row["inline_cross_references_json"]) if "inline_cross_references_json" in row.keys() and row["inline_cross_references_json"] else {}
+            inline_crs = {k: tuple(int(p) for p in pages) for k, pages in raw_crs.items()}
+            return PageIndexSummary(
+                workspace_id=row["workspace_id"],
+                document_id=row["document_id"],
+                document_version=row["document_version"],
+                total_pages=int(row["total_pages"]),
+                layout_status=row["layout_status"],
+                root_sections=root_sections,
+                has_s3_overflow=bool(row["has_s3_overflow"]),
+                s3_overflow_key=row["s3_overflow_key"],
+                inline_definitions=inline_defs,
+                inline_cross_references=inline_crs,
+                created_at=row["created_at"],
+                structural_elements_count=int(row["structural_elements_count"]),
+                raw_payload_bytes=int(row["raw_payload_bytes"]) if row["raw_payload_bytes"] is not None else None,
+                sections_overflowed=bool(row["sections_overflowed"]),
+            )
+
+    def list_page_index_summaries(self, workspace_id: str) -> list[PageIndexSummary]:
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                SELECT * FROM page_index_summaries
+                WHERE workspace_id = ? ORDER BY created_at ASC
+                """,
+                (workspace_id,),
+            )
+            rows = cursor.fetchall()
+            summaries: list[PageIndexSummary] = []
+            for row in rows:
+                root_sections = tuple(
+                    SectionSummary(**s) for s in json.loads(row["root_sections_json"])
+                )
+                inline_defs_raw = json.loads(row["inline_definitions_json"])
+                inline_defs = {
+                    k: tuple(ElementLocation(**loc) for loc in locs)
+                    for k, locs in inline_defs_raw.items()
+                }
+                raw_crs = json.loads(row["inline_cross_references_json"]) if "inline_cross_references_json" in row.keys() and row["inline_cross_references_json"] else {}
+                inline_crs = {k: tuple(int(p) for p in pages) for k, pages in raw_crs.items()}
+                summaries.append(
+                    PageIndexSummary(
+                        workspace_id=row["workspace_id"],
+                        document_id=row["document_id"],
+                        document_version=row["document_version"],
+                        total_pages=int(row["total_pages"]),
+                        layout_status=row["layout_status"],
+                        root_sections=root_sections,
+                        has_s3_overflow=bool(row["has_s3_overflow"]),
+                        s3_overflow_key=row["s3_overflow_key"],
+                        inline_definitions=inline_defs,
+                        inline_cross_references=inline_crs,
+                        created_at=row["created_at"],
+                        structural_elements_count=int(row["structural_elements_count"]),
+                        raw_payload_bytes=int(row["raw_payload_bytes"]) if row["raw_payload_bytes"] is not None else None,
+                        sections_overflowed=bool(row["sections_overflowed"]),
+                    )
+                )
+            return summaries
+
+    def delete_page_index_summary(
+        self, workspace_id: str, document_id: str, document_version: str
+    ) -> None:
+        with self._lock:
+            with self._conn:
+                self._conn.execute(
+                    """
+                    DELETE FROM page_index_summaries
+                    WHERE workspace_id = ? AND document_id = ? AND document_version = ?
+                    """,
+                    (workspace_id, document_id, document_version),
+                )
 
     def save_benchmark_metadata(self, metadata: BenchmarkRunMetadata) -> None:
         with self._lock:
@@ -1649,22 +1856,24 @@ class DynamoDBWorkspaceBoundaryRepository:
 
     def save_document_snapshot(self, snapshot: DocumentSnapshot) -> None:
         try:
-            self.table.put_item(
-                Item={
-                    "PK": f"WORKSPACE#{snapshot.workspace_id}",
-                    "SK": f"DOC_SNAPSHOT#{snapshot.document_id}",
-                    "workspace_id": snapshot.workspace_id,
-                    "document_id": snapshot.document_id,
-                    "source": snapshot.source,
-                    "version": snapshot.version,
-                    "format": snapshot.format,
-                    "incomplete_coverage_flag": snapshot.incomplete_coverage_flag,
-                    "exclusions_json": json.dumps(list(snapshot.exclusions)),
-                    "persisted_rows": snapshot.persisted_rows,
-                    "total_rows": snapshot.total_rows,
-                    "created_at": snapshot.created_at,
-                }
-            )
+            item = {
+                "PK": f"WORKSPACE#{snapshot.workspace_id}",
+                "SK": f"DOC_SNAPSHOT#{snapshot.document_id}",
+                "workspace_id": snapshot.workspace_id,
+                "document_id": snapshot.document_id,
+                "source": snapshot.source,
+                "version": snapshot.version,
+                "format": snapshot.format,
+                "incomplete_coverage_flag": snapshot.incomplete_coverage_flag,
+                "exclusions_json": json.dumps(list(snapshot.exclusions)),
+                "persisted_rows": snapshot.persisted_rows,
+                "total_rows": snapshot.total_rows,
+                "created_at": snapshot.created_at,
+                "page_index_elements_count": snapshot.page_index_elements_count,
+            }
+            if snapshot.page_index_status is not None:
+                item["page_index_status"] = snapshot.page_index_status
+            self.table.put_item(Item=item)
         except Exception as err:
             raise StorageUnavailableError(f"DynamoDB error saving document snapshot: {err}") from err
 
@@ -1687,6 +1896,8 @@ class DynamoDBWorkspaceBoundaryRepository:
                 persisted_rows=int(item.get("persisted_rows", 0)),
                 total_rows=int(item.get("total_rows", 0)),
                 created_at=item["created_at"],
+                page_index_status=item.get("page_index_status"),
+                page_index_elements_count=int(item.get("page_index_elements_count", 0)),
             )
         except Exception as err:
             raise StorageUnavailableError(f"DynamoDB error getting document snapshot: {err}") from err
@@ -1711,6 +1922,8 @@ class DynamoDBWorkspaceBoundaryRepository:
                     persisted_rows=int(item.get("persisted_rows", 0)),
                     total_rows=int(item.get("total_rows", 0)),
                     created_at=item["created_at"],
+                    page_index_status=item.get("page_index_status"),
+                    page_index_elements_count=int(item.get("page_index_elements_count", 0)),
                 )
                 for item in items
             ]
@@ -1805,6 +2018,130 @@ class DynamoDBWorkspaceBoundaryRepository:
             ]
         except Exception as err:
             raise StorageUnavailableError(f"DynamoDB error listing benchmark metadata: {err}") from err
+
+    def save_page_index_summary(self, summary: PageIndexSummary) -> None:
+        try:
+            item = {
+                "PK": f"WORKSPACE#{summary.workspace_id}",
+                "SK": f"PAGEINDEX_SUMMARY#{summary.document_id}#{summary.document_version}",
+                "workspace_id": summary.workspace_id,
+                "document_id": summary.document_id,
+                "document_version": summary.document_version,
+                "total_pages": summary.total_pages,
+                "layout_status": summary.layout_status,
+                "root_sections_json": json.dumps([s.model_dump() for s in summary.root_sections]),
+                "has_s3_overflow": summary.has_s3_overflow,
+                "s3_overflow_key": summary.s3_overflow_key or "",
+                "inline_definitions_json": json.dumps({k: [loc.model_dump() for loc in locs] for k, locs in summary.inline_definitions.items()}),
+                "inline_cross_references_json": json.dumps({k: list(v) for k, v in summary.inline_cross_references.items()}),
+                "created_at": summary.created_at,
+                "structural_elements_count": summary.structural_elements_count,
+                "sections_overflowed": summary.sections_overflowed,
+            }
+            if summary.raw_payload_bytes is not None:
+                item["raw_payload_bytes"] = summary.raw_payload_bytes
+            self.table.put_item(Item=item)
+        except Exception as err:
+            raise StorageUnavailableError(f"DynamoDB error saving page index summary: {err}") from err
+
+    def get_page_index_summary(
+        self, workspace_id: str, document_id: str, document_version: str
+    ) -> PageIndexSummary | None:
+        try:
+            resp = self.table.get_item(
+                Key={
+                    "PK": f"WORKSPACE#{workspace_id}",
+                    "SK": f"PAGEINDEX_SUMMARY#{document_id}#{document_version}",
+                }
+            )
+            item = resp.get("Item")
+            if not item:
+                return None
+            root_sections = tuple(
+                SectionSummary(**s) for s in json.loads(item["root_sections_json"])
+            )
+            inline_defs_raw = json.loads(item["inline_definitions_json"])
+            inline_defs = {
+                k: tuple(ElementLocation(**loc) for loc in locs)
+                for k, locs in inline_defs_raw.items()
+            }
+            raw_crs = json.loads(item.get("inline_cross_references_json", "{}")) if item.get("inline_cross_references_json") else {}
+            inline_crs = {k: tuple(int(p) for p in pages) for k, pages in raw_crs.items()}
+            raw_bytes = item.get("raw_payload_bytes")
+            return PageIndexSummary(
+                workspace_id=item["workspace_id"],
+                document_id=item["document_id"],
+                document_version=item["document_version"],
+                total_pages=int(item["total_pages"]),
+                layout_status=item["layout_status"],
+                root_sections=root_sections,
+                has_s3_overflow=bool(item.get("has_s3_overflow", False)),
+                s3_overflow_key=item.get("s3_overflow_key") or None,
+                inline_definitions=inline_defs,
+                inline_cross_references=inline_crs,
+                created_at=item["created_at"],
+                structural_elements_count=int(item.get("structural_elements_count", 0)),
+                raw_payload_bytes=int(raw_bytes) if raw_bytes is not None else None,
+                sections_overflowed=bool(item.get("sections_overflowed", False)),
+            )
+        except Exception as err:
+            raise StorageUnavailableError(f"DynamoDB error getting page index summary: {err}") from err
+
+    def list_page_index_summaries(self, workspace_id: str) -> list[PageIndexSummary]:
+        try:
+            from boto3.dynamodb.conditions import Key
+            resp = self.table.query(
+                KeyConditionExpression=Key("PK").eq(f"WORKSPACE#{workspace_id}")
+                & Key("SK").begins_with("PAGEINDEX_SUMMARY#")
+            )
+            items = resp.get("Items", [])
+            summaries: list[PageIndexSummary] = []
+            for item in items:
+                root_sections = tuple(
+                    SectionSummary(**s) for s in json.loads(item["root_sections_json"])
+                )
+                inline_defs_raw = json.loads(item["inline_definitions_json"])
+                inline_defs = {
+                    k: tuple(ElementLocation(**loc) for loc in locs)
+                    for k, locs in inline_defs_raw.items()
+                }
+                raw_crs = json.loads(item.get("inline_cross_references_json", "{}")) if item.get("inline_cross_references_json") else {}
+                inline_crs = {k: tuple(int(p) for p in pages) for k, pages in raw_crs.items()}
+                raw_bytes = item.get("raw_payload_bytes")
+                summaries.append(
+                    PageIndexSummary(
+                        workspace_id=item["workspace_id"],
+                        document_id=item["document_id"],
+                        document_version=item["document_version"],
+                        total_pages=int(item["total_pages"]),
+                        layout_status=item["layout_status"],
+                        root_sections=root_sections,
+                        has_s3_overflow=bool(item.get("has_s3_overflow", False)),
+                        s3_overflow_key=item.get("s3_overflow_key") or None,
+                        inline_definitions=inline_defs,
+                        inline_cross_references=inline_crs,
+                        created_at=item["created_at"],
+                        structural_elements_count=int(item.get("structural_elements_count", 0)),
+                        raw_payload_bytes=int(raw_bytes) if raw_bytes is not None else None,
+                        sections_overflowed=bool(item.get("sections_overflowed", False)),
+                    )
+                )
+            return summaries
+        except Exception as err:
+            raise StorageUnavailableError(f"DynamoDB error listing page index summaries: {err}") from err
+
+    def delete_page_index_summary(
+        self, workspace_id: str, document_id: str, document_version: str
+    ) -> None:
+        try:
+            self.table.delete_item(
+                Key={
+                    "PK": f"WORKSPACE#{workspace_id}",
+                    "SK": f"PAGEINDEX_SUMMARY#{document_id}#{document_version}",
+                }
+            )
+        except Exception as err:
+            raise StorageUnavailableError(f"DynamoDB error deleting page index summary: {err}") from err
 
 
 _SHARED_BOUNDARY_REPO: WorkspaceBoundaryRepositoryBase | None = None

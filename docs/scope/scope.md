@@ -20,7 +20,7 @@ _These are recommendations to keep your build orderly, not requirements. Skip an
 | 2 | Workspace authorization and boundary isolation | Foundation | done |
 | 3 | Snapshot registry, publication, and atomic deletion | Foundation | planned |
 | 4 | Core walking skeleton | Slice 1 | done |
-| 5 | Baseline ingestion pipeline | Slice 2 | planned |
+| 5 | PageIndex structural retrieval | Slice 2 | done |
 | 6 | Deterministic structured execution | Slice 3 | planned |
 | 7 | Baseline discovery retrieval and fusion | Slice 4 | planned |
 | 8 | Knowledge Map and requirement router | Slice 5 | planned |
@@ -109,15 +109,26 @@ Make the next milestone a bounded core engine walking skeleton that proves the c
 - [x] Review it (fresh model): `/check review core engine walking skeleton and benchmarks`
 Spec [0004](../specs/0004-core-engine-walking-skeleton.md) · code in `backend/src/`
 
-## Slice 2: PageIndex integration
+## Slice 2: PageIndex structural retrieval
 
-### 5. PageIndex integration · planned
-Plan PageIndex integration as a subsequent, independently verifiable slice after the baseline works.
-**Done when:** PageIndex is integrated into the retrieval pipeline and independently verified.
+### 5. PageIndex structural retrieval · done
+Extract and persist typed structural layout records, enforce isolated lookup with bounded concurrency and deadlines, and merge structural candidates safely into reciprocal rank fusion.
+**Done when:** PDF ingestion extracts document layout and definition targets, persists summaries with S3 overflow, lookups enforce deadlines and tombstones, and candidate pooling preserves baseline discovery.
 - [x] Design it (spec): `/architect PageIndex integration`
-- [ ] Build it: `/develop PageIndex integration`
-- [ ] Verify it: `/check verify PageIndex integration`
-- [ ] Test it: `/test PageIndex integration`
+- [x] Build it: `/develop PageIndex integration`
+   - [x] Typed structural records and boundary snapshot attributes (AC-1, AC-4, AC-7)
+   - [x] Deterministic layout extraction and target discrimination (AC-1, AC-2, AC-6)
+   - [x] Bounded persistence with S3-first overflow and tombstones (AC-4, AC-7)
+   - [x] Bounded concurrent lookup with storage-retained capacity and deadlines (AC-5, AC-7)
+   - [x] Baseline ingestion preservation and offline regressions (AC-1, AC-4, AC-5, AC-6, AC-7)
+   - [x] Soft reciprocal rank fusion candidate pooling without hard exclusions (AC-3)
+   - [x] Unscalable whole workspace scan elimination in PageIndexStrategy (AC-3)
+   - [x] Candidate telemetry trace exposure for PageIndex lookups (AC-8)
+   - [x] Offline ablation comparison suite and counterexample resilience (AC-3, AC-9)
+   - [x] Benchmark comparison precondition barrier (AC-10)
+- [x] Verify it: `/check verify PageIndex integration`
+- [x] Test it: `/test PageIndex integration`
+- [x] Review it (fresh model): `/check review PageIndex integration`
 Spec [0005](../specs/0005-pageindex-structural-retrieval.md) · code in `backend/src/`
 
 ## Slice 3: OKF integration

@@ -145,6 +145,27 @@ def ingest_document(
         logger.error("parse_service.embed_failed doc_id=%s error=%s", doc.id, e)
 
 
+    # PageIndex structural extraction and persistence for PDF documents
+    if doc.source_format == "pdf":
+        try:
+            import hashlib
+            from ingestion.page_index_service import extract_and_persist_page_index
+
+            doc_ver = (
+                hashlib.sha256(path.read_bytes()).hexdigest()[:32]
+                if path.exists()
+                else "v1"
+            )
+            extract_and_persist_page_index(
+                path=path,
+                document_id=doc.id,
+                workspace_id=doc.workspace_id,
+                document_version=doc_ver,
+                chunks=doc.chunks,
+            )
+        except Exception as e:
+            logger.error("parse_service.page_index_failed doc_id=%s error=%s", doc.id, e)
+
     # OKF — silent, bounded thread pool execution, never blocks ingestion
     try:
         from ingestion.okf_builder import build_okf

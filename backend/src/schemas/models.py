@@ -175,7 +175,11 @@ class QueryResponse(BaseModel):
     cached: bool = False
     document_ids: list[str] = Field(default_factory=list)
     latency_breakdown: dict[str, Any] | None = None
-    retrieval_candidates: dict[str, list[str]] = Field(default_factory=dict)
+    retrieval_candidates: dict[str, Any] = Field(default_factory=dict)
+    structural_candidate_ids: list[str] = Field(default_factory=list)
+    structural_match_count: int = 0
+    page_index_latency_ms: float = 0.0
+    structural_target_state: str = "none"
     reranker_mode: str = "remote_success"
 
 

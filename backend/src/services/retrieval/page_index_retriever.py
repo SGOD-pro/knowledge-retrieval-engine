@@ -5,16 +5,58 @@ from collections.abc import Sequence
 from config import settings
 from ingestion.page_index_service import score as structural_score
 from schemas.models import Chunk
+from src.schemas.contracts.page_index import StructuralLookupResult
+from src.services.retrieval.page_index_lookup import (
+    PageIndexLookupService,
+    get_page_index_controller,
+)
 
 logger = logging.getLogger(__name__)
 
 
 class PageIndexRetriever:
-    """Stage 2 retrieval module utilizing structural weight scoring.
+    """Stage 2 retrieval module utilizing structural weight scoring and isolated lookup.
 
     Rule 5: BM25 runs before PageIndex. PageIndex scopes Vector.
     Rule 10: Logs latency_ms and confidence_score.
     """
+
+    def __init__(self, lookup_service: PageIndexLookupService | None = None) -> None:
+        self.lookup_service = lookup_service or PageIndexLookupService()
+
+    async def lookup(
+        self,
+        workspace_id: str,
+        document_id: str,
+        document_version: str,
+        target_label: str,
+        deadline_ms: float | None = None,
+    ) -> tuple[StructuralLookupResult | None, str]:
+        """Perform deadline-enforced, concurrency-bounded isolated lookup."""
+        return await self.lookup_service.lookup_target(
+            workspace_id=workspace_id,
+            document_id=document_id,
+            document_version=document_version,
+            target_label=target_label,
+            deadline_ms=deadline_ms,
+        )
+
+    def lookup_sync(
+        self,
+        workspace_id: str,
+        document_id: str,
+        document_version: str,
+        target_label: str,
+        deadline_ms: float = 50.0,
+    ) -> StructuralLookupResult | None:
+        """Perform synchronous deadline-enforced isolated lookup for synchronous pipeline nodes."""
+        return self.lookup_service._sync_read_manifest_and_resolve(
+            workspace_id=workspace_id,
+            document_id=document_id,
+            document_version=document_version,
+            target_label=target_label,
+            remaining_deadline_s=deadline_ms / 1000.0,
+        )
 
     def filter_and_rank(
         self, query: str, candidates: Sequence[Chunk], top_k: int = 10

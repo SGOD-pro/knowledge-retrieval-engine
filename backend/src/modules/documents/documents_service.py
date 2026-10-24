@@ -35,6 +35,38 @@ class DocumentsService:
     def __init__(self, repo: DocumentsRepository | None = None):
         self.repo = repo or DocumentsRepository()
 
+    @staticmethod
+    def _enrich_page_index_snapshot_metadata(
+        workspace_id: str,
+        doc_id: str,
+        doc_ver: str,
+        filename: str,
+        temp_path: Path | None,
+        chunks: Any,
+        boundary_repo: Any,
+    ) -> tuple[str | None, int]:
+        """Resolve or extract PageIndex summary and return (status, elements_count)."""
+        if Path(filename).suffix.lower() != ".pdf":
+            return None, 0
+        try:
+            pi_summary = boundary_repo.get_page_index_summary(workspace_id, doc_id, doc_ver)
+            if not pi_summary:
+                from ingestion.page_index_service import extract_and_persist_page_index
+                pi_summary = extract_and_persist_page_index(
+                    path=temp_path,
+                    document_id=doc_id,
+                    workspace_id=workspace_id,
+                    document_version=doc_ver,
+                    chunks=chunks,
+                    boundary_repo=boundary_repo,
+                )
+            if pi_summary:
+                return pi_summary.layout_status, pi_summary.structural_elements_count
+            return "failed", 0
+        except Exception as pi_err:
+            logger.warning("Could not persist PageIndex for %s: %s", doc_id, pi_err)
+            return "failed", 0
+
     def background_ingest(
         self,
         temp_path_str: str,
@@ -155,6 +187,16 @@ class DocumentsService:
                     persisted = len(document.chunks)
                     total = len(document.chunks) + len(exclusions)
 
+                pi_status, pi_count = self._enrich_page_index_snapshot_metadata(
+                    workspace_id=workspace_id,
+                    doc_id=doc_id,
+                    doc_ver=doc_ver,
+                    filename=filename,
+                    temp_path=temp_path,
+                    chunks=document.chunks,
+                    boundary_repo=boundary_repo,
+                )
+
                 snapshot = DocumentSnapshot(
                     workspace_id=workspace_id,
                     document_id=doc_id,
@@ -166,6 +208,8 @@ class DocumentsService:
                     persisted_rows=persisted,
                     total_rows=total,
                     created_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    page_index_status=pi_status,
+                    page_index_elements_count=pi_count,
                 )
                 boundary_repo.save_document_snapshot(snapshot)
             except Exception as snap_err:
@@ -311,6 +355,16 @@ class DocumentsService:
                         persisted = len(doc.chunks)
                         total = len(doc.chunks) + len(exclusions)
 
+                    pi_status, pi_count = self._enrich_page_index_snapshot_metadata(
+                        workspace_id=workspace_id,
+                        doc_id=doc.id,
+                        doc_ver=doc_ver,
+                        filename=file.filename or "unknown",
+                        temp_path=path,
+                        chunks=doc.chunks,
+                        boundary_repo=boundary_repo,
+                    )
+
                     snapshot = DocumentSnapshot(
                         workspace_id=workspace_id,
                         document_id=doc.id,
@@ -322,6 +376,8 @@ class DocumentsService:
                         persisted_rows=persisted,
                         total_rows=total,
                         created_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                        page_index_status=pi_status,
+                        page_index_elements_count=pi_count,
                     )
                     boundary_repo.save_document_snapshot(snapshot)
                 except Exception as snap_err:

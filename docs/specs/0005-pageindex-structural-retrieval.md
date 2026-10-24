@@ -1,7 +1,7 @@
 # 0005. Bounded PageIndex Structural Retrieval Integration
 
 **Date**: 2026-10-24  
-**Status**: Proposed  
+**Status**: Accepted  
 
 ## Summary
 
@@ -44,8 +44,8 @@ PageIndex is therefore the single sound candidate for Slice 2. It introduces str
 - **AC-1**: Ingestion extracts and persists a typed `PageIndexManifest` per document version, capturing document section hierarchy, heading paths, page ranges, and verified structural definition targets without row or page truncation.
 - **AC-2**: For this bounded slice, PageIndex construction and query execution are completely deterministic, incurring exactly zero language model completion calls, zero embedding calls, and zero remote provider invocations. Future slices may explore generative layout extensions if justified, but this slice remains deterministic.
 - **AC-3**: PageIndex candidate merging preserves independent BM25 and vector discovery. Structural candidates are pooled and soft boosted in reciprocal rank fusion without hard excluding candidate pages or pruning baseline chunks. If PageIndex matches a wrong structural target, valid baseline candidates from other pages remain present in the candidate pool.
-- **AC-4**: PageIndex storage handles DynamoDB item size limits safely. Manifests up to 250KB store inline in `PageIndexSummary`; manifests exceeding 250KB store section summaries in DynamoDB and offload full structural element topology to S3 using the established S3 first write sequence from 0004 AC-10. Version readiness is tracked via `page_index_status` (`ready` or `failed`) on `DocumentSnapshot` without implementing deferred 0003 publication transactions or distributed garbage collection.
-- **AC-5**: PageIndex lookups enforce hard client deadlines using dedicated socket configuration (connect timeout 30ms, read timeout 40ms, 0 retries) and a 50ms wall clock deadline. A bounded thread pool (maximum 4 workers) prevents queued task accumulation under load. Expired or failing lookups drop structural candidates cleanly and log a structured warning.
+- **AC-4**: PageIndex storage handles DynamoDB item size limits safely. Manifests whose serialized summary fits within 250KB store inline in `PageIndexSummary`; manifests exceeding 250KB offload full structural element topology to S3 using the established S3 first write sequence from 0004 AC-10. If the serialized summary itself (including `root_sections`) exceeds the threshold, `root_sections` is bounded to top level sections and excess detail is moved to S3 without silent truncation, recording `sections_overflowed: true`. Version readiness is tracked via `page_index_status` (`ready`, `missing_layout`, or `failed`) on `DocumentSnapshot` without implementing deferred 0003 publication transactions or distributed garbage collection.
+- **AC-5**: PageIndex lookups enforce hard client deadlines using dedicated socket configuration (connect timeout 30ms, read timeout 40ms, explicit SDK retry disabling by unregistering retry handlers rather than assuming max_attempts=1 means zero retries) and a 50ms total wall clock deadline applied across DynamoDB and S3 reads. A bounded admission gate (maximum 4 concurrent workers, maximum 8 queued submissions) sheds load under saturation. Concurrency capacity is retained until underlying storage work actually completes, preventing worker pool exhaustion when callers time out or cancel, while distinguishing caller timeout from cancellation of storage work. Expired or failing lookups drop structural candidates cleanly and log a structured warning.
 - **AC-6**: Structural target parsing distinguishes definition locations from textual cross references. Outlines, headings, and formal caption starts (`Table N`, `Figure N`, `Exhibit N`) are indexed as definitions. Mentions inside paragraph body text or table cells are classified as cross references and excluded from definition targets. Ambiguous targets (such as duplicate table numbers across appendices) and documents lacking structural headings are recorded as explicit states (`ambiguous` and `missing_layout`).
 - **AC-7**: PageIndex storage and lookups are strictly partitioned by `workspace_id`, `document_id`, and `document_version`. Cross workspace queries return empty results with zero tenant leakage. Active source tombstones in `WorkspaceBoundaryRepository` immediately block PageIndex retrieval for that source or workspace, returning zero structural candidates without throwing storage errors.
 - **AC-8**: Dedicated administrative HTTP endpoints are deferred from this slice to keep the attack surface minimal and prevent contract drift. PageIndex readiness, latency, and hit statistics are exposed exclusively through existing `DocumentSnapshot` metadata, `retrieval_candidates` trace, and request telemetry.
@@ -178,10 +178,9 @@ Each `ElementLocation` contains:
 4. Baseline vector search continues to search across the full active workspace document scope. Baseline candidates are never pruned or gated based on PageIndex outputs.
 
 **Timeout and Concurrency Controls**:
-* **Storage Client Settings**: DynamoDB client uses `botocore.config.Config(connect_timeout=0.030, read_timeout=0.040, retries={'max_attempts': 1})`.
-* **Deadline Enforcement**: The lookup wraps in an enforceable 50ms wall clock deadline:
-  `asyncio.wait_for(page_index_lookup(), timeout=0.050)`.
-* **Worker Bounds**: A dedicated `ThreadPoolExecutor(max_workers=4, thread_name_prefix="page_index")` handles storage reads. If the pool saturates or timeout expires, the lookup drops out cleanly, logs `page_index.timeout_ms=50.0 fallback=baseline`, and baseline discovery continues without delay.
+* **Storage Client Settings**: DynamoDB and S3 clients use `botocore.config.Config(connect_timeout=0.030, read_timeout=0.040, retries={'max_attempts': 1, 'mode': 'standard'})` with retry handlers explicitly unregistered to guarantee zero SDK retries.
+* **Deadline Enforcement**: The lookup enforces a 50ms total wall clock deadline across DynamoDB metadata read and optional S3 detail read using `asyncio.wait_for(page_index_lookup(), timeout=0.050)`.
+* **Worker Bounds and Capacity Retention**: An admission gate limits concurrency to 4 active workers and 8 queued submissions. When saturation occurs, admissions are rejected immediately. Capacity slots remain retained until underlying storage worker threads finish executing, even when a caller coroutine experiences a timeout or cancellation. Caller timeout is distinguished from cancellation of storage work.
 
 **API surface**:
 Administrative HTTP endpoints are deferred from this slice. PageIndex status and statistics are exposed exclusively through existing internal mechanisms:
@@ -231,14 +230,19 @@ Administrative HTTP endpoints are deferred from this slice. PageIndex status and
 
 ## Build plan
 
-Following the Tracer Bullet build approach, this slice is implemented in thin, vertically verified steps:
+Following the Tracer Bullet build approach, this feature is implemented across two vertical slices:
 
-1. **Hierarchy Schema and Storage with Overflow**: Define `PageIndexSummary`, `SectionSummary`, `ElementLocation`, and repository adapter storing inline definitions under 250KB and offloading larger payloads to S3, satisfying **AC-1**, **AC-4**, **AC-7**.
-2. **Deterministic Layout Extraction and Target Discrimination**: Add layout hierarchy extraction to PDF adapter, distinguishing definition targets from body text cross references, and recording `ambiguous` or `missing_layout` states, satisfying **AC-1**, **AC-2**, **AC-6**.
-3. **Boundary and Tombstone Enforcement**: Implement workspace partition key validation and tombstone filtering in `PageIndexRepository`, ensuring deleted documents return zero items, satisfying **AC-7**.
-4. **Deadline Enforced Lookup and Soft Fusion**: Implement `PageIndexRetriever` with explicit socket timeouts (30ms/40ms) and 50ms deadline, merging structural candidates into reciprocal rank fusion (`_rrf_merge`) alongside independent baseline discovery without hard page exclusion, satisfying **AC-3**, **AC-5**.
-5. **Offline Ablation and Counterexample Regressions**: Build an offline ablation regression suite comparing candidate page recall, precision, and latency with PageIndex enabled versus disabled against the repaired baseline, including the counterexample regression where a wrong structural candidate does not prevent retrieval of the correct answer from an unindexed page, satisfying **AC-3**, **AC-9**.
-6. **Benchmark Comparison Preservation**: Enforce comparator rules ensuring no benchmark accuracy claims are made until controlled canonical comparison run executes on `ws_canonical_comparison_0004`, satisfying **AC-10**.
+### Slice 1: Extraction, Durable Index, and Isolated Lookup (Completed in this Slice)
+- [x] 1. **Hierarchy Schema and Storage with S3 Overflow**: Define `PageIndexSummary`, `SectionSummary`, `ElementLocation`, `CrossReference`, `PageIndexDetail`, and repository adapters storing inline summaries under 250KB and offloading large element topology to S3 using the established S3 first write sequence, satisfying **AC-1**, **AC-4**, **AC-7**.
+- [x] 2. **Deterministic Layout Extraction and Target Discrimination**: Implement deterministic hierarchy extraction from PDF parser elements and outline bookmarks, distinguishing formal definition targets from body text and table cell cross references, handling duplicate labels, and recording `missing_layout` states, satisfying **AC-1**, **AC-2**, **AC-6**.
+- [x] 3. **Boundary and Tombstone Enforcement**: Enforce workspace partition key isolation and active tombstone checks, returning empty candidates on tombstoned sources without storage errors, satisfying **AC-7**.
+- [x] 4. **Deadline Enforced Isolated Lookup and Concurrency Controls**: Implement scoped lookup with 50ms deadline across DynamoDB and S3 reads, disabling SDK retries explicitly, bounding admission queue capacity, retaining worker capacity until underlying storage completes, and distinguishing caller timeout from cancellation of storage work, satisfying **AC-5**, **AC-7**.
+- [x] 5. **Baseline Ingestion Preservation and Focused Regressions**: Wire enrichment into PDF ingestion so enrichment failures preserve baseline chunks and snapshots, and add focused offline regressions, satisfying **AC-1**, **AC-4**, **AC-5**, **AC-6**, **AC-7**.
+
+### Slice 2: Candidate Fusion, Pipeline Wiring, and Offline Ablation (Completed in this Slice)
+- [x] 6. **Reciprocal Rank Fusion Pooling**: Merge structural candidates alongside independent BM25 and vector discovery with soft ranking boost without hard page exclusion, satisfying **AC-3**.
+- [x] 7. **Offline Ablation Suite**: Compare candidate page recall, precision, and latency with PageIndex enabled versus disabled, verifying counterexample resilience where a wrong structural target preserves the true answer page, satisfying **AC-3**, **AC-9**.
+- [x] 8. **Benchmark Comparison Preservation**: Enforce comparator rules ensuring no benchmark accuracy claims are made until controlled canonical comparison run executes on `ws_canonical_comparison_0004`, satisfying **AC-10**.
 
 ## Consequences
 

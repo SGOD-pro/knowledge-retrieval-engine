@@ -272,7 +272,15 @@ class QueryService:
 
         planned_path = getattr(response, "planned_path", "fast" if fast_path else "full")
         executed_path = getattr(response, "executed_path", "fast" if fast_path else "full")
-        retrieval_candidates = getattr(response, "retrieval_candidates", {})
+        retrieval_candidates = dict(getattr(response, "retrieval_candidates", {}))
+        if "structural_candidate_ids" not in retrieval_candidates:
+            retrieval_candidates["structural_candidate_ids"] = getattr(response, "structural_candidate_ids", [])
+        if "structural_match_count" not in retrieval_candidates:
+            retrieval_candidates["structural_match_count"] = getattr(response, "structural_match_count", 0)
+        if "page_index_latency_ms" not in retrieval_candidates:
+            retrieval_candidates["page_index_latency_ms"] = getattr(response, "page_index_latency_ms", 0.0)
+        if "structural_target_state" not in retrieval_candidates:
+            retrieval_candidates["structural_target_state"] = getattr(response, "structural_target_state", "none")
         reranker_mode = getattr(response, "reranker_mode", "remote_success")
 
         logger.info(
@@ -305,6 +313,10 @@ class QueryService:
             "cached": False,
             "document_ids": req.document_ids or [],
             "retrieval_candidates": retrieval_candidates,
+            "structural_candidate_ids": retrieval_candidates.get("structural_candidate_ids", []),
+            "structural_match_count": retrieval_candidates.get("structural_match_count", 0),
+            "page_index_latency_ms": retrieval_candidates.get("page_index_latency_ms", 0.0),
+            "structural_target_state": retrieval_candidates.get("structural_target_state", "none"),
             "reranker_mode": reranker_mode,
             "bedrock_embedding_calls": req_telemetry.bedrock_embedding_calls,
             "bge_lambda_calls": req_telemetry.bge_lambda_calls,

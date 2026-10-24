@@ -740,3 +740,28 @@ class BenchmarkRunner:
             metadata=persisted_metadata,
             detailed_artifact=detailed_artifact,
         )
+
+
+def validate_benchmark_comparison_preconditions(
+    baseline_run_id: str,
+    candidate_run_id: str,
+    comparison_workspace_id: str,
+) -> bool:
+    """Validate that benchmark accuracy comparisons execute only on controlled canonical workspaces.
+
+    Per Spec 0005 AC-10:
+    Formal benchmark accuracy claims remain explicitly blocked until post-repair canonical
+    benchmark execution is run under controlled comparison conditions on ws_canonical_comparison_0004.
+    Requiring ws_canonical_comparison_0004 is an additional guard, not proof of comparability
+    or a replacement for manifest and configuration validation. Post-repair canonical evaluation
+    remains pending, with zero measured accuracy improvement or live AWS readiness claimed.
+    """
+    CANONICAL_COMPARISON_WORKSPACE = "ws_canonical_comparison_0004"
+    if comparison_workspace_id != CANONICAL_COMPARISON_WORKSPACE:
+        raise ValueError(
+            f"Benchmark comparison claims are blocked on workspace '{comparison_workspace_id}'. "
+            f"Comparisons must execute on canonical controlled workspace '{CANONICAL_COMPARISON_WORKSPACE}'."
+        )
+    if not baseline_run_id or not candidate_run_id:
+        raise ValueError("Both baseline_run_id and candidate_run_id are required for comparison.")
+    return True

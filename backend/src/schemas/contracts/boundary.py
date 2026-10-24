@@ -107,6 +107,8 @@ class DocumentSnapshot(BaseModel):
     persisted_rows: int = Field(default=0, description="Persisted tabular rows or indexed chunks")
     total_rows: int = Field(default=0, description="Total source rows or parsed units (chunks plus exclusions)")
     created_at: str
+    page_index_status: Literal["ready", "missing_layout", "failed"] | None = None
+    page_index_elements_count: int = 0
 
 
 class BenchmarkRunMetadata(BaseModel):

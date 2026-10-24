@@ -66,6 +66,13 @@ class Settings(BaseSettings):
     # Rejection Thresholds
     BM25_THRESHOLD: float = 0.1
     PAGEINDEX_THRESHOLD: float = 0.1
+    PAGEINDEX_ENABLED: bool = True
+    PAGEINDEX_TIMEOUT_MS: int = 50
+    PAGEINDEX_OVERFLOW_THRESHOLD_BYTES: int = 250000
+    PAGEINDEX_STRUCTURAL_WEIGHT: float = 1.1
+    PAGEINDEX_MAX_CONCURRENCY: int = 4
+    PAGEINDEX_MAX_QUEUE: int = 8
+    S3_PAGEINDEX_BUCKET: str = "kre-storage"
     VECTOR_THRESHOLD: float = 0.3
     # Lower reranker threshold: don't drop all chunks just because Jaccard scores are low
     RERANKER_THRESHOLD: float = 0.05
