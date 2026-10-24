@@ -242,7 +242,12 @@ class PageIndexRepository:
             cross_references=layout.cross_references,
         )
 
-        # Estimate serialized size of full inline summary
+        # Estimate serialized size of full inline summary including cross-references
+        inline_crs = {
+            k: tuple(sorted(list({cr.page_number for cr in crs})))
+            for k, crs in layout.cross_references.items()
+        }
+
         candidate_summary_dict = {
             "workspace_id": workspace_id,
             "document_id": document_id,
@@ -256,6 +261,9 @@ class PageIndexRepository:
                 k: [loc.model_dump() for loc in locs]
                 for k, locs in layout.definitions.items()
             },
+            "inline_cross_references": {
+                k: list(v) for k, v in inline_crs.items()
+            },
             "created_at": timestamp,
             "structural_elements_count": layout.structural_elements_count,
             "raw_payload_bytes": 0,
@@ -263,11 +271,6 @@ class PageIndexRepository:
         }
         raw_bytes = len(json.dumps(candidate_summary_dict).encode("utf-8"))
         candidate_summary_dict["raw_payload_bytes"] = raw_bytes
-
-        inline_crs = {
-            k: tuple(sorted(list({cr.page_number for cr in crs})))
-            for k, crs in layout.cross_references.items()
-        }
 
         if raw_bytes <= threshold:
             # Fits inline within DynamoDB 250KB bound
@@ -331,7 +334,44 @@ class PageIndexRepository:
                 len(bounded_sections),
             )
 
-        # Step 3: Persist bounded PageIndexSummary record to DynamoDB / SQLite
+        # Step 3: Recheck after overflow transformation and preserve full detail in S3 without silent truncation
+        def _measure_overflow_dict(secs: tuple[SectionSummary, ...], sec_ovf: bool) -> tuple[dict[str, Any], int]:
+            d = {
+                "workspace_id": workspace_id,
+                "document_id": document_id,
+                "document_version": document_version,
+                "total_pages": layout.total_pages,
+                "layout_status": layout.layout_status,
+                "root_sections": [s.model_dump() for s in secs],
+                "has_s3_overflow": True,
+                "s3_overflow_key": s3_key,
+                "inline_definitions": {},
+                "inline_cross_references": {},
+                "created_at": timestamp,
+                "structural_elements_count": layout.structural_elements_count,
+                "raw_payload_bytes": 0,
+                "sections_overflowed": sec_ovf,
+            }
+            b = len(json.dumps(d).encode("utf-8"))
+            d["raw_payload_bytes"] = b
+            return d, b
+
+        overflow_dict, overflow_bytes = _measure_overflow_dict(bounded_sections, sections_overflowed)
+
+        # If summary still exceeds threshold after initial bounding, further reduce retained sections
+        if overflow_bytes > threshold:
+            sections_overflowed = True
+            curr_secs = list(bounded_sections)
+            while curr_secs and overflow_bytes > threshold:
+                curr_secs = curr_secs[: max(0, len(curr_secs) // 2)]
+                bounded_sections = tuple(curr_secs)
+                overflow_dict, overflow_bytes = _measure_overflow_dict(bounded_sections, sections_overflowed)
+
+            if overflow_bytes > threshold:
+                bounded_sections = ()
+                overflow_dict, overflow_bytes = _measure_overflow_dict(bounded_sections, sections_overflowed)
+
+        # Step 4: Persist bounded PageIndexSummary record to DynamoDB / SQLite
         summary = PageIndexSummary(
             workspace_id=workspace_id,
             document_id=document_id,
@@ -342,9 +382,10 @@ class PageIndexRepository:
             has_s3_overflow=True,
             s3_overflow_key=s3_key,
             inline_definitions={},  # definitions offloaded to S3 detail
+            inline_cross_references={},  # cross-references offloaded to S3 detail
             created_at=timestamp,
             structural_elements_count=layout.structural_elements_count,
-            raw_payload_bytes=raw_bytes,
+            raw_payload_bytes=overflow_bytes,
             sections_overflowed=sections_overflowed,
         )
 

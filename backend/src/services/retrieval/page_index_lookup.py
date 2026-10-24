@@ -15,6 +15,7 @@ import asyncio
 import concurrent.futures
 import logging
 import re
+import threading
 import time
 from typing import Any, Callable
 
@@ -51,6 +52,8 @@ class PageIndexConcurrencyController:
         self._queued_callers = 0
         self._semaphore = asyncio.Semaphore(max_concurrency)
         self._lock = asyncio.Lock()
+        self._sync_semaphore = threading.Semaphore(max_concurrency)
+        self._thread_lock = threading.Lock()
         self._executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=max_concurrency,
             thread_name_prefix="page_index",
@@ -58,15 +61,23 @@ class PageIndexConcurrencyController:
 
     @property
     def active_count(self) -> int:
-        return self._active_workers
+        with self._thread_lock:
+            return self._active_workers
 
     @property
     def queued_count(self) -> int:
-        return self._queued_callers
+        with self._thread_lock:
+            return self._queued_callers
 
     def _release_worker_slot(self) -> None:
-        self._active_workers = max(0, self._active_workers - 1)
+        with self._thread_lock:
+            self._active_workers = max(0, self._active_workers - 1)
         self._semaphore.release()
+
+    def _release_worker_slot_sync(self) -> None:
+        with self._thread_lock:
+            self._active_workers = max(0, self._active_workers - 1)
+        self._sync_semaphore.release()
 
     async def run_storage_work(
         self,
@@ -84,7 +95,7 @@ class PageIndexConcurrencyController:
           - "storage_failed"
         """
         # 1. Bounded admission check
-        async with self._lock:
+        with self._thread_lock:
             if self._queued_callers >= self.max_queue:
                 logger.warning(
                     "page_index.admission_rejected queued=%d max=%d",
@@ -100,7 +111,7 @@ class PageIndexConcurrencyController:
         try:
             await asyncio.wait_for(self._semaphore.acquire(), timeout=deadline_s)
         except asyncio.TimeoutError:
-            async with self._lock:
+            with self._thread_lock:
                 self._queued_callers -= 1
             logger.warning(
                 "page_index.timeout_ms=%.1f fallback=baseline stage=queue_admission",
@@ -108,11 +119,11 @@ class PageIndexConcurrencyController:
             )
             return None, "caller_timeout"
         except asyncio.CancelledError:
-            async with self._lock:
+            with self._thread_lock:
                 self._queued_callers -= 1
             return None, "caller_cancelled"
 
-        async with self._lock:
+        with self._thread_lock:
             self._queued_callers -= 1
             self._active_workers += 1
 
@@ -157,6 +168,82 @@ class PageIndexConcurrencyController:
         except asyncio.CancelledError:
             logger.debug("page_index.caller_cancelled stage=storage_execution")
             return None, "caller_cancelled"
+
+    def run_storage_work_sync(
+        self,
+        func: Callable[..., Any],
+        *args: Any,
+        deadline_s: float = 0.050,
+    ) -> tuple[Any, str]:
+        """Execute blocking storage work synchronously with retained capacity and caller deadlines.
+
+        Returns (result, status) where status is one of:
+          - "completed"
+          - "caller_timeout"
+          - "admission_rejected"
+          - "storage_failed"
+        """
+        # 1. Bounded admission check
+        with self._thread_lock:
+            if self._queued_callers >= self.max_queue:
+                logger.warning(
+                    "page_index.admission_rejected queued=%d max=%d",
+                    self._queued_callers,
+                    self.max_queue,
+                )
+                return None, "admission_rejected"
+            self._queued_callers += 1
+
+        t0 = time.perf_counter()
+
+        # 2. Acquire concurrency slot within deadline
+        acquired = self._sync_semaphore.acquire(timeout=deadline_s)
+        if not acquired:
+            with self._thread_lock:
+                self._queued_callers -= 1
+            logger.warning(
+                "page_index.timeout_ms=%.1f fallback=baseline stage=queue_admission",
+                deadline_s * 1000.0,
+            )
+            return None, "caller_timeout"
+
+        with self._thread_lock:
+            self._queued_callers -= 1
+            self._active_workers += 1
+
+        # Calculate remaining time for storage execution
+        elapsed = time.perf_counter() - t0
+        remaining_s = max(0.001, deadline_s - elapsed)
+
+        outcome: dict[str, Any] = {"result": None, "status": "running", "error": None}
+        work_done = threading.Event()
+
+        def _worker_task() -> None:
+            try:
+                outcome["result"] = func(*args, remaining_s)
+                outcome["status"] = "completed"
+            except Exception as exc:
+                outcome["error"] = exc
+                outcome["status"] = "storage_failed"
+                logger.warning("page_index.storage_error: %s", exc)
+            finally:
+                # Capacity remains retained until thread actually completes
+                self._release_worker_slot_sync()
+                work_done.set()
+
+        self._executor.submit(_worker_task)
+
+        # 3. Wait for storage task completion within remaining deadline
+        finished = work_done.wait(timeout=remaining_s)
+        if finished:
+            return outcome["result"], outcome["status"]
+        else:
+            logger.warning(
+                "page_index.timeout_ms=%.1f fallback=baseline stage=storage_execution",
+                deadline_s * 1000.0,
+            )
+            # Worker slot remains retained until _worker_task finishes
+            return None, "caller_timeout"
 
 
 # Global process concurrency controller
@@ -293,6 +380,39 @@ class PageIndexLookupService:
 
         # 2. Run storage work via concurrency controller
         result, status = await self.controller.run_storage_work(
+            self._sync_read_manifest_and_resolve,
+            workspace_id,
+            document_id,
+            document_version,
+            target_label,
+            deadline_s=total_deadline_s,
+        )
+        return result, status
+
+    def lookup_target_sync(
+        self,
+        workspace_id: str,
+        document_id: str,
+        document_version: str,
+        target_label: str,
+        deadline_ms: float | None = None,
+    ) -> tuple[StructuralLookupResult | None, str]:
+        """Perform synchronous deadline-enforced, concurrency-bounded isolated lookup.
+
+        Returns (result, execution_status).
+        """
+        # 1. Immediate tombstone check (fast path)
+        if self.repo.boundary_repo.has_tombstone(workspace_id, "workspace", workspace_id):
+            logger.debug("page_index.tombstone_workspace_blocked ws=%s", workspace_id)
+            return None, "tombstoned"
+        if self.repo.boundary_repo.has_tombstone(workspace_id, "source", document_id):
+            logger.debug("page_index.tombstone_source_blocked doc=%s", document_id)
+            return None, "tombstoned"
+
+        total_deadline_s = (deadline_ms or getattr(settings, "PAGEINDEX_TIMEOUT_MS", 50)) / 1000.0
+
+        # 2. Run storage work via concurrency controller
+        result, status = self.controller.run_storage_work_sync(
             self._sync_read_manifest_and_resolve,
             workspace_id,
             document_id,

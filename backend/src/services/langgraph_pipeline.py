@@ -325,17 +325,55 @@ def run_page_index(state: PipelineState):
 
             pdf_snaps = [s for s in snaps if s.format.lower() == "pdf"]
 
+            # Bound total PageIndex stage work across documents and labels
+            stage_limit_ms = float(
+                getattr(settings, "PAGEINDEX_STAGE_TIMEOUT_MS", getattr(settings, "PAGEINDEX_TIMEOUT_MS", 50))
+            )
+            per_lookup_limit_ms = float(getattr(settings, "PAGEINDEX_TIMEOUT_MS", 50))
+            stage_t0 = time.perf_counter()
+            stage_exhausted = False
+
             for snap in pdf_snaps:
+                if stage_exhausted:
+                    break
                 doc_id = snap.document_id
                 doc_ver = snap.version
                 for t_label in target_labels:
-                    res = retriever.lookup_sync(
+                    elapsed_stage_ms = (time.perf_counter() - stage_t0) * 1000.0
+                    remaining_stage_ms = stage_limit_ms - elapsed_stage_ms
+                    if remaining_stage_ms <= 1.0:
+                        logger.warning(
+                            "page_index.stage_budget_exhausted elapsed_ms=%.1f limit_ms=%.1f fallback=baseline",
+                            elapsed_stage_ms,
+                            stage_limit_ms,
+                        )
+                        stage_exhausted = True
+                        break
+
+                    effective_deadline_ms = min(per_lookup_limit_ms, remaining_stage_ms)
+                    res, status = retriever.lookup_sync(
                         workspace_id=ws_id,
                         document_id=doc_id,
                         document_version=doc_ver,
                         target_label=t_label,
-                        deadline_ms=float(getattr(settings, "PAGEINDEX_TIMEOUT_MS", 50)),
+                        deadline_ms=effective_deadline_ms,
                     )
+                    if status == "caller_timeout":
+                        logger.warning(
+                            "page_index.lookup_timeout doc=%s ver=%s label=%s deadline_ms=%.1f (fallback=baseline)",
+                            doc_id,
+                            doc_ver,
+                            t_label,
+                            effective_deadline_ms,
+                        )
+                    elif status == "admission_rejected":
+                        logger.warning(
+                            "page_index.lookup_admission_rejected doc=%s ver=%s label=%s (queue saturated, fallback=baseline)",
+                            doc_id,
+                            doc_ver,
+                            t_label,
+                        )
+
                     if res and (res.candidate_pages or res.cross_reference_pages):
                         pages_to_fetch = res.candidate_pages if res.candidate_pages else res.cross_reference_pages
                         matched_pages.extend(pages_to_fetch)
@@ -359,6 +397,10 @@ def run_page_index(state: PipelineState):
                                     metadata=c_meta,
                                 )
                                 structural_chunks.append(c_struct)
+
+                # Check if total stage limit was reached across document iterations
+                if (time.perf_counter() - stage_t0) * 1000.0 >= stage_limit_ms:
+                    break
         except Exception as exc:
             logger.warning("page_index.lookup_failed error=%s (preserving baseline)", exc)
 

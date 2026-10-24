@@ -765,3 +765,115 @@ def test_pypdf_outline_page_range_bounded_by_subsequent_sections(tmp_path):
     assert ch2_title == "Chapter 2: Methods"
     assert ch2_start == 3
     assert ch2_end == 5  # Last section extends to document end
+
+
+def test_cross_reference_heavy_payload_sizing_and_overflow_bound():
+    """Verify complete summary sizing includes cross-references, triggering overflow and bounding persisted summary."""
+    import json
+    boundary_repo = InMemoryWorkspaceBoundaryRepository()
+    artifact_store = S3PageIndexArtifactStore()
+    pi_repo = PageIndexRepository(boundary_repo=boundary_repo, artifact_store=artifact_store)
+
+    # 1. Elements with few definitions (small definition payload ~500 bytes)
+    elements = [
+        {"id": "elem_def_1", "type": "table", "content": "Table 1: Tiny definition", "page_number": 1},
+        {"id": "elem_def_2", "type": "figure", "content": "Figure 1: Another definition", "page_number": 2},
+    ]
+
+    # 2. Add 200 textual cross-references with distinct table labels across pages
+    for i in range(1, 201):
+        elements.append({
+            "id": f"elem_cr_{i}",
+            "type": "paragraph",
+            "content": f"As observed in the experimental section, see Table {i} for details.",
+            "page_number": i,
+        })
+
+    layout = extract_layout_from_elements(elements, total_pages=200, document_id="doc_cr_heavy")
+    assert len(layout.definitions) >= 2
+    assert len(layout.cross_references) >= 200
+
+    # Set threshold to 3000 bytes.
+    # Definitions alone fit in ~500 bytes.
+    # Complete payload with 200 cross-references exceeds 4500 bytes (> 3000 threshold).
+    threshold = 3000
+    summary = pi_repo.persist_manifest(
+        "ws_test", "doc_cr_heavy", "v1", layout, threshold_bytes=threshold
+    )
+
+    # S3 overflow MUST be triggered because complete sizing includes cross-references!
+    assert summary.has_s3_overflow is True
+    assert summary.s3_overflow_key is not None
+    assert len(summary.inline_definitions) == 0
+    assert len(summary.inline_cross_references) == 0
+
+    # 100% of all cross-references are preserved in S3 detail without silent truncation
+    detail = pi_repo.get_detail(summary)
+    assert detail is not None
+    assert "table 1" in detail.cross_references
+    assert "table 200" in detail.cross_references
+    assert len(detail.cross_references) == 200
+
+    # The persisted summary in DynamoDB / boundary repo is strictly bounded within threshold
+    saved_summary = boundary_repo.get_page_index_summary("ws_test", "doc_cr_heavy", "v1")
+    assert saved_summary is not None
+    serialized_bytes = len(json.dumps(saved_summary.model_dump()).encode("utf-8"))
+    assert serialized_bytes <= threshold
+    assert summary.raw_payload_bytes <= threshold
+
+
+def test_sync_concurrency_controller_admission_deadlines_and_capacity_retention():
+    """Verify synchronous concurrency controller bounds admission, enforces deadlines, and retains worker capacity."""
+    from src.services.retrieval.page_index_lookup import PageIndexConcurrencyController
+
+    # Controller with capacity 1 and queue 1
+    controller = PageIndexConcurrencyController(max_concurrency=1, max_queue=1)
+    thread_finished = False
+
+    def lingering_storage_worker(*args):
+        nonlocal thread_finished
+        time.sleep(0.08)
+        thread_finished = True
+        return "storage_result"
+
+    # 1. Caller timeout test: worker takes 80ms, caller deadline is 20ms
+    t0 = time.perf_counter()
+    res, status = controller.run_storage_work_sync(lingering_storage_worker, deadline_s=0.020)
+    elapsed = time.perf_counter() - t0
+
+    # Caller receives timeout promptly
+    assert status == "caller_timeout"
+    assert res is None
+    assert elapsed < 0.040
+
+    # Worker capacity remains retained until underlying thread actually finishes!
+    assert controller.active_count == 1
+    assert thread_finished is False
+
+    # Wait for the lingering thread to finish
+    time.sleep(0.08)
+    assert thread_finished is True
+    assert controller.active_count == 0
+
+    # 2. Admission queue saturation test: capacity 1, queue 1
+    # Occupy slot with a thread
+    import concurrent.futures
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+
+    def slow_task(*args):
+        time.sleep(0.1)
+        return "ok"
+
+    f1 = pool.submit(controller.run_storage_work_sync, slow_task, deadline_s=0.3)
+    time.sleep(0.01)  # f1 acquires slot
+
+    f2 = pool.submit(controller.run_storage_work_sync, slow_task, deadline_s=0.3)
+    time.sleep(0.01)  # f2 enters admission queue
+
+    # Third caller arrives when queue is full: rejected immediately!
+    r3, s3 = controller.run_storage_work_sync(slow_task, deadline_s=0.3)
+    assert s3 == "admission_rejected"
+    assert r3 is None
+
+    pool.shutdown(wait=True)
+

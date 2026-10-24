@@ -697,3 +697,177 @@ async def test_page_index_strategy_eliminates_unscalable_scan():
     )
     assert len(res_targeted.items) == 1
     assert res_targeted.items[0].locator["candidate_pages"] == [6]
+
+
+# ===========================================================================
+# 9. Actual Pipeline Path Regressions: Slow Storage, Saturation, Stage Bounding
+# ===========================================================================
+
+def test_pipeline_actual_path_slow_storage_fallback_to_baseline(monkeypatch):
+    """Verify actual pipeline path enforces caller deadlines on slow storage and preserves baseline."""
+    monkeypatch.setattr(settings, "PAGEINDEX_TIMEOUT_MS", 25)
+    monkeypatch.setattr(settings, "PAGEINDEX_STAGE_TIMEOUT_MS", 50)
+
+    ws_id = "ws_pipeline_slow"
+    b_repo = get_workspace_boundary_repo()
+    b_repo.save_document_snapshot(
+        DocumentSnapshot(
+            workspace_id=ws_id,
+            document_id="doc_slow",
+            source="doc_slow.pdf",
+            version="v1",
+            format="pdf",
+            created_at="2026-10-24T00:00:00Z",
+            persisted_rows=1,
+            total_rows=1,
+            page_index_status="ready",
+            page_index_elements_count=5,
+        )
+    )
+
+    # Inject slow storage read (70ms) into PageIndexRepository.get_summary
+    from src.db.page_index_repo import PageIndexRepository
+    def slow_get_summary(*args, **kwargs):
+        time.sleep(0.070)
+        return None
+
+    monkeypatch.setattr(PageIndexRepository, "get_summary", slow_get_summary)
+
+    # Initial pipeline state with baseline candidate chunks
+    baseline_chunk = _make_chunk("c_base_1", "doc_slow", ws_id, "Baseline factual answer", 14, "paragraph")
+    state = {
+        "workspace_id": ws_id,
+        "query": "According to Table 1, what is the score?",
+        "bm25_candidates": [baseline_chunk],
+        "candidate_chunks": [baseline_chunk],
+        "stage_timings": {},
+        "retrieval_candidates": {},
+    }
+
+    t0 = time.perf_counter()
+    res_state = run_page_index(state)
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+    # Must return promptly without exceeding total deadline budget
+    assert elapsed_ms < 60.0
+
+    # PageIndex timed out: structural candidates are empty
+    assert res_state["structural_candidate_ids"] == []
+    assert res_state["structural_match_count"] == 0
+    assert res_state["structural_target_state"] == "none"
+
+    # Baseline candidate chunks remain completely preserved and unpruned
+    assert "candidate_chunks" not in res_state or res_state["candidate_chunks"] is None
+
+
+def test_pipeline_actual_path_concurrency_saturation_fallback_to_baseline(monkeypatch):
+    """Verify actual pipeline path handles admission queue saturation gracefully, falling back to baseline."""
+    from src.services.retrieval.page_index_lookup import PageIndexConcurrencyController, get_page_index_controller
+    import src.services.retrieval.page_index_lookup as p_lookup
+
+    # Controller with max_concurrency 1, max_queue 0 (any contending call rejected immediately)
+    saturated_controller = PageIndexConcurrencyController(max_concurrency=1, max_queue=0)
+    # Occupy the single worker slot
+    import threading
+    worker_running = threading.Event()
+    worker_release = threading.Event()
+
+    def slot_occupier(*args):
+        worker_running.set()
+        worker_release.wait(timeout=1.0)
+        return "occupied"
+
+    import concurrent.futures
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    pool.submit(saturated_controller.run_storage_work_sync, slot_occupier, deadline_s=1.0)
+    worker_running.wait(timeout=0.5)
+
+    monkeypatch.setattr(p_lookup, "_PAGE_INDEX_CONTROLLER", saturated_controller)
+
+    ws_id = "ws_pipeline_sat"
+    b_repo = get_workspace_boundary_repo()
+    b_repo.save_document_snapshot(
+        DocumentSnapshot(
+            workspace_id=ws_id,
+            document_id="doc_sat",
+            source="doc_sat.pdf",
+            version="v1",
+            format="pdf",
+            created_at="2026-10-24T00:00:00Z",
+            persisted_rows=1,
+            total_rows=1,
+            page_index_status="ready",
+            page_index_elements_count=5,
+        )
+    )
+
+    baseline_chunk = _make_chunk("c_base_sat", "doc_sat", ws_id, "Baseline factual answer", 10, "paragraph")
+    state = {
+        "workspace_id": ws_id,
+        "query": "Look at Table 2 for metrics",
+        "bm25_candidates": [baseline_chunk],
+        "candidate_chunks": [baseline_chunk],
+        "stage_timings": {},
+        "retrieval_candidates": {},
+    }
+
+    res_state = run_page_index(state)
+
+    # Queue saturation rejected lookup immediately; baseline discovery is preserved
+    assert res_state["structural_candidate_ids"] == []
+    assert res_state["structural_match_count"] == 0
+
+    # Cleanup background thread
+    worker_release.set()
+    pool.shutdown(wait=True)
+
+
+def test_pipeline_total_stage_deadline_bounded_across_multiple_documents_and_labels(monkeypatch):
+    """Verify total PageIndex stage work across multiple documents and labels is strictly bounded."""
+    monkeypatch.setattr(settings, "PAGEINDEX_TIMEOUT_MS", 20)
+    monkeypatch.setattr(settings, "PAGEINDEX_STAGE_TIMEOUT_MS", 45)
+
+    ws_id = "ws_stage_budget"
+    b_repo = get_workspace_boundary_repo()
+
+    # Create 6 PDF document snapshots
+    for i in range(1, 7):
+        b_repo.save_document_snapshot(
+            DocumentSnapshot(
+                workspace_id=ws_id,
+                document_id=f"doc_budget_{i}",
+                source=f"doc_{i}.pdf",
+                version="v1",
+                format="pdf",
+                created_at="2026-10-24T00:00:00Z",
+                persisted_rows=1,
+                total_rows=1,
+                page_index_status="ready",
+                page_index_elements_count=5,
+            )
+        )
+
+    # Inject a 15ms delay per lookup
+    # 6 docs * 2 labels = 12 lookups. Unbounded would take 12 * 15ms = 180ms!
+    from src.db.page_index_repo import PageIndexRepository
+    def delay_get_summary(*args, **kwargs):
+        time.sleep(0.015)
+        return None
+
+    monkeypatch.setattr(PageIndexRepository, "get_summary", delay_get_summary)
+
+    state = {
+        "workspace_id": ws_id,
+        "query": "Examine Table 1 and Figure 2 for results",  # 2 target labels
+        "stage_timings": {},
+        "retrieval_candidates": {},
+    }
+
+    t0 = time.perf_counter()
+    res_state = run_page_index(state)
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+    # Total stage work must NOT run all 180ms. It must break when stage budget (45ms) is reached!
+    assert elapsed_ms < 75.0  # bounded strictly within budget plus minimal thread dispatch
+    assert res_state["structural_match_count"] == 0
+

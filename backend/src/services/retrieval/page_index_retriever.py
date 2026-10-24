@@ -48,14 +48,14 @@ class PageIndexRetriever:
         document_version: str,
         target_label: str,
         deadline_ms: float = 50.0,
-    ) -> StructuralLookupResult | None:
-        """Perform synchronous deadline-enforced isolated lookup for synchronous pipeline nodes."""
-        return self.lookup_service._sync_read_manifest_and_resolve(
+    ) -> tuple[StructuralLookupResult | None, str]:
+        """Perform synchronous deadline-enforced, concurrency-bounded isolated lookup."""
+        return self.lookup_service.lookup_target_sync(
             workspace_id=workspace_id,
             document_id=document_id,
             document_version=document_version,
             target_label=target_label,
-            remaining_deadline_s=deadline_ms / 1000.0,
+            deadline_ms=deadline_ms,
         )
 
     def filter_and_rank(
