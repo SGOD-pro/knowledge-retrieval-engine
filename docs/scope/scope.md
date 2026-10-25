@@ -21,7 +21,7 @@ _These are recommendations to keep your build orderly, not requirements. Skip an
 | 3 | Snapshot registry, publication, and atomic deletion | Foundation | planned |
 | 4 | Core walking skeleton | Slice 1 | done |
 | 5 | PageIndex structural retrieval | Slice 2 | done |
-| 6 | Deterministic structured execution | Slice 3 | planned |
+| 6 | OKF integration | Slice 3 | in-progress |
 | 7 | Baseline discovery retrieval and fusion | Slice 4 | planned |
 | 8 | Knowledge Map and requirement router | Slice 5 | planned |
 | 9 | Evidence verification and answer assembly | Slice 6 | planned |
@@ -133,10 +133,16 @@ Spec [0005](../specs/0005-pageindex-structural-retrieval.md) · code in `backend
 
 ## Slice 3: OKF integration
 
-### 6. OKF integration · needs a decision
+### 6. OKF integration · in-progress
 Plan OKF integration as a subsequent, independently verifiable slice after the baseline works.
 **Done when:** OKF is integrated into the enrichment pipeline and independently verified.
-- [ ] Design it (spec): `/architect OKF integration`
+- [x] Design it (spec): `/architect OKF integration`
+- [ ] Build it: `/develop OKF integration`
+   - [ ] Slice 1: Extraction, partitioned storage, and isolated lookup (AC-1, AC-2, AC-5, AC-6, AC-7, AC-8)
+   - [ ] Slice 2: Candidate fusion, pipeline wiring, and offline ablation (AC-3, AC-4, AC-9, AC-10)
+- [ ] Verify it: `/check verify OKF integration`
+- [ ] Test it: `/test OKF integration`
+Spec [0006](../specs/0006-okf-integration.md) · code in `backend/src/`
 
 ## Slice 4: Knowledge graph enrichment
 
