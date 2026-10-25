@@ -37,6 +37,14 @@ _TARGET_QUERY_PATTERN = re.compile(
 )
 
 
+class WorkerResultWrapper:
+    """Explicit wrapper for worker tasks returning custom execution statuses."""
+
+    def __init__(self, result: Any, status: str = "completed"):
+        self.result = result
+        self.status = status
+
+
 class PageIndexConcurrencyController:
     """Admission gate and capacity tracker for PageIndex storage lookups.
 
@@ -157,7 +165,10 @@ class PageIndexConcurrencyController:
         # 3. Wait for storage task completion within remaining deadline
         try:
             await asyncio.wait_for(storage_done.wait(), timeout=remaining_s)
-            return outcome["result"], outcome["status"]
+            res = outcome["result"]
+            if isinstance(res, WorkerResultWrapper):
+                return res.result, res.status
+            return res, outcome["status"]
         except asyncio.TimeoutError:
             logger.warning(
                 "page_index.timeout_ms=%.1f fallback=baseline stage=storage_execution",
@@ -236,7 +247,10 @@ class PageIndexConcurrencyController:
         # 3. Wait for storage task completion within remaining deadline
         finished = work_done.wait(timeout=remaining_s)
         if finished:
-            return outcome["result"], outcome["status"]
+            res = outcome["result"]
+            if isinstance(res, WorkerResultWrapper):
+                return res.result, res.status
+            return res, outcome["status"]
         else:
             logger.warning(
                 "page_index.timeout_ms=%.1f fallback=baseline stage=storage_execution",
@@ -333,6 +347,64 @@ class PageIndexLookupService:
             matching_locations=(),
         )
 
+    def _sync_lookup_target(
+        self,
+        workspace_id: str,
+        document_id: str,
+        document_version: str,
+        target_label: str,
+        chunk_repo: Any | None,
+        remaining_deadline_s: float,
+    ) -> WorkerResultWrapper:
+        """Perform isolated tombstone checking, manifest/detail reading, and candidate chunk fetching."""
+        t_start = time.perf_counter()
+
+        # 1. Bounded tombstone check inside the worker (fail-closed)
+        try:
+            if self.repo.boundary_repo.has_tombstone(workspace_id, "workspace", workspace_id):
+                logger.debug("page_index.tombstone_workspace_blocked ws=%s", workspace_id)
+                return WorkerResultWrapper(None, "tombstoned")
+            if self.repo.boundary_repo.has_tombstone(workspace_id, "source", document_id):
+                logger.debug("page_index.tombstone_source_blocked doc=%s", document_id)
+                return WorkerResultWrapper(None, "tombstoned")
+        except Exception as exc:
+            logger.warning(
+                "page_index.tombstone_check_failed ws=%s doc=%s error=%s (fail-closed)",
+                workspace_id,
+                document_id,
+                exc,
+            )
+            return WorkerResultWrapper(None, "tombstoned")
+
+        # 2. Read manifest (DynamoDB or SQLite)
+        summary = self.repo.get_summary(workspace_id, document_id, document_version)
+        if summary is None:
+            return WorkerResultWrapper(None, "completed")
+
+        elapsed = time.perf_counter() - t_start
+        s3_budget = max(0.001, remaining_deadline_s - elapsed)
+
+        # 3. Resolve target from manifest (including S3 overflow if needed)
+        res = self.resolve_target_from_manifest(
+            summary=summary,
+            target_label=target_label,
+            remaining_deadline_s=s3_budget,
+        )
+        if res is None:
+            return WorkerResultWrapper(None, "completed")
+
+        # 4. Fetch candidate chunks inside the worker if chunk_repo is provided and pages matched
+        if chunk_repo is not None and (res.candidate_pages or res.cross_reference_pages):
+            pages_to_fetch = res.candidate_pages if res.candidate_pages else res.cross_reference_pages
+            doc_chunks = chunk_repo.get_all_chunks(
+                document_ids=[document_id],
+                workspace_id=workspace_id,
+                page_numbers=pages_to_fetch,
+            )
+            res = res.model_copy(update={"candidate_chunks": tuple(doc_chunks)})
+
+        return WorkerResultWrapper(res, "completed")
+
     def _sync_read_manifest_and_resolve(
         self,
         workspace_id: str,
@@ -342,19 +414,15 @@ class PageIndexLookupService:
         remaining_deadline_s: float,
     ) -> StructuralLookupResult | None:
         """Synchronous storage reading executed in the controller thread pool."""
-        t_start = time.perf_counter()
-        summary = self.repo.get_summary(workspace_id, document_id, document_version)
-        if summary is None:
-            return None
-
-        elapsed = time.perf_counter() - t_start
-        s3_budget = max(0.001, remaining_deadline_s - elapsed)
-
-        return self.resolve_target_from_manifest(
-            summary=summary,
+        outcome = self._sync_lookup_target(
+            workspace_id=workspace_id,
+            document_id=document_id,
+            document_version=document_version,
             target_label=target_label,
-            remaining_deadline_s=s3_budget,
+            chunk_repo=None,
+            remaining_deadline_s=remaining_deadline_s,
         )
+        return outcome.result if isinstance(outcome, WorkerResultWrapper) else outcome
 
     async def lookup_target(
         self,
@@ -363,28 +431,21 @@ class PageIndexLookupService:
         document_version: str,
         target_label: str,
         deadline_ms: float | None = None,
+        chunk_repo: Any | None = None,
     ) -> tuple[StructuralLookupResult | None, str]:
         """Perform deadline-enforced, concurrency-bounded isolated lookup.
 
         Returns (result, execution_status).
         """
-        # 1. Immediate tombstone check (fast path)
-        if self.repo.boundary_repo.has_tombstone(workspace_id, "workspace", workspace_id):
-            logger.debug("page_index.tombstone_workspace_blocked ws=%s", workspace_id)
-            return None, "tombstoned"
-        if self.repo.boundary_repo.has_tombstone(workspace_id, "source", document_id):
-            logger.debug("page_index.tombstone_source_blocked doc=%s", document_id)
-            return None, "tombstoned"
-
         total_deadline_s = (deadline_ms or getattr(settings, "PAGEINDEX_TIMEOUT_MS", 50)) / 1000.0
 
-        # 2. Run storage work via concurrency controller
         result, status = await self.controller.run_storage_work(
-            self._sync_read_manifest_and_resolve,
+            self._sync_lookup_target,
             workspace_id,
             document_id,
             document_version,
             target_label,
+            chunk_repo,
             deadline_s=total_deadline_s,
         )
         return result, status
@@ -396,28 +457,21 @@ class PageIndexLookupService:
         document_version: str,
         target_label: str,
         deadline_ms: float | None = None,
+        chunk_repo: Any | None = None,
     ) -> tuple[StructuralLookupResult | None, str]:
         """Perform synchronous deadline-enforced, concurrency-bounded isolated lookup.
 
         Returns (result, execution_status).
         """
-        # 1. Immediate tombstone check (fast path)
-        if self.repo.boundary_repo.has_tombstone(workspace_id, "workspace", workspace_id):
-            logger.debug("page_index.tombstone_workspace_blocked ws=%s", workspace_id)
-            return None, "tombstoned"
-        if self.repo.boundary_repo.has_tombstone(workspace_id, "source", document_id):
-            logger.debug("page_index.tombstone_source_blocked doc=%s", document_id)
-            return None, "tombstoned"
-
         total_deadline_s = (deadline_ms or getattr(settings, "PAGEINDEX_TIMEOUT_MS", 50)) / 1000.0
 
-        # 2. Run storage work via concurrency controller
         result, status = self.controller.run_storage_work_sync(
-            self._sync_read_manifest_and_resolve,
+            self._sync_lookup_target,
             workspace_id,
             document_id,
             document_version,
             target_label,
+            chunk_repo,
             deadline_s=total_deadline_s,
         )
         return result, status

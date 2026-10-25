@@ -273,6 +273,14 @@ def run_bm25(state: PipelineState):
     }
 
 
+def _sync_list_snapshots(
+    boundary_repo: Any,
+    workspace_id: str,
+    remaining_deadline_s: float,
+) -> list[Any]:
+    return boundary_repo.list_document_snapshots(workspace_id)
+
+
 def run_page_index(state: PipelineState):
     """PageIndex structural candidate extraction (Slice 2 / AC-3).
     Evaluates query for structural targets (Table N, Figure N), resolves candidate
@@ -316,15 +324,10 @@ def run_page_index(state: PipelineState):
     if target_labels and ws_id:
         repo = _get_repo()
         from src.db.workspace_boundary_repo import get_workspace_boundary_repo
+        from src.services.retrieval.page_index_lookup import get_page_index_controller
         b_repo = get_workspace_boundary_repo()
+        controller = get_page_index_controller()
         try:
-            snaps = b_repo.list_document_snapshots(ws_id)
-            if target_docs:
-                target_set = set(target_docs)
-                snaps = [s for s in snaps if s.document_id in target_set]
-
-            pdf_snaps = [s for s in snaps if s.format.lower() == "pdf"]
-
             # Bound total PageIndex stage work across documents and labels
             stage_limit_ms = float(
                 getattr(settings, "PAGEINDEX_STAGE_TIMEOUT_MS", getattr(settings, "PAGEINDEX_TIMEOUT_MS", 50))
@@ -332,6 +335,40 @@ def run_page_index(state: PipelineState):
             per_lookup_limit_ms = float(getattr(settings, "PAGEINDEX_TIMEOUT_MS", 50))
             stage_t0 = time.perf_counter()
             stage_exhausted = False
+
+            # Stage deadline covers snapshot discovery under bounded admission and caller deadline
+            elapsed_stage_ms = (time.perf_counter() - stage_t0) * 1000.0
+            remaining_stage_ms = stage_limit_ms - elapsed_stage_ms
+            if remaining_stage_ms <= 1.0:
+                logger.warning(
+                    "page_index.stage_budget_exhausted elapsed_ms=%.1f limit_ms=%.1f fallback=baseline",
+                    elapsed_stage_ms,
+                    stage_limit_ms,
+                )
+                stage_exhausted = True
+                snaps = []
+            else:
+                snaps_res, snap_status = controller.run_storage_work_sync(
+                    _sync_list_snapshots,
+                    b_repo,
+                    ws_id,
+                    deadline_s=min(per_lookup_limit_ms, remaining_stage_ms) / 1000.0,
+                )
+                if snap_status != "completed" or snaps_res is None:
+                    logger.warning(
+                        "page_index.snapshot_discovery_failed ws=%s status=%s (fallback=baseline)",
+                        ws_id,
+                        snap_status,
+                    )
+                    snaps = []
+                else:
+                    snaps = snaps_res
+
+            if target_docs:
+                target_set = set(target_docs)
+                snaps = [s for s in snaps if s.document_id in target_set]
+
+            pdf_snaps = [s for s in snaps if s.format.lower() == "pdf"]
 
             for snap in pdf_snaps:
                 if stage_exhausted:
@@ -357,6 +394,7 @@ def run_page_index(state: PipelineState):
                         document_version=doc_ver,
                         target_label=t_label,
                         deadline_ms=effective_deadline_ms,
+                        chunk_repo=repo,
                     )
                     if status == "caller_timeout":
                         logger.warning(
@@ -373,17 +411,20 @@ def run_page_index(state: PipelineState):
                             doc_ver,
                             t_label,
                         )
+                    elif status == "tombstoned":
+                        logger.info(
+                            "page_index.lookup_tombstoned doc=%s ver=%s label=%s (fail-closed, fallback=baseline)",
+                            doc_id,
+                            doc_ver,
+                            t_label,
+                        )
 
                     if res and (res.candidate_pages or res.cross_reference_pages):
                         pages_to_fetch = res.candidate_pages if res.candidate_pages else res.cross_reference_pages
                         matched_pages.extend(pages_to_fetch)
                         structural_target_state = res.state
 
-                        doc_chunks = repo.get_all_chunks(
-                            document_ids=[doc_id],
-                            workspace_id=ws_id,
-                            page_numbers=pages_to_fetch,
-                        )
+                        doc_chunks = res.candidate_chunks or ()
                         for c in doc_chunks:
                             if c.page_number in pages_to_fetch:
                                 from dataclasses import replace

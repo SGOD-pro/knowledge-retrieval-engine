@@ -744,6 +744,10 @@ def test_pipeline_actual_path_slow_storage_fallback_to_baseline(monkeypatch):
         "retrieval_candidates": {},
     }
 
+    # Warm up shared repository singleton to isolate storage work from cold start instantiation
+    from services.langgraph_pipeline import _get_repo
+    _get_repo()
+
     t0 = time.perf_counter()
     res_state = run_page_index(state)
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
@@ -863,6 +867,10 @@ def test_pipeline_total_stage_deadline_bounded_across_multiple_documents_and_lab
         "retrieval_candidates": {},
     }
 
+    # Warm up shared repository singleton to isolate storage work from cold start instantiation
+    from services.langgraph_pipeline import _get_repo
+    _get_repo()
+
     t0 = time.perf_counter()
     res_state = run_page_index(state)
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
@@ -870,4 +878,253 @@ def test_pipeline_total_stage_deadline_bounded_across_multiple_documents_and_lab
     # Total stage work must NOT run all 180ms. It must break when stage budget (45ms) is reached!
     assert elapsed_ms < 75.0  # bounded strictly within budget plus minimal thread dispatch
     assert res_state["structural_match_count"] == 0
+
+
+def test_pipeline_slow_snapshot_discovery_bounded_and_baseline_fallback(monkeypatch):
+    """Verify snapshot discovery under controller enforces deadline and falls back to baseline."""
+    monkeypatch.setattr(settings, "PAGEINDEX_TIMEOUT_MS", 25)
+    monkeypatch.setattr(settings, "PAGEINDEX_STAGE_TIMEOUT_MS", 50)
+
+    ws_id = "ws_pipeline_slow_snaps"
+    b_repo = get_workspace_boundary_repo()
+    orig_list_snaps = type(b_repo).list_document_snapshots
+
+    def slow_list_snaps(self, workspace_id, *args, **kwargs):
+        time.sleep(0.070)
+        return orig_list_snaps(self, workspace_id, *args, **kwargs)
+
+    monkeypatch.setattr(type(b_repo), "list_document_snapshots", slow_list_snaps)
+
+    baseline_chunk = _make_chunk("c_base_snap", "doc_snap", ws_id, "Baseline factual answer", 2, "paragraph")
+    state = {
+        "workspace_id": ws_id,
+        "query": "Look at Table 1 for details",
+        "bm25_candidates": [baseline_chunk],
+        "candidate_chunks": [baseline_chunk],
+        "stage_timings": {},
+        "retrieval_candidates": {},
+    }
+
+    # Warm up shared repository singleton to isolate storage work from cold start instantiation
+    from services.langgraph_pipeline import _get_repo
+    _get_repo()
+
+    t0 = time.perf_counter()
+    res_state = run_page_index(state)
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+    # Bounded caller latency (<60ms despite 70ms snapshot discovery delay)
+    assert elapsed_ms < 60.0
+
+    # Snapshot discovery timed out: structural candidates empty, baseline preserved
+    assert res_state["structural_candidate_ids"] == []
+    assert res_state["structural_match_count"] == 0
+    assert res_state["structural_target_state"] == "none"
+
+
+def test_pipeline_slow_tombstone_check_bounded_and_fail_closed(monkeypatch):
+    """Verify tombstone check inside worker enforces caller deadline, retains capacity, and fails closed."""
+    from src.ingestion.page_index_extractor import extract_layout_from_elements
+
+    monkeypatch.setattr(settings, "PAGEINDEX_TIMEOUT_MS", 25)
+    monkeypatch.setattr(settings, "PAGEINDEX_STAGE_TIMEOUT_MS", 50)
+
+    ws_id = "ws_pipeline_slow_tomb"
+    b_repo = get_workspace_boundary_repo()
+    b_repo.save_document_snapshot(
+        DocumentSnapshot(
+            workspace_id=ws_id,
+            document_id="doc_tomb_slow",
+            source="doc_tomb_slow.pdf",
+            version="v1",
+            format="pdf",
+            created_at="2026-10-24T00:00:00Z",
+            persisted_rows=1,
+            total_rows=1,
+            page_index_status="ready",
+            page_index_elements_count=5,
+        )
+    )
+
+    # Persist summary with Table 1 defined on page 5
+    from src.db.page_index_repo import PageIndexRepository
+    pi_repo = PageIndexRepository()
+    elements = [
+        {"type": "table", "content": "Table 1: Metrics", "page_number": 5, "label": "Table 1"},
+    ]
+    layout = extract_layout_from_elements(elements, total_pages=10, document_id="doc_tomb_slow")
+    pi_repo.persist_manifest(ws_id, "doc_tomb_slow", "v1", layout)
+
+    def slow_has_tombstone(self, workspace_id, resource_type, resource_id):
+        time.sleep(0.070)
+        return False
+
+    monkeypatch.setattr(type(b_repo), "has_tombstone", slow_has_tombstone)
+
+    baseline_chunk = _make_chunk("c_base_tomb", "doc_tomb_slow", ws_id, "Baseline answer", 5, "paragraph")
+    state = {
+        "workspace_id": ws_id,
+        "query": "According to Table 1, what are the metrics?",
+        "bm25_candidates": [baseline_chunk],
+        "candidate_chunks": [baseline_chunk],
+        "stage_timings": {},
+        "retrieval_candidates": {},
+    }
+
+    # Warm up shared repository singleton to isolate storage work from cold start instantiation
+    from services.langgraph_pipeline import _get_repo
+    _get_repo()
+
+    t0 = time.perf_counter()
+    res_state = run_page_index(state)
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+    # Bounded caller latency (<60ms despite 70ms tombstone delay)
+    assert elapsed_ms < 60.0
+
+    # Fail closed: no candidates published when tombstone check cannot finish within deadline
+    assert res_state["structural_candidate_ids"] == []
+    assert res_state["structural_match_count"] == 0
+    assert res_state["structural_target_state"] == "none"
+
+
+def test_pipeline_slow_candidate_chunk_fetching_bounded_and_no_late_publication(monkeypatch):
+    """Verify candidate chunk fetching inside worker enforces deadline and prevents late publication."""
+    import threading
+    from src.ingestion.page_index_extractor import extract_layout_from_elements
+
+    monkeypatch.setattr(settings, "PAGEINDEX_TIMEOUT_MS", 25)
+    monkeypatch.setattr(settings, "PAGEINDEX_STAGE_TIMEOUT_MS", 50)
+
+    ws_id = "ws_pipeline_slow_chunks"
+    b_repo = get_workspace_boundary_repo()
+    b_repo.save_document_snapshot(
+        DocumentSnapshot(
+            workspace_id=ws_id,
+            document_id="doc_chunk_slow",
+            source="doc_chunk_slow.pdf",
+            version="v1",
+            format="pdf",
+            created_at="2026-10-24T00:00:00Z",
+            persisted_rows=1,
+            total_rows=1,
+            page_index_status="ready",
+            page_index_elements_count=5,
+        )
+    )
+
+    from src.db.page_index_repo import PageIndexRepository
+    pi_repo = PageIndexRepository()
+    elements = [
+        {"type": "table", "content": "Table 1: Target Content", "page_number": 4, "label": "Table 1"},
+    ]
+    layout = extract_layout_from_elements(elements, total_pages=10, document_id="doc_chunk_slow")
+    pi_repo.persist_manifest(ws_id, "doc_chunk_slow", "v1", layout)
+
+    from db.database import CloudRepository
+
+    worker_finished = threading.Event()
+
+    def slow_get_all_chunks(self, *args, **kwargs):
+        time.sleep(0.070)
+        worker_finished.set()
+        return [_make_chunk("c_late_table", "doc_chunk_slow", ws_id, "Late Table 1 content", 4, "table")]
+
+    monkeypatch.setattr(CloudRepository, "get_all_chunks", slow_get_all_chunks)
+
+    baseline_chunk = _make_chunk("c_base_chunk", "doc_chunk_slow", ws_id, "Baseline answer", 1, "paragraph")
+    state = {
+        "workspace_id": ws_id,
+        "query": "Show me Table 1",
+        "bm25_candidates": [baseline_chunk],
+        "candidate_chunks": [baseline_chunk],
+        "stage_timings": {},
+        "retrieval_candidates": {},
+    }
+
+    # Warm up shared repository singleton to isolate storage work from cold start instantiation
+    from services.langgraph_pipeline import _get_repo
+    _get_repo()
+
+    t0 = time.perf_counter()
+    res_state = run_page_index(state)
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+    # Bounded caller latency (<60ms despite 70ms chunk read delay)
+    assert elapsed_ms < 60.0
+
+    # Caller timed out on chunk read: structural candidates are empty, baseline preserved
+    assert res_state["structural_candidate_ids"] == []
+    assert res_state["structural_match_count"] == 0
+    assert res_state["structural_target_state"] == "none"
+
+    # Wait for background worker to finish
+    worker_finished.wait(timeout=1.0)
+
+    # Prove no late publication: the returned state candidate list never mutated or published late chunks
+    assert res_state["structural_candidate_ids"] == []
+    assert res_state["structural_match_count"] == 0
+
+
+def test_pipeline_slow_s3_detail_read_bounded_and_baseline_fallback(monkeypatch):
+    """Verify S3 overflow detail read inside worker enforces deadline and falls back to baseline."""
+    from src.ingestion.page_index_extractor import extract_layout_from_elements
+
+    monkeypatch.setattr(settings, "PAGEINDEX_TIMEOUT_MS", 25)
+    monkeypatch.setattr(settings, "PAGEINDEX_STAGE_TIMEOUT_MS", 50)
+
+    ws_id = "ws_pipeline_slow_s3"
+    b_repo = get_workspace_boundary_repo()
+    b_repo.save_document_snapshot(
+        DocumentSnapshot(
+            workspace_id=ws_id,
+            document_id="doc_s3_slow",
+            source="doc_s3_slow.pdf",
+            version="v1",
+            format="pdf",
+            created_at="2026-10-24T00:00:00Z",
+            persisted_rows=1,
+            total_rows=1,
+            page_index_status="ready",
+            page_index_elements_count=50,
+        )
+    )
+
+    from src.db.page_index_repo import PageIndexRepository
+    pi_repo = PageIndexRepository()
+    elements = []
+    for i in range(1, 40):
+        elements.append({"type": "table", "content": f"Table {i} detailed content with excessive metadata to overflow payload size limit", "page_number": i, "label": f"Table {i}"})
+    layout = extract_layout_from_elements(elements, total_pages=50, document_id="doc_s3_slow")
+    pi_repo.persist_manifest(ws_id, "doc_s3_slow", "v1", layout)
+
+    def slow_get_detail(*args, **kwargs):
+        time.sleep(0.070)
+        return None
+
+    monkeypatch.setattr(PageIndexRepository, "get_detail", slow_get_detail)
+
+    baseline_chunk = _make_chunk("c_base_s3", "doc_s3_slow", ws_id, "Baseline answer", 1, "paragraph")
+    state = {
+        "workspace_id": ws_id,
+        "query": "Show me Table 15",
+        "bm25_candidates": [baseline_chunk],
+        "candidate_chunks": [baseline_chunk],
+        "stage_timings": {},
+        "retrieval_candidates": {},
+    }
+
+    # Warm up shared repository singleton to isolate storage work from cold start instantiation
+    from services.langgraph_pipeline import _get_repo
+    _get_repo()
+
+    t0 = time.perf_counter()
+    res_state = run_page_index(state)
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+    # Bounded caller latency (<60ms)
+    assert elapsed_ms < 60.0
+    assert res_state["structural_candidate_ids"] == []
+    assert res_state["structural_match_count"] == 0
+
 

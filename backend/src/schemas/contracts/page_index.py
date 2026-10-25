@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -83,3 +83,4 @@ class StructuralLookupResult(BaseModel):
     matching_locations: tuple[ElementLocation, ...] = Field(default_factory=tuple)
     has_cross_references_only: bool = False
     cross_reference_pages: tuple[int, ...] = Field(default_factory=tuple)
+    candidate_chunks: tuple[Any, ...] = Field(default_factory=tuple)

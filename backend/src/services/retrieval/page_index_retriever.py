@@ -1,6 +1,7 @@
 import logging
 import time
 from collections.abc import Sequence
+from typing import Any
 
 from config import settings
 from ingestion.page_index_service import score as structural_score
@@ -31,6 +32,7 @@ class PageIndexRetriever:
         document_version: str,
         target_label: str,
         deadline_ms: float | None = None,
+        chunk_repo: Any | None = None,
     ) -> tuple[StructuralLookupResult | None, str]:
         """Perform deadline-enforced, concurrency-bounded isolated lookup."""
         return await self.lookup_service.lookup_target(
@@ -39,6 +41,7 @@ class PageIndexRetriever:
             document_version=document_version,
             target_label=target_label,
             deadline_ms=deadline_ms,
+            chunk_repo=chunk_repo,
         )
 
     def lookup_sync(
@@ -48,6 +51,7 @@ class PageIndexRetriever:
         document_version: str,
         target_label: str,
         deadline_ms: float = 50.0,
+        chunk_repo: Any | None = None,
     ) -> tuple[StructuralLookupResult | None, str]:
         """Perform synchronous deadline-enforced, concurrency-bounded isolated lookup."""
         return self.lookup_service.lookup_target_sync(
@@ -56,6 +60,7 @@ class PageIndexRetriever:
             document_version=document_version,
             target_label=target_label,
             deadline_ms=deadline_ms,
+            chunk_repo=chunk_repo,
         )
 
     def filter_and_rank(
