@@ -17,6 +17,7 @@ class Chunk:
     structural_weight: float = 0.0
     similarity_score: float | None = None
     reranker_score: float | None = None
+    okf_weight: float | None = None
     provider: str = "dev"
     embedding_fast: list[float] | None = None
     embedding_full: list[float] | None = None
@@ -180,6 +181,11 @@ class QueryResponse(BaseModel):
     structural_match_count: int = 0
     page_index_latency_ms: float = 0.0
     structural_target_state: str = "none"
+    okf_candidate_ids: list[str] = Field(default_factory=list)
+    okf_match_count: int = 0
+    okf_latency_ms: float = 0.0
+    okf_entity_state: str = "none"
+    okf_property_state: str = "none"
     reranker_mode: str = "remote_success"
 
 

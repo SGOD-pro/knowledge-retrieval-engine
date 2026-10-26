@@ -550,6 +550,9 @@ class SQLiteWorkspaceBoundaryRepository:
                         created_at TEXT NOT NULL,
                         page_index_status TEXT,
                         page_index_elements_count INTEGER DEFAULT 0,
+                        okf_status TEXT,
+                        okf_entities_count INTEGER DEFAULT 0,
+                        okf_properties_count INTEGER DEFAULT 0,
                         PRIMARY KEY (workspace_id, document_id)
                     )
                     """
@@ -563,6 +566,12 @@ class SQLiteWorkspaceBoundaryRepository:
                     self._conn.execute("ALTER TABLE document_snapshots ADD COLUMN page_index_status TEXT")
                 if "page_index_elements_count" not in snap_cols:
                     self._conn.execute("ALTER TABLE document_snapshots ADD COLUMN page_index_elements_count INTEGER DEFAULT 0")
+                if "okf_status" not in snap_cols:
+                    self._conn.execute("ALTER TABLE document_snapshots ADD COLUMN okf_status TEXT")
+                if "okf_entities_count" not in snap_cols:
+                    self._conn.execute("ALTER TABLE document_snapshots ADD COLUMN okf_entities_count INTEGER DEFAULT 0")
+                if "okf_properties_count" not in snap_cols:
+                    self._conn.execute("ALTER TABLE document_snapshots ADD COLUMN okf_properties_count INTEGER DEFAULT 0")
 
                 self._conn.execute(
                     """
@@ -1082,8 +1091,9 @@ class SQLiteWorkspaceBoundaryRepository:
                     INSERT OR REPLACE INTO document_snapshots (
                         workspace_id, document_id, source, version, format,
                         incomplete_coverage_flag, exclusions_json, persisted_rows, total_rows, created_at,
-                        page_index_status, page_index_elements_count
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        page_index_status, page_index_elements_count,
+                        okf_status, okf_entities_count, okf_properties_count
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         snapshot.workspace_id,
@@ -1098,6 +1108,9 @@ class SQLiteWorkspaceBoundaryRepository:
                         snapshot.created_at,
                         snapshot.page_index_status,
                         snapshot.page_index_elements_count,
+                        snapshot.okf_status,
+                        snapshot.okf_entities_count,
+                        snapshot.okf_properties_count,
                     ),
                 )
 
@@ -1123,6 +1136,9 @@ class SQLiteWorkspaceBoundaryRepository:
                 created_at=row["created_at"],
                 page_index_status=row["page_index_status"] if "page_index_status" in row.keys() else None,
                 page_index_elements_count=int(row["page_index_elements_count"] or 0) if "page_index_elements_count" in row.keys() else 0,
+                okf_status=row["okf_status"] if "okf_status" in row.keys() else None,
+                okf_entities_count=int(row["okf_entities_count"] or 0) if "okf_entities_count" in row.keys() else 0,
+                okf_properties_count=int(row["okf_properties_count"] or 0) if "okf_properties_count" in row.keys() else 0,
             )
 
     def list_document_snapshots(self, workspace_id: str) -> list[DocumentSnapshot]:
@@ -1146,6 +1162,9 @@ class SQLiteWorkspaceBoundaryRepository:
                     created_at=r["created_at"],
                     page_index_status=r["page_index_status"] if "page_index_status" in r.keys() else None,
                     page_index_elements_count=int(r["page_index_elements_count"] or 0) if "page_index_elements_count" in r.keys() else 0,
+                    okf_status=r["okf_status"] if "okf_status" in r.keys() else None,
+                    okf_entities_count=int(r["okf_entities_count"] or 0) if "okf_entities_count" in r.keys() else 0,
+                    okf_properties_count=int(r["okf_properties_count"] or 0) if "okf_properties_count" in r.keys() else 0,
                 )
                 for r in rows
             ]
@@ -1870,9 +1889,13 @@ class DynamoDBWorkspaceBoundaryRepository:
                 "total_rows": snapshot.total_rows,
                 "created_at": snapshot.created_at,
                 "page_index_elements_count": snapshot.page_index_elements_count,
+                "okf_entities_count": snapshot.okf_entities_count,
+                "okf_properties_count": snapshot.okf_properties_count,
             }
             if snapshot.page_index_status is not None:
                 item["page_index_status"] = snapshot.page_index_status
+            if snapshot.okf_status is not None:
+                item["okf_status"] = snapshot.okf_status
             self.table.put_item(Item=item)
         except Exception as err:
             raise StorageUnavailableError(f"DynamoDB error saving document snapshot: {err}") from err
@@ -1898,6 +1921,9 @@ class DynamoDBWorkspaceBoundaryRepository:
                 created_at=item["created_at"],
                 page_index_status=item.get("page_index_status"),
                 page_index_elements_count=int(item.get("page_index_elements_count", 0)),
+                okf_status=item.get("okf_status"),
+                okf_entities_count=int(item.get("okf_entities_count", 0)),
+                okf_properties_count=int(item.get("okf_properties_count", 0)),
             )
         except Exception as err:
             raise StorageUnavailableError(f"DynamoDB error getting document snapshot: {err}") from err
@@ -1924,6 +1950,9 @@ class DynamoDBWorkspaceBoundaryRepository:
                     created_at=item["created_at"],
                     page_index_status=item.get("page_index_status"),
                     page_index_elements_count=int(item.get("page_index_elements_count", 0)),
+                    okf_status=item.get("okf_status"),
+                    okf_entities_count=int(item.get("okf_entities_count", 0)),
+                    okf_properties_count=int(item.get("okf_properties_count", 0)),
                 )
                 for item in items
             ]
@@ -2211,4 +2240,10 @@ __all__ = [
     "get_workspace_boundary_repo",
     "workspace_boundary_repo",
 ]
+
+import sys
+if __name__ in ("db.workspace_boundary_repo", "src.db.workspace_boundary_repo"):
+    sys.modules["db.workspace_boundary_repo"] = sys.modules[__name__]
+    sys.modules["src.db.workspace_boundary_repo"] = sys.modules[__name__]
+
 

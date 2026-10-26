@@ -109,6 +109,9 @@ class DocumentSnapshot(BaseModel):
     created_at: str
     page_index_status: Literal["ready", "missing_layout", "failed"] | None = None
     page_index_elements_count: int = 0
+    okf_status: Literal["ready", "empty", "failed"] | None = None
+    okf_entities_count: int = 0
+    okf_properties_count: int = 0
 
 
 class BenchmarkRunMetadata(BaseModel):

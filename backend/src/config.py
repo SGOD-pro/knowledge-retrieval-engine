@@ -78,6 +78,20 @@ class Settings(BaseSettings):
     # Lower reranker threshold: don't drop all chunks just because Jaccard scores are low
     RERANKER_THRESHOLD: float = 0.05
 
+    # OKF Bounded Integration Settings
+    OKF_ENABLED: bool = True
+    OKF_TIMEOUT_MS: int = 50
+    OKF_MAX_INPUT_TOKENS_PER_DOC: int = 4000
+    OKF_MAX_OUTPUT_TOKENS_PER_DOC: int = 1200
+    OKF_MAX_MODEL_CALLS_PER_DOC: int = 2
+    OKF_BEDROCK_MODEL_ID: str = "anthropic.claude-3-haiku-20240307-v1:0"
+    OKF_FUSION_WEIGHT: float = 1.15
+    OKF_MAX_CONCURRENCY: int = 4
+    OKF_MAX_QUEUE: int = 8
+    DYNAMODB_OKF_TABLE_NAME: str = "kre_okf_facts"
+    OKF_REPO_BACKEND: str | None = None
+    OKF_SQLITE_PATH: str | None = None
+
     model_config = {"env_file": _ENV_FILES, "extra": "ignore"}
 
 

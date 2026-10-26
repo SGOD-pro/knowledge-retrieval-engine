@@ -67,6 +67,38 @@ class DocumentsService:
             logger.warning("Could not persist PageIndex for %s: %s", doc_id, pi_err)
             return "failed", 0
 
+    @staticmethod
+    def _enrich_okf_snapshot_metadata(
+        workspace_id: str,
+        doc_id: str,
+        doc_ver: str,
+        filename: str,
+        chunks: Any,
+        table_name: str | None = None,
+        table_store: Any | None = None,
+    ) -> tuple[str | None, int, int]:
+        """Resolve or extract OKF facts and return (status, entities_count, properties_count)."""
+        suffix = Path(filename).suffix.lower()
+        if suffix not in (".pdf", ".csv"):
+            return None, 0, 0
+        try:
+            from ingestion.okf_builder import extract_and_persist_okf
+            manifest = extract_and_persist_okf(
+                workspace_id=workspace_id,
+                document_id=doc_id,
+                document_version=doc_ver,
+                format=suffix.replace(".", ""),
+                chunks=chunks,
+                table_name=table_name,
+                table_store=table_store,
+            )
+            if manifest:
+                return manifest.status, len(manifest.entities), len(manifest.assertions)
+            return "failed", 0, 0
+        except Exception as okf_err:
+            logger.warning("Could not persist OKF for %s: %s", doc_id, okf_err)
+            return "failed", 0, 0
+
     def background_ingest(
         self,
         temp_path_str: str,
@@ -141,18 +173,6 @@ class DocumentsService:
                 raw_bytes=content,
                 size_str=size_str,
             )
-            self.repo.update_document_status(
-                workspace_id=workspace_id,
-                doc_id=doc_id,
-                status="Ready",
-                chunk_count=len(document.chunks),
-            )
-            logger.info(
-                "background_ingest.success ws=%s doc_id=%s filename=%s",
-                workspace_id,
-                doc_id,
-                filename,
-            )
 
             # Record DocumentSnapshot and register source in boundary repo for 0004
             try:
@@ -197,6 +217,18 @@ class DocumentsService:
                     boundary_repo=boundary_repo,
                 )
 
+                t_name = Path(filename).stem if getattr(document, "source_format", "").lower() == "csv" else None
+                store_ref = store if getattr(document, "source_format", "").lower() == "csv" else None
+                okf_stat, okf_e_count, okf_p_count = self._enrich_okf_snapshot_metadata(
+                    workspace_id=workspace_id,
+                    doc_id=doc_id,
+                    doc_ver=doc_ver,
+                    filename=filename,
+                    chunks=document.chunks,
+                    table_name=t_name,
+                    table_store=store_ref,
+                )
+
                 snapshot = DocumentSnapshot(
                     workspace_id=workspace_id,
                     document_id=doc_id,
@@ -210,10 +242,26 @@ class DocumentsService:
                     created_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                     page_index_status=pi_status,
                     page_index_elements_count=pi_count,
+                    okf_status=okf_stat,
+                    okf_entities_count=okf_e_count,
+                    okf_properties_count=okf_p_count,
                 )
                 boundary_repo.save_document_snapshot(snapshot)
             except Exception as snap_err:
                 logger.warning("Could not persist DocumentSnapshot for %s: %s", doc_id, snap_err)
+
+            self.repo.update_document_status(
+                workspace_id=workspace_id,
+                doc_id=doc_id,
+                status="Ready",
+                chunk_count=len(document.chunks),
+            )
+            logger.info(
+                "background_ingest.success ws=%s doc_id=%s filename=%s",
+                workspace_id,
+                doc_id,
+                filename,
+            )
 
         except Exception as exc:
             logger.exception(
@@ -365,6 +413,19 @@ class DocumentsService:
                         boundary_repo=boundary_repo,
                     )
 
+                    is_csv = getattr(doc, "source_format", "").lower() == "csv" or (file.filename or "").lower().endswith(".csv")
+                    t_name = Path(file.filename or "unknown").stem if is_csv else None
+                    store_ref = store if is_csv else None
+                    okf_stat, okf_e_count, okf_p_count = self._enrich_okf_snapshot_metadata(
+                        workspace_id=workspace_id,
+                        doc_id=doc.id,
+                        doc_ver=doc_ver,
+                        filename=file.filename or "unknown",
+                        chunks=doc.chunks,
+                        table_name=t_name,
+                        table_store=store_ref,
+                    )
+
                     snapshot = DocumentSnapshot(
                         workspace_id=workspace_id,
                         document_id=doc.id,
@@ -378,6 +439,9 @@ class DocumentsService:
                         created_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                         page_index_status=pi_status,
                         page_index_elements_count=pi_count,
+                        okf_status=okf_stat,
+                        okf_entities_count=okf_e_count,
+                        okf_properties_count=okf_p_count,
                     )
                     boundary_repo.save_document_snapshot(snapshot)
                 except Exception as snap_err:

@@ -90,6 +90,17 @@ from src.schemas.contracts.query import (
     SelectionPredicate,
     ServerExecutionPolicy,
 )
+from src.schemas.contracts.okf import (
+    OkfEntityRecord,
+    OkfLookupResult,
+    OkfManifest,
+    OkfPropertyAssertion,
+    compute_assertion_id,
+    compute_entity_id,
+    compute_idempotency_key,
+    normalize_entity_name,
+    normalize_property_key,
+)
 from src.schemas.contracts.verification import (
     SupportStatus,
     VerificationRecord,
@@ -177,4 +188,14 @@ __all__ = [
     "PageIndexDetail",
     "PageIndexSummary",
     "StructuralLookupResult",
+    # OKF Records and Helpers
+    "OkfEntityRecord",
+    "OkfPropertyAssertion",
+    "OkfManifest",
+    "OkfLookupResult",
+    "normalize_entity_name",
+    "normalize_property_key",
+    "compute_entity_id",
+    "compute_assertion_id",
+    "compute_idempotency_key",
 ]

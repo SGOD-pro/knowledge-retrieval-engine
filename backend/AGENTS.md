@@ -23,6 +23,11 @@ FastAPI service providing parsing, structural indexing, retrieval orchestration,
 | `src/services/retrieval/page_index_lookup.py` | Bounded concurrent structural lookup service with capacity retention and timeout handling |
 | `src/services/retrieval/page_index_retriever.py` | Synchronous and asynchronous PageIndex structural lookup adapter |
 | `src/services/retrieval/strategies/page_index.py` | PageIndex structural evidence strategy with targeted label extraction and snapshot chunk retrieval |
+| `src/schemas/contracts/okf.py` | Typed OKF entity records, property assertions, manifests, and lookup results |
+| `src/db/okf_repo.py` | Partitioned OKF fact repository for DynamoDB, SQLite, and in memory stores with GSI1 and GSI2 |
+| `src/ingestion/okf_builder.py` | Bounded OKF extraction with chunk grounding verification and curated table schemas |
+| `src/services/retrieval/okf_lookup.py` | Bounded concurrent OKF storage lookup service with capacity retention |
+| `src/services/retrieval/okf_retriever.py` | Authoritative OKF retriever enforcing workspace boundaries and deadlines |
 | `src/services/benchmark/` | Benchmark runner, S3 artifact store, and recoverable metric persistence |
 
 ## Commands
@@ -60,6 +65,8 @@ uv run pytest tests/test_contracts_and_identity.py
 * PageIndex lookup bounds admission capacity and retains worker capacity until background storage calls finish, distinguishing caller timeouts from storage cancellation and disabling SDK retries explicitly. Actual pipeline lookups route through this controller and bound total stage work across documents and labels with PAGEINDEX_STAGE_TIMEOUT_MS to prevent unbounded query delays. The stage deadline covers all storage work in the pipeline, including snapshot discovery, tombstone checks, manifest reads, and candidate chunk retrieval inside bounded workers, guaranteeing fail closed tombstone behavior and preventing late candidate publication.
 * PageIndex persistence measures complete summary sizing including cross references, definitions, sections, and metadata, rechecking after overflow transformation to guarantee persisted summaries remain within configured byte bounds.
 * PageIndex candidates are soft pooled into reciprocal rank fusion with a calibrated weight of 1.1 (divided by 2 for ambiguous definitions); candidate page scopes and chunk exclusions remain unconstrained so vector and BM25 discovery search across the full active workspace without hard gating.
+* OKF extraction operates as an enrichment pass; extraction failures or missing properties preserve baseline chunks and fall back cleanly per ADR-001.
+* OKF lookups enforce a 50ms caller deadline via OkfConcurrencyController with SDK retries disabled and storage worker capacity retention; candidate chunks are soft pooled into reciprocal rank fusion with a calibrated weight of 1.15 (divided by 2 for ambiguous entities or conflicting properties).
 * Benchmark accuracy comparison claims remain strictly blocked by validate_benchmark_comparison_preconditions until controlled comparison runs execute on ws_canonical_comparison_0004. Requiring ws_canonical_comparison_0004 is an additional guard, not proof of comparability or a replacement for manifest and configuration validation; post repair canonical evaluation remains pending, with zero measured accuracy improvement or live AWS readiness claimed.
 
 ## Related specs
@@ -67,6 +74,7 @@ uv run pytest tests/test_contracts_and_identity.py
 * [docs/specs/0002-workspace-authorization-and-boundary-isolation.md](../docs/specs/0002-workspace-authorization-and-boundary-isolation.md)
 * [docs/specs/0004-core-engine-walking-skeleton.md](../docs/specs/0004-core-engine-walking-skeleton.md)
 * [docs/specs/0005-pageindex-structural-retrieval.md](../docs/specs/0005-pageindex-structural-retrieval.md)
+* [docs/specs/0006-okf-integration.md](../docs/specs/0006-okf-integration.md)
 * [docs/TECHNICAL_SPEC.md](../docs/TECHNICAL_SPEC.md)
 * [docs/ARCHITECTURE.md](../docs/ARCHITECTURE.md)
 * [docs/REQUIREMENTS.md](../docs/REQUIREMENTS.md)

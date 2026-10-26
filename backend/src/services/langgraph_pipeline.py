@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import logging
 import re
@@ -13,7 +14,7 @@ from services.retrieval.bm25_retriever import BM25Retriever
 from services.retrieval.compressor import compress_chunks
 from services.retrieval.fidelity_check import CoverageError, check_fidelity
 from services.retrieval.graph_retriever import GraphRetriever
-from services.retrieval.okf_retriever import OKFRetriever
+from services.retrieval.okf_retriever import OKFRetriever, OkfRetriever, get_okf_retriever
 from services.retrieval.page_index_retriever import PageIndexRetriever
 from services.retrieval.planner import Plan, planner
 from services.retrieval.reranker import rerank
@@ -88,6 +89,13 @@ class PipelineState(TypedDict):
     structural_match_count: int
     page_index_latency_ms: float
     structural_target_state: str
+    okf_candidates: list[Chunk]
+    okf_candidate_ids: list[str]
+    okf_match_count: int
+    okf_latency_ms: float
+    okf_entity_state: str
+    okf_property_state: str
+    okf_execution_status: str
 
 
 # ---------------------------------------------------------------------------
@@ -100,11 +108,13 @@ def _rrf_merge(
     vector_chunks: list,
     graph_chunks: list | None = None,
     structural_chunks: list | None = None,
+    okf_chunks: list | None = None,
     k: int = 60,
     graph_weight: float = 1.2,
     structural_weight: float = 1.1,
+    okf_weight: float = 1.15,
 ) -> list:
-    """Reciprocal Rank Fusion with graph and structural PageIndex evidence signals.
+    """Reciprocal Rank Fusion with graph, structural PageIndex, and OKF factual signals.
     k=60 per Cormack et al. 2009.
     Returns deduplicated list of Chunk objects ordered by descending RRF score."""
     scores: dict[str, float] = {}
@@ -121,8 +131,15 @@ def _rrf_merge(
             by_id[chunk.id] = chunk
     if structural_chunks:
         for rank, chunk in enumerate(structural_chunks):
-            w = getattr(chunk, "structural_weight", None) or structural_weight
-            scores[chunk.id] = scores.get(chunk.id, 0.0) + (float(w) / (k + rank + 1))
+            chunk_w = getattr(chunk, "structural_weight", None)
+            w = float(chunk_w) if chunk_w is not None else structural_weight
+            scores[chunk.id] = scores.get(chunk.id, 0.0) + (w / (k + rank + 1))
+            by_id[chunk.id] = chunk
+    if okf_chunks:
+        for rank, chunk in enumerate(okf_chunks):
+            chunk_w = getattr(chunk, "okf_weight", None)
+            w = float(chunk_w) if chunk_w is not None else okf_weight
+            scores[chunk.id] = scores.get(chunk.id, 0.0) + (w / (k + rank + 1))
             by_id[chunk.id] = chunk
     return [by_id[cid] for cid in sorted(scores, key=scores.__getitem__, reverse=True)]
 
@@ -178,39 +195,127 @@ def route_query(state: PipelineState):
 
 
 def run_okf_router(state: PipelineState):
-    """Pre-retrieval OKF lookup (Component 2). Returns okf_seed_chunk_ids for BM25
-    soft boost. Failure is always silent — empty seed list = retrieval unchanged."""
-    from services.retrieval.planner import extract_entities
-
+    """Bounded OKF factual candidate retrieval (Spec 0006 Slice 2 / AC-9).
+    Queries workspace-partitioned OKF facts repository with caller deadline (50ms).
+    Yields candidate chunks for soft pooling into reciprocal rank fusion with
+    calibrated weight (1.15), dividing weight by 2 for ambiguous or conflicting facts.
+    Bypasses OKF lookups completely on fast-path queries (0 tokens, 0ms)."""
     t0 = time.perf_counter()
-    entities = extract_entities(state["query"])
-    props, seed_ids = [], []
-    if entities:
-        try:
-            retriever = OKFRetriever()
-            props = retriever.lookup(entities)
-            seed_ids = [
-                p.get("source_chunk_id") for p in props if p.get("source_chunk_id")
-            ]
-        except Exception as e:
-            logger.warning(
-                "okf_router.failed entity_count=%d error=%s", len(entities), e
-            )
+    existing = state.get("stage_timings", {})
+
+    # 1. Check feature toggle
+    if not getattr(settings, "OKF_ENABLED", True):
+        return {
+            "okf_candidates": [],
+            "okf_candidate_ids": [],
+            "okf_match_count": 0,
+            "okf_latency_ms": 0.0,
+            "okf_entity_state": "none",
+            "okf_property_state": "none",
+            "okf_execution_status": "disabled",
+            "okf_properties": [],
+            "okf_seed_chunk_ids": [],
+            "stage_timings": {**existing, "okf_router_ms": 0.0},
+        }
+
+    # 2. Fast-path query bypass (AC-9, Key Invariants)
+    plan = state.get("plan")
+    if plan and getattr(plan, "fast_path", False):
+        logger.info("okf_router.fast_path_bypass query=%s", state.get("query", "")[:50])
+        return {
+            "okf_candidates": [],
+            "okf_candidate_ids": [],
+            "okf_match_count": 0,
+            "okf_latency_ms": 0.0,
+            "okf_entity_state": "none",
+            "okf_property_state": "none",
+            "okf_execution_status": "fast_path_bypassed",
+            "okf_properties": [],
+            "okf_seed_chunk_ids": [],
+            "stage_timings": {**existing, "okf_router_ms": 0.0},
+        }
+
+    ws_id = state.get("workspace_id", "")
+    query = state.get("query", "")
+    if not ws_id or not query:
+        return {
+            "okf_candidates": [],
+            "okf_candidate_ids": [],
+            "okf_match_count": 0,
+            "okf_latency_ms": 0.0,
+            "okf_entity_state": "none",
+            "okf_property_state": "none",
+            "okf_execution_status": "empty_input",
+            "okf_properties": [],
+            "okf_seed_chunk_ids": [],
+            "stage_timings": {**existing, "okf_router_ms": 0.0},
+        }
+
+    # 3. Execute authoritative OKF lookup with deadline & concurrency bounds
+    from db.okf_repo import get_okf_repo
+    from db.workspace_boundary_repo import get_workspace_boundary_repo
+
+    okf_repo = get_okf_repo()
+    boundary_repo = get_workspace_boundary_repo()
+    chunk_repo = _get_repo()
+
+    retriever = OkfRetriever(
+        repository=okf_repo,
+        boundary_repo=boundary_repo,
+        chunk_repo=chunk_repo,
+    )
+
+    timeout_ms = int(getattr(settings, "OKF_TIMEOUT_MS", 50))
+    lookup_res = retriever.lookup_sync(
+        workspace_id=ws_id,
+        query=query,
+        deadline_ms=timeout_ms,
+    )
+
+    # 4. Calibrate RRF weight (AC-4, AC-5, AC-9)
+    # Default calibrated weight is 1.15; divided by 2 if ambiguous or conflicting
+    base_weight = float(getattr(settings, "OKF_FUSION_WEIGHT", 1.15))
+    is_divided = (lookup_res.entity_state == "ambiguous" or lookup_res.property_state == "conflicting")
+    calibrated_weight = (base_weight / 2.0) if is_divided else base_weight
+
+    hydrated_chunks = [
+        dataclasses.replace(c, okf_weight=calibrated_weight) if hasattr(c, "okf_weight") else c
+        for c in lookup_res.candidate_chunks
+    ]
+
     latency_ms = (time.perf_counter() - t0) * 1000.0
     logger.info(
-        "okf_router.latency_ms=%.2f okf_router.seed_count=%d", latency_ms, len(seed_ids)
+        "okf_router.latency_ms=%.2f match_count=%d entity_state=%s prop_state=%s weight=%.3f status=%s",
+        latency_ms,
+        len(hydrated_chunks),
+        lookup_res.entity_state,
+        lookup_res.property_state,
+        calibrated_weight,
+        lookup_res.execution_status,
     )
-    existing = state.get("stage_timings", {})
+
+    props_data = [
+        ass.model_dump() if hasattr(ass, "model_dump") else ass.__dict__
+        for ass in lookup_res.matched_assertions
+    ]
+    candidate_ids = [str(c.id) for c in hydrated_chunks] or list(lookup_res.candidate_chunk_ids)
+
     return {
-        "okf_properties": props,
-        "okf_seed_chunk_ids": seed_ids,
+        "okf_candidates": hydrated_chunks,
+        "okf_candidate_ids": candidate_ids,
+        "okf_match_count": len(hydrated_chunks),
+        "okf_latency_ms": lookup_res.latency_ms,
+        "okf_entity_state": lookup_res.entity_state,
+        "okf_property_state": lookup_res.property_state,
+        "okf_execution_status": lookup_res.execution_status,
+        "okf_properties": props_data,
+        "okf_seed_chunk_ids": candidate_ids,
         "stage_timings": {**existing, "okf_router_ms": latency_ms},
     }
 
 
 def run_bm25(state: PipelineState):
-    """BM25 retrieval (Component 1 + 2). top_k=40 for union design.
-    Soft-boosts OKF-matched chunks by OKF_BOOST before returning."""
+    """BM25 retrieval (Component 1 + 2). top_k=40 for union design."""
     t0 = time.perf_counter()
     repo = _get_repo()
     from services.retrieval.bm25_retriever import get_cached_chunks
@@ -248,13 +353,6 @@ def run_bm25(state: PipelineState):
         results = combined_results
     else:
         results = retriever.search(state["query"], all_chunks, top_k=40)
-
-    # OKF soft-boost — any chunk whose id appears in okf_seed_chunk_ids gets
-    # its BM25 score multiplied by OKF_BOOST. This is a pre-reranker signal only.
-    seed_ids = set(state.get("okf_seed_chunk_ids", []))
-    if seed_ids:
-        results = [(c, s * OKF_BOOST if c.id in seed_ids else s) for c, s in results]
-        results.sort(key=lambda x: x[1], reverse=True)
 
     chunks = [c for c, _ in results]
     avg_score = sum(s for _, s in results) / max(1, len(results))
@@ -303,6 +401,13 @@ def run_page_index(state: PipelineState):
             "structural_match_count": 0,
             "page_index_latency_ms": 0.0,
             "structural_target_state": "none",
+            "okf_candidates": [],
+            "okf_candidate_ids": [],
+            "okf_match_count": 0,
+            "okf_latency_ms": 0.0,
+            "okf_entity_state": "none",
+            "okf_property_state": "none",
+            "okf_execution_status": "none",
             "candidate_page_ids": None,
             "candidate_chunk_ids": None,
             "candidate_page_scopes": None,
@@ -578,23 +683,27 @@ def run_graph(state: PipelineState):
 
 
 def run_reranker(state: PipelineState):
-    """RRF merge of bm25_candidates + candidate_chunks (vector) + graph_chunks + structural_candidates, then neural rerank.
+    """RRF merge of bm25_candidates + candidate_chunks (vector) + graph_chunks + structural_candidates + okf_candidates, then neural rerank.
     Tracks raw retrieval candidates per stage for honest evaluation."""
     t0 = time.perf_counter()
     bm25 = state.get("bm25_candidates", [])
     vector = state.get("candidate_chunks", [])
     graph = state.get("graph_chunks", [])
     structural = state.get("structural_candidates", [])
+    okf_candidates = state.get("okf_candidates", [])
 
     structural_weight = float(getattr(settings, "PAGEINDEX_STRUCTURAL_WEIGHT", 1.1))
+    okf_weight = float(getattr(settings, "OKF_FUSION_WEIGHT", 1.15))
     merged = _rrf_merge(
         bm25,
         vector,
         graph_chunks=graph,
         structural_chunks=structural,
+        okf_chunks=okf_candidates,
         k=60,
         graph_weight=1.2,
         structural_weight=structural_weight,
+        okf_weight=okf_weight,
     )
     if not merged:
         logger.warning("run_reranker: no chunks to rerank — returning empty")
@@ -604,8 +713,18 @@ def run_reranker(state: PipelineState):
             "vector": [],
             "graph": [],
             "structural": [],
+            "okf": [],
             "rrf": [],
             "reranked": [],
+            "structural_candidate_ids": [],
+            "structural_match_count": 0,
+            "page_index_latency_ms": 0.0,
+            "structural_target_state": "none",
+            "okf_candidate_ids": [],
+            "okf_match_count": 0,
+            "okf_latency_ms": 0.0,
+            "okf_entity_state": "none",
+            "okf_property_state": "none",
         })
         return {"top_chunks": [], "retrieval_candidates": cands, "reranker_mode": "remote_success"}
 
@@ -629,12 +748,18 @@ def run_reranker(state: PipelineState):
         "vector": [str(c.id) for c in vector],
         "graph": [str(c.id) for c in graph],
         "structural": [str(c.id) for c in structural],
+        "okf": [str(c.id) for c in okf_candidates],
         "rrf": [str(c.id) for c in merged],
         "reranked": [str(c.id) for c in top_chunks],
         "structural_candidate_ids": [str(c.id) for c in structural],
         "structural_match_count": len(structural),
         "page_index_latency_ms": state.get("page_index_latency_ms", 0.0),
         "structural_target_state": state.get("structural_target_state", "none"),
+        "okf_candidate_ids": [str(c.id) for c in okf_candidates],
+        "okf_match_count": len(okf_candidates),
+        "okf_latency_ms": state.get("okf_latency_ms", 0.0),
+        "okf_entity_state": state.get("okf_entity_state", "none"),
+        "okf_property_state": state.get("okf_property_state", "none"),
     }
 
     from services.retrieval.evidence_contract import evidence_item_from_chunk
@@ -643,7 +768,9 @@ def run_reranker(state: PipelineState):
     for c in top_chunks:
         strat = getattr(c, "strategy", None) or (c.metadata.get("strategy") if isinstance(getattr(c, "metadata", None), dict) else None)
         if not strat:
-            if c in structural:
+            if c in okf_candidates:
+                strat = "okf"
+            elif c in structural:
                 strat = "page_index"
             elif c in vector:
                 strat = "vector_rerank"
@@ -1431,6 +1558,13 @@ class Pipeline:
             "structural_match_count": 0,
             "page_index_latency_ms": 0.0,
             "structural_target_state": "none",
+            "okf_candidates": [],
+            "okf_candidate_ids": [],
+            "okf_match_count": 0,
+            "okf_latency_ms": 0.0,
+            "okf_entity_state": "none",
+            "okf_property_state": "none",
+            "okf_execution_status": "none",
         }
 
         final_state = app.invoke(initial_state)
@@ -1481,6 +1615,12 @@ class Pipeline:
                 self.structural_match_count = state.get("structural_match_count", 0)
                 self.page_index_latency_ms = state.get("page_index_latency_ms", 0.0)
                 self.structural_target_state = state.get("structural_target_state", "none")
+                self.okf_candidates = state.get("okf_candidates", [])
+                self.okf_candidate_ids = state.get("okf_candidate_ids", [])
+                self.okf_match_count = state.get("okf_match_count", 0)
+                self.okf_latency_ms = state.get("okf_latency_ms", 0.0)
+                self.okf_entity_state = state.get("okf_entity_state", "none")
+                self.okf_property_state = state.get("okf_property_state", "none")
                 self.query_embedding = state.get("query_embedding")
                 self.query_embedding_provenance = state.get("query_embedding_provenance")
 

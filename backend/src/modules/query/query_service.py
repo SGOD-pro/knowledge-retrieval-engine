@@ -281,6 +281,16 @@ class QueryService:
             retrieval_candidates["page_index_latency_ms"] = getattr(response, "page_index_latency_ms", 0.0)
         if "structural_target_state" not in retrieval_candidates:
             retrieval_candidates["structural_target_state"] = getattr(response, "structural_target_state", "none")
+        if "okf_candidate_ids" not in retrieval_candidates:
+            retrieval_candidates["okf_candidate_ids"] = getattr(response, "okf_candidate_ids", [])
+        if "okf_match_count" not in retrieval_candidates:
+            retrieval_candidates["okf_match_count"] = getattr(response, "okf_match_count", 0)
+        if "okf_latency_ms" not in retrieval_candidates:
+            retrieval_candidates["okf_latency_ms"] = getattr(response, "okf_latency_ms", 0.0)
+        if "okf_entity_state" not in retrieval_candidates:
+            retrieval_candidates["okf_entity_state"] = getattr(response, "okf_entity_state", "none")
+        if "okf_property_state" not in retrieval_candidates:
+            retrieval_candidates["okf_property_state"] = getattr(response, "okf_property_state", "none")
         reranker_mode = getattr(response, "reranker_mode", "remote_success")
 
         logger.info(
@@ -317,6 +327,11 @@ class QueryService:
             "structural_match_count": retrieval_candidates.get("structural_match_count", 0),
             "page_index_latency_ms": retrieval_candidates.get("page_index_latency_ms", 0.0),
             "structural_target_state": retrieval_candidates.get("structural_target_state", "none"),
+            "okf_candidate_ids": retrieval_candidates.get("okf_candidate_ids", []),
+            "okf_match_count": retrieval_candidates.get("okf_match_count", 0),
+            "okf_latency_ms": retrieval_candidates.get("okf_latency_ms", 0.0),
+            "okf_entity_state": retrieval_candidates.get("okf_entity_state", "none"),
+            "okf_property_state": retrieval_candidates.get("okf_property_state", "none"),
             "reranker_mode": reranker_mode,
             "bedrock_embedding_calls": req_telemetry.bedrock_embedding_calls,
             "bge_lambda_calls": req_telemetry.bge_lambda_calls,

@@ -1,7 +1,7 @@
 # 0006. Bounded Open Knowledge Framework (OKF) Integration
 
 **Date**: 2026-10-25
-**Status**: Proposed
+**Status**: Accepted
 
 ## Summary
 
@@ -348,20 +348,20 @@ class OkfRepository:
 Following the Tracer Bullet build approach, this feature is implemented across two vertical slices:
 
 ### Slice 1: Extraction, Grounding Validation, Partitioned Storage, and Isolated Lookup
-- [ ] 1. **Typed OKF Schema and Contracts**: Define `OkfEntityRecord`, `OkfPropertyAssertion`, `OkfManifest`, and `OkfLookupResult` contracts in `src/schemas/contracts/okf.py` with stable assertion identities and document scoped entity IDs, satisfying **AC-1**, **AC-4**, **AC-5**.
-- [ ] 2. **Partitioned Storage Repository**: Implement `OkfRepository` supporting partitioned DynamoDB and SQLite/memory stores with Main PK/SK, GSI1 (entity resolution), and GSI2 (document readiness and scoping), with exact query methods and bounded limits, satisfying **AC-6**, **AC-10**.
-- [ ] 3. **Curated Table and Schema Extraction**: Implement deterministic schema and header assertion extraction for tabular CSV files in `OkfBuilder`, mapping column names, data types, and table entities to TableStore locators with 0 model tokens, satisfying **AC-1**.
-- [ ] 4. **Bounded Ingestion Extraction with Grounding Verification**: Implement Bedrock completion extraction for text PDFs in `OkfBuilder` with hard token caps (4000 input, 1200 output), call limits (max 2), provider deadlines, idempotency replay, and verbatim chunk grounding validation that rejects unsupported assertions, satisfying **AC-2**, **AC-3**.
-- [ ] 5. **ADR-001 Baseline Publication Decoupling**: Wire OKF extraction as a decoupled enrichment pass in `DocumentsService`, updating `DocumentSnapshot` metadata (`okf_status`, `okf_entities_count`, `okf_properties_count`) while guaranteeing baseline snapshot creation never fails if OKF extraction fails or times out, satisfying **AC-1**, **AC-3**, **AC-11**.
-- [ ] 6. **Boundary and Tombstone Enforcement**: Enforce workspace partition key isolation and active tombstone filtering inside worker tasks, dropping assertions from deleted sources without storage errors, satisfying **AC-6**, **AC-7**.
-- [ ] 7. **Deadline Enforced Lookup and Concurrency Controls**: Implement `OkfConcurrencyController` and `OkfRetriever` with 50ms total caller deadline, disabling SDK retries, bounding admission queue capacity (4 workers, 8 queue limit), retaining worker capacity until underlying storage completes, and hydrating chunk objects inside the worker task, satisfying **AC-8**.
-- [ ] 8. **Slice 1 Regressions and Grounding Tests**: Add unit tests verifying schema validation, curated CSV extraction, grounding rejection, token budget enforcement, ADR-001 fail open ingestion resilience, stable assertion identity preservation, same name ambiguity, conflicting value retention, tombstone filtering, and timeout handling, satisfying **AC-1**, **AC-2**, **AC-3**, **AC-4**, **AC-5**, **AC-6**, **AC-7**, **AC-8**.
+- [x] 1. **Typed OKF Schema and Contracts**: Define `OkfEntityRecord`, `OkfPropertyAssertion`, `OkfManifest`, and `OkfLookupResult` contracts in `src/schemas/contracts/okf.py` with stable assertion identities and document scoped entity IDs, satisfying **AC-1**, **AC-4**, **AC-5**.
+- [x] 2. **Partitioned Storage Repository**: Implement `OkfRepository` supporting partitioned DynamoDB and SQLite/memory stores with Main PK/SK, GSI1 (entity resolution), and GSI2 (document readiness and scoping), with exact query methods and bounded limits, satisfying **AC-6**, **AC-10**.
+- [x] 3. **Curated Table and Schema Extraction**: Implement deterministic schema and header assertion extraction for tabular CSV files in `OkfBuilder`, mapping column names, data types, and table entities to TableStore locators with 0 model tokens, satisfying **AC-1**.
+- [x] 4. **Bounded Ingestion Extraction with Grounding Verification**: Implement Bedrock completion extraction for text PDFs in `OkfBuilder` with hard token caps (4000 input, 1200 output), call limits (max 2), provider deadlines, idempotency replay, and verbatim chunk grounding validation that rejects unsupported assertions, satisfying **AC-2**, **AC-3**.
+- [x] 5. **ADR-001 Baseline Publication Decoupling**: Wire OKF extraction as a decoupled enrichment pass in `DocumentsService`, updating `DocumentSnapshot` metadata (`okf_status`, `okf_entities_count`, `okf_properties_count`) while guaranteeing baseline snapshot creation never fails if OKF extraction fails or times out, satisfying **AC-1**, **AC-3**, **AC-11**.
+- [x] 6. **Boundary and Tombstone Enforcement**: Enforce workspace partition key isolation and active tombstone filtering inside worker tasks, dropping assertions from deleted sources without storage errors, satisfying **AC-6**, **AC-7**.
+- [x] 7. **Deadline Enforced Lookup and Concurrency Controls**: Implement `OkfConcurrencyController` and `OkfRetriever` with 50ms total caller deadline, disabling SDK retries, bounding admission queue capacity (4 workers, 8 queue limit), retaining worker capacity until underlying storage completes, and hydrating chunk objects inside the worker task, satisfying **AC-8**.
+- [x] 8. **Slice 1 Regressions and Grounding Tests**: Add unit tests verifying schema validation, curated CSV extraction, grounding rejection, token budget enforcement, ADR-001 fail open ingestion resilience, stable assertion identity preservation, same name ambiguity, conflicting value retention, tombstone filtering, and timeout handling, satisfying **AC-1**, **AC-2**, **AC-3**, **AC-4**, **AC-5**, **AC-6**, **AC-7**, **AC-8**.
 
 ### Slice 2: Candidate Fusion, Pipeline Wiring, and Offline Ablation
-- [ ] 9. **Reciprocal Rank Fusion Pooling and Ambiguity Handling**: Wire OKF property lookups into `langgraph_pipeline.py:run_okf_router`, remove legacy pre BM25 `OKF_BOOST` in `run_bm25`, bypass OKF on fast path queries, pool candidate chunks into reciprocal rank fusion with calibrated weight (1.15), and divide weights on ambiguous or conflicting properties, satisfying **AC-4**, **AC-5**, **AC-9**.
-- [ ] 10. **Pipeline Telemetry Exposure**: Expose `okf_candidate_ids`, `okf_latency_ms`, and `okf_match_count` in `QueryResponse.retrieval_candidates` trace, satisfying **AC-11**.
-- [ ] 11. **Offline Ablation Suite**: Compare candidate page recall, precision, and latency with OKF enabled versus disabled across canonical evaluation documents, verifying counterexample resilience where an incorrect entity match preserves the true answer page, satisfying **AC-9**, **AC-12**.
-- [ ] 12. **Benchmark Comparison Barrier**: Enforce comparator rules ensuring no benchmark accuracy claims are made until controlled canonical comparison run executes on `ws_canonical_comparison_0004`, satisfying **AC-12**.
+- [x] 9. **Reciprocal Rank Fusion Pooling and Ambiguity Handling**: Wire OKF property lookups into `langgraph_pipeline.py:run_okf_router`, remove legacy pre BM25 `OKF_BOOST` in `run_bm25`, bypass OKF on fast path queries, pool candidate chunks into reciprocal rank fusion with calibrated weight (1.15), and divide weights on ambiguous or conflicting properties, satisfying **AC-4**, **AC-5**, **AC-9**.
+- [x] 10. **Pipeline Telemetry Exposure**: Expose `okf_candidate_ids`, `okf_latency_ms`, and `okf_match_count` in `QueryResponse.retrieval_candidates` trace, satisfying **AC-11**.
+- [x] 11. **Offline Ablation Suite**: Compare candidate page recall, precision, and latency with OKF enabled versus disabled across canonical evaluation documents, verifying counterexample resilience where an incorrect entity match preserves the true answer page, satisfying **AC-9**, **AC-12**.
+- [x] 12. **Benchmark Comparison Barrier**: Enforce comparator rules ensuring no benchmark accuracy claims are made until controlled canonical comparison run executes on `ws_canonical_comparison_0004`, satisfying **AC-12**.
 
 ## Migration plan
 

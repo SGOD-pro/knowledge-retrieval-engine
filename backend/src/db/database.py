@@ -126,3 +126,58 @@ class CloudRepository(
             )
         except Exception as e:
             logger.debug("DynamoDB table creation skipped: %s", e)
+
+    # ── OKF Facade Delegations ───────────────────────────────────────
+    def resolve_entities(self, workspace_id: str, candidate_names: Any, limit: int = 20):
+        from db.okf_repo import get_okf_repo
+        return get_okf_repo().resolve_entities(workspace_id, candidate_names, limit=limit)
+
+    def get_assertions_for_entity(
+        self,
+        workspace_id: str,
+        entity_id: str,
+        property_key: str | None = None,
+        active_document_ids: Any = None,
+        limit: int = 20,
+    ):
+        from db.okf_repo import get_okf_repo
+        return get_okf_repo().get_assertions_for_entity(
+            workspace_id,
+            entity_id,
+            property_key=property_key,
+            active_document_ids=active_document_ids,
+            limit=limit,
+        )
+
+    def save_manifest(self, workspace_id: str, manifest: Any = None) -> None:
+        from db.okf_repo import get_okf_repo
+        if manifest is None and not isinstance(workspace_id, str):
+            manifest = workspace_id
+            workspace_id = manifest.workspace_id
+        return get_okf_repo().save_manifest(workspace_id, manifest)
+
+    def get_manifest(self, workspace_id: str, document_id: str):
+        from db.okf_repo import get_okf_repo
+        return get_okf_repo().get_manifest(workspace_id, document_id)
+
+    def has_ready_okf(self, workspace_id: str, document_id: str) -> bool:
+        from db.okf_repo import get_okf_repo
+        return get_okf_repo().has_ready_okf(workspace_id, document_id)
+
+    def get_okf_properties(self, concept_id: str) -> list[dict[str, Any]]:
+        from db.okf_repo import get_okf_repo
+        repo = get_okf_repo()
+        if hasattr(repo, "get_okf_properties"):
+            return repo.get_okf_properties(concept_id)
+        assertions = repo.get_assertions_for_entity("default", concept_id)
+        return [
+            {
+                "concept": a.entity_name,
+                "property_name": a.property_key,
+                "property_value": a.property_value,
+                "source_chunk_id": a.source_chunk_id or "",
+                "confidence": 1.0,
+            }
+            for a in assertions
+        ]
+

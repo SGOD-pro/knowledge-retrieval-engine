@@ -79,39 +79,47 @@ def generate_completion(
         }
         q_tokens = [w.lower() for w in re.findall(r"\w+", query_part) if len(w) > 2 and w.lower() not in stop_words]
 
-        # Extract non-empty candidate clauses from context
+        # Extract non-empty candidate clauses from context along with originating chunk_id
         candidates = []
+        current_cid = chunk_ids[0] if chunk_ids else None
         for line in context_part.splitlines():
+            m_cid = re.match(r"^\[([a-zA-Z0-9_:.-]+)\]", line)
+            if m_cid:
+                current_cid = m_cid.group(1)
             clean = re.sub(r"^\[[a-zA-Z0-9_:.-]+\]\s*", "", line).strip()
             if clean and len(clean) > 5 and not clean.startswith("["):
                 for part in re.split(r"(?<=[.!?])\s+", clean):
                     p = part.strip()
                     if len(p) > 5:
-                        candidates.append(p)
+                        candidates.append((p, current_cid))
 
         factual_answer = "Verified factual answer based directly on context."
+        winning_cid = chunk_ids[0] if chunk_ids else None
         if candidates:
             ranked = []
-            for cand in candidates:
+            for cand, cand_cid in candidates:
                 cand_lower = cand.lower()
                 cand_tokens = set(re.findall(r"\w+", cand_lower))
                 score = len(set(q_tokens) & cand_tokens)
                 for tok in q_tokens:
                     if re.search(rf"\b{tok}\s*:", cand, re.IGNORECASE):
                         score += 5
-                ranked.append((score, len(cand), cand))
+                ranked.append((score, len(cand), cand, cand_cid))
 
             ranked.sort(key=lambda x: (x[0], x[1]), reverse=True)
             if ranked and ranked[0][0] > 0:
                 factual_answer = ranked[0][2]
+                winning_cid = ranked[0][3]
             else:
-                factual_answer = candidates[0]
+                factual_answer = candidates[0][0]
+                winning_cid = candidates[0][1]
         elif not chunk_ids:
             factual_answer = "NOT_FOUND"
 
+        cited = [winning_cid] if winning_cid else (chunk_ids[:1] if chunk_ids else [])
         ans = {
             "answer": factual_answer,
-            "citations": chunk_ids[:1] if factual_answer != "NOT_FOUND" else [],
+            "citations": cited if factual_answer != "NOT_FOUND" else [],
         }
         return json.dumps(ans), {"input_tokens": 10, "output_tokens": 10}
 
