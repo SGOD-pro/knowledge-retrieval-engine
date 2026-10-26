@@ -142,6 +142,54 @@ class OkfRepositoryBase(Protocol):
         ...
 
 
+def _anchor_entity_to_manifest(
+    ent: OkfEntityRecord,
+    workspace_id: str,
+    document_id: str,
+    document_version: str,
+) -> OkfEntityRecord:
+    if ent.document_id != document_id or ent.workspace_id != workspace_id or ent.document_version != document_version:
+        return OkfEntityRecord(
+            workspace_id=workspace_id,
+            entity_id=ent.entity_id,
+            entity_name=ent.entity_name,
+            normalized_name=ent.normalized_name,
+            entity_type=ent.entity_type,
+            document_id=document_id,
+            document_version=document_version,
+            created_at=ent.created_at,
+        )
+    return ent
+
+
+def _anchor_assertion_to_manifest(
+    ass: OkfPropertyAssertion,
+    workspace_id: str,
+    document_id: str,
+    document_version: str,
+) -> OkfPropertyAssertion:
+    if ass.document_id != document_id or ass.workspace_id != workspace_id or ass.document_version != document_version:
+        return OkfPropertyAssertion(
+            assertion_id=ass.assertion_id,
+            workspace_id=workspace_id,
+            entity_id=ass.entity_id,
+            entity_name=ass.entity_name,
+            property_key=ass.property_key,
+            property_value=ass.property_value,
+            value_type=ass.value_type,
+            source_chunk_id=ass.source_chunk_id,
+            document_id=document_id,
+            document_version=document_version,
+            page_number=ass.page_number,
+            table_name=ass.table_name,
+            column_name=ass.column_name,
+            confidence_score=ass.confidence_score,
+            validation_status=ass.validation_status,
+            created_at=ass.created_at,
+        )
+    return ass
+
+
 class InMemoryOkfRepository:
     """Thread safe in memory OKF repository strictly for isolated test suites."""
 
@@ -161,11 +209,13 @@ class InMemoryOkfRepository:
         with self._lock:
             # Save manifest
             self._manifests[(workspace_id, manifest.document_id, manifest.document_version)] = manifest
-            # Save entities
+            # Save entities anchored to manifest scope
             for ent in manifest.entities:
+                ent = _anchor_entity_to_manifest(ent, workspace_id, manifest.document_id, manifest.document_version)
                 self._entities[(workspace_id, ent.entity_id, ent.document_id, ent.document_version)] = ent
-            # Save assertions
+            # Save assertions anchored to manifest scope
             for ass in manifest.assertions:
+                ass = _anchor_assertion_to_manifest(ass, workspace_id, manifest.document_id, manifest.document_version)
                 self._assertions[(workspace_id, ass.entity_id, ass.assertion_id)] = ass
 
     def resolve_entities(
@@ -370,6 +420,7 @@ class SQLiteOkfRepository:
 
                 # 2. Save entity records
                 for ent in manifest.entities:
+                    ent = _anchor_entity_to_manifest(ent, workspace_id, manifest.document_id, manifest.document_version)
                     ent_pk = f"WORKSPACE#{workspace_id}"
                     ent_sk = f"ENTITY#{ent.entity_id}#DOC#{ent.document_id}#VER#{ent.document_version}"
                     ent_gsi1_pk = ent_pk
@@ -393,6 +444,7 @@ class SQLiteOkfRepository:
 
                 # 3. Save assertion records
                 for ass in manifest.assertions:
+                    ass = _anchor_assertion_to_manifest(ass, workspace_id, manifest.document_id, manifest.document_version)
                     ass_pk = f"WORKSPACE#{workspace_id}"
                     ass_sk = f"ENTITY#{ass.entity_id}#ASSERTION#{ass.assertion_id}"
                     ass_gsi1_pk = ass_pk
@@ -664,6 +716,7 @@ class DynamoDBOkfRepository:
 
                 # Entities
                 for ent in manifest.entities:
+                    ent = _anchor_entity_to_manifest(ent, workspace_id, manifest.document_id, manifest.document_version)
                     batch.put_item(
                         Item={
                             "PK": f"WORKSPACE#{workspace_id}",
@@ -685,6 +738,7 @@ class DynamoDBOkfRepository:
 
                 # Assertions
                 for ass in manifest.assertions:
+                    ass = _anchor_assertion_to_manifest(ass, workspace_id, manifest.document_id, manifest.document_version)
                     batch.put_item(
                         Item={
                             "PK": f"WORKSPACE#{workspace_id}",

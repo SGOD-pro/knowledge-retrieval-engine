@@ -21,7 +21,7 @@ import pytest
 
 from config import settings
 from db.database import CloudRepository
-from db.okf_repo import InMemoryOkfRepository, get_okf_repo
+from db.okf_repo import InMemoryOkfRepository, SQLiteOkfRepository, get_okf_repo
 from db.workspace_boundary_repo import (
     DocumentSnapshot,
     InMemoryWorkspaceBoundaryRepository,
@@ -31,6 +31,8 @@ from ingestion.embed_service import _deterministic_vector, embed_fast_local
 from ingestion.okf_builder import (
     DocumentExtractionBudget,
     OkfBuilder,
+    _EXTRACTION_BUDGETS,
+    get_or_create_document_budget,
     is_value_grounded,
     reset_budget_ledger,
     validate_assertion_grounding,
@@ -623,3 +625,408 @@ def test_baseline_readiness_published_independently_on_okf_failure():
     assert snapshot is not None
     assert snapshot.okf_status == "failed"
     assert snapshot.persisted_rows >= 0
+
+
+# ==============================================================================
+# 5. Complete Entity-Property-Value Relational Grounding (AC-2)
+# ==============================================================================
+
+
+def test_complete_entity_property_value_grounding_reproducer():
+    """Reproducer: 'Acme reported revenue of 100.'
+    
+    revenue=100 passes; employee_count=100 fails.
+    Rejects unsupported relationships without relying on value/entity co-occurrence alone.
+    """
+    text = "Acme reported revenue of 100."
+
+    # 1. revenue=100 is supported by entity, property, and value
+    ok_rev, reason_rev = validate_assertion_grounding(
+        entity_name="Acme",
+        property_key="revenue",
+        property_value="100",
+        chunk_text=text,
+    )
+    assert ok_rev is True
+    assert reason_rev == "verified"
+
+    # 2. employee_count=100 must fail (property relationship unsupported in text)
+    ok_emp, reason_emp = validate_assertion_grounding(
+        entity_name="Acme",
+        property_key="employee_count",
+        property_value="100",
+        chunk_text=text,
+    )
+    assert ok_emp is False
+    assert reason_emp == "unsupported_property"
+
+    # 3. Multi-sentence test: Value 100 is in the revenue sentence, not the employee sentence
+    multi_sentence_text = "Acme has 500 employees. Acme reported revenue of 100."
+    ok_multi_rev, reason_multi_rev = validate_assertion_grounding(
+        entity_name="Acme",
+        property_key="revenue",
+        property_value="100",
+        chunk_text=multi_sentence_text,
+    )
+    assert ok_multi_rev is True
+    assert reason_multi_rev == "verified"
+
+    ok_multi_emp500, reason_multi_emp500 = validate_assertion_grounding(
+        entity_name="Acme",
+        property_key="employee_count",
+        property_value="500",
+        chunk_text=multi_sentence_text,
+    )
+    assert ok_multi_emp500 is True
+    assert reason_multi_emp500 == "verified"
+
+    # Attributing employee_count=100 must fail because 100 is tied to revenue, not employees
+    ok_multi_emp100, reason_multi_emp100 = validate_assertion_grounding(
+        entity_name="Acme",
+        property_key="employee_count",
+        property_value="100",
+        chunk_text=multi_sentence_text,
+    )
+    assert ok_multi_emp100 is False
+    assert reason_multi_emp100 == "unsupported_relationship"
+
+
+# ==============================================================================
+# 6. Fail-Closed Optional OKF Retrieval on Missing/Unavailable Metadata
+# ==============================================================================
+
+
+def test_retriever_fails_closed_when_snapshot_lookup_raises_error():
+    """Verify that when snapshot discovery raises an error, retrieval fails closed to baseline."""
+    repo = InMemoryOkfRepository()
+    boundary_repo = InMemoryWorkspaceBoundaryRepository()
+    retriever = OkfRetriever(repository=repo, boundary_repo=boundary_repo)
+
+    ws_id = "ws_fail_closed_err"
+    # Seed an entity and ready manifest
+    now = "2026-10-26T12:00:00Z"
+    ent = OkfEntityRecord(
+        workspace_id=ws_id,
+        entity_id="e_acme",
+        entity_name="Acme Corp",
+        normalized_name="acme corp",
+        entity_type="organization",
+        document_id="doc_fc",
+        document_version="v1",
+        created_at=now,
+    )
+    ass = OkfPropertyAssertion(
+        assertion_id="ass_1",
+        workspace_id=ws_id,
+        entity_id="e_acme",
+        entity_name="Acme Corp",
+        property_key="revenue",
+        property_value="$10M",
+        value_type="string",
+        source_chunk_id="chk_1",
+        document_id="doc_fc",
+        document_version="v1",
+        created_at=now,
+    )
+    repo.save_manifest(ws_id, OkfManifest(
+        workspace_id=ws_id,
+        document_id="doc_fc",
+        document_version="v1",
+        entities=(ent,),
+        assertions=(ass,),
+        status="ready",
+        idempotency_key="k_fc",
+        created_at=now,
+    ))
+
+    # Mock list_document_snapshots to throw an unexpected exception
+    with patch.object(boundary_repo, "list_document_snapshots", side_effect=RuntimeError("DynamoDB boundary unavailable")):
+        res = retriever.lookup_sync(
+            workspace_id=ws_id,
+            query="What is Acme Corp revenue?",
+            target_entities=["Acme Corp"],
+        )
+
+    # Must fail closed: entity_state="none", property_state="none", no assertions
+    assert res.entity_state == "none"
+    assert res.property_state == "none"
+    assert len(res.matched_assertions) == 0
+    assert len(res.candidate_chunk_ids) == 0
+
+
+def test_retriever_fails_closed_when_manifest_metadata_is_missing():
+    """Verify that entities without a ready manifest in okf_repo are rejected (missing metadata fails closed)."""
+    repo = InMemoryOkfRepository()
+    retriever = OkfRetriever(repository=repo)
+
+    ws_id = "ws_missing_metadata"
+    now = "2026-10-26T12:00:00Z"
+    ent = OkfEntityRecord(
+        workspace_id=ws_id,
+        entity_id="e_orphaned",
+        entity_name="Orphaned Entity",
+        normalized_name="orphaned entity",
+        entity_type="organization",
+        document_id="doc_orphaned",
+        document_version="v1",
+        created_at=now,
+    )
+    ass = OkfPropertyAssertion(
+        assertion_id="ass_orphaned",
+        workspace_id=ws_id,
+        entity_id="e_orphaned",
+        entity_name="Orphaned Entity",
+        property_key="revenue",
+        property_value="$99M",
+        value_type="string",
+        source_chunk_id="chk_orphaned",
+        document_id="doc_orphaned",
+        document_version="v1",
+        created_at=now,
+    )
+    # Save entity and assertion directly without creating a manifest in okf_repo
+    repo._entities[(ws_id, ent.entity_id, ent.document_id, ent.document_version)] = ent
+    repo._assertions[(ws_id, ass.entity_id, ass.assertion_id)] = ass
+
+    res = retriever.lookup_sync(
+        workspace_id=ws_id,
+        query="What is Orphaned Entity revenue?",
+        target_entities=["Orphaned Entity"],
+    )
+
+    # Missing manifest must reject the unverified assertion
+    assert res.entity_state == "none"
+    assert res.property_state == "none"
+    assert len(res.matched_assertions) == 0
+
+
+# ==============================================================================
+# 7. Complete Upfront Budget Reservation & Shared Deadline Across Retries
+# ==============================================================================
+
+
+def test_upfront_budget_reservation_and_persistence_across_replays():
+    """Verify complete prompt/output budget reservation, shared deadline across retries, and attempt persistence."""
+    # 1. Test upfront budget reservation limits
+    budget = DocumentExtractionBudget(
+        workspace_id="ws_b",
+        document_id="doc_b",
+        document_version="v1",
+        max_calls=2,
+        max_input_tokens=4000,
+        max_output_tokens=1200,
+        max_elapsed_s=10.0,
+    )
+
+    # Reserve call 1 (2500 input tokens, 600 output tokens) -> fits
+    assert budget.reserve_call(prompt_tokens=2500, max_output_tokens=600) is True
+    assert budget.calls_made == 1
+    assert budget.input_tokens_used == 2500
+    assert budget.output_tokens_used == 600
+
+    # Reserve call 2 (2000 input tokens) -> would exceed 4000 max_input_tokens -> rejected upfront
+    assert budget.reserve_call(prompt_tokens=2000, max_output_tokens=600) is False
+    assert budget.exhausted is True
+    assert "input_token_limit_exceeded" in (budget.exhaustion_reason or "")
+
+    # 2. Shared document deadline across retry delays
+    repo = InMemoryOkfRepository()
+    mock_bedrock = MagicMock()
+    # Simulate throttling error
+    mock_bedrock.converse.side_effect = Exception("ThrottlingException: HTTP 429 Too Many Requests")
+
+    ch = Chunk(
+        id="doc_deadline:c1",
+        document_id="doc_deadline",
+        source_format="pdf",
+        text="Acme Corp reported $15M in revenue.",
+        element_type="paragraph",
+        page_number=1,
+    )
+
+    builder = OkfBuilder(repo=repo, bedrock_client=mock_bedrock)
+
+    # Create budget with only 0.8s remaining (started 9.2s ago with 10.0s deadline)
+    budget_tight = DocumentExtractionBudget(
+        workspace_id="ws_tight",
+        document_id="doc_tight",
+        document_version="v1",
+        max_elapsed_s=10.0,
+        started_at=time.perf_counter() - 9.2,
+    )
+
+    t_start = time.perf_counter()
+    prompt_out, stats = builder._invoke_bedrock_extraction(
+        client=mock_bedrock,
+        chunks=[ch],
+        workspace_id="ws_tight",
+        document_id="doc_tight",
+        budget=budget_tight,
+    )
+    t_elapsed = time.perf_counter() - t_start
+
+    # Must NOT sleep 2.0s when doing so would exceed the 10.0s deadline
+    assert t_elapsed < 1.5
+    assert budget_tight.exhausted is True
+    assert "retry_would_exceed_deadline" in (budget_tight.exhaustion_reason or "")
+
+    # 3. Preserve attempt accounting across restart/replay without silent reset
+    ws_replay = "ws_replay_persist"
+    doc_replay = "doc_replay_persist"
+    ver_replay = "v1"
+    now = "2026-10-26T12:00:00Z"
+
+    # Pre-save a failed manifest with exhausted model calls (2 calls)
+    failed_man = OkfManifest(
+        workspace_id=ws_replay,
+        document_id=doc_replay,
+        document_version=ver_replay,
+        entities=(),
+        assertions=(),
+        status="failed",
+        model_calls=2,
+        extraction_tokens=3500,
+        idempotency_key="k_rep",
+        created_at=now,
+    )
+    repo.save_manifest(ws_replay, failed_man)
+
+    # Simulate service restart by wiping in-memory ledger
+    reset_budget_ledger()
+
+    # Attempt re-extraction with fresh mock client
+    mock_call_tracker = MagicMock()
+    replay_builder = OkfBuilder(repo=repo, bedrock_client=mock_call_tracker)
+    man_result = replay_builder.extract_and_persist(
+        workspace_id=ws_replay,
+        document_id=doc_replay,
+        document_version=ver_replay,
+        format="pdf",
+        chunks=[ch],
+        force_reextract=False,
+    )
+
+    # Zero model calls made: durable manifest attempt count is preserved across restart
+    assert mock_call_tracker.converse.call_count == 0
+    assert man_result.status == "failed"
+    assert man_result.model_calls == 2
+
+
+def test_budget_ledger_bounded_capacity_and_eviction():
+    """Verify that extraction budget ledger remains strictly bounded under capacity limits.
+
+    1. When capacity is reached and all budgets are exhausted, eviction operates without unbounded growth.
+    2. When unexhausted and exhausted budgets coexist, exhausted budgets are evicted preferentially.
+    """
+    reset_budget_ledger()
+    test_capacity = 4
+
+    with patch("ingestion.okf_builder._MAX_BUDGET_LEDGER_ENTRIES", test_capacity):
+        # 1. Fill ledger up to capacity with exhausted budgets
+        for i in range(test_capacity):
+            b = get_or_create_document_budget(
+                workspace_id="ws_b",
+                document_id=f"doc_{i}",
+                document_version="v1",
+                idempotency_key=f"k_{i}",
+            )
+            b.exhausted = True
+            b.exhaustion_reason = f"exhausted_{i}"
+
+        assert len(_EXTRACTION_BUDGETS) == test_capacity
+
+        # Add 5th budget: must evict an exhausted entry and stay strictly at capacity
+        b5 = get_or_create_document_budget(
+            workspace_id="ws_b",
+            document_id="doc_new",
+            document_version="v1",
+            idempotency_key="k_new",
+        )
+        assert len(_EXTRACTION_BUDGETS) == test_capacity
+        assert "k_new" in _EXTRACTION_BUDGETS
+        assert "k_0" not in _EXTRACTION_BUDGETS  # Oldest exhausted evicted
+
+        # 2. Preferential eviction: add unexhausted budget, then exhausted, verify exhausted evicted first
+        reset_budget_ledger()
+        # Create 2 unexhausted budgets
+        b_act1 = get_or_create_document_budget("ws_b", "doc_act1", "v1", "k_act1")
+        b_act2 = get_or_create_document_budget("ws_b", "doc_act2", "v1", "k_act2")
+
+        # Create 2 exhausted budgets
+        b_ex1 = get_or_create_document_budget("ws_b", "doc_ex1", "v1", "k_ex1")
+        b_ex1.exhausted = True
+        b_ex2 = get_or_create_document_budget("ws_b", "doc_ex2", "v1", "k_ex2")
+        b_ex2.exhausted = True
+
+        assert len(_EXTRACTION_BUDGETS) == test_capacity
+
+        # Adding a 5th budget should evict exhausted 'k_ex1' rather than active 'k_act1'
+        b_next = get_or_create_document_budget("ws_b", "doc_next", "v1", "k_next")
+        assert len(_EXTRACTION_BUDGETS) == test_capacity
+        assert "k_ex1" not in _EXTRACTION_BUDGETS
+        assert "k_act1" in _EXTRACTION_BUDGETS
+        assert "k_act2" in _EXTRACTION_BUDGETS
+
+
+def test_repository_manifest_scope_anchoring_parity(tmp_path):
+    """Verify that InMemoryOkfRepository and SqliteOkfRepository have identical scoping behavior.
+
+    When manifest entities or assertions have mismatched document or version attributes,
+    both repositories anchor them to the manifest scope (workspace, document_id, version).
+    """
+    ws_id = "ws_parity"
+    now = _now()
+    doc_target = "doc_correct"
+    ver_target = "v2"
+
+    mismatched_ent = OkfEntityRecord(
+        workspace_id=ws_id,
+        entity_id="e_mismatch",
+        entity_name="Parity Test Corp",
+        normalized_name="parity test corp",
+        entity_type="organization",
+        document_id="doc_wrong",
+        document_version="v1",
+        created_at=now,
+    )
+    mismatched_ass = OkfPropertyAssertion(
+        assertion_id="ass_mismatch",
+        workspace_id=ws_id,
+        entity_id="e_mismatch",
+        entity_name="Parity Test Corp",
+        property_key="revenue",
+        property_value="$42M",
+        value_type="string",
+        source_chunk_id="chk_p1",
+        document_id="doc_wrong",
+        document_version="v1",
+        created_at=now,
+    )
+
+    manifest = OkfManifest(
+        workspace_id=ws_id,
+        document_id=doc_target,
+        document_version=ver_target,
+        entities=(mismatched_ent,),
+        assertions=(mismatched_ass,),
+        status="ready",
+        idempotency_key="k_parity",
+        created_at=now,
+    )
+
+    # 1. In-Memory repo
+    in_mem_repo = InMemoryOkfRepository()
+    in_mem_repo.save_manifest(ws_id, manifest)
+    in_mem_ass, _ = in_mem_repo.list_assertions_by_document(ws_id, doc_target, ver_target)
+    assert len(in_mem_ass) == 1
+    assert in_mem_ass[0].document_id == doc_target
+    assert in_mem_ass[0].document_version == ver_target
+
+    # 2. SQLite repo
+    db_path = tmp_path / "parity_test.db"
+    sqlite_repo = SQLiteOkfRepository(db_path=db_path)
+    sqlite_repo.save_manifest(ws_id, manifest)
+    sqlite_ass, _ = sqlite_repo.list_assertions_by_document(ws_id, doc_target, ver_target)
+    assert len(sqlite_ass) == 1
+    assert sqlite_ass[0].document_id == doc_target
+    assert sqlite_ass[0].document_version == ver_target

@@ -62,7 +62,7 @@ class DocumentExtractionBudget:
     max_calls: int = 2
     max_input_tokens: int = 4000
     max_output_tokens: int = 1200
-    max_elapsed_s: float = 20.0
+    max_elapsed_s: float = 10.0
     calls_made: int = 0
     input_tokens_used: int = 0
     output_tokens_used: int = 0
@@ -91,6 +91,50 @@ class DocumentExtractionBudget:
             self.exhaustion_reason = f"elapsed_time_limit_reached ({elapsed:.1f}s/{self.max_elapsed_s:.1f}s)"
             return False
         return True
+
+    def reserve_call(self, prompt_tokens: int, max_output_tokens: int = 600) -> bool:
+        """Reserve complete prompt and output budgets before provider calls."""
+        if self.exhausted:
+            return False
+        if self.calls_made + 1 > self.max_calls:
+            self.exhausted = True
+            self.exhaustion_reason = f"call_limit_reached ({self.calls_made}/{self.max_calls})"
+            return False
+        if self.input_tokens_used + prompt_tokens > self.max_input_tokens:
+            self.exhausted = True
+            self.exhaustion_reason = f"input_token_limit_exceeded ({self.input_tokens_used + prompt_tokens}/{self.max_input_tokens})"
+            return False
+        if self.output_tokens_used + max_output_tokens > self.max_output_tokens:
+            self.exhausted = True
+            self.exhaustion_reason = f"output_token_limit_exceeded ({self.output_tokens_used + max_output_tokens}/{self.max_output_tokens})"
+            return False
+        elapsed = time.perf_counter() - self.started_at
+        if elapsed >= self.max_elapsed_s:
+            self.exhausted = True
+            self.exhaustion_reason = f"elapsed_time_limit_reached ({elapsed:.1f}s/{self.max_elapsed_s:.1f}s)"
+            return False
+
+        self.calls_made += 1
+        self.input_tokens_used += prompt_tokens
+        self.output_tokens_used += max_output_tokens
+        return True
+
+    def reconcile_call(
+        self,
+        reserved_prompt_tokens: int,
+        reserved_output_tokens: int,
+        actual_prompt_tokens: int,
+        actual_output_tokens: int,
+    ) -> None:
+        """Reconcile actual token usage against upfront reservations."""
+        self.input_tokens_used += (actual_prompt_tokens - reserved_prompt_tokens)
+        self.output_tokens_used += (actual_output_tokens - reserved_output_tokens)
+        if (
+            self.calls_made >= self.max_calls
+            or self.input_tokens_used >= self.max_input_tokens
+            or self.output_tokens_used >= self.max_output_tokens
+        ):
+            self.exhausted = True
 
     def record_call(self, input_tokens: int, output_tokens: int) -> None:
         self.calls_made += 1
@@ -121,8 +165,9 @@ def get_document_extraction_lock(idempotency_key: str) -> threading.Lock:
     with _GLOBAL_LOCK:
         if idempotency_key not in _EXTRACTION_LOCKS:
             if len(_EXTRACTION_LOCKS) >= _MAX_BUDGET_LEDGER_ENTRIES:
-                oldest_k = next(iter(_EXTRACTION_LOCKS))
-                del _EXTRACTION_LOCKS[oldest_k]
+                unlocked_keys = [k for k, l in _EXTRACTION_LOCKS.items() if not l.locked()]
+                if unlocked_keys:
+                    del _EXTRACTION_LOCKS[unlocked_keys[0]]
             _EXTRACTION_LOCKS[idempotency_key] = threading.Lock()
         return _EXTRACTION_LOCKS[idempotency_key]
 
@@ -135,14 +180,35 @@ def get_or_create_document_budget(
     max_calls: int = 2,
     max_input_tokens: int = 4000,
     max_output_tokens: int = 1200,
-    max_elapsed_s: float = 20.0,
+    max_elapsed_s: float = 10.0,
+    repo: Any | None = None,
 ) -> DocumentExtractionBudget:
     with _GLOBAL_LOCK:
         if idempotency_key in _EXTRACTION_BUDGETS:
             return _EXTRACTION_BUDGETS[idempotency_key]
         if len(_EXTRACTION_BUDGETS) >= _MAX_BUDGET_LEDGER_ENTRIES:
-            oldest_k = next(iter(_EXTRACTION_BUDGETS))
-            del _EXTRACTION_BUDGETS[oldest_k]
+            # Prioritize evicting completed or exhausted budgets first; otherwise oldest overall
+            exhausted_keys = [k for k, b in _EXTRACTION_BUDGETS.items() if b.exhausted]
+            evict_key = exhausted_keys[0] if exhausted_keys else next(iter(_EXTRACTION_BUDGETS))
+            del _EXTRACTION_BUDGETS[evict_key]
+
+        # Preserve attempt accounting across restart and replay from durable repository manifest
+        prior_calls = 0
+        prior_tokens = 0
+        prior_exhausted = False
+        prior_reason = None
+        if repo is not None:
+            try:
+                existing_man = repo.get_manifest(workspace_id, document_id, document_version)
+                if existing_man is not None:
+                    prior_calls = getattr(existing_man, "model_calls", 0)
+                    prior_tokens = getattr(existing_man, "extraction_tokens", 0)
+                    if existing_man.status == "failed" or prior_calls >= max_calls:
+                        prior_exhausted = True
+                        prior_reason = f"prior_recorded_attempts ({prior_calls}/{max_calls})"
+            except Exception as e:
+                logger.debug("okf_builder.prior_manifest_lookup_err: %s", e)
+
         budget = DocumentExtractionBudget(
             workspace_id=workspace_id,
             document_id=document_id,
@@ -151,6 +217,11 @@ def get_or_create_document_budget(
             max_input_tokens=max_input_tokens,
             max_output_tokens=max_output_tokens,
             max_elapsed_s=max_elapsed_s,
+            calls_made=prior_calls,
+            input_tokens_used=prior_tokens // 2,
+            output_tokens_used=prior_tokens - (prior_tokens // 2),
+            exhausted=prior_exhausted,
+            exhaustion_reason=prior_reason,
         )
         _EXTRACTION_BUDGETS[idempotency_key] = budget
         return budget
@@ -193,6 +264,87 @@ def is_value_grounded(property_value: str, chunk_text: str) -> bool:
     return False
 
 
+_PROPERTY_SYNONYM_GROUPS: tuple[set[str], ...] = (
+    {"employee", "employees", "staff", "headcount", "workforce", "personnel", "worker", "workers", "people"},
+    {"revenue", "revenues", "sales", "turnover", "topline", "receipts"},
+    {"profit", "profits", "income", "earnings", "ebitda", "gain", "gains", "margin"},
+    {"operating", "operations", "operational"},
+    {"founded", "founding", "established", "started", "incorporated", "created", "origin", "originated"},
+    {"headquarters", "headquarter", "hq", "based", "located", "location"},
+    {"ceo", "chief executive", "chief executive officer", "president"},
+    {"cfo", "chief financial officer"},
+    {"cto", "chief technology officer"},
+    {"price", "cost", "costs", "valuation", "worth", "amount", "fee", "expense", "expenses"},
+    {"acquisition", "acquired", "purchased", "bought", "buyout", "merger", "takeover"},
+    {"customer", "customers", "client", "clients", "user", "users", "subscribers", "subscriber"},
+    {"debt", "debts", "liabilities", "liability", "borrowing", "borrowings", "loans", "loan"},
+    {"asset", "assets", "holdings", "reserves", "cash"},
+    {"dividend", "dividends", "yield", "payout"},
+    {"shares", "stock", "equity"},
+    {"industry", "sector", "field", "domain", "vertical"},
+)
+
+_GENERIC_METRIC_MODIFIERS: set[str] = {
+    "total", "net", "gross", "annual", "quarterly", "fiscal", "count", "number",
+    "rate", "ratio", "level", "value", "year", "date", "percent", "percentage",
+    "amount", "figure", "item", "category",
+}
+
+
+def _normalize_stem(w: str) -> str:
+    s = w.lower()
+    if s.endswith("ies") and len(s) > 4:
+        return s[:-3] + "y"
+    if s.endswith("es") and len(s) > 4:
+        return s[:-2]
+    if s.endswith("s") and not s.endswith("ss") and len(s) > 3:
+        return s[:-1]
+    if s.endswith("ing") and len(s) > 5:
+        return s[:-3]
+    if s.endswith("ed") and len(s) > 4:
+        return s[:-2]
+    return s
+
+
+def is_property_grounded(property_key: str, text: str) -> bool:
+    """Validate that property_key semantic tokens or domain synonyms are grounded in text."""
+    if not property_key or not text:
+        return False
+    norm = re.sub(r"([a-z])([A-Z])", r"\1 \2", property_key).lower()
+    norm = re.sub(r"[-_]+", " ", norm)
+    raw_tokens = [t for t in re.findall(r"\w+", norm) if t not in _STOP_WORDS and len(t) > 1]
+    if not raw_tokens:
+        return property_key.strip().lower() in text.lower()
+
+    substantive = [t for t in raw_tokens if t not in _GENERIC_METRIC_MODIFIERS]
+    tokens_to_match = substantive if substantive else raw_tokens
+
+    text_lower = text.lower()
+    text_tokens = re.findall(r"\w+", text_lower)
+    text_token_set = set(text_tokens)
+    text_stems = {_normalize_stem(t) for t in text_tokens}
+
+    if norm in text_lower:
+        return True
+
+    for target in tokens_to_match:
+        if target in text_token_set:
+            return True
+        target_stem = _normalize_stem(target)
+        if target_stem in text_stems:
+            return True
+        for group in _PROPERTY_SYNONYM_GROUPS:
+            if target in group or target_stem in group:
+                for syn in group:
+                    if " " in syn:
+                        if syn in text_lower:
+                            return True
+                    elif syn in text_token_set or _normalize_stem(syn) in text_stems:
+                        return True
+
+    return False
+
+
 def validate_assertion_grounding(
     entity_name: str,
     property_key: str,
@@ -204,10 +356,9 @@ def validate_assertion_grounding(
     Verifies that:
     1. The property value occurs in the chunk text.
     2. The asserted entity occurs in the chunk text.
-    3. The value is syntactically or relationally attributed to the asserted entity rather than
-       another competing entity in the chunk. If the value occurs in a sentence with a different
-       entity and not the asserted entity, or if another entity is closer and directly governs
-       the value, the claim is rejected as wrong entity attribution or ambiguous.
+    3. The property key concept is grounded in the chunk text and specifically in the context of the value.
+    4. The value is syntactically or relationally attributed to the asserted entity rather than
+       another competing entity in the chunk.
     """
     if not property_value or not chunk_text or not entity_name:
         return False, "missing_input"
@@ -220,7 +371,11 @@ def validate_assertion_grounding(
     if not is_value_grounded(entity_name, chunk_text):
         return False, "entity_not_in_chunk"
 
-    # Check 3: Relational binding between entity and value
+    # Check 3: Property key grounding in chunk
+    if not is_property_grounded(property_key, chunk_text):
+        return False, "unsupported_property"
+
+    # Check 4: Relational binding between entity, property, and value
     ent_lower = entity_name.strip().lower()
     val_lower = property_value.strip().lower()
 
@@ -232,6 +387,13 @@ def validate_assertion_grounding(
     val_sentences = [s for s in sentences if is_value_grounded(property_value, s)]
     if not val_sentences:
         val_sentences = sentences
+
+    # Verify that at least one sentence containing the value supports this property
+    supporting_val_sentences = [s for s in val_sentences if is_property_grounded(property_key, s)]
+    if not supporting_val_sentences:
+        if len(sentences) > 1:
+            return False, "unsupported_relationship"
+        supporting_val_sentences = val_sentences
 
     # Identify potential competing entities in the chunk text
     prop_norm = property_key.strip().lower().replace("_", " ")
@@ -267,7 +429,7 @@ def validate_assertion_grounding(
         if len(cand_words) > 1 or has_corp or is_mid_sentence:
             other_entities.add(cand_norm)
 
-    for sent in val_sentences:
+    for sent in supporting_val_sentences:
         sent_lower = sent.lower()
         ent_in_sent = is_value_grounded(entity_name, sent)
         competing_in_sent = [oe for oe in other_entities if is_value_grounded(oe, sent)]
@@ -399,20 +561,23 @@ class OkfBuilder:
                 document_version=document_version,
                 idempotency_key=idempotency_key,
                 max_calls=int(getattr(settings, "OKF_MAX_MODEL_CALLS_PER_DOC", 2)),
+                max_elapsed_s=10.0,
+                repo=self.repo,
             )
 
             # Enforce single document extraction budget across replays and attempts (AC-3)
             # Replays and concurrent ingestion must not reset that budget silently
-            if not force_reextract:
+            if not force_reextract and budget.exhausted:
+                logger.warning(
+                    "okf_builder.budget_exhausted_replay ws=%s doc=%s ver=%s prior_calls=%d reason=%s (not resetting budget)",
+                    workspace_id,
+                    document_id,
+                    document_version,
+                    budget.calls_made,
+                    budget.exhaustion_reason,
+                )
                 existing_man = self.repo.get_manifest(workspace_id, document_id, document_version)
-                if existing_man and existing_man.status == "failed" and existing_man.model_calls >= budget.max_calls:
-                    logger.warning(
-                        "okf_builder.budget_exhausted_replay ws=%s doc=%s ver=%s prior_calls=%d (not resetting budget)",
-                        workspace_id,
-                        document_id,
-                        document_version,
-                        existing_man.model_calls,
-                    )
+                if existing_man:
                     return existing_man
 
             fmt = (format or "").lower().replace(".", "")
@@ -822,6 +987,7 @@ class OkfBuilder:
                 workspace_id=workspace_id,
                 document_id=document_id,
                 document_version="v_default",
+                max_elapsed_s=10.0,
             )
 
         system_prompt = (
@@ -852,24 +1018,29 @@ class OkfBuilder:
             user_content_blocks.append(f"<source_chunk id=\"{ch_id}\">\n{ch_text}\n</source_chunk>")
 
         user_prompt = "\n\n".join(user_content_blocks)
+        estimated_prompt_tokens = max(1, len(user_prompt) // _CHARS_PER_TOKEN)
+        max_output_tokens = 600
 
         # Test environment fallback
         if client is None:
-            if not budget.can_call():
-                logger.warning("okf_builder.test_mode_budget_exhausted calls=%d", budget.calls_made)
+            if not budget.reserve_call(estimated_prompt_tokens, max_output_tokens):
+                logger.warning(
+                    "okf_builder.test_mode_budget_exhausted calls=%d reason=%s",
+                    budget.calls_made,
+                    budget.exhaustion_reason,
+                )
                 return "", {"input_tokens": 0, "output_tokens": 0}
             out_json, stats = self._test_mode_fallback(chunks)
-            budget.record_call(stats["input_tokens"], stats["output_tokens"])
+            budget.reconcile_call(estimated_prompt_tokens, max_output_tokens, stats["input_tokens"], stats["output_tokens"])
             return out_json, stats
 
         model_id = getattr(settings, "OKF_BEDROCK_MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0")
-        max_output_tokens = 600
 
         messages = [{"role": "user", "content": [{"text": user_prompt}]}]
         max_attempts = 2  # at most 1 retry on throttling (HTTP 429)
 
         for attempt in range(max_attempts):
-            if not budget.can_call():
+            if not budget.reserve_call(estimated_prompt_tokens, max_output_tokens):
                 logger.warning(
                     "okf_builder.call_budget_exceeded attempt=%d reason=%s",
                     attempt, budget.exhaustion_reason,
@@ -889,20 +1060,27 @@ class OkfBuilder:
                 output_text = resp["output"]["message"]["content"][0]["text"]
                 raw_usage = resp.get("usage", {})
                 usage = {
-                    "input_tokens": raw_usage.get("inputTokens", 0),
+                    "input_tokens": raw_usage.get("inputTokens", estimated_prompt_tokens),
                     "output_tokens": raw_usage.get("outputTokens", 0),
                 }
-                budget.record_call(usage["input_tokens"], usage["output_tokens"])
+                budget.reconcile_call(estimated_prompt_tokens, max_output_tokens, usage["input_tokens"], usage["output_tokens"])
                 return output_text, usage
 
             except Exception as e:
-                budget.calls_made += 1
                 err_str = str(e)
                 if ("ThrottlingException" in err_str or "429" in err_str) and attempt < max_attempts - 1:
-                    if budget.can_call():
+                    elapsed_so_far = time.perf_counter() - budget.started_at
+                    retry_delay = 2.0
+                    if elapsed_so_far + retry_delay < budget.max_elapsed_s:
                         logger.warning("Bedrock OKF throttled (429), retrying once after 2.0s...")
-                        time.sleep(2.0)
+                        time.sleep(retry_delay)
                         continue
+                    else:
+                        budget.exhausted = True
+                        budget.exhaustion_reason = f"retry_would_exceed_deadline ({elapsed_so_far + retry_delay:.1f}s/{budget.max_elapsed_s:.1f}s)"
+                        logger.warning("Bedrock OKF throttled (429), cannot retry within deadline: %s", budget.exhaustion_reason)
+                        return "", {"input_tokens": 0, "output_tokens": 0}
+
                 # Zero retries on model errors, bad requests, or timeouts (AC-3)
                 logger.warning("Bedrock OKF call failed (no retries per AC-3): %s", e)
                 return "", {"input_tokens": 0, "output_tokens": 0}
