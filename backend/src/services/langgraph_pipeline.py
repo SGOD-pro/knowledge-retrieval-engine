@@ -254,22 +254,27 @@ def run_okf_router(state: PipelineState):
     # 3. Execute authoritative OKF lookup with deadline & concurrency bounds
     from db.okf_repo import get_okf_repo
     from db.workspace_boundary_repo import get_workspace_boundary_repo
+    from services.retrieval.okf_lookup import get_okf_controller
 
     okf_repo = get_okf_repo()
     boundary_repo = get_workspace_boundary_repo()
     chunk_repo = _get_repo()
+    controller = get_okf_controller()
 
     retriever = OkfRetriever(
         repository=okf_repo,
         boundary_repo=boundary_repo,
         chunk_repo=chunk_repo,
+        controller=controller,
     )
 
+    target_docs = state.get("document_ids")
     timeout_ms = int(getattr(settings, "OKF_TIMEOUT_MS", 50))
     lookup_res = retriever.lookup_sync(
         workspace_id=ws_id,
         query=query,
         deadline_ms=timeout_ms,
+        document_ids=target_docs,
     )
 
     # 4. Calibrate RRF weight (AC-4, AC-5, AC-9)

@@ -114,10 +114,10 @@ class DocumentsService:
 
             ingest_fn = getattr(_api_routes, "ingest_document", ingest_document)
 
-            # Re-ingestion guard: if the workspace-scoped doc_id already has a
+            # Reingestion guard: if the workspace scoped doc_id already has a
             # persisted document (same workspace + same filename → same ID) with the
             # exact same content hash version, skip the expensive pipeline.
-            # If the content hash differs (file content changed), proceed with re-ingestion
+            # If the content hash differs (file content changed), proceed with reingestion
             # and replace the document, table records, and snapshot.
             incoming_version = hashlib.sha256(content).hexdigest()[:32]
             existing = self.repo.get(doc_id)
@@ -207,29 +207,8 @@ class DocumentsService:
                     persisted = len(document.chunks)
                     total = len(document.chunks) + len(exclusions)
 
-                pi_status, pi_count = self._enrich_page_index_snapshot_metadata(
-                    workspace_id=workspace_id,
-                    doc_id=doc_id,
-                    doc_ver=doc_ver,
-                    filename=filename,
-                    temp_path=temp_path,
-                    chunks=document.chunks,
-                    boundary_repo=boundary_repo,
-                )
-
-                t_name = Path(filename).stem if getattr(document, "source_format", "").lower() == "csv" else None
-                store_ref = store if getattr(document, "source_format", "").lower() == "csv" else None
-                okf_stat, okf_e_count, okf_p_count = self._enrich_okf_snapshot_metadata(
-                    workspace_id=workspace_id,
-                    doc_id=doc_id,
-                    doc_ver=doc_ver,
-                    filename=filename,
-                    chunks=document.chunks,
-                    table_name=t_name,
-                    table_store=store_ref,
-                )
-
-                snapshot = DocumentSnapshot(
+                # 1. Publish baseline DocumentSnapshot and Ready status immediately (ADR-001)
+                baseline_snapshot = DocumentSnapshot(
                     workspace_id=workspace_id,
                     document_id=doc_id,
                     source=filename,
@@ -240,15 +219,81 @@ class DocumentsService:
                     persisted_rows=persisted,
                     total_rows=total,
                     created_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    page_index_status=None,
+                    page_index_elements_count=0,
+                    okf_status=None,
+                    okf_entities_count=0,
+                    okf_properties_count=0,
+                )
+                try:
+                    boundary_repo.save_document_snapshot(baseline_snapshot)
+                except Exception as snap_err:
+                    logger.warning("Could not persist initial DocumentSnapshot for %s: %s", doc_id, snap_err)
+
+                self.repo.update_document_status(
+                    workspace_id=workspace_id,
+                    doc_id=doc_id,
+                    status="Ready",
+                    chunk_count=len(document.chunks),
+                )
+                logger.info("baseline_publication.ready ws=%s doc_id=%s filename=%s", workspace_id, doc_id, filename)
+
+                # 2. Decoupled enrichment pass for PageIndex (ADR-001)
+                try:
+                    pi_status, pi_count = self._enrich_page_index_snapshot_metadata(
+                        workspace_id=workspace_id,
+                        doc_id=doc_id,
+                        doc_ver=doc_ver,
+                        filename=filename,
+                        temp_path=temp_path,
+                        chunks=document.chunks,
+                        boundary_repo=boundary_repo,
+                    )
+                except Exception as pi_err:
+                    logger.warning("PageIndex enrichment failed for %s: %s", doc_id, pi_err)
+                    pi_status, pi_count = "failed", 0
+
+                # 3. Decoupled enrichment pass for OKF (ADR-001)
+                t_name = Path(filename).stem if getattr(document, "source_format", "").lower() == "csv" else None
+                store_ref = store if getattr(document, "source_format", "").lower() == "csv" else None
+                try:
+                    okf_stat, okf_e_count, okf_p_count = self._enrich_okf_snapshot_metadata(
+                        workspace_id=workspace_id,
+                        doc_id=doc_id,
+                        doc_ver=doc_ver,
+                        filename=filename,
+                        chunks=document.chunks,
+                        table_name=t_name,
+                        table_store=store_ref,
+                    )
+                except Exception as okf_err:
+                    logger.warning("OKF enrichment failed for %s: %s", doc_id, okf_err)
+                    okf_stat, okf_e_count, okf_p_count = "failed", 0, 0
+
+                # 4. Update DocumentSnapshot with enrichment outcomes while preserving Ready status
+                enriched_snapshot = DocumentSnapshot(
+                    workspace_id=workspace_id,
+                    document_id=doc_id,
+                    source=filename,
+                    version=doc_ver,
+                    format=Path(filename).suffix.lower().replace(".", ""),
+                    incomplete_coverage_flag=incomplete_cov,
+                    exclusions=exclusions,
+                    persisted_rows=persisted,
+                    total_rows=total,
+                    created_at=baseline_snapshot.created_at,
                     page_index_status=pi_status,
                     page_index_elements_count=pi_count,
                     okf_status=okf_stat,
                     okf_entities_count=okf_e_count,
                     okf_properties_count=okf_p_count,
                 )
-                boundary_repo.save_document_snapshot(snapshot)
-            except Exception as snap_err:
-                logger.warning("Could not persist DocumentSnapshot for %s: %s", doc_id, snap_err)
+                try:
+                    boundary_repo.save_document_snapshot(enriched_snapshot)
+                except Exception as snap_up_err:
+                    logger.warning("Could not update DocumentSnapshot enrichment for %s: %s", doc_id, snap_up_err)
+            except Exception as outer_err:
+                logger.warning("Unexpected error during document ingestion for %s: %s", doc_id, outer_err)
 
             self.repo.update_document_status(
                 workspace_id=workspace_id,
@@ -403,30 +448,8 @@ class DocumentsService:
                         persisted = len(doc.chunks)
                         total = len(doc.chunks) + len(exclusions)
 
-                    pi_status, pi_count = self._enrich_page_index_snapshot_metadata(
-                        workspace_id=workspace_id,
-                        doc_id=doc.id,
-                        doc_ver=doc_ver,
-                        filename=file.filename or "unknown",
-                        temp_path=path,
-                        chunks=doc.chunks,
-                        boundary_repo=boundary_repo,
-                    )
-
-                    is_csv = getattr(doc, "source_format", "").lower() == "csv" or (file.filename or "").lower().endswith(".csv")
-                    t_name = Path(file.filename or "unknown").stem if is_csv else None
-                    store_ref = store if is_csv else None
-                    okf_stat, okf_e_count, okf_p_count = self._enrich_okf_snapshot_metadata(
-                        workspace_id=workspace_id,
-                        doc_id=doc.id,
-                        doc_ver=doc_ver,
-                        filename=file.filename or "unknown",
-                        chunks=doc.chunks,
-                        table_name=t_name,
-                        table_store=store_ref,
-                    )
-
-                    snapshot = DocumentSnapshot(
+                    # 1. Publish baseline DocumentSnapshot and Ready status immediately (ADR-001)
+                    baseline_snapshot = DocumentSnapshot(
                         workspace_id=workspace_id,
                         document_id=doc.id,
                         source=file.filename or "unknown",
@@ -437,13 +460,78 @@ class DocumentsService:
                         persisted_rows=persisted,
                         total_rows=total,
                         created_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                        page_index_status=None,
+                        page_index_elements_count=0,
+                        okf_status=None,
+                        okf_entities_count=0,
+                        okf_properties_count=0,
+                    )
+                    try:
+                        boundary_repo.save_document_snapshot(baseline_snapshot)
+                        self.repo.update_document_status(
+                            workspace_id=workspace_id,
+                            doc_id=doc.id,
+                            status="Ready",
+                            chunk_count=len(doc.chunks),
+                        )
+                    except Exception as init_err:
+                        logger.warning("Could not persist initial DocumentSnapshot in direct ingest for %s: %s", doc.id, init_err)
+
+                    # 2. Decoupled enrichment pass for PageIndex
+                    try:
+                        pi_status, pi_count = self._enrich_page_index_snapshot_metadata(
+                            workspace_id=workspace_id,
+                            doc_id=doc.id,
+                            doc_ver=doc_ver,
+                            filename=file.filename or "unknown",
+                            temp_path=path,
+                            chunks=doc.chunks,
+                            boundary_repo=boundary_repo,
+                        )
+                    except Exception as pi_err:
+                        logger.warning("PageIndex enrichment failed for %s: %s", doc.id, pi_err)
+                        pi_status, pi_count = "failed", 0
+
+                    # 3. Decoupled enrichment pass for OKF
+                    is_csv = getattr(doc, "source_format", "").lower() == "csv" or (file.filename or "").lower().endswith(".csv")
+                    t_name = Path(file.filename or "unknown").stem if is_csv else None
+                    store_ref = store if is_csv else None
+                    try:
+                        okf_stat, okf_e_count, okf_p_count = self._enrich_okf_snapshot_metadata(
+                            workspace_id=workspace_id,
+                            doc_id=doc.id,
+                            doc_ver=doc_ver,
+                            filename=file.filename or "unknown",
+                            chunks=doc.chunks,
+                            table_name=t_name,
+                            table_store=store_ref,
+                        )
+                    except Exception as okf_err:
+                        logger.warning("OKF enrichment failed for %s: %s", doc.id, okf_err)
+                        okf_stat, okf_e_count, okf_p_count = "failed", 0, 0
+
+                    # 4. Update DocumentSnapshot with enrichment outcomes while preserving Ready status
+                    enriched_snapshot = DocumentSnapshot(
+                        workspace_id=workspace_id,
+                        document_id=doc.id,
+                        source=file.filename or "unknown",
+                        version=doc_ver,
+                        format=suffix.replace(".", ""),
+                        incomplete_coverage_flag=incomplete_cov,
+                        exclusions=exclusions,
+                        persisted_rows=persisted,
+                        total_rows=total,
+                        created_at=baseline_snapshot.created_at,
                         page_index_status=pi_status,
                         page_index_elements_count=pi_count,
                         okf_status=okf_stat,
                         okf_entities_count=okf_e_count,
                         okf_properties_count=okf_p_count,
                     )
-                    boundary_repo.save_document_snapshot(snapshot)
+                    try:
+                        boundary_repo.save_document_snapshot(enriched_snapshot)
+                    except Exception as snap_up_err:
+                        logger.warning("Could not persist updated DocumentSnapshot in direct ingest for %s: %s", doc.id, snap_up_err)
                 except Exception as snap_err:
                     logger.warning("Could not persist DocumentSnapshot in direct ingest for %s: %s", doc.id, snap_err)
 
@@ -468,7 +556,7 @@ class DocumentsService:
         if document is not None:
             return document.to_dict()
 
-        # Check in-memory / fallback workspace documents
+        # Check in memory and fallback workspace documents
         from db.database import _WORKSPACE_DOCS
 
         for ws_id, docs in _WORKSPACE_DOCS.items():

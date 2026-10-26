@@ -22,4 +22,5 @@ backend/reports/
 *.log
 *.db-wal
 *.db-shm
+backend/data/kre_okf.db
 .agents

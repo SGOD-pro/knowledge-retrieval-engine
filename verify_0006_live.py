@@ -164,7 +164,7 @@ pdf_snapshot = None
 for _ in range(40):
     time.sleep(0.5)
     pdf_snapshot = boundary_repo.get_document_snapshot(ws_id, pdf_doc_id)
-    if pdf_snapshot:
+    if pdf_snapshot and pdf_snapshot.okf_status in ("ready", "empty", "failed"):
         break
     r_docs = requests.get(f"{BASE_URL}/workspaces/{ws_id}/documents", headers=ALICE_HEADERS)
     if r_docs.status_code == 200:

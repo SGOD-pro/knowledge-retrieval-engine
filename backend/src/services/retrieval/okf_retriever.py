@@ -62,6 +62,7 @@ class OkfRetriever:
         target_entities: Sequence[str] | None = None,
         deadline_ms: int | None = None,
         fast_path: bool = False,
+        document_ids: Sequence[str] | None = None,
     ) -> OkfLookupResult | list[dict[str, Any]]:
         """Lookup OKF assertions within deadline and bounded concurrency.
         
@@ -109,6 +110,7 @@ class OkfRetriever:
                 query=" ".join(entities),
                 target_entities=entities,
                 deadline_ms=deadline_ms,
+                document_ids=document_ids,
             )
             return [
                 {
@@ -135,6 +137,7 @@ class OkfRetriever:
             target_entities=target_entities,
             deadline_ms=deadline_ms,
             fast_path=fast_path,
+            document_ids=document_ids,
         )
 
     def lookup_sync(
@@ -144,6 +147,7 @@ class OkfRetriever:
         target_entities: Sequence[str] | None = None,
         deadline_ms: int | None = None,
         fast_path: bool = False,
+        document_ids: Sequence[str] | None = None,
     ) -> OkfLookupResult:
         """Execute synchronous bounded OKF lookup with 50ms deadline and concurrency retention."""
         t0 = time.perf_counter()
@@ -207,6 +211,42 @@ class OkfRetriever:
                     status="completed",
                 )
 
+            # Step 1.5: Discover authorized document scope, active versions, and ready manifests (AC-6, AC-7)
+            target_docs_set = set(document_ids) if document_ids is not None else None
+            active_ready_versions: dict[str, str] = {}
+            has_snapshot_data = False
+
+            try:
+                if hasattr(self.boundary_repo, "list_document_snapshots"):
+                    snaps = self.boundary_repo.list_document_snapshots(workspace_id)
+                    if snaps:
+                        has_snapshot_data = True
+                        for s in snaps:
+                            if target_docs_set is not None and s.document_id not in target_docs_set:
+                                continue
+                            if self.boundary_repo.has_tombstone(workspace_id, "source", s.document_id):
+                                continue
+                            if getattr(s, "okf_status", None) == "failed":
+                                continue
+                            man = self.okf_repo.get_manifest(workspace_id, s.document_id, s.version)
+                            if man is not None and man.status != "ready":
+                                continue
+                            if getattr(s, "okf_status", None) == "ready" or self.okf_repo.has_ready_okf(workspace_id, s.document_id, s.version):
+                                active_ready_versions[s.document_id] = s.version
+            except Exception as snap_err:
+                logger.warning("okf.snapshot_scope_check_error ws=%s error=%s", workspace_id, snap_err)
+
+            if has_snapshot_data and not active_ready_versions:
+                return WorkerResultWrapper(
+                    OkfLookupResult(
+                        target_entity=target_display,
+                        entity_state="none",
+                        property_state="none",
+                        execution_status="completed",
+                    ),
+                    status="completed",
+                )
+
             if not candidate_names:
                 return WorkerResultWrapper(
                     OkfLookupResult(
@@ -225,7 +265,28 @@ class OkfRetriever:
                 limit=10,
             )
 
-            if not entities:
+            # Filter entities by authorized document scope, active versions, and ready manifests
+            valid_entities = []
+            for ent in entities:
+                if target_docs_set is not None and ent.document_id not in target_docs_set:
+                    continue
+                try:
+                    if self.boundary_repo.has_tombstone(workspace_id, "source", ent.document_id):
+                        continue
+                except Exception:
+                    continue
+                if has_snapshot_data:
+                    if ent.document_id not in active_ready_versions:
+                        continue
+                    if ent.document_version != active_ready_versions[ent.document_id]:
+                        continue
+                else:
+                    man = self.okf_repo.get_manifest(workspace_id, ent.document_id, ent.document_version)
+                    if man is not None and man.status == "failed":
+                        continue
+                valid_entities.append(ent)
+
+            if not valid_entities:
                 return WorkerResultWrapper(
                     OkfLookupResult(
                         target_entity=target_display,
@@ -236,11 +297,11 @@ class OkfRetriever:
                     status="completed",
                 )
 
-            # Step 3: Entity state - check for ambiguity across distinct documents (AC-5)
+            # Step 3: Entity state: check for ambiguity across distinct documents (AC-5)
             # Same name entity across distinct documents: entity_state = "ambiguous"
-            distinct_docs = {e.document_id for e in entities}
+            distinct_docs = {e.document_id for e in valid_entities}
             entity_docs_by_name: dict[str, set[str]] = {}
-            for e in entities:
+            for e in valid_entities:
                 entity_docs_by_name.setdefault(e.normalized_name, set()).add(e.document_id)
 
             has_same_name_ambiguity = any(len(docs) > 1 for docs in entity_docs_by_name.values())
@@ -248,27 +309,31 @@ class OkfRetriever:
 
             # Step 4: Retrieve and filter assertions for matched entities
             raw_assertions: list[OkfPropertyAssertion] = []
-            for ent in entities:
-                # Active source tombstone filtering (AC-7)
-                try:
-                    if self.boundary_repo.has_tombstone(workspace_id, "source", ent.document_id):
-                        logger.debug("okf.source_tombstoned doc=%s", ent.document_id)
-                        continue
-                except Exception:
-                    continue
-
+            for ent in valid_entities:
+                active_docs_param = list(active_ready_versions.keys()) if has_snapshot_data else (list(target_docs_set) if target_docs_set is not None else None)
                 ent_assertions = self.okf_repo.get_assertions_for_entity(
                     workspace_id=workspace_id,
                     entity_id=ent.entity_id,
+                    active_document_ids=active_docs_param,
                     limit=20,
                 )
                 for ass in ent_assertions:
-                    # Filter out assertions belonging to tombstoned documents
+                    if target_docs_set is not None and ass.document_id not in target_docs_set:
+                        continue
                     try:
                         if self.boundary_repo.has_tombstone(workspace_id, "source", ass.document_id):
                             continue
                     except Exception:
                         continue
+                    if has_snapshot_data:
+                        if ass.document_id not in active_ready_versions:
+                            continue
+                        if ass.document_version != active_ready_versions[ass.document_id]:
+                            continue
+                    else:
+                        man = self.okf_repo.get_manifest(workspace_id, ass.document_id, ass.document_version)
+                        if man is not None and man.status == "failed":
+                            continue
                     raw_assertions.append(ass)
 
             if not raw_assertions:
@@ -329,7 +394,17 @@ class OkfRetriever:
                     chunk_map = {str(c.id): c for c in all_matching}
                     for cid in candidate_chunk_ids:
                         if cid in chunk_map:
-                            hydrated_chunks.append(chunk_map[cid])
+                            chk = chunk_map[cid]
+                            chk_ver = (
+                                getattr(chk, "version", None)
+                                or getattr(chk, "document_version", None)
+                                or (getattr(chk, "metadata", None) or {}).get("version")
+                            )
+                            chk_doc = getattr(chk, "document_id", None)
+                            if has_snapshot_data and chk_ver and chk_doc and chk_doc in active_ready_versions:
+                                if chk_ver != active_ready_versions[chk_doc]:
+                                    continue
+                            hydrated_chunks.append(chk)
                 except Exception as exc:
                     logger.debug("okf.chunk_hydration_error: %s", exc)
 

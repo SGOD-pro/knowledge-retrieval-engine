@@ -8,10 +8,12 @@ unsupported or hallucinated model claims before persistence.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
 import logging
 import re
+import threading
 import time
 from typing import Any, Sequence
 
@@ -38,9 +40,120 @@ logger = logging.getLogger(__name__)
 # Approximate characters per token for batch sizing
 _CHARS_PER_TOKEN = 4
 
+_STOP_WORDS = {
+    "what", "when", "where", "who", "how", "tell", "is", "are", "the", "for",
+    "under", "in", "on", "at", "to", "of", "with", "by", "according", "about",
+    "from", "during", "before", "after", "per", "which", "whose", "does", "have",
+    "show", "give", "can", "could", "should", "would", "an", "a", "this", "that",
+    "these", "those", "all", "any", "some", "and", "or", "but", "while", "also",
+}
+
 
 def _now_utc() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+@dataclass
+class DocumentExtractionBudget:
+    """Enforces document level extraction bounds across batches, attempts, and retries."""
+    workspace_id: str
+    document_id: str
+    document_version: str
+    max_calls: int = 2
+    max_input_tokens: int = 4000
+    max_output_tokens: int = 1200
+    max_elapsed_s: float = 20.0
+    calls_made: int = 0
+    input_tokens_used: int = 0
+    output_tokens_used: int = 0
+    started_at: float = field(default_factory=time.perf_counter)
+    exhausted: bool = False
+    exhaustion_reason: str | None = None
+
+    def can_call(self) -> bool:
+        if self.exhausted:
+            return False
+        if self.calls_made >= self.max_calls:
+            self.exhausted = True
+            self.exhaustion_reason = f"call_limit_reached ({self.calls_made}/{self.max_calls})"
+            return False
+        if self.input_tokens_used >= self.max_input_tokens:
+            self.exhausted = True
+            self.exhaustion_reason = f"input_token_limit_reached ({self.input_tokens_used}/{self.max_input_tokens})"
+            return False
+        if self.output_tokens_used >= self.max_output_tokens:
+            self.exhausted = True
+            self.exhaustion_reason = f"output_token_limit_reached ({self.output_tokens_used}/{self.max_output_tokens})"
+            return False
+        elapsed = time.perf_counter() - self.started_at
+        if elapsed >= self.max_elapsed_s:
+            self.exhausted = True
+            self.exhaustion_reason = f"elapsed_time_limit_reached ({elapsed:.1f}s/{self.max_elapsed_s:.1f}s)"
+            return False
+        return True
+
+    def record_call(self, input_tokens: int, output_tokens: int) -> None:
+        self.calls_made += 1
+        self.input_tokens_used += input_tokens
+        self.output_tokens_used += output_tokens
+        if (
+            self.calls_made >= self.max_calls
+            or self.input_tokens_used >= self.max_input_tokens
+            or self.output_tokens_used >= self.max_output_tokens
+        ):
+            self.exhausted = True
+
+
+_MAX_BUDGET_LEDGER_ENTRIES = 1000
+_EXTRACTION_LOCKS: dict[str, threading.Lock] = {}
+_EXTRACTION_BUDGETS: dict[str, DocumentExtractionBudget] = {}
+_GLOBAL_LOCK = threading.Lock()
+
+
+def reset_budget_ledger() -> None:
+    """Reset in memory extraction locks and budget ledger primarily for test isolation."""
+    with _GLOBAL_LOCK:
+        _EXTRACTION_BUDGETS.clear()
+        _EXTRACTION_LOCKS.clear()
+
+
+def get_document_extraction_lock(idempotency_key: str) -> threading.Lock:
+    with _GLOBAL_LOCK:
+        if idempotency_key not in _EXTRACTION_LOCKS:
+            if len(_EXTRACTION_LOCKS) >= _MAX_BUDGET_LEDGER_ENTRIES:
+                oldest_k = next(iter(_EXTRACTION_LOCKS))
+                del _EXTRACTION_LOCKS[oldest_k]
+            _EXTRACTION_LOCKS[idempotency_key] = threading.Lock()
+        return _EXTRACTION_LOCKS[idempotency_key]
+
+
+def get_or_create_document_budget(
+    workspace_id: str,
+    document_id: str,
+    document_version: str,
+    idempotency_key: str,
+    max_calls: int = 2,
+    max_input_tokens: int = 4000,
+    max_output_tokens: int = 1200,
+    max_elapsed_s: float = 20.0,
+) -> DocumentExtractionBudget:
+    with _GLOBAL_LOCK:
+        if idempotency_key in _EXTRACTION_BUDGETS:
+            return _EXTRACTION_BUDGETS[idempotency_key]
+        if len(_EXTRACTION_BUDGETS) >= _MAX_BUDGET_LEDGER_ENTRIES:
+            oldest_k = next(iter(_EXTRACTION_BUDGETS))
+            del _EXTRACTION_BUDGETS[oldest_k]
+        budget = DocumentExtractionBudget(
+            workspace_id=workspace_id,
+            document_id=document_id,
+            document_version=document_version,
+            max_calls=max_calls,
+            max_input_tokens=max_input_tokens,
+            max_output_tokens=max_output_tokens,
+            max_elapsed_s=max_elapsed_s,
+        )
+        _EXTRACTION_BUDGETS[idempotency_key] = budget
+        return budget
 
 
 def is_value_grounded(property_value: str, chunk_text: str) -> bool:
@@ -78,6 +191,131 @@ def is_value_grounded(property_value: str, chunk_text: str) -> bool:
             return True
 
     return False
+
+
+def validate_assertion_grounding(
+    entity_name: str,
+    property_key: str,
+    property_value: str,
+    chunk_text: str,
+) -> tuple[bool, str]:
+    """Validate entity property value relationship in chunk, rejecting unsupported or ambiguous claims.
+    
+    Verifies that:
+    1. The property value occurs in the chunk text.
+    2. The asserted entity occurs in the chunk text.
+    3. The value is syntactically or relationally attributed to the asserted entity rather than
+       another competing entity in the chunk. If the value occurs in a sentence with a different
+       entity and not the asserted entity, or if another entity is closer and directly governs
+       the value, the claim is rejected as wrong entity attribution or ambiguous.
+    """
+    if not property_value or not chunk_text or not entity_name:
+        return False, "missing_input"
+
+    # Check 1: Value grounding
+    if not is_value_grounded(property_value, chunk_text):
+        return False, "value_not_grounded"
+
+    # Check 2: Entity grounding in chunk
+    if not is_value_grounded(entity_name, chunk_text):
+        return False, "entity_not_in_chunk"
+
+    # Check 3: Relational binding between entity and value
+    ent_lower = entity_name.strip().lower()
+    val_lower = property_value.strip().lower()
+
+    # Split chunk into sentences
+    raw_sentences = [s.strip() for s in re.split(r"(?<=[.!?\n])\s+", chunk_text) if s.strip()]
+    sentences = raw_sentences if raw_sentences else [chunk_text]
+
+    # Find sentences containing the property value
+    val_sentences = [s for s in sentences if is_value_grounded(property_value, s)]
+    if not val_sentences:
+        val_sentences = sentences
+
+    # Identify potential competing entities in the chunk text
+    prop_norm = property_key.strip().lower().replace("_", " ")
+    prop_tokens = set(re.findall(r"\w+", prop_norm))
+    metric_terms = {
+        "total", "net", "gross", "operating", "fiscal", "annual", "quarterly",
+        "average", "median", "minimum", "maximum", "estimated", "reported",
+        "adjusted", "year", "month", "period", "table", "summary", "column",
+        "figure", "item", "category", "number", "value", "percent", "percentage",
+        "rate", "ratio", "score", "index", "level", "cost", "price", "amount",
+        "revenue", "income", "profit", "loss", "expense", "expenses", "ebitda",
+        "margin", "cash", "debt", "equity", "asset", "assets", "liability", "liabilities",
+    }
+    corp_indicators = (
+        "inc", "corp", "llc", "ltd", "group", "bank", "technologies", "company",
+        "co", "labs", "partners", "holdings",
+    )
+
+    candidate_entities = re.findall(r"\b[A-Z][a-zA-Z0-9]+(?:\s+[A-Z][a-zA-Z0-9]+)*\b", chunk_text)
+    other_entities: set[str] = set()
+    for cand in candidate_entities:
+        cand_norm = cand.strip().lower()
+        if cand_norm == ent_lower or cand_norm in ent_lower or ent_lower in cand_norm:
+            continue
+        if cand_norm in _STOP_WORDS or len(cand_norm) <= 3:
+            continue
+        cand_words = set(re.findall(r"\w+", cand_norm))
+        # Exclude candidates that overlap with property key tokens or common financial metric terms
+        if cand_words.intersection(prop_tokens) or cand_words.issubset(metric_terms):
+            continue
+        has_corp = any(ci in cand_norm for ci in corp_indicators)
+        is_mid_sentence = bool(re.search(rf"(?<![.!?\n]\s)(?<!^)\b{re.escape(cand)}\b", chunk_text))
+        if len(cand_words) > 1 or has_corp or is_mid_sentence:
+            other_entities.add(cand_norm)
+
+    for sent in val_sentences:
+        sent_lower = sent.lower()
+        ent_in_sent = is_value_grounded(entity_name, sent)
+        competing_in_sent = [oe for oe in other_entities if is_value_grounded(oe, sent)]
+
+        if ent_in_sent and not competing_in_sent:
+            return True, "verified"
+
+        if not ent_in_sent and competing_in_sent:
+            # The value is in a sentence that mentions another entity, but NOT the asserted entity
+            # Counterexample: real value attributed to the wrong entity
+            return False, "wrong_entity_attribution"
+
+        if ent_in_sent and competing_in_sent:
+            # Both asserted entity and competing entity appear in the same sentence.
+            # Measure character index proximity to the property value
+            val_idx = sent_lower.find(val_lower)
+            if val_idx == -1:
+                val_toks = re.findall(r"\w+", val_lower)
+                if val_toks:
+                    val_idx = sent_lower.find(val_toks[0])
+
+            ent_idx = sent_lower.find(ent_lower)
+            if ent_idx == -1:
+                ent_toks = re.findall(r"\w+", ent_lower)
+                if ent_toks:
+                    ent_idx = sent_lower.find(ent_toks[0])
+
+            ent_dist = abs(val_idx - ent_idx) if (val_idx != -1 and ent_idx != -1) else 999999
+
+            other_closer = False
+            for oe in competing_in_sent:
+                oe_idx = sent_lower.find(oe)
+                if oe_idx != -1 and val_idx != -1:
+                    oe_dist = abs(val_idx - oe_idx)
+                    if oe_dist < ent_dist:
+                        other_closer = True
+                        break
+
+            if other_closer:
+                return False, "wrong_entity_attribution"
+
+            return True, "verified"
+
+    # If entity and value are in different sentences and other entities exist in the chunk
+    if other_entities:
+        return False, "ambiguous_relationship"
+
+    return True, "verified"
 
 
 class OkfBuilder:
@@ -140,86 +378,111 @@ class OkfBuilder:
         idempotency_key = compute_idempotency_key(workspace_id, document_id, document_version)
         timestamp = _now_utc()
 
-        # Idempotency check: Reuse existing manifest if ready and not forced
-        if not force_reextract and self.repo.has_ready_okf(workspace_id, document_id, document_version):
-            existing_man = self.repo.get_manifest(workspace_id, document_id, document_version)
-            if existing_man:
-                logger.info(
-                    "okf_builder.idempotent_replay ws=%s doc=%s ver=%s assertions=%d",
+        doc_lock = get_document_extraction_lock(idempotency_key)
+        with doc_lock:
+            # Idempotency check: Reuse existing manifest if ready and not forced
+            if not force_reextract and self.repo.has_ready_okf(workspace_id, document_id, document_version):
+                existing_man = self.repo.get_manifest(workspace_id, document_id, document_version)
+                if existing_man:
+                    logger.info(
+                        "okf_builder.idempotent_replay ws=%s doc=%s ver=%s assertions=%d",
+                        workspace_id,
+                        document_id,
+                        document_version,
+                        len(existing_man.assertions),
+                    )
+                    return existing_man
+
+            budget = get_or_create_document_budget(
+                workspace_id=workspace_id,
+                document_id=document_id,
+                document_version=document_version,
+                idempotency_key=idempotency_key,
+                max_calls=int(getattr(settings, "OKF_MAX_MODEL_CALLS_PER_DOC", 2)),
+            )
+
+            # Enforce single document extraction budget across replays and attempts (AC-3)
+            # Replays and concurrent ingestion must not reset that budget silently
+            if not force_reextract:
+                existing_man = self.repo.get_manifest(workspace_id, document_id, document_version)
+                if existing_man and existing_man.status == "failed" and existing_man.model_calls >= budget.max_calls:
+                    logger.warning(
+                        "okf_builder.budget_exhausted_replay ws=%s doc=%s ver=%s prior_calls=%d (not resetting budget)",
+                        workspace_id,
+                        document_id,
+                        document_version,
+                        existing_man.model_calls,
+                    )
+                    return existing_man
+
+            fmt = (format or "").lower().replace(".", "")
+
+            try:
+                if fmt == "csv":
+                    return self._extract_csv(
+                        workspace_id=workspace_id,
+                        document_id=document_id,
+                        document_version=document_version,
+                        chunks=chunks,
+                        table_name=table_name,
+                        table_store=table_store,
+                        idempotency_key=idempotency_key,
+                        timestamp=timestamp,
+                    )
+                elif fmt == "pdf":
+                    return self._extract_pdf(
+                        workspace_id=workspace_id,
+                        document_id=document_id,
+                        document_version=document_version,
+                        chunks=chunks,
+                        idempotency_key=idempotency_key,
+                        timestamp=timestamp,
+                        budget=budget,
+                    )
+                else:
+                    # Unsupported format for factual entity extraction (DOCX/PPTX) -> return empty manifest
+                    manifest = OkfManifest(
+                        workspace_id=workspace_id,
+                        document_id=document_id,
+                        document_version=document_version,
+                        entities=(),
+                        assertions=(),
+                        rejected_assertions_count=0,
+                        status="empty",
+                        extraction_tokens=0,
+                        model_calls=0,
+                        idempotency_key=idempotency_key,
+                        created_at=timestamp,
+                    )
+                    self.repo.save_manifest(workspace_id, manifest)
+                    return manifest
+
+            except Exception as exc:
+                logger.warning(
+                    "okf_builder.extraction_failed ws=%s doc=%s ver=%s error=%s (failing open per ADR-001)",
                     workspace_id,
                     document_id,
                     document_version,
-                    len(existing_man.assertions),
+                    exc,
                 )
-                return existing_man
-
-        fmt = (format or "").lower().replace(".", "")
-
-        try:
-            if fmt == "csv":
-                return self._extract_csv(
-                    workspace_id=workspace_id,
-                    document_id=document_id,
-                    document_version=document_version,
-                    chunks=chunks,
-                    table_name=table_name,
-                    table_store=table_store,
-                    idempotency_key=idempotency_key,
-                    timestamp=timestamp,
-                )
-            elif fmt == "pdf":
-                return self._extract_pdf(
-                    workspace_id=workspace_id,
-                    document_id=document_id,
-                    document_version=document_version,
-                    chunks=chunks,
-                    idempotency_key=idempotency_key,
-                    timestamp=timestamp,
-                )
-            else:
-                # Unsupported format for factual entity extraction (DOCX/PPTX) -> return empty manifest
-                manifest = OkfManifest(
+                failed_manifest = OkfManifest(
                     workspace_id=workspace_id,
                     document_id=document_id,
                     document_version=document_version,
                     entities=(),
                     assertions=(),
                     rejected_assertions_count=0,
-                    status="empty",
-                    extraction_tokens=0,
-                    model_calls=0,
+                    status="failed",
+                    extraction_tokens=budget.input_tokens_used + budget.output_tokens_used if 'budget' in locals() else 0,
+                    model_calls=budget.calls_made if 'budget' in locals() else 1,
                     idempotency_key=idempotency_key,
                     created_at=timestamp,
                 )
-                self.repo.save_manifest(workspace_id, manifest)
-                return manifest
-
-        except Exception as exc:
-            logger.warning(
-                "okf_builder.extraction_failed ws=%s doc=%s ver=%s error=%s (failing open per ADR-001)",
-                workspace_id,
-                document_id,
-                document_version,
-                exc,
-            )
-            failed_manifest = OkfManifest(
-                workspace_id=workspace_id,
-                document_id=document_id,
-                document_version=document_version,
-                entities=(),
-                assertions=(),
-                rejected_assertions_count=0,
-                status="failed",
-                extraction_tokens=0,
-                model_calls=0,
-                idempotency_key=idempotency_key,
-                created_at=timestamp,
-            )
-            try:
-                self.repo.save_manifest(workspace_id, failed_manifest)
-            except Exception:
-                pass
-            return failed_manifest
+                try:
+                    self.repo.save_manifest(workspace_id, failed_manifest)
+                except Exception:
+                    pass
+                return failed_manifest
 
     def _extract_csv(
         self,
@@ -347,8 +610,14 @@ class OkfBuilder:
         chunks: Sequence[Any],
         idempotency_key: str,
         timestamp: str,
+        budget: DocumentExtractionBudget | None = None,
     ) -> OkfManifest:
         """Bounded Bedrock fact extraction for text PDFs with chunk grounding validation."""
+        if budget is None:
+            budget = get_or_create_document_budget(
+                workspace_id, document_id, document_version, idempotency_key
+            )
+
         if not chunks:
             manifest = OkfManifest(
                 workspace_id=workspace_id,
@@ -371,7 +640,7 @@ class OkfBuilder:
 
         # Select introductory and high density chunks up to budget
         # AC-3: max 2 calls, max 2000 input tokens per call, max 4000 total input tokens
-        max_calls = getattr(settings, "OKF_MAX_MODEL_CALLS_PER_DOC", 2)
+        max_calls = budget.max_calls
         max_prompt_chars = 2000 * _CHARS_PER_TOKEN  # ~8000 chars per call
 
         batches: list[list[Any]] = []
@@ -393,15 +662,15 @@ class OkfBuilder:
         if current_batch and len(batches) < max_calls:
             batches.append(current_batch)
 
-        total_input_tokens = 0
-        total_output_tokens = 0
-        calls_made = 0
         raw_candidates: list[dict[str, Any]] = []
-
         client = self._get_bedrock_client()
 
         for batch_idx, batch in enumerate(batches):
-            if calls_made >= max_calls:
+            if not budget.can_call():
+                logger.warning(
+                    "okf_builder.budget_stopped batch=%d reason=%s",
+                    batch_idx, budget.exhaustion_reason,
+                )
                 break
 
             prompt_text, text_stats = self._invoke_bedrock_extraction(
@@ -409,10 +678,8 @@ class OkfBuilder:
                 chunks=batch,
                 workspace_id=workspace_id,
                 document_id=document_id,
+                budget=budget,
             )
-            calls_made += 1
-            total_input_tokens += text_stats["input_tokens"]
-            total_output_tokens += text_stats["output_tokens"]
 
             if prompt_text:
                 parsed = self._parse_model_response(prompt_text)
@@ -453,11 +720,15 @@ class OkfBuilder:
                 rejected_count += 1
                 continue
 
-            # Check 3: Grounding text match (verbatim appearance) (AC-2)
+            # Check 3: Entity property value relationship grounding verification (AC-2)
             ch_text = getattr(chunk, "text", "") or ""
-            if not is_value_grounded(prop_val, ch_text):
+            is_valid, reason = validate_assertion_grounding(ent_name, prop_key, prop_val, ch_text)
+            if not is_valid:
                 logger.debug(
-                    "okf_builder.rejection_unsupported_claim val=%r chunk_id=%s",
+                    "okf_builder.rejection_unsupported_claim reason=%s ent=%r key=%r val=%r chunk_id=%s",
+                    reason,
+                    ent_name,
+                    prop_key,
                     prop_val,
                     chunk_id,
                 )
@@ -517,9 +788,9 @@ class OkfBuilder:
             entities=tuple(valid_entities_map.values()),
             assertions=tuple(valid_assertions),
             rejected_assertions_count=rejected_count,
-            status="ready" if valid_assertions else ("failed" if calls_made > 0 and not raw_candidates else "empty"),
-            extraction_tokens=total_input_tokens + total_output_tokens,
-            model_calls=calls_made,
+            status="ready" if valid_assertions else ("failed" if budget.calls_made > 0 and not raw_candidates else "empty"),
+            extraction_tokens=budget.input_tokens_used + budget.output_tokens_used,
+            model_calls=budget.calls_made,
             idempotency_key=idempotency_key,
             created_at=timestamp,
         )
@@ -533,7 +804,7 @@ class OkfBuilder:
             len(valid_assertions),
             rejected_count,
             manifest.extraction_tokens,
-            calls_made,
+            budget.calls_made,
         )
         return manifest
 
@@ -543,8 +814,16 @@ class OkfBuilder:
         chunks: Sequence[Any],
         workspace_id: str,
         document_id: str,
+        budget: DocumentExtractionBudget | None = None,
     ) -> tuple[str, dict[str, int]]:
         """Execute Bedrock Converse API with token caps, 10s deadline, and max 1 retry on throttling."""
+        if budget is None:
+            budget = DocumentExtractionBudget(
+                workspace_id=workspace_id,
+                document_id=document_id,
+                document_version="v_default",
+            )
+
         system_prompt = (
             "You are a factual property extraction system for an enterprise knowledge retrieval engine.\n"
             "Extract entities and factual property assertions from the provided document chunks.\n"
@@ -576,7 +855,12 @@ class OkfBuilder:
 
         # Test environment fallback
         if client is None:
-            return self._test_mode_fallback(chunks)
+            if not budget.can_call():
+                logger.warning("okf_builder.test_mode_budget_exhausted calls=%d", budget.calls_made)
+                return "", {"input_tokens": 0, "output_tokens": 0}
+            out_json, stats = self._test_mode_fallback(chunks)
+            budget.record_call(stats["input_tokens"], stats["output_tokens"])
+            return out_json, stats
 
         model_id = getattr(settings, "OKF_BEDROCK_MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0")
         max_output_tokens = 600
@@ -585,6 +869,13 @@ class OkfBuilder:
         max_attempts = 2  # at most 1 retry on throttling (HTTP 429)
 
         for attempt in range(max_attempts):
+            if not budget.can_call():
+                logger.warning(
+                    "okf_builder.call_budget_exceeded attempt=%d reason=%s",
+                    attempt, budget.exhaustion_reason,
+                )
+                return "", {"input_tokens": 0, "output_tokens": 0}
+
             try:
                 resp = client.converse(
                     modelId=model_id,
@@ -601,14 +892,17 @@ class OkfBuilder:
                     "input_tokens": raw_usage.get("inputTokens", 0),
                     "output_tokens": raw_usage.get("outputTokens", 0),
                 }
+                budget.record_call(usage["input_tokens"], usage["output_tokens"])
                 return output_text, usage
 
             except Exception as e:
+                budget.calls_made += 1
                 err_str = str(e)
                 if ("ThrottlingException" in err_str or "429" in err_str) and attempt < max_attempts - 1:
-                    logger.warning("Bedrock OKF throttled (429), retrying once after 2.0s...")
-                    time.sleep(2.0)
-                    continue
+                    if budget.can_call():
+                        logger.warning("Bedrock OKF throttled (429), retrying once after 2.0s...")
+                        time.sleep(2.0)
+                        continue
                 # Zero retries on model errors, bad requests, or timeouts (AC-3)
                 logger.warning("Bedrock OKF call failed (no retries per AC-3): %s", e)
                 return "", {"input_tokens": 0, "output_tokens": 0}

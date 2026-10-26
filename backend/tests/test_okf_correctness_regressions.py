@@ -1,0 +1,625 @@
+"""Focused regression tests for OKF correctness gaps.
+
+Verifies:
+1. Carrying authorized document scope, active versions, and ready manifests into pipeline OKF lookup.
+2. Single document-level extraction budget across attempts, retries, and replays without silent reset.
+3. Entity-property-value relational grounding rejecting wrong entity attribution (counterexample).
+4. Baseline publication independent of optional OKF extraction, preserving baseline availability on failure.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from datetime import datetime, timezone
+import json
+from pathlib import Path
+import threading
+import time
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from config import settings
+from db.database import CloudRepository
+from db.okf_repo import InMemoryOkfRepository, get_okf_repo
+from db.workspace_boundary_repo import (
+    DocumentSnapshot,
+    InMemoryWorkspaceBoundaryRepository,
+    get_workspace_boundary_repo,
+)
+from ingestion.embed_service import _deterministic_vector, embed_fast_local
+from ingestion.okf_builder import (
+    DocumentExtractionBudget,
+    OkfBuilder,
+    is_value_grounded,
+    reset_budget_ledger,
+    validate_assertion_grounding,
+)
+from modules.documents.documents_repository import _IN_MEMORY_CHUNKS, _IN_MEMORY_DOCS
+from modules.documents.documents_service import DocumentsService
+from schemas.contracts.okf import (
+    OkfEntityRecord,
+    OkfManifest,
+    OkfPropertyAssertion,
+    compute_assertion_id,
+    compute_entity_id,
+    compute_idempotency_key,
+)
+from schemas.models import Chunk, Document
+from services.langgraph_pipeline import run_okf_router
+from services.retrieval.okf_lookup import get_okf_controller
+from services.retrieval.okf_retriever import OkfRetriever
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+@pytest.fixture(autouse=True)
+def clean_fixtures():
+    reset_budget_ledger()
+    _IN_MEMORY_DOCS.clear()
+    _IN_MEMORY_CHUNKS.clear()
+    b_repo = get_workspace_boundary_repo(reset=True)
+    okf_repo = get_okf_repo(reset=True)
+    yield b_repo, okf_repo
+    reset_budget_ledger()
+    _IN_MEMORY_DOCS.clear()
+    _IN_MEMORY_CHUNKS.clear()
+
+
+# ==============================================================================
+# 1. Pipeline Scoping: Explicit Document Scope, Active Versions & Ready Manifests
+# ==============================================================================
+
+
+def test_pipeline_explicit_document_scope_and_version_filtering():
+    """Verify authorized document_ids scope and active version constraints in pipeline OKF lookup."""
+    boundary_repo = InMemoryWorkspaceBoundaryRepository()
+    okf_repo = InMemoryOkfRepository()
+    chunk_repo = CloudRepository()
+
+    ws_id = "ws_pipeline_scope"
+    now = _now()
+
+    # Document A (active version v2)
+    chunk_a2 = Chunk(
+        id="doc_a:c2",
+        document_id="doc_a",
+        workspace_id=ws_id,
+        source_format="pdf",
+        text="Alpha Corp generated $100M in revenue for 2026.",
+        element_type="paragraph",
+        page_number=1,
+        embedding_fast=embed_fast_local("Alpha Corp generated $100M in revenue for 2026."),
+        embedding_full=_deterministic_vector("Alpha Corp generated $100M in revenue for 2026.", 1024),
+    )
+    # Document A old version v1 chunk
+    chunk_a1 = Chunk(
+        id="doc_a:c1",
+        document_id="doc_a",
+        workspace_id=ws_id,
+        source_format="pdf",
+        text="Alpha Corp generated $10M in revenue for 2025.",
+        element_type="paragraph",
+        page_number=1,
+        embedding_fast=embed_fast_local("Alpha Corp generated $10M in revenue for 2025."),
+        embedding_full=_deterministic_vector("Alpha Corp generated $10M in revenue for 2025.", 1024),
+    )
+    # Document B (active version v1)
+    chunk_b1 = Chunk(
+        id="doc_b:c1",
+        document_id="doc_b",
+        workspace_id=ws_id,
+        source_format="pdf",
+        text="Alpha Corp generated $200M in revenue according to secondary report.",
+        element_type="paragraph",
+        page_number=1,
+        embedding_fast=embed_fast_local("Alpha Corp generated $200M in revenue according to secondary report."),
+        embedding_full=_deterministic_vector("Alpha Corp generated $200M in revenue according to secondary report.", 1024),
+    )
+
+    doc_a = Document(id="doc_a", filename="alpha.pdf", source_format="pdf", chunks=[chunk_a1, chunk_a2], workspace_id=ws_id)
+    doc_b = Document(id="doc_b", filename="beta.pdf", source_format="pdf", chunks=[chunk_b1], workspace_id=ws_id)
+    chunk_repo.save(doc_a)
+    chunk_repo.save(doc_b)
+
+    # Active snapshots in boundary repo: doc_a is on v2, doc_b is on v1
+    snap_a = DocumentSnapshot(
+        workspace_id=ws_id,
+        document_id="doc_a",
+        source="alpha.pdf",
+        version="v2",
+        format="pdf",
+        incomplete_coverage_flag=False,
+        exclusions=(),
+        persisted_rows=1,
+        total_rows=1,
+        created_at=now,
+        okf_status="ready",
+        okf_entities_count=1,
+        okf_properties_count=1,
+    )
+    snap_b = DocumentSnapshot(
+        workspace_id=ws_id,
+        document_id="doc_b",
+        source="beta.pdf",
+        version="v1",
+        format="pdf",
+        incomplete_coverage_flag=False,
+        exclusions=(),
+        persisted_rows=1,
+        total_rows=1,
+        created_at=now,
+        okf_status="ready",
+        okf_entities_count=1,
+        okf_properties_count=1,
+    )
+    boundary_repo.save_document_snapshot(snap_a)
+    boundary_repo.save_document_snapshot(snap_b)
+
+    # Seed OKF assertions:
+    # 1. doc_a old version v1 assertion ($10M)
+    e_a1_id = compute_entity_id(ws_id, "doc_a", "alpha corp")
+    ass_a1 = OkfPropertyAssertion(
+        assertion_id="ass_a1",
+        workspace_id=ws_id,
+        entity_id=e_a1_id,
+        entity_name="Alpha Corp",
+        property_key="revenue",
+        property_value="$10M",
+        source_chunk_id="doc_a:c1",
+        document_id="doc_a",
+        document_version="v1",  # Old version!
+        confidence_score=1.0,
+        validation_status="verified",
+        created_at=now,
+    )
+    okf_repo.save_manifest(ws_id, OkfManifest(
+        workspace_id=ws_id, document_id="doc_a", document_version="v1",
+        entities=(OkfEntityRecord(workspace_id=ws_id, entity_id=e_a1_id, entity_name="Alpha Corp", normalized_name="alpha corp", entity_type="organization", document_id="doc_a", document_version="v1", created_at=now),),
+        assertions=(ass_a1,), status="ready", idempotency_key="k_a1", created_at=now,
+    ))
+
+    # 2. doc_a active version v2 assertion ($100M)
+    e_a2_id = compute_entity_id(ws_id, "doc_a", "alpha corp")
+    ass_a2 = OkfPropertyAssertion(
+        assertion_id="ass_a2",
+        workspace_id=ws_id,
+        entity_id=e_a2_id,
+        entity_name="Alpha Corp",
+        property_key="revenue",
+        property_value="$100M",
+        source_chunk_id="doc_a:c2",
+        document_id="doc_a",
+        document_version="v2",  # Active version!
+        confidence_score=1.0,
+        validation_status="verified",
+        created_at=now,
+    )
+    okf_repo.save_manifest(ws_id, OkfManifest(
+        workspace_id=ws_id, document_id="doc_a", document_version="v2",
+        entities=(OkfEntityRecord(workspace_id=ws_id, entity_id=e_a2_id, entity_name="Alpha Corp", normalized_name="alpha corp", entity_type="organization", document_id="doc_a", document_version="v2", created_at=now),),
+        assertions=(ass_a2,), status="ready", idempotency_key="k_a2", created_at=now,
+    ))
+
+    # 3. doc_b active version v1 assertion ($200M)
+    e_b1_id = compute_entity_id(ws_id, "doc_b", "alpha corp")
+    ass_b1 = OkfPropertyAssertion(
+        assertion_id="ass_b1",
+        workspace_id=ws_id,
+        entity_id=e_b1_id,
+        entity_name="Alpha Corp",
+        property_key="revenue",
+        property_value="$200M",
+        source_chunk_id="doc_b:c1",
+        document_id="doc_b",
+        document_version="v1",
+        confidence_score=1.0,
+        validation_status="verified",
+        created_at=now,
+    )
+    okf_repo.save_manifest(ws_id, OkfManifest(
+        workspace_id=ws_id, document_id="doc_b", document_version="v1",
+        entities=(OkfEntityRecord(workspace_id=ws_id, entity_id=e_b1_id, entity_name="Alpha Corp", normalized_name="alpha corp", entity_type="organization", document_id="doc_b", document_version="v1", created_at=now),),
+        assertions=(ass_b1,), status="ready", idempotency_key="k_b1", created_at=now,
+    ))
+
+    retriever = OkfRetriever(
+        repository=okf_repo,
+        boundary_repo=boundary_repo,
+        chunk_repo=chunk_repo,
+    )
+
+    # Test 1: Query restricted to document_ids=["doc_a"]
+    # Must return ONLY active v2 assertion ($100M) and NEVER old v1 ($10M) or doc_b ($200M)
+    res_scoped_a = retriever.lookup_sync(
+        workspace_id=ws_id,
+        query="What is Alpha Corp revenue?",
+        target_entities=["Alpha Corp"],
+        document_ids=["doc_a"],
+    )
+    assert len(res_scoped_a.matched_assertions) == 1
+    assert res_scoped_a.matched_assertions[0].property_value == "$100M"
+    assert res_scoped_a.matched_assertions[0].document_version == "v2"
+    assert res_scoped_a.candidate_chunk_ids == ("doc_a:c2",)
+
+    # Test 2: Pipeline execution with state["document_ids"] = ["doc_b"]
+    with patch("services.langgraph_pipeline._get_repo", return_value=chunk_repo), \
+         patch("db.okf_repo.get_okf_repo", return_value=okf_repo), \
+         patch("db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=boundary_repo):
+        pipeline_state = {
+            "workspace_id": ws_id,
+            "query": "What is Alpha Corp revenue?",
+            "document_ids": ["doc_b"],
+        }
+        res_pipeline = run_okf_router(pipeline_state)
+
+        assert res_pipeline["okf_match_count"] == 1
+        assert res_pipeline["okf_candidate_ids"] == ["doc_b:c1"]
+        matched_vals = [p["property_value"] for p in res_pipeline["okf_properties"]]
+        assert matched_vals == ["$200M"]
+
+
+def test_pipeline_failed_manifest_skipping():
+    """Verify that documents with failed OKF manifests are cleanly skipped by OKF lookup."""
+    boundary_repo = InMemoryWorkspaceBoundaryRepository()
+    okf_repo = InMemoryOkfRepository()
+    ws_id = "ws_failed_manifest"
+    now = _now()
+
+    # Document snapshot marked as okf_status="failed"
+    snap_failed = DocumentSnapshot(
+        workspace_id=ws_id,
+        document_id="doc_err",
+        source="error.pdf",
+        version="v1",
+        format="pdf",
+        incomplete_coverage_flag=False,
+        exclusions=(),
+        persisted_rows=1,
+        total_rows=1,
+        created_at=now,
+        okf_status="failed",
+        okf_entities_count=0,
+        okf_properties_count=0,
+    )
+    boundary_repo.save_document_snapshot(snap_failed)
+
+    # Manifest in okf_repo marked status="failed"
+    okf_repo.save_manifest(ws_id, OkfManifest(
+        workspace_id=ws_id,
+        document_id="doc_err",
+        document_version="v1",
+        entities=(),
+        assertions=(),
+        status="failed",
+        idempotency_key="k_err",
+        created_at=now,
+    ))
+
+    retriever = OkfRetriever(
+        repository=okf_repo,
+        boundary_repo=boundary_repo,
+    )
+
+    res = retriever.lookup_sync(
+        workspace_id=ws_id,
+        query="What is the revenue?",
+        target_entities=["Revenue"],
+        document_ids=["doc_err"],
+    )
+    assert len(res.matched_assertions) == 0
+    assert len(res.candidate_chunk_ids) == 0
+    assert res.execution_status == "completed"
+
+
+# ==============================================================================
+# 2. Document Level Extraction Budget & Retry Exhaustion (AC-3)
+# ==============================================================================
+
+
+def test_extraction_budget_enforces_call_limit_and_retry_exhaustion():
+    """Verify document-level extraction budget caps provider attempts at 2 across retries."""
+    reset_budget_ledger()
+    repo = InMemoryOkfRepository()
+
+    ch1 = Chunk(id="d_b:c1", document_id="d_b", source_format="pdf", text="Acme Corp report.", element_type="paragraph", page_number=1)
+    ch2 = Chunk(id="d_b:c2", document_id="d_b", source_format="pdf", text="Acme Corp finances.", element_type="paragraph", page_number=2)
+
+    # Bedrock client that throttles on every attempt (HTTP 429)
+    mock_client = MagicMock()
+    mock_client.converse.side_effect = Exception("ThrottlingException: Rate exceeded (HTTP 429)")
+
+    builder = OkfBuilder(repo=repo, bedrock_client=mock_client)
+
+    manifest = builder.extract_and_persist(
+        workspace_id="ws_budget",
+        document_id="d_b",
+        document_version="v1",
+        format="pdf",
+        chunks=[ch1, ch2],
+    )
+
+    # Should make at most 2 calls (initial + 1 retry) and fail open per ADR-001
+    assert mock_client.converse.call_count == 2
+    assert manifest.status == "failed"
+    assert manifest.model_calls == 2
+
+    # Replaying the failed document version must NOT reset the budget silently
+    mock_client.converse.reset_mock()
+    replay_manifest = builder.extract_and_persist(
+        workspace_id="ws_budget",
+        document_id="d_b",
+        document_version="v1",
+        format="pdf",
+        chunks=[ch1, ch2],
+    )
+    # Zero new Bedrock calls on replay of exhausted budget
+    assert mock_client.converse.call_count == 0
+    assert replay_manifest.status == "failed"
+    assert replay_manifest.model_calls == 2
+
+
+def test_concurrent_ingestion_shares_single_document_budget():
+    """Verify concurrent ingestion requests for the same document version share one budget."""
+    reset_budget_ledger()
+    repo = InMemoryOkfRepository()
+
+    ch = Chunk(id="d_c:c1", document_id="d_c", source_format="pdf", text="Acme Corp reported $5M revenue.", element_type="paragraph", page_number=1)
+
+    call_count = 0
+    lock = threading.Lock()
+
+    def _fake_converse(*args, **kwargs):
+        nonlocal call_count
+        with lock:
+            call_count += 1
+        time.sleep(0.05)
+        return {
+            "output": {"message": {"content": [{"text": json.dumps([{
+                "entity_name": "Acme Corp", "property_key": "revenue", "property_value": "$5M", "source_chunk_id": "d_c:c1"
+            }])}]}},
+            "usage": {"inputTokens": 100, "outputTokens": 20},
+        }
+
+    mock_client = MagicMock()
+    mock_client.converse.side_effect = _fake_converse
+
+    builder = OkfBuilder(repo=repo, bedrock_client=mock_client)
+
+    def _worker():
+        builder.extract_and_persist(
+            workspace_id="ws_concurrent",
+            document_id="d_c",
+            document_version="v1",
+            format="pdf",
+            chunks=[ch],
+        )
+
+    t1 = threading.Thread(target=_worker)
+    t2 = threading.Thread(target=_worker)
+
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    # Total model calls across concurrent threads must be exactly 1 (idempotent lock & shared budget)
+    assert call_count == 1
+    manifest = repo.get_manifest("ws_concurrent", "d_c", "v1")
+    assert manifest is not None
+    assert manifest.status == "ready"
+    assert manifest.model_calls == 1
+
+
+# ==============================================================================
+# 3. Relational Grounding & Counterexample: Real Value Attributed to Wrong Entity
+# ==============================================================================
+
+
+def test_relational_grounding_rejects_real_value_attributed_to_wrong_entity():
+    """Counterexample: $15M is a real value in the chunk text, but belongs to Acme Corp, not Beta LLC.
+    
+    Verifies that value occurrence alone does not accept an assertion when attributed to the wrong entity.
+    """
+    chunk_text = (
+        "Acme Corp reported $15M in revenue for fiscal year 2025. "
+        "Competitor Beta LLC posted $2M in revenue."
+    )
+
+    # 1. Attributing $15M to Acme Corp is valid and grounded
+    is_valid_acme, reason_acme = validate_assertion_grounding(
+        entity_name="Acme Corp",
+        property_key="revenue",
+        property_value="$15M",
+        chunk_text=chunk_text,
+    )
+    assert is_valid_acme is True
+    assert reason_acme == "verified"
+
+    # 2. Counterexample: Attributing $15M to Beta LLC MUST BE REJECTED
+    # $15M is in chunk_text, Beta LLC is in chunk_text, revenue is in chunk_text,
+    # but the relationship is wrong!
+    is_valid_beta, reason_beta = validate_assertion_grounding(
+        entity_name="Beta LLC",
+        property_key="revenue",
+        property_value="$15M",
+        chunk_text=chunk_text,
+    )
+    assert is_valid_beta is False
+    assert reason_beta == "wrong_entity_attribution"
+
+    # 3. Attributing $2M to Beta LLC is valid and grounded
+    is_valid_beta_2m, reason_beta_2m = validate_assertion_grounding(
+        entity_name="Beta LLC",
+        property_key="revenue",
+        property_value="$2M",
+        chunk_text=chunk_text,
+    )
+    assert is_valid_beta_2m is True
+    assert reason_beta_2m == "verified"
+
+    # 4. Entity not mentioned in chunk at all
+    is_valid_unmentioned, reason_unmentioned = validate_assertion_grounding(
+        entity_name="Gamma Industries",
+        property_key="revenue",
+        property_value="$15M",
+        chunk_text=chunk_text,
+    )
+    assert is_valid_unmentioned is False
+    assert reason_unmentioned == "entity_not_in_chunk"
+
+
+def test_builder_rejects_wrong_entity_in_extraction_pass():
+    """Verify that OkfBuilder rejects wrong-entity counterexamples during PDF ingestion."""
+    repo = InMemoryOkfRepository()
+
+    ch = Chunk(
+        id="doc_counter:c1",
+        document_id="doc_counter",
+        source_format="pdf",
+        text="Acme Corp reported $15M in revenue for fiscal year 2025. Beta LLC posted $2M in revenue.",
+        element_type="paragraph",
+        page_number=1,
+    )
+
+    model_output = json.dumps([
+        # Valid claim for Acme Corp
+        {"entity_name": "Acme Corp", "property_key": "revenue", "property_value": "$15M", "source_chunk_id": "doc_counter:c1"},
+        # Counterexample claim: Real value ($15M) attributed to WRONG entity (Beta LLC)
+        {"entity_name": "Beta LLC", "property_key": "revenue", "property_value": "$15M", "source_chunk_id": "doc_counter:c1"},
+        # Valid claim for Beta LLC
+        {"entity_name": "Beta LLC", "property_key": "revenue", "property_value": "$2M", "source_chunk_id": "doc_counter:c1"},
+    ])
+
+    mock_bedrock = MagicMock()
+    mock_bedrock.converse.return_value = {
+        "output": {"message": {"content": [{"text": model_output}]}},
+        "usage": {"inputTokens": 100, "outputTokens": 50},
+    }
+
+    builder = OkfBuilder(repo=repo, bedrock_client=mock_bedrock)
+    manifest = builder.extract_and_persist(
+        workspace_id="ws_counter",
+        document_id="doc_counter",
+        document_version="v1",
+        format="pdf",
+        chunks=[ch],
+    )
+
+    # Exactly 2 valid claims accepted, 1 counterexample rejected
+    assert len(manifest.assertions) == 2
+    assert manifest.rejected_assertions_count == 1
+
+    accepted_pairs = {(a.entity_name, a.property_value) for a in manifest.assertions}
+    assert accepted_pairs == {("Acme Corp", "$15M"), ("Beta LLC", "$2M")}
+    assert ("Beta LLC", "$15M") not in accepted_pairs
+
+
+def test_relational_grounding_accepts_capitalized_metric_terms_and_property_keys():
+    """Verify that capitalized property keys and sentence initial metric terms do not trigger false rejection."""
+    # 1. Capitalized metric term at start of sentence
+    text1 = "Acme Corp had strong financial results. Total revenue reached $15M in 2025."
+    valid1, reason1 = validate_assertion_grounding(
+        entity_name="Acme Corp",
+        property_key="revenue",
+        property_value="$15M",
+        chunk_text=text1,
+    )
+    assert valid1 is True
+    assert reason1 == "verified"
+
+    # 2. Operating income capitalized next to value
+    text2 = "Acme Corp announced fiscal updates. Operating income was $5M."
+    valid2, reason2 = validate_assertion_grounding(
+        entity_name="Acme Corp",
+        property_key="operating_income",
+        property_value="$5M",
+        chunk_text=text2,
+    )
+    assert valid2 is True
+    assert reason2 == "verified"
+
+    # 3. Capitalized property name in same sentence
+    text3 = "In 2025, Acme Corp recorded Total Revenue of $15M."
+    valid3, reason3 = validate_assertion_grounding(
+        entity_name="Acme Corp",
+        property_key="revenue",
+        property_value="$15M",
+        chunk_text=text3,
+    )
+    assert valid3 is True
+    assert reason3 == "verified"
+
+
+# ==============================================================================
+# 4. Baseline Readiness Published Independently of Optional OKF (ADR-001)
+# ==============================================================================
+
+
+def test_baseline_readiness_published_independently_on_okf_failure():
+    """Verify that document baseline status is published as Ready and available even if OKF fails."""
+    repo = CloudRepository()
+    boundary_repo = get_workspace_boundary_repo()
+
+    doc_service = DocumentsService(repo=repo)
+
+    ws_id = "ws_adr001_decoupling"
+    doc_id = "doc_decoupled"
+    filename = "report.pdf"
+    content = b"%PDF-1.4 test document content for baseline readiness."
+
+    boundary_repo.create_workspace(workspace_id=ws_id, name="Test WS", owner_principal_id="test_user")
+
+    text = "Sample baseline document text for testing."
+    ch = Chunk(
+        id=f"{doc_id}:c1",
+        document_id=doc_id,
+        workspace_id=ws_id,
+        text=text,
+        source_format="pdf",
+        element_type="paragraph",
+        page_number=1,
+        embedding_fast=embed_fast_local(text),
+        embedding_full=_deterministic_vector(text, 1024),
+    )
+    parsed_doc = Document(id=doc_id, filename=filename, source_format="pdf", chunks=[ch], workspace_id=ws_id)
+    repo.add_placeholder_document(workspace_id=ws_id, doc_id=doc_id, filename=filename, format_str="pdf", size_str="100 KB")
+
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+        tmp.write(content)
+        tmp_path = tmp.name
+
+    try:
+        # Mock ingest_document to return parsed document and simulate OKF extraction failure
+        with patch("api.routes.ingest_document", return_value=parsed_doc), \
+             patch("modules.documents.documents_service.ingest_document", return_value=parsed_doc), \
+             patch("ingestion.okf_builder.extract_and_persist_okf", side_effect=RuntimeError("Bedrock unavailable")):
+            doc_service.background_ingest(
+                temp_path_str=tmp_path,
+                workspace_id=ws_id,
+                doc_id=doc_id,
+                filename=filename,
+                content=content,
+                size_str="100 KB",
+            )
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+    # 1. Document record and chunks must be published and accessible in repository
+    doc_record = repo.get(doc_id)
+    assert doc_record is not None
+    assert len(doc_record.chunks) == 1
+
+    # Document status in workspace must be published as Ready
+    from modules.documents.documents_repository import _WORKSPACE_DOCS
+    doc_entry = next(d for d in _WORKSPACE_DOCS[ws_id] if str(d.get("id")) == str(doc_id))
+    assert doc_entry["status"] == "Ready"
+
+    # 2. DocumentSnapshot must exist with okf_status="failed", preserving baseline
+    snapshot = boundary_repo.get_document_snapshot(ws_id, doc_id)
+    assert snapshot is not None
+    assert snapshot.okf_status == "failed"
+    assert snapshot.persisted_rows >= 0
