@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 import json
+import math
 from pathlib import Path
 import threading
 import time
@@ -32,6 +33,7 @@ from ingestion.okf_builder import (
     DocumentExtractionBudget,
     OkfBuilder,
     _EXTRACTION_BUDGETS,
+    count_request_tokens,
     get_or_create_document_budget,
     is_value_grounded,
     reset_budget_ledger,
@@ -1030,3 +1032,259 @@ def test_repository_manifest_scope_anchoring_parity(tmp_path):
     assert len(sqlite_ass) == 1
     assert sqlite_ass[0].document_id == doc_target
     assert sqlite_ass[0].document_version == ver_target
+
+
+# ==============================================================================
+# 9. Grounding Reproducer, Fail Closed Metadata, Complete Budget & Deadline
+# ==============================================================================
+
+
+def test_competing_property_relational_grounding_reproducer():
+    """Reproduce grounding counterexample: 'Acme reported revenue of 100 and profit of 20.'
+
+    revenue=100 passes; revenue=20 fails.
+    profit=20 passes; profit=100 fails.
+    Bind entity, property, and value together; refuse ambiguous relations.
+    """
+    text = "Acme reported revenue of 100 and profit of 20."
+
+    # 1. revenue=100 is validly bound
+    ok_rev100, reason_rev100 = validate_assertion_grounding(
+        entity_name="Acme",
+        property_key="revenue",
+        property_value="100",
+        chunk_text=text,
+    )
+    assert ok_rev100 is True
+    assert reason_rev100 == "verified"
+
+    # 2. revenue=20 must fail (20 is bound to profit, not revenue)
+    ok_rev20, reason_rev20 = validate_assertion_grounding(
+        entity_name="Acme",
+        property_key="revenue",
+        property_value="20",
+        chunk_text=text,
+    )
+    assert ok_rev20 is False
+    assert reason_rev20 == "unsupported_relationship"
+
+    # 3. profit=20 is validly bound
+    ok_prof20, reason_prof20 = validate_assertion_grounding(
+        entity_name="Acme",
+        property_key="profit",
+        property_value="20",
+        chunk_text=text,
+    )
+    assert ok_prof20 is True
+    assert reason_prof20 == "verified"
+
+    # 4. profit=100 must fail (100 is bound to revenue, not profit)
+    ok_prof100, reason_prof100 = validate_assertion_grounding(
+        entity_name="Acme",
+        property_key="profit",
+        property_value="100",
+        chunk_text=text,
+    )
+    assert ok_prof100 is False
+    assert reason_prof100 == "unsupported_relationship"
+
+    # 5. Inverted clause order: 'Acme reported profit of 20 and revenue of 100.'
+    inverted_text = "Acme reported profit of 20 and revenue of 100."
+    assert validate_assertion_grounding("Acme", "revenue", "100", inverted_text)[0] is True
+    assert validate_assertion_grounding("Acme", "revenue", "20", inverted_text)[0] is False
+    assert validate_assertion_grounding("Acme", "profit", "20", inverted_text)[0] is True
+    assert validate_assertion_grounding("Acme", "profit", "100", inverted_text)[0] is False
+
+    # 6. Ambiguous compound attribution: competing property intervenes between target and value
+    ambiguous_text = "Acme reported revenue and profit of 100."
+    ok_amb_rev, reason_amb_rev = validate_assertion_grounding(
+        entity_name="Acme",
+        property_key="revenue",
+        property_value="100",
+        chunk_text=ambiguous_text,
+    )
+    # Revenue is separated from 100 by intervening competing property profit
+    assert ok_amb_rev is False
+    assert reason_amb_rev == "unsupported_relationship"
+
+
+def test_empty_or_missing_snapshots_yields_zero_okf_candidates():
+    """Empty or missing snapshots in boundary repo must yield no OKF candidates.
+
+    Manifest-only fallback must not authorize assertions without active snapshot proof.
+    """
+    repo = InMemoryOkfRepository()
+    boundary_repo = InMemoryWorkspaceBoundaryRepository()
+    retriever = OkfRetriever(repository=repo, boundary_repo=boundary_repo)
+
+    ws_id = "ws_empty_snaps"
+    now = _now()
+    ent = OkfEntityRecord(
+        workspace_id=ws_id,
+        entity_id="e_ghost",
+        entity_name="Ghost Corp",
+        normalized_name="ghost corp",
+        entity_type="organization",
+        document_id="doc_ghost",
+        document_version="v1",
+        created_at=now,
+    )
+    ass = OkfPropertyAssertion(
+        assertion_id="ass_ghost",
+        workspace_id=ws_id,
+        entity_id="e_ghost",
+        entity_name="Ghost Corp",
+        property_key="revenue",
+        property_value="$10M",
+        value_type="string",
+        source_chunk_id="chk_ghost",
+        document_id="doc_ghost",
+        document_version="v1",
+        created_at=now,
+    )
+    # Manifest exists in okf_repo with status ready, but NO snapshots exist in boundary_repo
+    repo.save_manifest(ws_id, OkfManifest(
+        workspace_id=ws_id,
+        document_id="doc_ghost",
+        document_version="v1",
+        entities=(ent,),
+        assertions=(ass,),
+        status="ready",
+        idempotency_key="k_ghost",
+        created_at=now,
+    ))
+
+    # Query with zero snapshots present
+    res = retriever.lookup_sync(
+        workspace_id=ws_id,
+        query="What is Ghost Corp revenue?",
+        target_entities=["Ghost Corp"],
+    )
+
+    # Must fail closed: 0 matched assertions, entity_state none, property_state none
+    assert res.entity_state == "none"
+    assert res.property_state == "none"
+    assert len(res.matched_assertions) == 0
+    assert len(res.candidate_chunk_ids) == 0
+
+    # Case B: Snapshot exists but okf_status is failed
+    boundary_repo.save_document_snapshot(DocumentSnapshot(
+        workspace_id=ws_id,
+        document_id="doc_ghost",
+        source="doc_ghost.pdf",
+        version="v1",
+        format="pdf",
+        created_at=now,
+        okf_status="failed",
+    ))
+    res_failed = retriever.lookup_sync(
+        workspace_id=ws_id,
+        query="What is Ghost Corp revenue?",
+        target_entities=["Ghost Corp"],
+    )
+    assert res_failed.entity_state == "none"
+    assert len(res_failed.matched_assertions) == 0
+
+    # Case C: Snapshot has active version v2, but manifest is for v1
+    boundary_repo.save_document_snapshot(DocumentSnapshot(
+        workspace_id=ws_id,
+        document_id="doc_ghost",
+        source="doc_ghost.pdf",
+        version="v2",
+        format="pdf",
+        created_at=now,
+        okf_status="ready",
+    ))
+    res_stale = retriever.lookup_sync(
+        workspace_id=ws_id,
+        query="What is Ghost Corp revenue?",
+        target_entities=["Ghost Corp"],
+    )
+    # Manifest for v2 does not exist, so v1 manifest is not authorized
+    assert res_stale.entity_state == "none"
+    assert len(res_stale.matched_assertions) == 0
+
+
+def test_complete_provider_request_budgeting_including_system_prompt():
+    """Budget the complete provider request including system instructions and framing overhead."""
+    system_prompt = (
+        "You are an Open Knowledge Fact extractor. Extract entities and properties. "
+        "Return valid JSON matching the schema."
+    )
+    user_prompt = "<source_chunk id=\"chk_1\">\nAcme reported revenue of 100.\n</source_chunk>"
+
+    counted = count_request_tokens(system_prompt, user_prompt)
+    full_text = f"{system_prompt}\n\n{user_prompt}"
+
+    # Verify conservative bound dominates character ratio
+    assert counted >= len(full_text) // 4
+    assert counted >= math.ceil(len(full_text) / 3.0) + 16
+
+    # Verify upfront reservation rejects requests when total request exceeds input token budget
+    budget = DocumentExtractionBudget(
+        workspace_id="ws_b",
+        document_id="doc_b",
+        document_version="v1",
+        max_calls=2,
+        max_input_tokens=counted - 1,  # Not enough tokens to cover complete request
+        max_output_tokens=600,
+        max_elapsed_s=10.0,
+    )
+
+    can_reserve = budget.reserve_call(counted, max_output_tokens=600)
+    assert can_reserve is False
+    assert budget.exhausted is True
+    assert "input_token_limit_exceeded" in budget.exhaustion_reason
+
+
+def test_blocking_provider_call_enforces_remaining_document_deadline():
+    """Enforce the remaining document deadline across actual blocking provider calls with zero retries."""
+    builder = OkfBuilder()
+    mock_client = MagicMock()
+
+    # Simulate a slow client call that takes 0.5s
+    def slow_converse(**kwargs):
+        time.sleep(0.5)
+        return {
+            "output": {"message": {"content": [{"text": "{}"}]}},
+            "usage": {"inputTokens": 100, "outputTokens": 50},
+        }
+
+    mock_client.converse.side_effect = slow_converse
+
+    # Create budget with an elapsed deadline of only 0.05s
+    budget = DocumentExtractionBudget(
+        workspace_id="ws_dead",
+        document_id="doc_dead",
+        document_version="v1",
+        max_calls=2,
+        max_input_tokens=4000,
+        max_output_tokens=1200,
+        max_elapsed_s=0.05,
+    )
+
+    test_chunk = Chunk(
+        id="chk_d1",
+        document_id="doc_dead",
+        source_format="pdf",
+        text="Acme revenue is 100.",
+        element_type="text",
+        metadata={"token_count": 5},
+    )
+
+    with patch.object(builder, "_get_bedrock_client", return_value=mock_client):
+        raw_json, usage = builder._invoke_bedrock_extraction(
+            chunks=[test_chunk],
+            workspace_id="ws_dead",
+            document_id="doc_dead",
+            client=mock_client,
+            budget=budget,
+        )
+
+    # Verification: Call timed out cleanly, budget exhausted, zero retries
+    assert raw_json == ""
+    assert usage == {"input_tokens": 0, "output_tokens": 0}
+    assert budget.exhausted is True
+    assert "document_deadline_exceeded" in budget.exhaustion_reason or "elapsed_time_limit_reached" in budget.exhaustion_reason
+    # Because timeout triggers zero retries per AC-3, client.converse was called at most once
+    assert mock_client.converse.call_count <= 1

@@ -284,6 +284,14 @@ def test_ambiguity_and_conflict_weight_division_ac4_ac5():
     ws_id = "ws_ambig_test"
     now = "2026-10-26T00:00:00Z"
     b_repo.create_workspace(ws_id, owner_principal_id="test", workspace_id=ws_id)
+    b_repo.save_document_snapshot(DocumentSnapshot(
+        workspace_id=ws_id, document_id="doc_a", source="doc_a.pdf", version="v1",
+        format="pdf", created_at=now, okf_status="ready",
+    ))
+    b_repo.save_document_snapshot(DocumentSnapshot(
+        workspace_id=ws_id, document_id="doc_b", source="doc_b.pdf", version="v1",
+        format="pdf", created_at=now, okf_status="ready",
+    ))
 
     # 1. Ambiguous entity: John Smith in Doc A and Doc B
     e_a = OkfEntityRecord(

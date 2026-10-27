@@ -8,10 +8,12 @@ unsupported or hallucinated model claims before persistence.
 
 from __future__ import annotations
 
+import concurrent.futures
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
 import logging
+import math
 import re
 import threading
 import time
@@ -345,6 +347,64 @@ def is_property_grounded(property_key: str, text: str) -> bool:
     return False
 
 
+def _extract_property_terms(property_key: str) -> tuple[set[str], set[str]]:
+    """Return (target_synonyms, competing_property_terms) for a given property key."""
+    norm = re.sub(r"([a-z])([A-Z])", r"\1 \2", property_key).lower()
+    norm = re.sub(r"[-_]+", " ", norm)
+    raw_tokens = [t for t in re.findall(r"\w+", norm) if t not in _STOP_WORDS and len(t) > 1]
+    substantive = [t for t in raw_tokens if t not in _GENERIC_METRIC_MODIFIERS]
+    match_tokens = substantive if substantive else raw_tokens
+
+    target_synonyms: set[str] = set(match_tokens)
+    target_groups: list[set[str]] = []
+
+    for t in match_tokens:
+        t_stem = _normalize_stem(t)
+        for group in _PROPERTY_SYNONYM_GROUPS:
+            if t in group or t_stem in group:
+                target_synonyms.update(group)
+                target_groups.append(group)
+
+    competing_terms: set[str] = set()
+    for group in _PROPERTY_SYNONYM_GROUPS:
+        if group not in target_groups:
+            competing_terms.update(group)
+
+    metric_property_terms = {
+        "profit", "profits", "income", "earnings", "ebitda", "revenue", "revenues",
+        "sales", "turnover", "loss", "losses", "expense", "expenses", "cost", "costs",
+        "debt", "debts", "liabilities", "asset", "assets", "headcount", "employee",
+        "employees", "margin", "valuation", "price", "dividend", "shares", "equity",
+    }
+    target_stems = {_normalize_stem(s) for s in target_synonyms}
+    for m in metric_property_terms:
+        if m not in target_synonyms and _normalize_stem(m) not in target_stems:
+            competing_terms.add(m)
+
+    return target_synonyms, competing_terms
+
+
+def _span_dist(s1: int, e1: int, s2: int, e2: int) -> int:
+    """Compute character distance between two spans (0 if overlapping or contiguous)."""
+    if e1 <= s2:
+        return s2 - e1
+    if e2 <= s1:
+        return s1 - e2
+    return 0
+
+
+def _find_term_occurrences(terms: set[str], text: str) -> list[tuple[int, int, str]]:
+    """Find character spans (start, end, term) of matched terms in text."""
+    text_lower = text.lower()
+    occurrences: list[tuple[int, int, str]] = []
+    for term in terms:
+        pattern = rf"\b{re.escape(term)}\b"
+        for match in re.finditer(pattern, text_lower):
+            occurrences.append((match.start(), match.end(), term))
+    occurrences.sort(key=lambda x: x[0])
+    return occurrences
+
+
 def validate_assertion_grounding(
     entity_name: str,
     property_key: str,
@@ -429,8 +489,87 @@ def validate_assertion_grounding(
         if len(cand_words) > 1 or has_corp or is_mid_sentence:
             other_entities.add(cand_norm)
 
+    target_synonyms, competing_property_terms = _extract_property_terms(property_key)
+    has_ambiguous_binding = False
+    valid_sentence_found = False
+
     for sent in supporting_val_sentences:
         sent_lower = sent.lower()
+
+        # Step 4a: Competing property relational validation within sentence
+        target_prop_mentions = _find_term_occurrences(target_synonyms, sent)
+        competing_prop_mentions = _find_term_occurrences(competing_property_terms, sent)
+
+        val_occurrences = _find_term_occurrences({val_lower}, sent)
+        if not val_occurrences:
+            val_idx = sent_lower.find(val_lower)
+            if val_idx != -1:
+                val_occurrences = [(val_idx, val_idx + len(val_lower), val_lower)]
+            else:
+                val_toks = re.findall(r"\w+", val_lower)
+                if val_toks:
+                    v_tok = val_toks[0]
+                    v_idx = sent_lower.find(v_tok)
+                    if v_idx != -1:
+                        val_occurrences = [(v_idx, v_idx + len(v_tok), v_tok)]
+
+        # Check if any value occurrence in this sentence is validly bound to the target property
+        has_valid_property_binding = False
+
+        if not competing_prop_mentions:
+            has_valid_property_binding = True
+        else:
+            # We have competing properties in this sentence!
+            clause_delims = [0] + [m.start() for m in re.finditer(r"\b(?:and|but|while|whereas|although|however|meanwhile)\b|[;,]", sent, flags=re.IGNORECASE)] + [len(sent)]
+            clause_delims = sorted(set(clause_delims))
+            clauses = [(clause_delims[i], clause_delims[i+1]) for i in range(len(clause_delims) - 1)]
+
+            for v_start, v_end, _ in val_occurrences:
+                # 1. Clause analysis
+                v_clause = next(((c_s, c_e) for c_s, c_e in clauses if c_s <= v_start < c_e), (0, len(sent)))
+                clause_competing = any(c_s >= v_clause[0] and c_e <= v_clause[1] for c_s, c_e, _ in competing_prop_mentions)
+                clause_target = any(p_s >= v_clause[0] and p_e <= v_clause[1] for p_s, p_e, _ in target_prop_mentions)
+
+                if clause_competing and not clause_target:
+                    # Value is in a clause with a competing property and without the target property
+                    continue
+
+                if clause_target and not clause_competing:
+                    # Value is in a distinct clause containing only the target property
+                    has_valid_property_binding = True
+                    break
+
+                # 2. Proximity and intervening property check when both or neither in clause
+                dist_target = min(_span_dist(v_start, v_end, p_s, p_e) for p_s, p_e, _ in target_prop_mentions) if target_prop_mentions else 999999
+                dist_comp = min(_span_dist(v_start, v_end, c_s, c_e) for c_s, c_e, _ in competing_prop_mentions)
+
+                # Competing property is strictly closer
+                if dist_comp < dist_target:
+                    continue
+
+                # Competing property intervenes between target property and value
+                closest_target = min(target_prop_mentions, key=lambda p: _span_dist(v_start, v_end, p[0], p[1])) if target_prop_mentions else None
+                intervening = False
+                if closest_target is not None:
+                    p_min, p_max = min(closest_target[0], v_start), max(closest_target[1], v_end)
+                    for c_s, c_e, _ in competing_prop_mentions:
+                        if p_min < c_s < p_max:
+                            intervening = True
+                            break
+                if intervening:
+                    continue
+
+                if dist_comp == dist_target:
+                    has_ambiguous_binding = True
+                    continue
+
+                has_valid_property_binding = True
+                break
+
+        if not has_valid_property_binding:
+            continue
+
+        # Step 4b: Entity attribution within sentence
         ent_in_sent = is_value_grounded(entity_name, sent)
         competing_in_sent = [oe for oe in other_entities if is_value_grounded(oe, sent)]
 
@@ -439,18 +578,12 @@ def validate_assertion_grounding(
 
         if not ent_in_sent and competing_in_sent:
             # The value is in a sentence that mentions another entity, but NOT the asserted entity
-            # Counterexample: real value attributed to the wrong entity
             return False, "wrong_entity_attribution"
 
         if ent_in_sent and competing_in_sent:
             # Both asserted entity and competing entity appear in the same sentence.
             # Measure character index proximity to the property value
-            val_idx = sent_lower.find(val_lower)
-            if val_idx == -1:
-                val_toks = re.findall(r"\w+", val_lower)
-                if val_toks:
-                    val_idx = sent_lower.find(val_toks[0])
-
+            val_idx = val_occurrences[0][0] if val_occurrences else sent_lower.find(val_lower)
             ent_idx = sent_lower.find(ent_lower)
             if ent_idx == -1:
                 ent_toks = re.findall(r"\w+", ent_lower)
@@ -473,11 +606,31 @@ def validate_assertion_grounding(
 
             return True, "verified"
 
+        valid_sentence_found = True
+
+    if not valid_sentence_found:
+        if has_ambiguous_binding:
+            return False, "ambiguous_relationship"
+        return False, "unsupported_relationship"
+
     # If entity and value are in different sentences and other entities exist in the chunk
     if other_entities:
         return False, "ambiguous_relationship"
 
     return True, "verified"
+
+
+def count_request_tokens(system_prompt: str, user_prompt: str) -> int:
+    """Compute a defensible conservative upper bound on tokens for the complete provider request.
+
+    Budgets the complete request including system instructions, user content blocks,
+    XML tags, punctuation, and envelope framing overhead.
+    """
+    full_text = f"{system_prompt}\n\n{user_prompt}"
+    punct_words_count = len(re.findall(r"\w+|[^\w\s]", full_text))
+    char_bound = math.ceil(len(full_text) / 3.0)
+    envelope_overhead = 16
+    return max(punct_words_count, char_bound) + envelope_overhead
 
 
 class OkfBuilder:
@@ -1018,7 +1171,7 @@ class OkfBuilder:
             user_content_blocks.append(f"<source_chunk id=\"{ch_id}\">\n{ch_text}\n</source_chunk>")
 
         user_prompt = "\n\n".join(user_content_blocks)
-        estimated_prompt_tokens = max(1, len(user_prompt) // _CHARS_PER_TOKEN)
+        estimated_prompt_tokens = count_request_tokens(system_prompt, user_prompt)
         max_output_tokens = 600
 
         # Test environment fallback
@@ -1040,6 +1193,16 @@ class OkfBuilder:
         max_attempts = 2  # at most 1 retry on throttling (HTTP 429)
 
         for attempt in range(max_attempts):
+            remaining_deadline = budget.max_elapsed_s - (time.perf_counter() - budget.started_at)
+            if remaining_deadline <= 0:
+                budget.exhausted = True
+                budget.exhaustion_reason = f"elapsed_time_limit_reached ({budget.max_elapsed_s:.1f}s)"
+                logger.warning(
+                    "okf_builder.call_budget_exceeded attempt=%d reason=%s",
+                    attempt, budget.exhaustion_reason,
+                )
+                return "", {"input_tokens": 0, "output_tokens": 0}
+
             if not budget.reserve_call(estimated_prompt_tokens, max_output_tokens):
                 logger.warning(
                     "okf_builder.call_budget_exceeded attempt=%d reason=%s",
@@ -1047,8 +1210,11 @@ class OkfBuilder:
                 )
                 return "", {"input_tokens": 0, "output_tokens": 0}
 
+            call_timeout = max(0.001, budget.max_elapsed_s - (time.perf_counter() - budget.started_at))
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
             try:
-                resp = client.converse(
+                future = executor.submit(
+                    client.converse,
                     modelId=model_id,
                     messages=messages,
                     system=[{"text": system_prompt}],
@@ -1057,6 +1223,7 @@ class OkfBuilder:
                         "maxTokens": max_output_tokens,
                     },
                 )
+                resp = future.result(timeout=call_timeout)
                 output_text = resp["output"]["message"]["content"][0]["text"]
                 raw_usage = resp.get("usage", {})
                 usage = {
@@ -1065,6 +1232,14 @@ class OkfBuilder:
                 }
                 budget.reconcile_call(estimated_prompt_tokens, max_output_tokens, usage["input_tokens"], usage["output_tokens"])
                 return output_text, usage
+
+            except concurrent.futures.TimeoutError:
+                budget.exhausted = True
+                elapsed_total = time.perf_counter() - budget.started_at
+                budget.exhaustion_reason = f"document_deadline_exceeded ({elapsed_total:.1f}s/{budget.max_elapsed_s:.1f}s)"
+                logger.warning("Bedrock OKF call exceeded document deadline: %s", budget.exhaustion_reason)
+                # Zero retries on timeouts per AC-3
+                return "", {"input_tokens": 0, "output_tokens": 0}
 
             except Exception as e:
                 err_str = str(e)
@@ -1084,6 +1259,8 @@ class OkfBuilder:
                 # Zero retries on model errors, bad requests, or timeouts (AC-3)
                 logger.warning("Bedrock OKF call failed (no retries per AC-3): %s", e)
                 return "", {"input_tokens": 0, "output_tokens": 0}
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
 
         return "", {"input_tokens": 0, "output_tokens": 0}
 

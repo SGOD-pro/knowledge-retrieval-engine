@@ -214,13 +214,11 @@ class OkfRetriever:
             # Step 1.5: Discover authorized document scope, active versions, and ready manifests (AC-6, AC-7)
             target_docs_set = set(document_ids) if document_ids is not None else None
             active_ready_versions: dict[str, str] = {}
-            has_snapshot_data = False
 
             try:
                 if hasattr(self.boundary_repo, "list_document_snapshots"):
                     snaps = self.boundary_repo.list_document_snapshots(workspace_id)
                     if snaps:
-                        has_snapshot_data = True
                         for s in snaps:
                             if target_docs_set is not None and s.document_id not in target_docs_set:
                                 continue
@@ -244,7 +242,9 @@ class OkfRetriever:
                     status="completed",
                 )
 
-            if has_snapshot_data and not active_ready_versions:
+            # Empty/missing snapshots must yield no OKF candidates.
+            # Do not use manifest-only fallback as proof of active source version.
+            if not active_ready_versions:
                 return WorkerResultWrapper(
                     OkfLookupResult(
                         target_entity=target_display,
@@ -283,18 +283,10 @@ class OkfRetriever:
                         continue
                 except Exception:
                     continue
-                if has_snapshot_data:
-                    if ent.document_id not in active_ready_versions:
-                        continue
-                    if ent.document_version != active_ready_versions[ent.document_id]:
-                        continue
-                else:
-                    try:
-                        man = self.okf_repo.get_manifest(workspace_id, ent.document_id, ent.document_version)
-                    except Exception:
-                        man = None
-                    if man is None or man.status != "ready":
-                        continue
+                if ent.document_id not in active_ready_versions:
+                    continue
+                if ent.document_version != active_ready_versions[ent.document_id]:
+                    continue
                 valid_entities.append(ent)
 
             if not valid_entities:
@@ -322,7 +314,7 @@ class OkfRetriever:
             raw_assertions: list[OkfPropertyAssertion] = []
             seen_assertion_ids: set[str] = set()
             for ent in valid_entities:
-                active_docs_param = list(active_ready_versions.keys()) if has_snapshot_data else (list(target_docs_set) if target_docs_set is not None else None)
+                active_docs_param = list(active_ready_versions.keys())
                 ent_assertions = self.okf_repo.get_assertions_for_entity(
                     workspace_id=workspace_id,
                     entity_id=ent.entity_id,
@@ -339,18 +331,10 @@ class OkfRetriever:
                             continue
                     except Exception:
                         continue
-                    if has_snapshot_data:
-                        if ass.document_id not in active_ready_versions:
-                            continue
-                        if ass.document_version != active_ready_versions[ass.document_id]:
-                            continue
-                    else:
-                        try:
-                            man = self.okf_repo.get_manifest(workspace_id, ass.document_id, ass.document_version)
-                        except Exception:
-                            man = None
-                        if man is None or man.status != "ready":
-                            continue
+                    if ass.document_id not in active_ready_versions:
+                        continue
+                    if ass.document_version != active_ready_versions[ass.document_id]:
+                        continue
                     seen_assertion_ids.add(ass.assertion_id)
                     raw_assertions.append(ass)
 
@@ -419,24 +403,10 @@ class OkfRetriever:
                                 or (getattr(chk, "metadata", None) or {}).get("version")
                             )
                             chk_doc = getattr(chk, "document_id", None)
-                            if has_snapshot_data:
-                                if chk_doc not in active_ready_versions:
-                                    continue
-                                if chk_ver and chk_ver != active_ready_versions[chk_doc]:
-                                    continue
-                            else:
-                                if chk_doc:
-                                    try:
-                                        ass_doc_ver = next(
-                                            (a.document_version for a in final_assertions if a.source_chunk_id == cid),
-                                            None,
-                                        )
-                                        effective_ver = chk_ver or ass_doc_ver or "v1"
-                                        man = self.okf_repo.get_manifest(workspace_id, chk_doc, effective_ver)
-                                    except Exception:
-                                        man = None
-                                    if man is None or man.status != "ready":
-                                        continue
+                            if chk_doc not in active_ready_versions:
+                                continue
+                            if chk_ver and chk_ver != active_ready_versions[chk_doc]:
+                                continue
                             hydrated_chunks.append(chk)
                 except Exception as exc:
                     logger.debug("okf.chunk_hydration_error: %s", exc)

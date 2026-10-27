@@ -374,9 +374,15 @@ def test_adr001_fail_open_ingestion_resilience():
 def test_conflicting_property_values_retention():
     """Doc A asserts revenue as $10M; Doc B asserts revenue as $12M. Both persist and conflict."""
     repo = InMemoryOkfRepository()
-    retriever = OkfRetriever(repository=repo)
-
+    boundary_repo = InMemoryWorkspaceBoundaryRepository()
     now = datetime.now(timezone.utc).isoformat()
+    boundary_repo.save_document_snapshot(DocumentSnapshot(
+        workspace_id="ws_conflict", document_id="doc_a", source="doc_a.pdf", version="v1", format="pdf", created_at=now, okf_status="ready"
+    ))
+    boundary_repo.save_document_snapshot(DocumentSnapshot(
+        workspace_id="ws_conflict", document_id="doc_b", source="doc_b.pdf", version="v1", format="pdf", created_at=now, okf_status="ready"
+    ))
+    retriever = OkfRetriever(repository=repo, boundary_repo=boundary_repo)
     # Doc A assertion
     ass_a = OkfPropertyAssertion(
         assertion_id="ass_a",
@@ -457,8 +463,15 @@ def test_conflicting_property_values_retention():
 def test_same_name_entity_ambiguity():
     """Doc A has John Smith (CEO); Doc B has John Smith (Author). Distinct entity IDs and ambiguity."""
     repo = InMemoryOkfRepository()
-    retriever = OkfRetriever(repository=repo)
+    boundary_repo = InMemoryWorkspaceBoundaryRepository()
     now = datetime.now(timezone.utc).isoformat()
+    boundary_repo.save_document_snapshot(DocumentSnapshot(
+        workspace_id="ws_ambig", document_id="doc_ceo", source="doc_ceo.pdf", version="v1", format="pdf", created_at=now, okf_status="ready"
+    ))
+    boundary_repo.save_document_snapshot(DocumentSnapshot(
+        workspace_id="ws_ambig", document_id="doc_author", source="doc_author.pdf", version="v1", format="pdf", created_at=now, okf_status="ready"
+    ))
+    retriever = OkfRetriever(repository=repo, boundary_repo=boundary_repo)
 
     # Distinct entity IDs scoped to document
     e_id_a = compute_entity_id("ws_ambig", "doc_ceo", "john smith")
@@ -553,7 +566,14 @@ def test_same_name_entity_ambiguity():
 
     # In a clean workspace with distinct entities from distinct docs:
     repo_clean = InMemoryOkfRepository()
-    retriever_clean = OkfRetriever(repository=repo_clean)
+    boundary_clean = InMemoryWorkspaceBoundaryRepository()
+    boundary_clean.save_document_snapshot(DocumentSnapshot(
+        workspace_id="ws_clean", document_id="doc1", source="doc1.pdf", version="v1", format="pdf", created_at=now, okf_status="ready"
+    ))
+    boundary_clean.save_document_snapshot(DocumentSnapshot(
+        workspace_id="ws_clean", document_id="doc2", source="doc2.pdf", version="v1", format="pdf", created_at=now, okf_status="ready"
+    ))
+    retriever_clean = OkfRetriever(repository=repo_clean, boundary_repo=boundary_clean)
     repo_clean.save_manifest("ws_clean", OkfManifest(
         workspace_id="ws_clean", document_id="doc1", document_version="v1",
         entities=(ent_a,), assertions=(), idempotency_key="k1", created_at=now,
@@ -578,8 +598,12 @@ def test_same_name_entity_ambiguity():
 def test_partitioned_workspace_isolation_zero_leakage():
     """Facts in ws_a are never returned to queries in ws_b."""
     repo = InMemoryOkfRepository()
-    retriever = OkfRetriever(repository=repo)
+    boundary_repo = InMemoryWorkspaceBoundaryRepository()
     now = datetime.now(timezone.utc).isoformat()
+    boundary_repo.save_document_snapshot(DocumentSnapshot(
+        workspace_id="ws_a", document_id="doc_a", source="doc_a.pdf", version="v1", format="pdf", created_at=now, okf_status="ready"
+    ))
+    retriever = OkfRetriever(repository=repo, boundary_repo=boundary_repo)
 
     ent = OkfEntityRecord(
         workspace_id="ws_a",
@@ -687,6 +711,12 @@ def test_tombstone_filtering_immediate_enforcement():
     boundary_repo.create_workspace("ws_tomb", owner_principal_id="admin", workspace_id="ws_tomb")
     boundary_repo.create_source("ws_tomb", "active doc", source_id="doc_active")
     boundary_repo.create_source("ws_tomb", "deleted doc", source_id="doc_deleted")
+    boundary_repo.save_document_snapshot(DocumentSnapshot(
+        workspace_id="ws_tomb", document_id="doc_active", source="doc_active.pdf", version="v1", format="pdf", created_at=now, okf_status="ready"
+    ))
+    boundary_repo.save_document_snapshot(DocumentSnapshot(
+        workspace_id="ws_tomb", document_id="doc_deleted", source="doc_deleted.pdf", version="v1", format="pdf", created_at=now, okf_status="ready"
+    ))
 
     # Record tombstone for doc_deleted
     boundary_repo.record_source_tombstone("ws_tomb", "doc_deleted", caller_principal_id="admin")
@@ -711,8 +741,17 @@ def test_tombstone_filtering_immediate_enforcement():
 def test_storage_deadline_enforcement_and_timeout():
     """Injecting a delay beyond 50ms deadline cleanly drops candidates with caller_timeout."""
     repo = InMemoryOkfRepository()
+    boundary_repo = InMemoryWorkspaceBoundaryRepository()
+    now = datetime.now(timezone.utc).isoformat()
+    boundary_repo.save_document_snapshot(DocumentSnapshot(
+        workspace_id="ws_to", document_id="doc_to", source="doc_to.pdf", version="v1", format="pdf", created_at=now, okf_status="ready"
+    ))
+    repo.save_manifest("ws_to", OkfManifest(
+        workspace_id="ws_to", document_id="doc_to", document_version="v1",
+        entities=(), assertions=(), idempotency_key="k_to", status="ready", created_at=now,
+    ))
     controller = OkfConcurrencyController(max_concurrency=2, max_queue=4)
-    retriever = OkfRetriever(repository=repo, controller=controller)
+    retriever = OkfRetriever(repository=repo, boundary_repo=boundary_repo, controller=controller)
 
     # Slow function simulating delayed storage
     def slow_resolve(*args, **kwargs):
