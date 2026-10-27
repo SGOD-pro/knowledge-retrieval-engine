@@ -17,7 +17,7 @@ import math
 import re
 import threading
 import time
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from config import settings
 from src.db.okf_repo import (
@@ -38,6 +38,13 @@ from src.schemas.contracts.okf import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Supported model configurations with verified BPE token bounds
+SUPPORTED_OKF_MODELS: set[str] = {
+    "anthropic.claude-3-haiku-20240307-v1:0",
+    "anthropic.claude-3-5-sonnet-20240620-v1:0",
+    "anthropic.claude-3-sonnet-20240229-v1:0",
+}
 
 # Approximate characters per token for batch sizing
 _CHARS_PER_TOKEN = 4
@@ -61,6 +68,7 @@ class DocumentExtractionBudget:
     workspace_id: str
     document_id: str
     document_version: str
+    idempotency_key: str = ""
     max_calls: int = 2
     max_input_tokens: int = 4000
     max_output_tokens: int = 1200
@@ -161,6 +169,7 @@ def reset_budget_ledger() -> None:
     with _GLOBAL_LOCK:
         _EXTRACTION_BUDGETS.clear()
         _EXTRACTION_LOCKS.clear()
+    reset_provider_controller()
 
 
 def get_document_extraction_lock(idempotency_key: str) -> threading.Lock:
@@ -215,6 +224,7 @@ def get_or_create_document_budget(
             workspace_id=workspace_id,
             document_id=document_id,
             document_version=document_version,
+            idempotency_key=idempotency_key,
             max_calls=max_calls,
             max_input_tokens=max_input_tokens,
             max_output_tokens=max_output_tokens,
@@ -620,17 +630,164 @@ def validate_assertion_grounding(
     return True, "verified"
 
 
-def count_request_tokens(system_prompt: str, user_prompt: str) -> int:
+def count_request_tokens(
+    system_prompt: str,
+    user_prompt: str,
+    model_id: str | None = None,
+) -> int:
     """Compute a defensible conservative upper bound on tokens for the complete provider request.
 
     Budgets the complete request including system instructions, user content blocks,
     XML tags, punctuation, and envelope framing overhead.
+
+    For supported Claude 3 models in byte-level BPE, every token consumes at least
+    1 byte of UTF-8 input text. Therefore, byte length plus framing overhead establishes
+    a mathematically proven upper bound that cannot be underestimated by high-density
+    or punctuation-heavy sequences.
     """
+    if model_id is not None and model_id not in SUPPORTED_OKF_MODELS:
+        raise ValueError(f"Unsupported model configuration: {model_id}")
+
     full_text = f"{system_prompt}\n\n{user_prompt}"
-    punct_words_count = len(re.findall(r"\w+|[^\w\s]", full_text))
-    char_bound = math.ceil(len(full_text) / 3.0)
-    envelope_overhead = 16
-    return max(punct_words_count, char_bound) + envelope_overhead
+    byte_bound = len(full_text.encode("utf-8"))
+    envelope_overhead = 32
+    return byte_bound + envelope_overhead
+
+
+class OkfProviderConcurrencyController:
+    """Global concurrency controller for OKF provider extraction calls across documents.
+
+    Enforces:
+    - Bounded concurrency across documents (default max 2 concurrent Bedrock calls).
+    - Bounded admission queue with immediate load shedding (default max 4 queued calls).
+    - Capacity retention: when a caller's document deadline expires (caller timeout),
+      the underlying worker slot in the semaphore and thread pool is retained until the
+      underlying provider call finishes, preventing caller timeouts from flooding Bedrock.
+    """
+
+    def __init__(
+        self,
+        max_concurrency: int = 2,
+        max_queue: int = 4,
+    ) -> None:
+        self.max_concurrency = max_concurrency
+        self.max_queue = max_queue
+        self._active_workers = 0
+        self._queued_callers = 0
+        self._semaphore = threading.Semaphore(self.max_concurrency)
+        self._lock = threading.Lock()
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.max_concurrency,
+            thread_name_prefix="okf_provider_worker",
+        )
+
+    @property
+    def active_count(self) -> int:
+        with self._lock:
+            return self._active_workers
+
+    @property
+    def queued_count(self) -> int:
+        with self._lock:
+            return self._queued_callers
+
+    def run_provider_call(
+        self,
+        func: Callable[..., Any],
+        *args: Any,
+        timeout_s: float = 10.0,
+        **kwargs: Any,
+    ) -> tuple[Any, str]:
+        """Execute blocking provider call with capacity retention and caller timeout enforcement.
+
+        Returns (result, status) where status is:
+        - "completed": underlying call returned successfully
+        - "caller_timeout": caller deadline expired while waiting for slot or completion
+        - "admission_rejected": queue is saturated
+        - "call_failed": underlying call raised an exception
+        """
+        with self._lock:
+            if self._queued_callers >= self.max_queue:
+                logger.warning(
+                    "okf.provider_admission_rejected queued=%d max=%d",
+                    self._queued_callers,
+                    self.max_queue,
+                )
+                return None, "admission_rejected"
+            self._queued_callers += 1
+
+        t0 = time.perf_counter()
+        acquired = self._semaphore.acquire(timeout=timeout_s)
+        if not acquired:
+            with self._lock:
+                self._queued_callers -= 1
+            logger.warning("okf.provider_timeout stage=queue_admission timeout_s=%.2f", timeout_s)
+            return None, "caller_timeout"
+
+        with self._lock:
+            self._queued_callers -= 1
+            self._active_workers += 1
+
+        elapsed = time.perf_counter() - t0
+        remaining_s = max(0.001, timeout_s - elapsed)
+
+        outcome: dict[str, Any] = {"result": None, "error": None, "status": "running"}
+        call_done = threading.Event()
+
+        def _worker_task() -> None:
+            try:
+                outcome["result"] = func(*args, **kwargs)
+                outcome["status"] = "completed"
+            except Exception as exc:
+                outcome["error"] = exc
+                outcome["status"] = "call_failed"
+            finally:
+                with self._lock:
+                    self._active_workers = max(0, self._active_workers - 1)
+                self._semaphore.release()
+                call_done.set()
+
+        self._executor.submit(_worker_task)
+
+        finished = call_done.wait(timeout=remaining_s)
+        if finished:
+            if outcome["error"] is not None:
+                raise outcome["error"]
+            return outcome["result"], outcome["status"]
+
+        # Caller timeout: capacity in self._semaphore remains retained
+        # until _worker_task actually finishes in the background!
+        logger.warning("okf.provider_timeout stage=call_execution timeout_s=%.2f", timeout_s)
+        return None, "caller_timeout"
+
+
+_PROVIDER_CONCURRENCY_CONTROLLER: OkfProviderConcurrencyController | None = None
+
+
+def get_okf_provider_controller() -> OkfProviderConcurrencyController:
+    """Return the global shared OKF provider concurrency controller."""
+    global _PROVIDER_CONCURRENCY_CONTROLLER
+    with _GLOBAL_LOCK:
+        if _PROVIDER_CONCURRENCY_CONTROLLER is None:
+            max_c = int(getattr(settings, "OKF_PROVIDER_MAX_CONCURRENCY", 2))
+            max_q = int(getattr(settings, "OKF_PROVIDER_MAX_QUEUE", 4))
+            _PROVIDER_CONCURRENCY_CONTROLLER = OkfProviderConcurrencyController(
+                max_concurrency=max_c,
+                max_queue=max_q,
+            )
+        return _PROVIDER_CONCURRENCY_CONTROLLER
+
+
+def reset_provider_controller() -> None:
+    """Reset the global provider concurrency controller for test isolation."""
+    global _PROVIDER_CONCURRENCY_CONTROLLER
+    with _GLOBAL_LOCK:
+        if _PROVIDER_CONCURRENCY_CONTROLLER is not None:
+            try:
+                _PROVIDER_CONCURRENCY_CONTROLLER._executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+            _PROVIDER_CONCURRENCY_CONTROLLER = None
 
 
 class OkfBuilder:
@@ -640,9 +797,11 @@ class OkfBuilder:
         self,
         repo: OkfRepositoryBase | None = None,
         bedrock_client: Any | None = None,
+        provider_controller: OkfProviderConcurrencyController | None = None,
     ) -> None:
         self.repo = repo or get_okf_repo()
         self._bedrock_client = bedrock_client
+        self.provider_controller = provider_controller or get_okf_provider_controller()
 
     def _get_bedrock_client(self) -> Any:
         if self._bedrock_client is not None:
@@ -933,7 +1092,7 @@ class OkfBuilder:
         """Bounded Bedrock fact extraction for text PDFs with chunk grounding validation."""
         if budget is None:
             budget = get_or_create_document_budget(
-                workspace_id, document_id, document_version, idempotency_key
+                workspace_id, document_id, document_version, idempotency_key, repo=self.repo,
             )
 
         if not chunks:
@@ -958,24 +1117,25 @@ class OkfBuilder:
 
         # Select introductory and high density chunks up to budget
         # AC-3: max 2 calls, max 2000 input tokens per call, max 4000 total input tokens
+        # Safe byte sizing ensures request (system + user + framing) cannot exceed 2000 tokens
         max_calls = budget.max_calls
-        max_prompt_chars = 2000 * _CHARS_PER_TOKEN  # ~8000 chars per call
+        max_prompt_bytes = 1300
 
         batches: list[list[Any]] = []
         current_batch: list[Any] = []
-        current_chars = 0
+        current_bytes = 0
 
         for ch in chunks:
             ch_text = getattr(ch, "text", "") or ""
-            ch_len = min(len(ch_text), max_prompt_chars)
-            if current_chars + ch_len > max_prompt_chars and current_batch:
+            ch_bytes = min(len(ch_text.encode("utf-8")), max_prompt_bytes)
+            if current_bytes + ch_bytes > max_prompt_bytes and current_batch:
                 batches.append(current_batch)
                 current_batch = []
-                current_chars = 0
+                current_bytes = 0
                 if len(batches) >= max_calls:
                     break
             current_batch.append(ch)
-            current_chars += ch_len
+            current_bytes += ch_bytes
 
         if current_batch and len(batches) < max_calls:
             batches.append(current_batch)
@@ -1161,17 +1321,29 @@ class OkfBuilder:
             "3. Do not invent facts, extrapolate, or hallucinate claims."
         )
 
-        max_prompt_chars = 2000 * _CHARS_PER_TOKEN
+        sys_prompt_bytes = len(system_prompt.encode("utf-8")) + 32
+        max_prompt_bytes = max(100, 2000 - sys_prompt_bytes)
         user_content_blocks = []
         for ch in chunks:
             ch_id = str(getattr(ch, "id", ""))
             ch_text = getattr(ch, "text", "") or ""
-            if len(ch_text) > max_prompt_chars:
-                ch_text = ch_text[:max_prompt_chars]
+            if len(ch_text.encode("utf-8")) > max_prompt_bytes:
+                ch_text = ch_text.encode("utf-8")[:max_prompt_bytes].decode("utf-8", errors="ignore")
             user_content_blocks.append(f"<source_chunk id=\"{ch_id}\">\n{ch_text}\n</source_chunk>")
 
+        model_id = getattr(settings, "OKF_BEDROCK_MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0")
+        if model_id not in SUPPORTED_OKF_MODELS:
+            budget.exhausted = True
+            budget.exhaustion_reason = f"unsupported_model_configuration ({model_id})"
+            logger.error(
+                "okf_builder.unsupported_model model_id=%s not in supported configuration %s",
+                model_id,
+                SUPPORTED_OKF_MODELS,
+            )
+            return "", {"input_tokens": 0, "output_tokens": 0}
+
         user_prompt = "\n\n".join(user_content_blocks)
-        estimated_prompt_tokens = count_request_tokens(system_prompt, user_prompt)
+        estimated_prompt_tokens = count_request_tokens(system_prompt, user_prompt, model_id=model_id)
         max_output_tokens = 600
 
         # Test environment fallback
@@ -1186,8 +1358,6 @@ class OkfBuilder:
             out_json, stats = self._test_mode_fallback(chunks)
             budget.reconcile_call(estimated_prompt_tokens, max_output_tokens, stats["input_tokens"], stats["output_tokens"])
             return out_json, stats
-
-        model_id = getattr(settings, "OKF_BEDROCK_MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0")
 
         messages = [{"role": "user", "content": [{"text": user_prompt}]}]
         max_attempts = 2  # at most 1 retry on throttling (HTTP 429)
@@ -1210,11 +1380,36 @@ class OkfBuilder:
                 )
                 return "", {"input_tokens": 0, "output_tokens": 0}
 
-            call_timeout = max(0.001, budget.max_elapsed_s - (time.perf_counter() - budget.started_at))
-            executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            # Persist in-flight attempt reservation to durable repository before provider call
+            # This ensures that if the process crashes or dies mid-call, the durable store records
+            # the attempted model call and does not silently reset upon restart/replay.
             try:
-                future = executor.submit(
+                ver = getattr(budget, "document_version", "v1")
+                ikey = getattr(budget, "idempotency_key", "") or f"{workspace_id}:{document_id}:{ver}"
+                self.repo.save_manifest(
+                    workspace_id,
+                    OkfManifest(
+                        workspace_id=workspace_id,
+                        document_id=document_id,
+                        document_version=ver,
+                        entities=(),
+                        assertions=(),
+                        rejected_assertions_count=0,
+                        status="failed",
+                        extraction_tokens=budget.input_tokens_used + budget.output_tokens_used,
+                        model_calls=budget.calls_made,
+                        idempotency_key=ikey,
+                        created_at=_now_utc(),
+                    ),
+                )
+            except Exception as save_err:
+                logger.debug("okf_builder.reservation_persistence_err: %s", save_err)
+
+            call_timeout = max(0.001, budget.max_elapsed_s - (time.perf_counter() - budget.started_at))
+            try:
+                resp, status = self.provider_controller.run_provider_call(
                     client.converse,
+                    timeout_s=call_timeout,
                     modelId=model_id,
                     messages=messages,
                     system=[{"text": system_prompt}],
@@ -1223,7 +1418,21 @@ class OkfBuilder:
                         "maxTokens": max_output_tokens,
                     },
                 )
-                resp = future.result(timeout=call_timeout)
+
+                if status == "caller_timeout":
+                    budget.exhausted = True
+                    elapsed_total = time.perf_counter() - budget.started_at
+                    budget.exhaustion_reason = f"document_deadline_exceeded ({elapsed_total:.1f}s/{budget.max_elapsed_s:.1f}s)"
+                    logger.warning("Bedrock OKF call exceeded document deadline: %s", budget.exhaustion_reason)
+                    # Zero retries on timeouts per AC-3
+                    return "", {"input_tokens": 0, "output_tokens": 0}
+
+                if status == "admission_rejected":
+                    budget.exhausted = True
+                    budget.exhaustion_reason = "provider_concurrency_queue_saturated"
+                    logger.warning("Bedrock OKF call rejected: %s", budget.exhaustion_reason)
+                    return "", {"input_tokens": 0, "output_tokens": 0}
+
                 output_text = resp["output"]["message"]["content"][0]["text"]
                 raw_usage = resp.get("usage", {})
                 usage = {
@@ -1232,14 +1441,6 @@ class OkfBuilder:
                 }
                 budget.reconcile_call(estimated_prompt_tokens, max_output_tokens, usage["input_tokens"], usage["output_tokens"])
                 return output_text, usage
-
-            except concurrent.futures.TimeoutError:
-                budget.exhausted = True
-                elapsed_total = time.perf_counter() - budget.started_at
-                budget.exhaustion_reason = f"document_deadline_exceeded ({elapsed_total:.1f}s/{budget.max_elapsed_s:.1f}s)"
-                logger.warning("Bedrock OKF call exceeded document deadline: %s", budget.exhaustion_reason)
-                # Zero retries on timeouts per AC-3
-                return "", {"input_tokens": 0, "output_tokens": 0}
 
             except Exception as e:
                 err_str = str(e)
@@ -1259,8 +1460,6 @@ class OkfBuilder:
                 # Zero retries on model errors, bad requests, or timeouts (AC-3)
                 logger.warning("Bedrock OKF call failed (no retries per AC-3): %s", e)
                 return "", {"input_tokens": 0, "output_tokens": 0}
-            finally:
-                executor.shutdown(wait=False, cancel_futures=True)
 
         return "", {"input_tokens": 0, "output_tokens": 0}
 

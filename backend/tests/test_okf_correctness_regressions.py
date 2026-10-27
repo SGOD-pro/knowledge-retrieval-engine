@@ -30,13 +30,17 @@ from db.workspace_boundary_repo import (
 )
 from ingestion.embed_service import _deterministic_vector, embed_fast_local
 from ingestion.okf_builder import (
+    SUPPORTED_OKF_MODELS,
     DocumentExtractionBudget,
     OkfBuilder,
+    OkfProviderConcurrencyController,
     _EXTRACTION_BUDGETS,
     count_request_tokens,
+    get_okf_provider_controller,
     get_or_create_document_budget,
     is_value_grounded,
     reset_budget_ledger,
+    reset_provider_controller,
     validate_assertion_grounding,
 )
 from modules.documents.documents_repository import _IN_MEMORY_CHUNKS, _IN_MEMORY_DOCS
@@ -1288,3 +1292,249 @@ def test_blocking_provider_call_enforces_remaining_document_deadline():
     assert "document_deadline_exceeded" in budget.exhaustion_reason or "elapsed_time_limit_reached" in budget.exhaustion_reason
     # Because timeout triggers zero retries per AC-3, client.converse was called at most once
     assert mock_client.converse.call_count <= 1
+
+
+# ==============================================================================
+# 10. Provider Concurrency, Token Bound Defensibility, and Attempt Persistence
+# ==============================================================================
+
+
+def test_token_bound_never_underestimates_and_catches_heuristic_failures():
+    """Verify defensible token bounds prevent underestimation from character heuristics."""
+    system_prompt = "You are an extractor."
+
+    # 1. Single character spaced sequence where len // 4 severely underestimates
+    user_prompt_sparse = "a b c d e f g h i j k l m n o p q r s t u v w x y z"
+    full_text_sparse = f"{system_prompt}\n\n{user_prompt_sparse}"
+
+    heuristic_div4 = len(full_text_sparse) // 4
+    heuristic_div3 = math.ceil(len(full_text_sparse) / 3.0)
+    bound = count_request_tokens(system_prompt, user_prompt_sparse)
+
+    # Prove character heuristics underestimate
+    assert heuristic_div4 < 26  # Underestimates single character token count
+    assert bound >= len(full_text_sparse.encode("utf-8")) + 32
+    assert bound > heuristic_div4
+    assert bound > heuristic_div3
+
+    # 2. Punctuation dense sequence where each symbol represents a distinct token
+    user_prompt_punct = "! , . ? ; : ( ) [ ] { } / @ # $ % ^ & * + = < >"
+    full_text_punct = f"{system_prompt}\n\n{user_prompt_punct}"
+    punct_div4 = len(full_text_punct) // 4
+    bound_punct = count_request_tokens(system_prompt, user_prompt_punct)
+    assert bound_punct > punct_div4 * 2
+
+    # 3. Model configuration validation fails closed on unsupported models
+    with pytest.raises(ValueError, match="Unsupported model configuration"):
+        count_request_tokens(system_prompt, user_prompt_sparse, model_id="unsupported.fake.model")
+
+    # 4. In OkfBuilder, unsupported model configuration fails closed with zero calls
+    builder = OkfBuilder()
+    mock_bedrock = MagicMock()
+    with patch("config.settings.OKF_BEDROCK_MODEL_ID", "unsupported.model.v1"):
+        budget = DocumentExtractionBudget(
+            workspace_id="ws_unsup",
+            document_id="doc_unsup",
+            document_version="v1",
+            max_calls=2,
+            max_input_tokens=4000,
+            max_output_tokens=1200,
+            max_elapsed_s=10.0,
+        )
+        test_chunk = Chunk(
+            id="chk_u1",
+            document_id="doc_unsup",
+            source_format="pdf",
+            text="Acme revenue is 100.",
+            element_type="text",
+        )
+        raw_out, stats = builder._invoke_bedrock_extraction(
+            client=mock_bedrock,
+            chunks=[test_chunk],
+            workspace_id="ws_unsup",
+            document_id="doc_unsup",
+            budget=budget,
+        )
+        assert raw_out == ""
+        assert stats == {"input_tokens": 0, "output_tokens": 0}
+        assert budget.exhausted is True
+        assert "unsupported_model_configuration" in (budget.exhaustion_reason or "")
+        assert mock_bedrock.converse.call_count == 0
+
+
+def test_concurrent_provider_calls_bounded_across_documents():
+    """Verify provider call concurrency across documents is strictly bounded by controller."""
+    controller = OkfProviderConcurrencyController(max_concurrency=2, max_queue=4)
+    active_tracker: list[int] = []
+    tracker_lock = threading.Lock()
+
+    def slow_provider_work(*args, **kwargs):
+        with tracker_lock:
+            active_tracker.append(controller.active_count)
+        time.sleep(0.08)
+        return {"output": {"message": {"content": [{"text": "[]"}]}}, "usage": {"inputTokens": 50, "outputTokens": 10}}
+
+    mock_client = MagicMock()
+    mock_client.converse.side_effect = slow_provider_work
+
+    builder = OkfBuilder(bedrock_client=mock_client, provider_controller=controller)
+
+    def run_doc(doc_id: str):
+        test_chunk = Chunk(
+            id=f"chk_{doc_id}",
+            document_id=doc_id,
+            source_format="pdf",
+            text="Corporate revenue was 500.",
+            element_type="text",
+        )
+        budget = DocumentExtractionBudget(
+            workspace_id="ws_conc",
+            document_id=doc_id,
+            document_version="v1",
+            max_calls=2,
+            max_input_tokens=4000,
+            max_output_tokens=1200,
+            max_elapsed_s=10.0,
+        )
+        return builder._invoke_bedrock_extraction(
+            client=mock_client,
+            chunks=[test_chunk],
+            workspace_id="ws_conc",
+            document_id=doc_id,
+            budget=budget,
+        )
+
+    threads = []
+    results = [None] * 4
+    for i in range(4):
+        def worker(idx=i):
+            results[idx] = run_doc(f"doc_{idx}")
+        t = threading.Thread(target=worker)
+        threads.append(t)
+        t.start()
+
+    for t in threads:
+        t.join()
+
+    # Verify concurrency was strictly bounded to at most 2 at all times
+    assert len(active_tracker) == 4
+    assert max(active_tracker) <= 2
+    # All 4 documents succeeded through bounded admission
+    for res in results:
+        assert res is not None
+        assert res[0] == "[]"
+
+
+def test_provider_timeout_capacity_retention_blocks_immediate_new_calls():
+    """Verify that when a caller times out, worker capacity is retained until underlying work finishes."""
+    controller = OkfProviderConcurrencyController(max_concurrency=1, max_queue=2)
+
+    underlying_completed = threading.Event()
+
+    def very_slow_provider_call(*args, **kwargs):
+        time.sleep(0.25)
+        underlying_completed.set()
+        return {"result": "success"}
+
+    # Caller 1 starts with a tight 0.05s deadline
+    caller1_result: list[Any] = []
+
+    def caller1():
+        res, status = controller.run_provider_call(very_slow_provider_call, timeout_s=0.05)
+        caller1_result.append((res, status))
+
+    t1 = threading.Thread(target=caller1)
+    t1.start()
+    t1.join()
+
+    # Caller 1 timed out
+    assert len(caller1_result) == 1
+    assert caller1_result[0][1] == "caller_timeout"
+    # But underlying provider work is still executing in the background!
+    assert not underlying_completed.is_set()
+    assert controller.active_count == 1
+
+    # Caller 2 immediately attempts to acquire a slot with a 0.05s timeout
+    caller2_result: list[Any] = []
+
+    def caller2():
+        res, status = controller.run_provider_call(lambda: "instant", timeout_s=0.05)
+        caller2_result.append((res, status))
+
+    t2 = threading.Thread(target=caller2)
+    t2.start()
+    t2.join()
+
+    # Caller 2 could NOT acquire the slot because capacity was retained by caller 1's ongoing work
+    assert len(caller2_result) == 1
+    assert caller2_result[0][1] == "caller_timeout"
+
+    # Wait until underlying provider work actually completes
+    finished = underlying_completed.wait(timeout=1.0)
+    assert finished is True
+    time.sleep(0.02)  # brief settle for lock release
+
+    # Now Caller 3 can acquire the slot immediately and succeed
+    res3, status3 = controller.run_provider_call(lambda: "success_c3", timeout_s=0.1)
+    assert status3 == "completed"
+    assert res3 == "success_c3"
+
+
+def test_attempt_reservation_survives_crash_and_restart():
+    """Verify attempt reservations persist to durable store before calls and survive simulated crashes."""
+    repo = InMemoryOkfRepository()
+    ws_id = "ws_crash_test"
+    doc_id = "doc_crash_test"
+    doc_ver = "v1"
+
+    builder = OkfBuilder(repo=repo)
+    budget = get_or_create_document_budget(
+        workspace_id=ws_id,
+        document_id=doc_id,
+        document_version=doc_ver,
+        idempotency_key=f"{ws_id}:{doc_id}:{doc_ver}",
+        repo=repo,
+    )
+
+    # Mock client that raises an unexpected crash exception during call 1
+    mock_crash_client = MagicMock()
+    mock_crash_client.converse.side_effect = RuntimeError("Fatal worker process crash simulation")
+
+    test_chunk = Chunk(
+        id="chk_c1",
+        document_id=doc_id,
+        source_format="pdf",
+        text="Acme revenue is 100.",
+        element_type="text",
+    )
+
+    builder._invoke_bedrock_extraction(
+        client=mock_crash_client,
+        chunks=[test_chunk],
+        workspace_id=ws_id,
+        document_id=doc_id,
+        budget=budget,
+    )
+
+    # 1. Verify durable repository persisted the attempt reservation before or during failure
+    durable_man = repo.get_manifest(ws_id, doc_id, doc_ver)
+    assert durable_man is not None
+    assert durable_man.model_calls == 1
+    assert durable_man.status == "failed"
+
+    # 2. Simulate total service crash by clearing in memory ledger
+    reset_budget_ledger()
+
+    # 3. Create fresh builder and budget after restart
+    recovered_budget = get_or_create_document_budget(
+        workspace_id=ws_id,
+        document_id=doc_id,
+        document_version=doc_ver,
+        idempotency_key=f"{ws_id}:{doc_id}:{doc_ver}",
+        repo=repo,
+    )
+
+    # Attempt count was recovered from durable storage and was not silently reset
+    assert recovered_budget.calls_made == 1
+    assert recovered_budget.exhausted is True
+    assert "prior_recorded_attempts" in (recovered_budget.exhaustion_reason or "")
