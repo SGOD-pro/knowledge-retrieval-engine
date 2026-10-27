@@ -124,8 +124,9 @@ class OkfRepositoryBase(Protocol):
         workspace_id: str,
         document_id: str,
         document_version: str,
+        consistent_read: bool = True,
     ) -> OkfManifest | None:
-        """Retrieve manifest for a given workspace and document version."""
+        """Retrieve manifest for a given workspace and document version using strongly consistent reads."""
         ...
 
     def delete_document_facts(
@@ -307,6 +308,7 @@ class InMemoryOkfRepository:
         workspace_id: str,
         document_id: str,
         document_version: str,
+        consistent_read: bool = True,
     ) -> OkfManifest | None:
         with self._lock:
             return self._manifests.get((workspace_id, document_id, document_version))
@@ -603,6 +605,7 @@ class SQLiteOkfRepository:
         workspace_id: str,
         document_id: str,
         document_version: str,
+        consistent_read: bool = True,
     ) -> OkfManifest | None:
         with self._lock:
             pk = f"WORKSPACE#{workspace_id}"
@@ -917,6 +920,7 @@ class DynamoDBOkfRepository:
         workspace_id: str,
         document_id: str,
         document_version: str,
+        consistent_read: bool = True,
     ) -> OkfManifest | None:
         _, table = self._get_resources()
         try:
@@ -924,7 +928,8 @@ class DynamoDBOkfRepository:
                 Key={
                     "PK": f"WORKSPACE#{workspace_id}",
                     "SK": f"MANIFEST#DOC#{document_id}#VER#{document_version}",
-                }
+                },
+                ConsistentRead=consistent_read,
             )
             item = resp.get("Item")
             if not item:

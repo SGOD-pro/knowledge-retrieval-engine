@@ -169,6 +169,10 @@ class DocumentExtractionBudget:
 
 
 _MAX_BUDGET_LEDGER_ENTRIES = 1000
+# Note on process boundary: _EXTRACTION_LOCKS and _EXTRACTION_BUDGETS coordinate concurrent
+# threads within a single Python process. Multi process coordination across separate processes
+# on the same host or across multiple hosts remains an open limitation for AC-3 pending
+# distributed leasing or atomic conditional writes.
 _EXTRACTION_LOCKS: dict[str, threading.Lock] = {}
 _EXTRACTION_BUDGETS: dict[str, DocumentExtractionBudget] = {}
 _GLOBAL_LOCK = threading.Lock()
@@ -225,7 +229,13 @@ def get_or_create_document_budget(
         prior_reason = None
         if repo is not None:
             try:
-                existing_man = repo.get_manifest(workspace_id, document_id, document_version)
+                # Strongly consistent read ensures recovery does not miss recently committed reservations
+                existing_man = repo.get_manifest(
+                    workspace_id,
+                    document_id,
+                    document_version,
+                    consistent_read=True,
+                )
                 if existing_man is not None:
                     prior_calls = getattr(existing_man, "model_calls", 0)
                     prior_tokens = getattr(existing_man, "extraction_tokens", 0)
@@ -891,7 +901,12 @@ class OkfBuilder:
             # Idempotency check: Reuse existing manifest if ready and not forced
             try:
                 if not force_reextract and self.repo.has_ready_okf(workspace_id, document_id, document_version):
-                    existing_man = self.repo.get_manifest(workspace_id, document_id, document_version)
+                    existing_man = self.repo.get_manifest(
+                        workspace_id,
+                        document_id,
+                        document_version,
+                        consistent_read=True,
+                    )
                     if existing_man:
                         logger.info(
                             "okf_builder.idempotent_replay ws=%s doc=%s ver=%s assertions=%d",
@@ -940,7 +955,12 @@ class OkfBuilder:
                     budget.exhaustion_reason,
                 )
                 try:
-                    existing_man = self.repo.get_manifest(workspace_id, document_id, document_version)
+                    existing_man = self.repo.get_manifest(
+                        workspace_id,
+                        document_id,
+                        document_version,
+                        consistent_read=True,
+                    )
                     if existing_man:
                         return existing_man
                 except Exception:

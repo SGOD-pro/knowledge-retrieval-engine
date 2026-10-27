@@ -1860,3 +1860,127 @@ def test_per_call_input_token_limit_enforced_independently():
     assert mock_bedrock.converse.call_count == 0  # Zero provider calls!
     assert budget_prov.exhausted is True
     assert "per_call_input_token_limit_exceeded" in (budget_prov.exhaustion_reason or "")
+
+
+def test_dynamodb_adapter_budget_recovery_strongly_consistent_read():
+    """Verify that budget recovery through DynamoDBOkfRepository uses strongly consistent reads (ConsistentRead=True)
+    and handles:
+    1. Restart after recorded attempt (loads recorded attempt, enforces budget exhaustion).
+    2. Genuinely missing record (returns None, cleanly authorizes fresh budget).
+    3. Read error (raises StorageUnavailableError, fails closed with exhausted budget and zero provider calls).
+    """
+    from db.okf_repo import DynamoDBOkfRepository
+    from src.schemas.contracts.boundary import StorageUnavailableError
+
+    repo = DynamoDBOkfRepository(table_name="test_facts")
+    mock_table = MagicMock()
+    mock_client = MagicMock()
+    repo._table = mock_table
+    repo._client = mock_client
+
+    ws_id = "ws_cr_test"
+    doc_id = "doc_cr_test"
+    doc_ver = "v1"
+    idempotency_key = f"{ws_id}:{doc_id}:{doc_ver}"
+
+    # --- Scenario 1: Restart after recorded attempt ---
+    recorded_manifest_data = {
+        "workspace_id": ws_id,
+        "document_id": doc_id,
+        "document_version": doc_ver,
+        "entities": [],
+        "assertions": [],
+        "rejected_assertions_count": 0,
+        "status": "failed",
+        "extraction_tokens": 300,
+        "model_calls": 2,
+        "idempotency_key": idempotency_key,
+        "created_at": "2026-10-28T00:00:00Z",
+    }
+    mock_table.get_item.return_value = {
+        "Item": {
+            "PK": f"WORKSPACE#{ws_id}",
+            "SK": f"MANIFEST#DOC#{doc_id}#VER#{doc_ver}",
+            "data_json": json.dumps(recorded_manifest_data),
+        }
+    }
+
+    reset_budget_ledger()
+    budget1 = get_or_create_document_budget(
+        workspace_id=ws_id,
+        document_id=doc_id,
+        document_version=doc_ver,
+        idempotency_key=idempotency_key,
+        repo=repo,
+        max_calls=2,
+    )
+
+    mock_table.get_item.assert_called_once()
+    call_kwargs1 = mock_table.get_item.call_args[1]
+    assert call_kwargs1.get("ConsistentRead") is True
+    assert budget1.calls_made == 2
+    assert budget1.exhausted is True
+    assert budget1.can_call() is False
+    assert "prior_recorded_attempts" in (budget1.exhaustion_reason or "")
+
+    # --- Scenario 2: Genuinely missing record ---
+    mock_table.reset_mock()
+    mock_table.get_item.return_value = {"ResponseMetadata": {"HTTPStatusCode": 200}}
+
+    reset_budget_ledger()
+    budget2 = get_or_create_document_budget(
+        workspace_id=ws_id,
+        document_id=doc_id,
+        document_version="v2",
+        idempotency_key=f"{ws_id}:{doc_id}:v2",
+        repo=repo,
+    )
+
+    mock_table.get_item.assert_called_once()
+    call_kwargs2 = mock_table.get_item.call_args[1]
+    assert call_kwargs2.get("ConsistentRead") is True
+    assert budget2.calls_made == 0
+    assert budget2.exhausted is False
+    assert budget2.can_call() is True
+
+    # --- Scenario 3: Read error ---
+    mock_table.reset_mock()
+    mock_table.get_item.side_effect = Exception("DynamoDB service unavailable")
+
+    reset_budget_ledger()
+    budget3 = get_or_create_document_budget(
+        workspace_id=ws_id,
+        document_id=doc_id,
+        document_version="v3",
+        idempotency_key=f"{ws_id}:{doc_id}:v3",
+        repo=repo,
+    )
+
+    mock_table.get_item.assert_called_once()
+    call_kwargs3 = mock_table.get_item.call_args[1]
+    assert call_kwargs3.get("ConsistentRead") is True
+    assert budget3.exhausted is True
+    assert "storage_read_failed" in (budget3.exhaustion_reason or "")
+    assert budget3.can_call() is False
+
+    # Verify zero provider calls when extract_and_persist runs with this repository
+    mock_bedrock = MagicMock()
+    builder = OkfBuilder(repo=repo, bedrock_client=mock_bedrock)
+    test_chunk = Chunk(
+        id="chk_cr1",
+        document_id=doc_id,
+        source_format="pdf",
+        text="Acme revenue is 100.",
+        element_type="text",
+        page_number=1,
+    )
+    manifest = builder.extract_and_persist(
+        workspace_id=ws_id,
+        document_id=doc_id,
+        document_version="v3",
+        format="pdf",
+        chunks=[test_chunk],
+    )
+    assert manifest.status == "failed"
+    assert mock_bedrock.converse.call_count == 0
+
