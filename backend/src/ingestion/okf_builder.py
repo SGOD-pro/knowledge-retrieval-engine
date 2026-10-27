@@ -666,19 +666,17 @@ def count_request_tokens(
       individual UTF-8 byte values (0 to 255), each token represents at least 1 byte of input text.
       Merged tokens represent 2 or more bytes. Therefore, for all UTF-8 text T,
       the token count N satisfies: N_tokens <= |T|_bytes.
-    - Proven Upper Bound: Taking byte length |T|_bytes guarantees that token count cannot
-      be underestimated, even for pathological high-density single-character or punctuation
+    - Proven Text Upper Bound: Taking byte length |T|_bytes guarantees that text token count cannot
+      be underestimated, even for pathological high density single character or punctuation
       sequences where character heuristics (such as len // 4) fail by more than 2x.
-    - Envelope Framing: Bedrock Converse API wraps inputs into JSON message envelopes
-      with system blocks, user content blocks, role indicators, and model delimiter tokens.
-      Converse API overhead consumes fewer than 16 special tokens; 32 tokens provides
-      a conservative 2x safety margin.
 
-    Documented Assumptions and Non-BPE Limitations:
-    - The upper bound proof strictly relies on the byte-level BPE invariant N_tokens <= |T|_bytes.
-    - For non-BPE tokenizers, synthetic expansion models, or unverified model families,
-      this assumption is unverified.
-    - Therefore, any model_id outside SUPPORTED_OKF_MODELS fails closed by raising ValueError,
+    Documented Assumptions and Open Evidence Requirements:
+    - Text Payload: The text upper bound proof relies on the byte-level BPE invariant N_tokens <= |T|_bytes.
+      For non-BPE tokenizers, synthetic expansion models, or unverified model families, this is unverified.
+    - Framing Allowance: The 32 token envelope framing allowance covers Bedrock Converse API JSON structure,
+      system content blocks, role indicators, and internal turn delimiters. This 32 token buffer is an unverified
+      heuristic assumption that still requires empirical provider and model tokenizer evidence from AWS Bedrock.
+    - Fail Closed Enforcement: Any model_id outside SUPPORTED_OKF_MODELS fails closed by raising ValueError,
       preventing unbudgeted provider calls.
     """
     if model_id is not None and model_id not in SUPPORTED_OKF_MODELS:

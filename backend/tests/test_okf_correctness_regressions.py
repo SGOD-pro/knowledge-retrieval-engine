@@ -1670,6 +1670,100 @@ def test_storage_read_failure_fails_closed_without_fresh_budget():
     assert mock_client.converse.call_count == 0  # Zero provider calls executed!
 
 
+def test_dynamodb_repository_adapter_read_failure_fails_closed_without_fresh_budget():
+    """Verify that when DynamoDB get_item raises a storage exception on the actual adapter, it raises StorageUnavailableError and fails closed."""
+    from db.okf_repo import DynamoDBOkfRepository
+    from src.schemas.contracts.boundary import StorageUnavailableError
+
+    repo = DynamoDBOkfRepository(table_name="test_facts")
+    mock_table = MagicMock()
+    mock_client = MagicMock()
+    # Inject mocked get_item failure on the actual DynamoDB adapter
+    mock_table.get_item.side_effect = Exception("DynamoDB socket timeout (read timed out)")
+    repo._table = mock_table
+    repo._client = mock_client
+
+    ws_id = "ws_ddb_fail"
+    doc_id = "doc_ddb_fail"
+    doc_ver = "v1"
+
+    # 1. Directly verify DynamoDBOkfRepository.get_manifest raises StorageUnavailableError rather than swallowing to None
+    with pytest.raises(StorageUnavailableError, match="DynamoDB error reading OKF manifest"):
+        repo.get_manifest(ws_id, doc_id, doc_ver)
+
+    # 2. Verify budget recovery through get_or_create_document_budget fails closed
+    reset_budget_ledger()
+    idempotency_key = f"{ws_id}:{doc_id}:{doc_ver}"
+    budget = get_or_create_document_budget(
+        workspace_id=ws_id,
+        document_id=doc_id,
+        document_version=doc_ver,
+        idempotency_key=idempotency_key,
+        repo=repo,
+    )
+    assert budget.exhausted is True
+    assert "storage_read_failed" in (budget.exhaustion_reason or "")
+    assert budget.can_call() is False
+
+    # 3. Verify extract_and_persist makes zero provider calls and fails open for baseline availability
+    mock_bedrock = MagicMock()
+    builder = OkfBuilder(repo=repo, bedrock_client=mock_bedrock)
+    test_chunk = Chunk(
+        id="chk_ddb1",
+        document_id=doc_id,
+        source_format="pdf",
+        text="Acme revenue is 100.",
+        element_type="text",
+        page_number=1,
+    )
+    manifest = builder.extract_and_persist(
+        workspace_id=ws_id,
+        document_id=doc_id,
+        document_version=doc_ver,
+        format="pdf",
+        chunks=[test_chunk],
+    )
+    assert manifest.status == "failed"
+    assert len(manifest.assertions) == 0
+    assert mock_bedrock.converse.call_count == 0  # Zero provider calls!
+
+
+def test_dynamodb_repository_adapter_missing_item_authorizes_fresh_budget():
+    """Verify that when DynamoDB get_item returns an empty item (missing reservation), it returns None and starts a fresh budget."""
+    from db.okf_repo import DynamoDBOkfRepository
+
+    repo = DynamoDBOkfRepository(table_name="test_facts")
+    mock_table = MagicMock()
+    mock_client = MagicMock()
+    # Mock clean missing item response from DynamoDB (item not found)
+    mock_table.get_item.return_value = {"ResponseMetadata": {"HTTPStatusCode": 200}}
+    mock_table.query.return_value = {"Items": []}
+    repo._table = mock_table
+    repo._client = mock_client
+
+    ws_id = "ws_ddb_clean"
+    doc_id = "doc_ddb_clean"
+    doc_ver = "v1"
+
+    # 1. Directly verify DynamoDBOkfRepository.get_manifest returns None on missing item
+    assert repo.get_manifest(ws_id, doc_id, doc_ver) is None
+
+    # 2. Verify budget recovery through get_or_create_document_budget cleanly starts fresh budget
+    reset_budget_ledger()
+    idempotency_key = f"{ws_id}:{doc_id}:{doc_ver}"
+    budget = get_or_create_document_budget(
+        workspace_id=ws_id,
+        document_id=doc_id,
+        document_version=doc_ver,
+        idempotency_key=idempotency_key,
+        repo=repo,
+    )
+    assert budget.exhausted is False
+    assert budget.exhaustion_reason is None
+    assert budget.calls_made == 0
+    assert budget.can_call() is True
+
+
 def test_missing_reservation_authorizes_fresh_budget_cleanly():
     """Verify legitimately missing reservation (get_manifest returning None) authorizes a fresh budget."""
     repo = InMemoryOkfRepository()

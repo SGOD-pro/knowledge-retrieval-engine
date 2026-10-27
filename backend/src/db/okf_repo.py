@@ -607,14 +607,18 @@ class SQLiteOkfRepository:
         with self._lock:
             pk = f"WORKSPACE#{workspace_id}"
             sk = f"MANIFEST#DOC#{document_id}#VER#{document_version}"
-            cursor = self._conn.execute(
-                "SELECT data_json FROM kre_okf_facts WHERE pk = ? AND sk = ?",
-                (pk, sk),
-            )
-            row = cursor.fetchone()
-            if not row:
-                return None
-            return OkfManifest(**json.loads(row["data_json"]))
+            try:
+                cursor = self._conn.execute(
+                    "SELECT data_json FROM kre_okf_facts WHERE pk = ? AND sk = ?",
+                    (pk, sk),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                return OkfManifest(**json.loads(row["data_json"]))
+            except Exception as exc:
+                logger.error("SQLite get_manifest failed: %s", exc)
+                raise StorageUnavailableError(f"SQLite error reading OKF manifest: {exc}") from exc
 
     def delete_document_facts(
         self,
@@ -871,8 +875,8 @@ class DynamoDBOkfRepository:
             )
             return len(resp.get("Items", [])) > 0
         except Exception as exc:
-            logger.warning("DynamoDB has_ready_okf GSI2 query failed: %s", exc)
-            return False
+            logger.error("DynamoDB has_ready_okf GSI2 query failed: %s", exc)
+            raise StorageUnavailableError(f"DynamoDB error querying OKF readiness: {exc}") from exc
 
     def list_assertions_by_document(
         self,
@@ -927,8 +931,8 @@ class DynamoDBOkfRepository:
                 return None
             return OkfManifest(**json.loads(item["data_json"]))
         except Exception as exc:
-            logger.warning("DynamoDB get_manifest failed: %s", exc)
-            return None
+            logger.error("DynamoDB get_manifest failed: %s", exc)
+            raise StorageUnavailableError(f"DynamoDB error reading OKF manifest: {exc}") from exc
 
     def delete_document_facts(
         self,
