@@ -813,27 +813,44 @@ def test_retriever_fails_closed_when_manifest_metadata_is_missing():
 
 def test_upfront_budget_reservation_and_persistence_across_replays():
     """Verify complete prompt/output budget reservation, shared deadline across retries, and attempt persistence."""
-    # 1. Test upfront budget reservation limits
+    # 1. Test upfront budget reservation limits: per-call limit and document total limit
     budget = DocumentExtractionBudget(
         workspace_id="ws_b",
         document_id="doc_b",
         document_version="v1",
         max_calls=2,
         max_input_tokens=4000,
+        max_call_input_tokens=2000,
         max_output_tokens=1200,
         max_elapsed_s=10.0,
     )
 
-    # Reserve call 1 (2500 input tokens, 600 output tokens) -> fits
-    assert budget.reserve_call(prompt_tokens=2500, max_output_tokens=600) is True
-    assert budget.calls_made == 1
-    assert budget.input_tokens_used == 2500
-    assert budget.output_tokens_used == 600
-
-    # Reserve call 2 (2000 input tokens) -> would exceed 4000 max_input_tokens -> rejected upfront
-    assert budget.reserve_call(prompt_tokens=2000, max_output_tokens=600) is False
+    # Per-call limit rejection: 2500 input tokens exceeds 2000 per-call limit even though 4000 total has room
+    assert budget.reserve_call(prompt_tokens=2500, max_output_tokens=600) is False
     assert budget.exhausted is True
-    assert "input_token_limit_exceeded" in (budget.exhaustion_reason or "")
+    assert "per_call_input_token_limit_exceeded" in (budget.exhaustion_reason or "")
+
+    # Document total limit rejection across valid per-call requests
+    budget2 = DocumentExtractionBudget(
+        workspace_id="ws_b",
+        document_id="doc_b2",
+        document_version="v1",
+        max_calls=2,
+        max_input_tokens=3000,
+        max_call_input_tokens=2000,
+        max_output_tokens=1200,
+        max_elapsed_s=10.0,
+    )
+    # Reserve call 1 (1800 input tokens, 600 output tokens) -> fits under 2000 per-call and 3000 total
+    assert budget2.reserve_call(prompt_tokens=1800, max_output_tokens=600) is True
+    assert budget2.calls_made == 1
+    assert budget2.input_tokens_used == 1800
+    assert budget2.output_tokens_used == 600
+
+    # Reserve call 2 (1500 input tokens) -> fits 2000 per-call, but 1800 + 1500 = 3300 > 3000 max_input_tokens -> rejected
+    assert budget2.reserve_call(prompt_tokens=1500, max_output_tokens=600) is False
+    assert budget2.exhausted is True
+    assert "input_token_limit_exceeded" in (budget2.exhaustion_reason or "")
 
     # 2. Shared document deadline across retry delays
     repo = InMemoryOkfRepository()
@@ -1538,3 +1555,214 @@ def test_attempt_reservation_survives_crash_and_restart():
     assert recovered_budget.calls_made == 1
     assert recovered_budget.exhausted is True
     assert "prior_recorded_attempts" in (recovered_budget.exhaustion_reason or "")
+
+
+def test_reservation_write_failure_aborts_provider_call_and_preserves_baseline():
+    """Verify that when saving attempt reservation fails, provider is never called and baseline is preserved."""
+    repo = InMemoryOkfRepository()
+    # Inject failure into repo.save_manifest
+    repo.save_manifest = MagicMock(side_effect=RuntimeError("DynamoDB save_manifest connection timeout"))
+
+    ws_id = "ws_persist_fail"
+    doc_id = "doc_persist_fail"
+    doc_ver = "v1"
+
+    mock_client = MagicMock()
+    mock_client.converse = MagicMock()
+
+    builder = OkfBuilder(repo=repo, bedrock_client=mock_client)
+    budget = DocumentExtractionBudget(
+        workspace_id=ws_id,
+        document_id=doc_id,
+        document_version=doc_ver,
+        max_elapsed_s=10.0,
+    )
+
+    test_chunk = Chunk(
+        id="chk_pf1",
+        document_id=doc_id,
+        source_format="pdf",
+        text="Acme revenue is 100.",
+        element_type="text",
+        page_number=1,
+    )
+
+    # 1. Test direct invocation of _invoke_bedrock_extraction aborts immediately
+    out_text, stats = builder._invoke_bedrock_extraction(
+        client=mock_client,
+        chunks=[test_chunk],
+        workspace_id=ws_id,
+        document_id=doc_id,
+        budget=budget,
+    )
+
+    assert out_text == ""
+    assert stats["input_tokens"] == 0
+    assert stats["output_tokens"] == 0
+    assert mock_client.converse.call_count == 0  # Zero provider calls!
+    assert budget.exhausted is True
+    assert "reservation_persistence_failed" in (budget.exhaustion_reason or "")
+
+    # 2. Test full extract_and_persist fails open per ADR-001 with zero unhandled exceptions
+    reset_budget_ledger()
+    manifest = builder.extract_and_persist(
+        workspace_id=ws_id,
+        document_id=doc_id,
+        document_version=doc_ver,
+        format="pdf",
+        chunks=[test_chunk],
+    )
+
+    assert manifest.status == "failed"
+    assert len(manifest.assertions) == 0
+    assert mock_client.converse.call_count == 0  # Zero provider calls across entire ingestion!
+
+
+def test_storage_read_failure_fails_closed_without_fresh_budget():
+    """Verify budget recovery distinguishes missing reservation from storage read failure, failing closed on read error."""
+    repo = InMemoryOkfRepository()
+    # Inject storage read failure (e.g. DynamoDB network partition)
+    repo.get_manifest = MagicMock(side_effect=RuntimeError("Storage read timeout or partition"))
+
+    ws_id = "ws_read_fail"
+    doc_id = "doc_read_fail"
+    doc_ver = "v1"
+    idempotency_key = f"{ws_id}:{doc_id}:{doc_ver}"
+
+    # 1. get_or_create_document_budget must fail closed instead of silently authorizing fresh budget
+    reset_budget_ledger()
+    budget = get_or_create_document_budget(
+        workspace_id=ws_id,
+        document_id=doc_id,
+        document_version=doc_ver,
+        idempotency_key=idempotency_key,
+        repo=repo,
+    )
+
+    assert budget.exhausted is True
+    assert "storage_read_failed" in (budget.exhaustion_reason or "")
+    assert budget.can_call() is False
+
+    # 2. extract_and_persist with this broken storage makes zero provider calls
+    mock_client = MagicMock()
+    mock_client.converse = MagicMock()
+    builder = OkfBuilder(repo=repo, bedrock_client=mock_client)
+
+    test_chunk = Chunk(
+        id="chk_rf1",
+        document_id=doc_id,
+        source_format="pdf",
+        text="Acme revenue is 100.",
+        element_type="text",
+        page_number=1,
+    )
+
+    manifest = builder.extract_and_persist(
+        workspace_id=ws_id,
+        document_id=doc_id,
+        document_version=doc_ver,
+        format="pdf",
+        chunks=[test_chunk],
+    )
+
+    assert manifest.status == "failed"
+    assert len(manifest.assertions) == 0
+    assert mock_client.converse.call_count == 0  # Zero provider calls executed!
+
+
+def test_missing_reservation_authorizes_fresh_budget_cleanly():
+    """Verify legitimately missing reservation (get_manifest returning None) authorizes a fresh budget."""
+    repo = InMemoryOkfRepository()
+    ws_id = "ws_missing_clean"
+    doc_id = "doc_missing_clean"
+    doc_ver = "v1"
+    idempotency_key = f"{ws_id}:{doc_id}:{doc_ver}"
+
+    reset_budget_ledger()
+    assert repo.get_manifest(ws_id, doc_id, doc_ver) is None
+
+    budget = get_or_create_document_budget(
+        workspace_id=ws_id,
+        document_id=doc_id,
+        document_version=doc_ver,
+        idempotency_key=idempotency_key,
+        repo=repo,
+    )
+
+    assert budget.exhausted is False
+    assert budget.exhaustion_reason is None
+    assert budget.calls_made == 0
+    assert budget.can_call() is True
+
+
+def test_per_call_input_token_limit_enforced_independently():
+    """Verify 2,000 input token per-call limit is enforced on complete reserved request independently of total document budget."""
+    # 1. Single call exceeding 2000 input tokens on fresh 4000-token total budget is rejected
+    budget = DocumentExtractionBudget(
+        workspace_id="ws_percall",
+        document_id="doc_percall",
+        document_version="v1",
+        max_calls=2,
+        max_input_tokens=4000,
+        max_call_input_tokens=2000,
+        max_output_tokens=1200,
+        max_call_output_tokens=600,
+    )
+
+    assert budget.reserve_call(prompt_tokens=2001, max_output_tokens=600) is False
+    assert budget.exhausted is True
+    assert "per_call_input_token_limit_exceeded (2001/2000)" in (budget.exhaustion_reason or "")
+    assert budget.calls_made == 0
+
+    # 2. Single call exceeding 600 output tokens is rejected
+    budget_out = DocumentExtractionBudget(
+        workspace_id="ws_percall",
+        document_id="doc_percall",
+        document_version="v1",
+        max_calls=2,
+        max_input_tokens=4000,
+        max_call_input_tokens=2000,
+        max_output_tokens=1200,
+        max_call_output_tokens=600,
+    )
+
+    assert budget_out.reserve_call(prompt_tokens=1000, max_output_tokens=601) is False
+    assert budget_out.exhausted is True
+    assert "per_call_output_token_limit_exceeded (601/600)" in (budget_out.exhaustion_reason or "")
+    assert budget_out.calls_made == 0
+
+    # 3. Provider invocation with prompt tokens exceeding per-call limit makes zero provider calls
+    repo = InMemoryOkfRepository()
+    mock_bedrock = MagicMock()
+    builder = OkfBuilder(repo=repo, bedrock_client=mock_bedrock)
+
+    budget_prov = DocumentExtractionBudget(
+        workspace_id="ws_prov",
+        document_id="doc_prov",
+        document_version="v1",
+        max_call_input_tokens=2000,
+        max_input_tokens=4000,
+    )
+
+    # Patch count_request_tokens to simulate a counted prompt exceeding 2,000 tokens
+    with patch("ingestion.okf_builder.count_request_tokens", return_value=2050):
+        test_chunk = Chunk(
+            id="chk_pc1",
+            document_id="doc_prov",
+            source_format="pdf",
+            text="Acme revenue is 100.",
+            element_type="text",
+        )
+        out, stats = builder._invoke_bedrock_extraction(
+            client=mock_bedrock,
+            chunks=[test_chunk],
+            workspace_id="ws_prov",
+            document_id="doc_prov",
+            budget=budget_prov,
+        )
+
+    assert out == ""
+    assert stats["input_tokens"] == 0
+    assert mock_bedrock.converse.call_count == 0  # Zero provider calls!
+    assert budget_prov.exhausted is True
+    assert "per_call_input_token_limit_exceeded" in (budget_prov.exhaustion_reason or "")

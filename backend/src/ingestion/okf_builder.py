@@ -71,7 +71,9 @@ class DocumentExtractionBudget:
     idempotency_key: str = ""
     max_calls: int = 2
     max_input_tokens: int = 4000
+    max_call_input_tokens: int = 2000
     max_output_tokens: int = 1200
+    max_call_output_tokens: int = 600
     max_elapsed_s: float = 10.0
     calls_made: int = 0
     input_tokens_used: int = 0
@@ -109,6 +111,14 @@ class DocumentExtractionBudget:
         if self.calls_made + 1 > self.max_calls:
             self.exhausted = True
             self.exhaustion_reason = f"call_limit_reached ({self.calls_made}/{self.max_calls})"
+            return False
+        if prompt_tokens > self.max_call_input_tokens:
+            self.exhausted = True
+            self.exhaustion_reason = f"per_call_input_token_limit_exceeded ({prompt_tokens}/{self.max_call_input_tokens})"
+            return False
+        if max_output_tokens > self.max_call_output_tokens:
+            self.exhausted = True
+            self.exhaustion_reason = f"per_call_output_token_limit_exceeded ({max_output_tokens}/{self.max_call_output_tokens})"
             return False
         if self.input_tokens_used + prompt_tokens > self.max_input_tokens:
             self.exhausted = True
@@ -190,7 +200,9 @@ def get_or_create_document_budget(
     idempotency_key: str,
     max_calls: int = 2,
     max_input_tokens: int = 4000,
+    max_call_input_tokens: int = 2000,
     max_output_tokens: int = 1200,
+    max_call_output_tokens: int = 600,
     max_elapsed_s: float = 10.0,
     repo: Any | None = None,
 ) -> DocumentExtractionBudget:
@@ -204,6 +216,9 @@ def get_or_create_document_budget(
             del _EXTRACTION_BUDGETS[evict_key]
 
         # Preserve attempt accounting across restart and replay from durable repository manifest
+        # Budget recovery distinguishes a missing reservation (get_manifest returns None)
+        # from a storage read failure (get_manifest raises an exception); a failed read
+        # must fail closed and mark the budget exhausted, rather than silently authorizing a fresh budget.
         prior_calls = 0
         prior_tokens = 0
         prior_exhausted = False
@@ -218,7 +233,9 @@ def get_or_create_document_budget(
                         prior_exhausted = True
                         prior_reason = f"prior_recorded_attempts ({prior_calls}/{max_calls})"
             except Exception as e:
-                logger.debug("okf_builder.prior_manifest_lookup_err: %s", e)
+                logger.error("okf_builder.prior_manifest_storage_read_failed: %s", e)
+                prior_exhausted = True
+                prior_reason = f"storage_read_failed ({e})"
 
         budget = DocumentExtractionBudget(
             workspace_id=workspace_id,
@@ -227,7 +244,9 @@ def get_or_create_document_budget(
             idempotency_key=idempotency_key,
             max_calls=max_calls,
             max_input_tokens=max_input_tokens,
+            max_call_input_tokens=max_call_input_tokens,
             max_output_tokens=max_output_tokens,
+            max_call_output_tokens=max_call_output_tokens,
             max_elapsed_s=max_elapsed_s,
             calls_made=prior_calls,
             input_tokens_used=prior_tokens // 2,
@@ -640,10 +659,27 @@ def count_request_tokens(
     Budgets the complete request including system instructions, user content blocks,
     XML tags, punctuation, and envelope framing overhead.
 
-    For supported Claude 3 models in byte-level BPE, every token consumes at least
-    1 byte of UTF-8 input text. Therefore, byte length plus framing overhead establishes
-    a mathematically proven upper bound that cannot be underestimated by high-density
-    or punctuation-heavy sequences.
+    Mathematical Evidence for Supported Models:
+    - Supported Models: Claude 3 Haiku, Claude 3.5 Sonnet, and Claude 3 Sonnet.
+    - Tokenizer: Byte-level Byte Pair Encoding (BPE).
+    - Lower Bound Invariant: In byte-level BPE vocabularies where base tokens represent
+      individual UTF-8 byte values (0 to 255), each token represents at least 1 byte of input text.
+      Merged tokens represent 2 or more bytes. Therefore, for all UTF-8 text T,
+      the token count N satisfies: N_tokens <= |T|_bytes.
+    - Proven Upper Bound: Taking byte length |T|_bytes guarantees that token count cannot
+      be underestimated, even for pathological high-density single-character or punctuation
+      sequences where character heuristics (such as len // 4) fail by more than 2x.
+    - Envelope Framing: Bedrock Converse API wraps inputs into JSON message envelopes
+      with system blocks, user content blocks, role indicators, and model delimiter tokens.
+      Converse API overhead consumes fewer than 16 special tokens; 32 tokens provides
+      a conservative 2x safety margin.
+
+    Documented Assumptions and Non-BPE Limitations:
+    - The upper bound proof strictly relies on the byte-level BPE invariant N_tokens <= |T|_bytes.
+    - For non-BPE tokenizers, synthetic expansion models, or unverified model families,
+      this assumption is unverified.
+    - Therefore, any model_id outside SUPPORTED_OKF_MODELS fails closed by raising ValueError,
+      preventing unbudgeted provider calls.
     """
     if model_id is not None and model_id not in SUPPORTED_OKF_MODELS:
         raise ValueError(f"Unsupported model configuration: {model_id}")
@@ -855,17 +891,34 @@ class OkfBuilder:
         doc_lock = get_document_extraction_lock(idempotency_key)
         with doc_lock:
             # Idempotency check: Reuse existing manifest if ready and not forced
-            if not force_reextract and self.repo.has_ready_okf(workspace_id, document_id, document_version):
-                existing_man = self.repo.get_manifest(workspace_id, document_id, document_version)
-                if existing_man:
-                    logger.info(
-                        "okf_builder.idempotent_replay ws=%s doc=%s ver=%s assertions=%d",
-                        workspace_id,
-                        document_id,
-                        document_version,
-                        len(existing_man.assertions),
-                    )
-                    return existing_man
+            try:
+                if not force_reextract and self.repo.has_ready_okf(workspace_id, document_id, document_version):
+                    existing_man = self.repo.get_manifest(workspace_id, document_id, document_version)
+                    if existing_man:
+                        logger.info(
+                            "okf_builder.idempotent_replay ws=%s doc=%s ver=%s assertions=%d",
+                            workspace_id,
+                            document_id,
+                            document_version,
+                            len(existing_man.assertions),
+                        )
+                        return existing_man
+            except Exception as ready_err:
+                logger.error("okf_builder.idempotency_lookup_failed: %s", ready_err)
+                failed_manifest = OkfManifest(
+                    workspace_id=workspace_id,
+                    document_id=document_id,
+                    document_version=document_version,
+                    entities=(),
+                    assertions=(),
+                    rejected_assertions_count=0,
+                    status="failed",
+                    extraction_tokens=0,
+                    model_calls=0,
+                    idempotency_key=idempotency_key,
+                    created_at=timestamp,
+                )
+                return failed_manifest
 
             budget = get_or_create_document_budget(
                 workspace_id=workspace_id,
@@ -888,9 +941,26 @@ class OkfBuilder:
                     budget.calls_made,
                     budget.exhaustion_reason,
                 )
-                existing_man = self.repo.get_manifest(workspace_id, document_id, document_version)
-                if existing_man:
-                    return existing_man
+                try:
+                    existing_man = self.repo.get_manifest(workspace_id, document_id, document_version)
+                    if existing_man:
+                        return existing_man
+                except Exception:
+                    pass
+                failed_manifest = OkfManifest(
+                    workspace_id=workspace_id,
+                    document_id=document_id,
+                    document_version=document_version,
+                    entities=(),
+                    assertions=(),
+                    rejected_assertions_count=0,
+                    status="failed",
+                    extraction_tokens=budget.input_tokens_used + budget.output_tokens_used,
+                    model_calls=budget.calls_made,
+                    idempotency_key=idempotency_key,
+                    created_at=timestamp,
+                )
+                return failed_manifest
 
             fmt = (format or "").lower().replace(".", "")
 
@@ -1266,23 +1336,46 @@ class OkfBuilder:
             entities=tuple(valid_entities_map.values()),
             assertions=tuple(valid_assertions),
             rejected_assertions_count=rejected_count,
-            status="ready" if valid_assertions else ("failed" if budget.calls_made > 0 and not raw_candidates else "empty"),
+            status="ready" if valid_assertions else ("failed" if (budget.calls_made > 0 or budget.exhausted) and not raw_candidates else "empty"),
             extraction_tokens=budget.input_tokens_used + budget.output_tokens_used,
             model_calls=budget.calls_made,
             idempotency_key=idempotency_key,
             created_at=timestamp,
         )
 
-        self.repo.save_manifest(workspace_id, manifest)
+        try:
+            self.repo.save_manifest(workspace_id, manifest)
+        except Exception as save_err:
+            logger.warning(
+                "okf_builder.final_manifest_save_failed ws=%s doc=%s: %s (failing open per ADR-001)",
+                workspace_id,
+                document_id,
+                save_err,
+            )
+            manifest = OkfManifest(
+                workspace_id=workspace_id,
+                document_id=document_id,
+                document_version=document_version,
+                entities=(),
+                assertions=(),
+                rejected_assertions_count=rejected_count,
+                status="failed",
+                extraction_tokens=manifest.extraction_tokens,
+                model_calls=manifest.model_calls,
+                idempotency_key=idempotency_key,
+                created_at=timestamp,
+            )
+
         logger.info(
-            "okf_builder.pdf_ready ws=%s doc=%s ver=%s assertions=%d rejected=%d tokens=%d calls=%d",
+            "okf_builder.pdf_ready ws=%s doc=%s ver=%s assertions=%d rejected=%d tokens=%d calls=%d status=%s",
             workspace_id,
             document_id,
             document_version,
-            len(valid_assertions),
+            len(manifest.assertions),
             rejected_count,
             manifest.extraction_tokens,
             budget.calls_made,
+            manifest.status,
         )
         return manifest
 
@@ -1383,6 +1476,8 @@ class OkfBuilder:
             # Persist in-flight attempt reservation to durable repository before provider call
             # This ensures that if the process crashes or dies mid-call, the durable store records
             # the attempted model call and does not silently reset upon restart/replay.
+            # If persistence fails, do not call the provider; report failed optional enrichment
+            # and preserve baseline availability per ADR-001.
             try:
                 ver = getattr(budget, "document_version", "v1")
                 ikey = getattr(budget, "idempotency_key", "") or f"{workspace_id}:{document_id}:{ver}"
@@ -1403,7 +1498,10 @@ class OkfBuilder:
                     ),
                 )
             except Exception as save_err:
-                logger.debug("okf_builder.reservation_persistence_err: %s", save_err)
+                logger.error("okf_builder.reservation_persistence_failed: %s", save_err)
+                budget.exhausted = True
+                budget.exhaustion_reason = f"reservation_persistence_failed ({save_err})"
+                return "", {"input_tokens": 0, "output_tokens": 0}
 
             call_timeout = max(0.001, budget.max_elapsed_s - (time.perf_counter() - budget.started_at))
             try:
