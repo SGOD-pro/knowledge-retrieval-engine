@@ -150,6 +150,7 @@ def ingest_comparison_corpus(
         "boundary_repo_type": type(boundary_repo).__name__,
         "tables": {},
         "snapshots": {},
+        "page_index": {},
         "smoke_test": smoke_test,
     }
 
@@ -186,6 +187,16 @@ def ingest_comparison_corpus(
         )
         assert res.coverage_complete is True, f"Table '{table_name}' coverage is not complete"
 
+        # Verify TableStore manifests and complete reads before declaring comparison readiness
+        if not manifest:
+            raise ValueError(f"Table '{table_name}' manifest missing for document {doc_id}")
+        if manifest.get("coverage_complete") is not True:
+            raise ValueError(f"Table '{table_name}' manifest reports incomplete coverage: {manifest}")
+        if manifest.get("persisted_rows") != expected_rows:
+            raise ValueError(
+                f"Table '{table_name}' manifest persisted_rows mismatch: expected {expected_rows}, got {manifest.get('persisted_rows')}"
+            )
+
         okf_table_status = None
         okf_table_entities = 0
         okf_table_props = 0
@@ -208,15 +219,24 @@ def ingest_comparison_corpus(
             except Exception as okf_err:
                 logger.warning("OKF schema extraction failed for %s: %s", table_name, okf_err)
 
-        # Verify paginated and streaming reads from TableStore
+        # Verify paginated sample read from TableStore
         sample_rows = store.query_rows(table_name, workspace_id, limit=5)
-        agg_val, count, row_ids, idxs, digest = store.execute_single_pass_query(
+        if len(sample_rows) != min(5, expected_rows):
+            raise ValueError(
+                f"Table '{table_name}' sample read failed: expected {min(5, expected_rows)} rows, got {len(sample_rows)}"
+            )
+
+        # Complete read verification through single pass query
+        agg_val, full_count, row_ids, idxs, digest = store.execute_single_pass_query(
             table_id=table_name,
             workspace_id=workspace_id,
             column_index=None,
             op=None,
-            limit=10,
         )
+        if full_count != expected_rows:
+            raise ValueError(
+                f"Table '{table_name}' complete read mismatch: expected {expected_rows} rows, got {full_count}"
+            )
 
         results["tables"][table_name] = {
             "document_id": doc_id,
@@ -224,9 +244,9 @@ def ingest_comparison_corpus(
             "persisted_rows": res.persisted_rows,
             "source_rows": res.source_rows,
             "coverage_complete": res.coverage_complete,
-            "manifest_verified": manifest is not None and manifest.get("coverage_complete") is True,
+            "manifest_verified": True,
             "sample_rows_read": len(sample_rows),
-            "streaming_count": count,
+            "complete_read_count": full_count,
             "digest": digest[:16] if digest else None,
             "okf_status": okf_table_status,
             "okf_entities_count": okf_table_entities,
@@ -281,11 +301,17 @@ def ingest_comparison_corpus(
             "version": doc_ver,
             "format": suffix,
             "persisted_rows": persisted,
+            "total_rows": total,
+            "incomplete_coverage_flag": incomplete,
+            "page_index_status": None,
+            "page_index_elements_count": 0,
+            "okf_status": okf_stat,
         }
 
-    # 3. Full Production Embedding / Parsing Ingestion (skipped in smoke test)
+    # 3. Full Production Embedding and Parsing Ingestion (skipped in smoke test)
     if not smoke_test:
         from ingestion.embed_service import embed_chunks_dual
+        from ingestion.page_index_service import extract_and_persist_page_index
         from schemas.models import Document
 
         for fname, fpath in file_paths.items():
@@ -303,6 +329,8 @@ def ingest_comparison_corpus(
                 source_format=parsed_doc.source_format,
                 chunks=tuple(embedded_chunks),
                 workspace_id=workspace_id,
+                incomplete_coverage_flag=getattr(parsed_doc, "incomplete_coverage_flag", False),
+                exclusions=getattr(parsed_doc, "exclusions", ()),
             )
             cloud_repo.save(doc)
             raw_bytes = fpath.read_bytes()
@@ -314,17 +342,58 @@ def ingest_comparison_corpus(
             )
             logger.info("Saved %s with %d chunks to DynamoDB/Qdrant", fname, len(embedded_chunks))
 
-            # PageIndex summary resolution
+            # PageIndex summary extraction and verification
             pi_status = None
             pi_count = 0
+            pi_targets: list[str] = []
             if suffix == "pdf":
                 try:
-                    pi_summary = boundary_repo.get_page_index_summary(workspace_id, doc_id, doc_ver)
-                    if pi_summary:
-                        pi_status = pi_summary.layout_status
-                        pi_count = pi_summary.structural_elements_count
+                    pi_summary = extract_and_persist_page_index(
+                        path=fpath,
+                        document_id=doc_id,
+                        workspace_id=workspace_id,
+                        document_version=doc_ver,
+                        chunks=doc.chunks,
+                        boundary_repo=boundary_repo,
+                    )
+                    persisted_pi = boundary_repo.get_page_index_summary(workspace_id, doc_id, doc_ver)
+                    if persisted_pi is not None and persisted_pi.layout_status == "ready":
+                        pi_status = "ready"
+                        pi_count = persisted_pi.structural_elements_count
+                        pi_targets = sorted(list(persisted_pi.inline_definitions.keys()))
+                        logger.info(
+                            "PageIndex verified ready for %s: %d elements, %d retrievable targets",
+                            fname,
+                            pi_count,
+                            len(pi_targets),
+                        )
+                    elif persisted_pi is not None:
+                        pi_status = persisted_pi.layout_status
+                        pi_count = persisted_pi.structural_elements_count
+                        logger.warning(
+                            "PageIndex layout unavailable for %s: status=%s elements=%d",
+                            fname,
+                            pi_status,
+                            pi_count,
+                        )
+                    else:
+                        pi_status = "missing_layout"
+                        pi_count = 0
+                        logger.warning("PageIndex layout unavailable for %s: no summary persisted", fname)
                 except Exception as pi_err:
-                    logger.warning("PageIndex summary lookup failed for %s: %s", fname, pi_err)
+                    logger.error("PageIndex extraction failed for %s: %s", fname, pi_err)
+                    pi_status = "failed"
+                    pi_count = 0
+                    pi_targets = []
+
+                results["page_index"][fname] = {
+                    "document_id": doc_id,
+                    "version": doc_ver,
+                    "status": pi_status,
+                    "elements_count": pi_count,
+                    "retrievable_targets": pi_targets,
+                    "layout_available": (pi_status == "ready"),
+                }
 
             # OKF factual extraction for PDFs under AC-3 bounds
             okf_stat = None
@@ -340,24 +409,49 @@ def ingest_comparison_corpus(
                         format="pdf",
                         chunks=doc.chunks,
                     )
-                    if okf_man:
+                    if okf_man and okf_man.status == "ready":
                         okf_stat = okf_man.status
                         okf_e_count = len(okf_man.entities)
                         okf_p_count = len(okf_man.assertions)
+                    elif okf_man:
+                        okf_stat = okf_man.status
+                        okf_e_count = len(okf_man.entities)
+                        okf_p_count = len(okf_man.assertions)
+                    else:
+                        okf_stat = "failed"
                 except Exception as okf_err:
                     logger.warning("OKF extraction failed for %s: %s", fname, okf_err)
+                    okf_stat = "failed"
 
-            # Update DocumentSnapshot with enriched metrics
+            # Update DocumentSnapshot with enriched metrics while preserving accurate counts
+            if suffix == "csv":
+                t_name = "survay" if "survay" in fname else "rs_status_bill_passed_assent_1952_2016"
+                t_info = results["tables"].get(t_name, {})
+                persisted_rows = t_info.get("persisted_rows", 0)
+                total_rows = t_info.get("source_rows", persisted_rows)
+                incomplete_flag = not t_info.get("coverage_complete", True)
+                exclusions_tuple: tuple[str, ...] = ()
+                okf_stat = t_info.get("okf_status")
+                okf_e_count = t_info.get("okf_entities_count", 0)
+                okf_p_count = t_info.get("okf_properties_count", 0)
+                pi_status = None
+                pi_count = 0
+            else:
+                exclusions_tuple = tuple(getattr(parsed_doc, "exclusions", ()))
+                incomplete_flag = bool(getattr(parsed_doc, "incomplete_coverage_flag", False))
+                persisted_rows = len(doc.chunks)
+                total_rows = len(doc.chunks) + len(exclusions_tuple)
+
             enriched_snap = DocumentSnapshot(
                 workspace_id=workspace_id,
                 document_id=doc_id,
                 source=fname,
                 version=doc_ver,
                 format=suffix,
-                incomplete_coverage_flag=False,
-                exclusions=(),
-                persisted_rows=1,
-                total_rows=1,
+                incomplete_coverage_flag=incomplete_flag,
+                exclusions=exclusions_tuple,
+                persisted_rows=persisted_rows,
+                total_rows=total_rows,
                 created_at=now_iso,
                 page_index_status=pi_status,
                 page_index_elements_count=pi_count,
@@ -366,6 +460,33 @@ def ingest_comparison_corpus(
                 okf_properties_count=okf_p_count,
             )
             boundary_repo.save_document_snapshot(enriched_snap)
+            results["snapshots"][fname] = {
+                "document_id": doc_id,
+                "version": doc_ver,
+                "format": suffix,
+                "persisted_rows": persisted_rows,
+                "total_rows": total_rows,
+                "incomplete_coverage_flag": incomplete_flag,
+                "page_index_status": pi_status,
+                "page_index_elements_count": pi_count,
+                "okf_status": okf_stat,
+            }
+
+    results["readiness"] = {
+        "tables_verified": all(
+            t.get("manifest_verified") and t.get("complete_read_count") == t.get("persisted_rows")
+            for t in results["tables"].values()
+        ),
+        "table_rows_total": sum(t.get("persisted_rows", 0) for t in results["tables"].values()),
+        "unavailable_page_index_layouts": [
+            fname for fname, pinfo in results.get("page_index", {}).items() if not pinfo.get("layout_available")
+        ],
+        "failed_enrichments": [
+            fname
+            for fname, s in results.get("snapshots", {}).items()
+            if s.get("page_index_status") == "failed" or s.get("okf_status") == "failed"
+        ],
+    }
 
     logger.info("Ingestion / Smoke check finished successfully for %s", workspace_id)
     return results
