@@ -247,14 +247,47 @@ def resolve_ground_truth_chunk_ids(
     return resolved, unscorable
 
 
+def get_reranker_policy() -> str:
+    """Return effective configured reranker provider, model, and fallback policy."""
+    if os.environ.get("RERANKER_POLICY"):
+        return os.environ["RERANKER_POLICY"]
+    from config import settings
+
+    model = getattr(
+        settings,
+        "OPENROUTER_RERANKER_MODEL",
+        "nvidia/llama-nemotron-rerank-vl-1b-v2:free",
+    )
+    return f"openrouter:{model} (fallback: lexical_bm25_plus)"
+
+
 def run_benchmark(
     workspace_id: str = "ws_fresh_benchmark",
     benchmark_type: str = "cold",
     baseline_path: str | None = None,
     allow_dirty: bool = False,
     test_path: str = "data/test.json",
+    page_index: bool | None = None,
+    okf: bool | None = None,
 ) -> dict[str, Any]:
-    """Execute canonical benchmark run."""
+    """Execute canonical benchmark run.
+
+    Note: Temporarily overrides settings.PAGEINDEX_ENABLED and settings.OKF_ENABLED
+    when explicit parameters are supplied. Original settings are restored upon exit.
+    """
+    orig_page_index = getattr(settings, "PAGEINDEX_ENABLED", True)
+    orig_okf = getattr(settings, "OKF_ENABLED", True)
+    if page_index is not None:
+        settings.PAGEINDEX_ENABLED = page_index
+    if okf is not None:
+        settings.OKF_ENABLED = okf
+
+    logger.info(
+        "Strategy configuration: PAGEINDEX_ENABLED=%s OKF_ENABLED=%s",
+        settings.PAGEINDEX_ENABLED,
+        settings.OKF_ENABLED,
+    )
+
     if not allow_dirty:
         verify_clean_worktree()
 
@@ -537,7 +570,13 @@ def run_benchmark(
         "corpus_file_hashes": file_hashes,
         "embedding_model": get_embedding_model(),
         "llm_model": get_llm_model(),
-        "reranker_policy": "openrouter:cross-encoder/ms-marco-MiniLM-L-6-v2",
+        "reranker_policy": get_reranker_policy(),
+        "strategies": {
+            "page_index_enabled": bool(getattr(settings, "PAGEINDEX_ENABLED", True)),
+            "okf_enabled": bool(getattr(settings, "OKF_ENABLED", True)),
+            "page_index_weight": float(getattr(settings, "PAGEINDEX_STRUCTURAL_WEIGHT", 1.1)),
+            "okf_fusion_weight": float(getattr(settings, "OKF_FUSION_WEIGHT", 1.15)),
+        },
         "cache_mode": "bypass_exact_and_semantic",
         "total_questions": total_q,
         "denominators": {
@@ -640,6 +679,11 @@ def run_benchmark(
                 for k, v in cmp_res.get("deltas", {}).items():
                     logger.info("  %s: %+.4f", k, v)
 
+    if page_index is not None:
+        settings.PAGEINDEX_ENABLED = orig_page_index
+    if okf is not None:
+        settings.OKF_ENABLED = orig_okf
+
     return manifest
 
 
@@ -650,6 +694,8 @@ if __name__ == "__main__":
     parser.add_argument("--baseline-path", default=None, help="Path to baseline manifest.json for comparison")
     parser.add_argument("--allow-dirty", action="store_true", help="Allow uncommitted worktree changes during development")
     parser.add_argument("--test-path", default="data/test.json", help="Path to test.json evaluation suite")
+    parser.add_argument("--page-index", action=argparse.BooleanOptionalAction, default=None, help="Enable or disable PageIndex structural retrieval")
+    parser.add_argument("--okf", action=argparse.BooleanOptionalAction, default=None, help="Enable or disable OKF retrieval")
 
     args = parser.parse_args()
     res = run_benchmark(
@@ -658,5 +704,7 @@ if __name__ == "__main__":
         baseline_path=args.baseline_path,
         allow_dirty=args.allow_dirty,
         test_path=args.test_path,
+        page_index=args.page_index,
+        okf=args.okf,
     )
     print(json.dumps(res["metrics"], indent=2))
