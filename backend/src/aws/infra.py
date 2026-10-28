@@ -71,8 +71,13 @@ def _is_floci_available() -> bool:
         return False
 
 
-def _build_client(service: str, region_name: str | None = None):
+def _build_client(
+    service: str,
+    region_name: str | None = None,
+    config: Config | None = None,
+):
     env = settings.ENVIRONMENT
+    client_config = config or _RETRY_CONFIG
 
     if service in _CLOUD_SERVICES:
         # User requirement: lambda and bedrock always use profile=aws, region=ap-south-1
@@ -85,7 +90,7 @@ def _build_client(service: str, region_name: str | None = None):
             region,
         )
         session = boto3.Session(profile_name=_AWS_PROFILE, region_name=region)
-        return session.client(service, config=_RETRY_CONFIG)
+        return session.client(service, config=client_config)
 
     if env == "dev" and _is_floci_available():
         # Dev local services use local profile and endpoint
@@ -97,7 +102,7 @@ def _build_client(service: str, region_name: str | None = None):
         )
         session = boto3.Session(profile_name=_LOCAL_PROFILE, region_name=_LOCAL_REGION)
         return session.client(
-            service, endpoint_url=_FLOCI_ENDPOINT, config=_RETRY_CONFIG
+            service, endpoint_url=_FLOCI_ENDPOINT, config=client_config
         )
     else:
         # Real AWS local services use aws profile and ap-south-1
@@ -110,7 +115,7 @@ def _build_client(service: str, region_name: str | None = None):
             region,
         )
         session = boto3.Session(profile_name=_AWS_PROFILE, region_name=region)
-        return session.client(service, config=_RETRY_CONFIG)
+        return session.client(service, config=client_config)
 
 
 def _build_resource(service: str):
@@ -149,7 +154,11 @@ def _build_resource(service: str):
         return session.resource(service, config=_RETRY_CONFIG)
 
 
-def get_client(service: str, region_name: str | None = None):
+def get_client(
+    service: str,
+    region_name: str | None = None,
+    config: Config | None = None,
+):
     """Return a cached boto3 client for the given service.
 
     Routing:
@@ -157,9 +166,15 @@ def get_client(service: str, region_name: str | None = None):
       dev  + cloud service  → Real AWS    (profile=aws)
       prod                  → Real AWS    (IAM role)
     """
-    cache_key = f"{service}:{region_name}" if region_name else service
+    cache_key = (
+        f"{service}:{region_name}:{id(config)}"
+        if config is not None
+        else (f"{service}:{region_name}" if region_name else service)
+    )
     if cache_key not in _clients:
-        _clients[cache_key] = _build_client(service, region_name=region_name)
+        _clients[cache_key] = _build_client(
+            service, region_name=region_name, config=config
+        )
     return _clients[cache_key]
 
 

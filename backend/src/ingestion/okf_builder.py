@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 import json
 import logging
 import math
+import os
 import re
 import threading
 import time
@@ -45,6 +46,24 @@ SUPPORTED_OKF_MODELS: set[str] = {
     "anthropic.claude-3-5-sonnet-20240620-v1:0",
     "anthropic.claude-3-sonnet-20240229-v1:0",
 }
+
+OKF_EXTRACTION_SYSTEM_PROMPT = (
+    "You are a factual property extraction system for an enterprise knowledge retrieval engine.\n"
+    "Extract entities and factual property assertions from the provided document chunks.\n"
+    "Return ONLY valid JSON matching this schema:\n"
+    "[\n"
+    "  {\n"
+    '    "entity_name": "Entity Name",\n'
+    '    "property_key": "property_name",\n'
+    '    "property_value": "exact verbatim text from chunk",\n'
+    '    "source_chunk_id": "chunk id from header"\n'
+    "  }\n"
+    "]\n"
+    "CRITICAL RULES:\n"
+    "1. 'property_value' MUST appear VERBATIM in the chunk text.\n"
+    "2. 'source_chunk_id' MUST match the bracketed chunk id exactly.\n"
+    "3. Do not invent facts, extrapolate, or hallucinate claims."
+)
 
 # Approximate characters per token for batch sizing
 _CHARS_PER_TOKEN = 4
@@ -863,10 +882,12 @@ class OkfBuilder:
         try:
             client = get_client("bedrock-runtime", config=cfg)
         except Exception:
-            session = boto3.Session()
+            profile = getattr(settings, "AWS_PROFILE", None) or os.getenv("AWS_PROFILE") or "aws"
+            region = getattr(settings, "AWS_REGION", None) or os.getenv("AWS_REGION") or "ap-south-1"
+            session = boto3.Session(profile_name=profile, region_name=region)
             client = session.client(
                 "bedrock-runtime",
-                region_name=getattr(settings, "AWS_REGION", "us-east-1"),
+                region_name=region,
                 config=cfg,
             )
         disable_client_retries(client)
@@ -1207,16 +1228,19 @@ class OkfBuilder:
         # AC-3: max 2 calls, max 2000 input tokens per call, max 4000 total input tokens
         # Safe byte sizing ensures request (system + user + framing) cannot exceed 2000 tokens
         max_calls = budget.max_calls
-        max_prompt_bytes = 1300
+        sys_prompt_bytes = len(OKF_EXTRACTION_SYSTEM_PROMPT.encode("utf-8")) + 34
+        max_user_bytes = max(100, budget.max_call_input_tokens - sys_prompt_bytes)
 
         batches: list[list[Any]] = []
         current_batch: list[Any] = []
         current_bytes = 0
 
         for ch in chunks:
+            ch_id = str(getattr(ch, "id", ""))
             ch_text = getattr(ch, "text", "") or ""
-            ch_bytes = min(len(ch_text.encode("utf-8")), max_prompt_bytes)
-            if current_bytes + ch_bytes > max_prompt_bytes and current_batch:
+            tag_bytes = len(f'<source_chunk id="{ch_id}">\n\n</source_chunk>'.encode("utf-8")) + 2
+            ch_bytes = min(len(ch_text.encode("utf-8")) + tag_bytes, max_user_bytes)
+            if current_bytes + ch_bytes > max_user_bytes and current_batch:
                 batches.append(current_batch)
                 current_batch = []
                 current_bytes = 0
@@ -1414,33 +1438,31 @@ class OkfBuilder:
                 max_elapsed_s=10.0,
             )
 
-        system_prompt = (
-            "You are a factual property extraction system for an enterprise knowledge retrieval engine.\n"
-            "Extract entities and factual property assertions from the provided document chunks.\n"
-            "Return ONLY valid JSON matching this schema:\n"
-            "[\n"
-            "  {\n"
-            '    "entity_name": "Entity Name",\n'
-            '    "property_key": "property_name",\n'
-            '    "property_value": "exact verbatim text from chunk",\n'
-            '    "source_chunk_id": "chunk id from header"\n'
-            "  }\n"
-            "]\n"
-            "CRITICAL RULES:\n"
-            "1. 'property_value' MUST appear VERBATIM in the chunk text.\n"
-            "2. 'source_chunk_id' MUST match the bracketed chunk id exactly.\n"
-            "3. Do not invent facts, extrapolate, or hallucinate claims."
-        )
+        system_prompt = OKF_EXTRACTION_SYSTEM_PROMPT
+        sys_prompt_bytes = len(system_prompt.encode("utf-8"))
+        overhead = sys_prompt_bytes + 2 + 32
+        max_user_bytes = max(50, budget.max_call_input_tokens - overhead)
 
-        sys_prompt_bytes = len(system_prompt.encode("utf-8")) + 32
-        max_prompt_bytes = max(100, 2000 - sys_prompt_bytes)
         user_content_blocks = []
+        remaining_user_bytes = max_user_bytes
         for ch in chunks:
+            if remaining_user_bytes <= 50:
+                break
             ch_id = str(getattr(ch, "id", ""))
             ch_text = getattr(ch, "text", "") or ""
-            if len(ch_text.encode("utf-8")) > max_prompt_bytes:
-                ch_text = ch_text.encode("utf-8")[:max_prompt_bytes].decode("utf-8", errors="ignore")
-            user_content_blocks.append(f"<source_chunk id=\"{ch_id}\">\n{ch_text}\n</source_chunk>")
+            tag_prefix = f'<source_chunk id="{ch_id}">\n'
+            tag_suffix = "\n</source_chunk>"
+            tag_bytes = len(tag_prefix.encode("utf-8")) + len(tag_suffix.encode("utf-8"))
+            sep_bytes = 2 if user_content_blocks else 0
+            if tag_bytes + sep_bytes >= remaining_user_bytes:
+                break
+            max_chunk_text = remaining_user_bytes - tag_bytes - sep_bytes
+            ch_text_bytes = ch_text.encode("utf-8")
+            if len(ch_text_bytes) > max_chunk_text:
+                ch_text = ch_text_bytes[:max_chunk_text].decode("utf-8", errors="ignore")
+            block = f"{tag_prefix}{ch_text}{tag_suffix}"
+            user_content_blocks.append(block)
+            remaining_user_bytes -= (len(block.encode("utf-8")) + sep_bytes)
 
         model_id = getattr(settings, "OKF_BEDROCK_MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0")
         if model_id not in SUPPORTED_OKF_MODELS:
