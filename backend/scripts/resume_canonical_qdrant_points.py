@@ -6,17 +6,20 @@ Targets:
 
 Design guarantees:
 1. Pure read first verification: Queries Qdrant Cloud to determine exact existing point IDs.
-2. Rejects source hash and DocumentSnapshot version mismatches.
-3. Verifies required chunk records and metadata exist in DynamoDB before execution.
+2. Fails closed on boundary snapshot lookup failure or source hash mismatch.
+3. Verifies required chunk records, IDs, and provenance in DynamoDB before execution.
 4. Calculates deterministic Qdrant point UUID5: uuid.uuid5(uuid.NAMESPACE_OID, str(chunk.id)).
-5. In default dry run mode, reports:
-   - Existing points count
+5. Validates existing point identity, payload, and vector dimensions before skipping.
+6. Does not infer model provenance from dimensions alone; treats unverifiable provenance as unresolved.
+7. In default dry run mode, reports:
+   - Existing points count and provenance status
    - Missing points count
+   - Unresolved provenance count
    - Estimated Titan V2 embedding calls
    - Estimated token count and cost ($0.02 / 1M tokens)
    - Exits cleanly without making paid calls.
-6. When --execute is explicitly supplied:
-   - Dispatches missing chunks in bounded batches (default batch size 25).
+8. When --execute is explicitly supplied:
+   - Dispatches target chunks in bounded batches (default batch size 25).
    - Generates local BGE fast embeddings (384-dim) and Bedrock Titan Text Embeddings V2 (1024-dim).
    - Upserts points with 120s timeout and exponential backoff retry.
    - Treats timed out upserts as unknown outcomes, performing point level read back to find landed points.
@@ -26,12 +29,13 @@ Design guarantees:
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import hashlib
 import logging
 from pathlib import Path
-import sqlite3
 import sys
 import time
+from typing import Any
 import uuid
 
 # Ensure backend/src is on sys.path for standalone script execution
@@ -50,130 +54,412 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("resume_canonical_qdrant_points")
 
 
-def verify_source_version(csv_path: Path, workspace_id: str, document_id: str) -> str:
-    """Verify that source CSV hash matches DocumentSnapshot version in workspace_boundary.db."""
+@dataclass
+class PointValidationResult:
+    point_id: str
+    chunk_id: str
+    is_present: bool
+    identity_valid: bool
+    payload_valid: bool
+    vector_dims_valid: bool
+    model_provenance_verified: bool
+    status: str  # "missing", "valid_verified", "valid_unresolved_provenance", "corrupted"
+    reason: str | None = None
+
+
+def verify_source_version(
+    csv_path: Path,
+    workspace_id: str,
+    document_id: str,
+    boundary_repo: Any | None = None,
+) -> str:
+    """Verify that source CSV hash matches DocumentSnapshot version in configured boundary repo.
+    
+    Fails closed if boundary repository cannot be resolved, snapshot is missing,
+    or source hash prefix does not match snapshot version.
+    """
+    if not csv_path.exists():
+        raise FileNotFoundError(f"Source file not found: {csv_path}")
+
     file_bytes = csv_path.read_bytes()
     file_sha256 = hashlib.sha256(file_bytes).hexdigest()
     computed_version = file_sha256[:32]
 
-    # Resolve boundary db path
-    boundary_db = Path(__file__).resolve().parent.parent / "data" / "workspace_boundary.db"
-    if not boundary_db.exists():
-        boundary_db = Path("data/workspace_boundary.db")
-    if not boundary_db.exists():
-        boundary_db = Path("backend/data/workspace_boundary.db")
+    if boundary_repo is None:
+        try:
+            from db.workspace_boundary_repo import get_workspace_boundary_repo
+            boundary_repo = get_workspace_boundary_repo(require_durable=True)
+        except Exception as repo_err:
+            logger.error("Failed to resolve configured workspace boundary repository: %s", repo_err)
+            raise RuntimeError(f"Cannot resolve configured workspace boundary repository: {repo_err}") from repo_err
 
-    if not boundary_db.exists():
-        logger.warning("Boundary database not found at %s; skipping snapshot version comparison", boundary_db)
-        return computed_version
-
-    con = sqlite3.connect(str(boundary_db))
-    cur = con.cursor()
-    row = cur.execute(
-        "SELECT version FROM document_snapshots WHERE workspace_id=? AND document_id=?",
-        (workspace_id, document_id),
-    ).fetchone()
-    con.close()
-
-    if row is None:
-        logger.warning(
-            "No DocumentSnapshot found in %s for workspace=%s doc=%s",
-            boundary_db, workspace_id, document_id
+    snapshot = boundary_repo.get_document_snapshot(workspace_id=workspace_id, document_id=document_id)
+    if snapshot is None:
+        logger.error(
+            "No DocumentSnapshot found in configured boundary repository for workspace=%s doc=%s",
+            workspace_id,
+            document_id,
         )
-        return computed_version
+        raise RuntimeError(
+            f"Preflight failed: missing DocumentSnapshot for workspace={workspace_id} doc={document_id}"
+        )
 
-    snapshot_version = row[0]
+    snapshot_version = getattr(snapshot, "version", "")
     if computed_version != snapshot_version[:32]:
         logger.error(
             "Source version mismatch for %s: file hash prefix=%s, DocumentSnapshot version=%s",
-            csv_path.name, computed_version, snapshot_version
+            csv_path.name,
+            computed_version,
+            snapshot_version,
         )
-        raise ValueError(f"Source version mismatch: expected {snapshot_version}, got {computed_version}")
+        raise ValueError(
+            f"Source version mismatch: expected {snapshot_version}, got {computed_version}"
+        )
 
     logger.info("Source version verified: %s (matches DocumentSnapshot)", computed_version)
     return computed_version
 
 
-def verify_dynamodb_chunk_records(workspace_id: str, document_id: str, expected_count: int) -> bool:
-    """Verify that chunk text and metadata records are present in DynamoDB."""
+def verify_dynamodb_chunk_records(
+    workspace_id: str,
+    document_id: str,
+    expected_chunk_ids: set[str],
+    expected_source_format: str = "csv",
+    dynamodb_resource: Any | None = None,
+) -> bool:
+    """Verify chunk text and metadata records exist in DynamoDB with exact provenance.
+    
+    Fails closed on read errors, missing chunk IDs, unexpected chunk IDs,
+    or workspace/document/format provenance mismatches.
+    """
     try:
-        from aws.infra import get_resource
         from boto3.dynamodb.conditions import Key
+        if dynamodb_resource is None:
+            from aws.infra import get_resource
+            dynamodb_resource = get_resource("dynamodb")
         table_name = getattr(settings, "DYNAMODB_TABLE_NAME", "kre-table")
-        dynamodb = get_resource("dynamodb")
-        table = dynamodb.Table(table_name)
-        total_chunks = 0
+        table = dynamodb_resource.Table(table_name)
+
+        found_chunk_ids: set[str] = set()
         kwargs = {
             "KeyConditionExpression": Key("PK").eq(f"DOC#{document_id}") & Key("SK").begins_with("CHUNK#"),
-            "Select": "COUNT",
+            "ProjectionExpression": "#cid, #ws, #doc, #fmt",
+            "ExpressionAttributeNames": {
+                "#cid": "id",
+                "#ws": "workspace_id",
+                "#doc": "document_id",
+                "#fmt": "source_format",
+            },
         }
+
         while True:
             resp = table.query(**kwargs)
-            total_chunks += resp.get("Count", 0)
+            items = resp.get("Items", [])
+            for item in items:
+                raw_cid = item.get("id")
+                if not raw_cid:
+                    raise RuntimeError("DynamoDB chunk record missing required 'id' attribute")
+                cid = str(raw_cid)
+                ws = str(item.get("workspace_id"))
+                doc = str(item.get("document_id"))
+                fmt = str(item.get("source_format"))
+
+                if ws != workspace_id:
+                    raise RuntimeError(
+                        f"Chunk provenance mismatch for {cid}: workspace_id expected {workspace_id}, found {ws}"
+                    )
+                if doc != document_id:
+                    raise RuntimeError(
+                        f"Chunk provenance mismatch for {cid}: document_id expected {document_id}, found {doc}"
+                    )
+                if fmt != expected_source_format:
+                    raise RuntimeError(
+                        f"Chunk provenance mismatch for {cid}: source_format expected {expected_source_format}, found {fmt}"
+                    )
+                found_chunk_ids.add(cid)
+
             if "LastEvaluatedKey" in resp:
                 kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
             else:
                 break
 
-        logger.info("DynamoDB chunk verification: %d / %d chunks present in table %s", total_chunks, expected_count, table_name)
-        if total_chunks < expected_count:
-            logger.error("Missing chunk records in DynamoDB: expected %d, found %d", expected_count, total_chunks)
-            return False
+        missing = expected_chunk_ids - found_chunk_ids
+        unexpected = found_chunk_ids - expected_chunk_ids
+
+        if missing:
+            logger.error("Missing chunk records in DynamoDB: expected %d, missing %d", len(expected_chunk_ids), len(missing))
+            raise RuntimeError(f"DynamoDB chunk verification failed: {len(missing)} chunk records missing in {table_name}")
+
+        if unexpected:
+            logger.error("Unexpected chunk records in DynamoDB: %d unexpected items", len(unexpected))
+            raise RuntimeError(f"DynamoDB chunk verification failed: {len(unexpected)} unexpected chunk records found in {table_name}")
+
+        logger.info(
+            "DynamoDB chunk verification: all %d chunks present with verified provenance in table %s",
+            len(found_chunk_ids),
+            table_name,
+        )
         return True
     except Exception as ddb_err:
-        logger.warning("Could not verify DynamoDB chunk records (offline or permission): %s", ddb_err)
-        return True
+        logger.error("DynamoDB chunk verification failed: %s", ddb_err)
+        raise RuntimeError(f"Preflight DynamoDB chunk verification failed: {ddb_err}") from ddb_err
 
 
-def get_existing_point_ids(
+def inspect_existing_qdrant_points(
     client: QdrantClient,
     collection_name: str,
     workspace_id: str,
     document_id: str,
-) -> set[str]:
-    """Scroll Qdrant to retrieve all existing point IDs for the workspace and document."""
-    existing_ids = set()
-    offset = None
+    expected_point_map: dict[str, Any],
+) -> tuple[dict[str, PointValidationResult], set[str]]:
+    """Scroll Qdrant and validate point identity, required payload, and vector dimensions.
+    
+    Treats unverifiable model provenance as unresolved; does not infer model provenance
+    from dimensions alone.
+    Returns (results_by_point_id, unexpected_point_ids).
+    """
+    results: dict[str, PointValidationResult] = {}
+    unexpected_ids: set[str] = set()
+
     flt = qmodels.Filter(
         must=[
             qmodels.FieldCondition(key="workspace_id", match=qmodels.MatchValue(value=workspace_id)),
             qmodels.FieldCondition(key="document_id", match=qmodels.MatchValue(value=document_id)),
         ]
     )
+
+    offset = None
     while True:
         records, next_offset = client.scroll(
             collection_name=collection_name,
             scroll_filter=flt,
             limit=250,
-            with_payload=False,
-            with_vectors=False,
+            with_payload=True,
+            with_vectors=True,
             offset=offset,
         )
         for r in records:
-            existing_ids.add(str(r.id))
+            point_id = str(r.id)
+            if point_id not in expected_point_map:
+                unexpected_ids.add(point_id)
+                continue
+
+            expected_chunk = expected_point_map[point_id]
+            expected_uuid = str(uuid.uuid5(uuid.NAMESPACE_OID, str(expected_chunk.id)))
+            identity_valid = (point_id == expected_uuid)
+
+            payload = r.payload or {}
+            orig_id = payload.get("original_id")
+            p_doc = payload.get("document_id")
+            p_ws = payload.get("workspace_id")
+            payload_valid = (
+                orig_id == str(expected_chunk.id)
+                and p_doc == document_id
+                and p_ws == workspace_id
+            )
+
+            vecs = r.vector or {}
+            fast = vecs.get("embedding_fast") if isinstance(vecs, dict) else None
+            full = vecs.get("embedding_full") if isinstance(vecs, dict) else None
+            vector_dims_valid = (
+                isinstance(vecs, dict)
+                and len(fast or []) == 384
+                and len(full or []) == 1024
+            )
+
+            fast_model = payload.get("fast_model") or payload.get("model_fast")
+            full_model = payload.get("full_model") or payload.get("model_full")
+            model_provenance_verified = bool(fast_model and full_model)
+
+            if not identity_valid:
+                status = "corrupted"
+                reason = f"Identity mismatch: point_id={point_id} != expected_uuid={expected_uuid}"
+            elif not payload_valid:
+                status = "corrupted"
+                reason = f"Payload mismatch: original_id={orig_id}, doc={p_doc}, ws={p_ws}"
+            elif not vector_dims_valid:
+                fast_len = len(fast or []) if isinstance(fast, (list, tuple)) else 0
+                full_len = len(full or []) if isinstance(full, (list, tuple)) else 0
+                status = "corrupted"
+                reason = f"Vector dimensions mismatch: fast={fast_len}/384, full={full_len}/1024"
+            elif model_provenance_verified:
+                status = "valid_verified"
+                reason = f"Verified fast_model={fast_model}, full_model={full_model}"
+            else:
+                status = "valid_unresolved_provenance"
+                reason = "Valid geometry (384/1024) and payload, but model provenance is unverified in store payload"
+
+            results[point_id] = PointValidationResult(
+                point_id=point_id,
+                chunk_id=str(expected_chunk.id),
+                is_present=True,
+                identity_valid=identity_valid,
+                payload_valid=payload_valid,
+                vector_dims_valid=vector_dims_valid,
+                model_provenance_verified=model_provenance_verified,
+                status=status,
+                reason=reason,
+            )
+
         if next_offset is None:
             break
         offset = next_offset
-    return existing_ids
+
+    # Mark expected points that were not found in store
+    for point_id, chunk in expected_point_map.items():
+        if point_id not in results:
+            results[point_id] = PointValidationResult(
+                point_id=point_id,
+                chunk_id=str(chunk.id),
+                is_present=False,
+                identity_valid=True,
+                payload_valid=False,
+                vector_dims_valid=False,
+                model_provenance_verified=False,
+                status="missing",
+                reason="Point not present in Qdrant store",
+            )
+
+    return results, unexpected_ids
 
 
 def retrieve_landed_point_ids(
     client: QdrantClient,
     collection_name: str,
     point_ids: list[str],
+    workspace_id: str,
+    document_id: str,
+    expected_point_map: dict[str, Any],
 ) -> set[str]:
-    """Check which specific points from a batch actually landed in Qdrant after timeout."""
+    """Check which specific points from a batch actually landed in Qdrant after timeout.
+    
+    Validates retrieved point payload and vector dimensions before considering them landed.
+    """
     try:
         records = client.retrieve(
             collection_name=collection_name,
             ids=point_ids,
-            with_payload=False,
-            with_vectors=False,
+            with_payload=True,
+            with_vectors=True,
         )
-        return {str(r.id) for r in records}
+        landed_valid_ids = set()
+        for r in records:
+            pid = str(r.id)
+            if pid not in expected_point_map:
+                continue
+            expected_chunk = expected_point_map[pid]
+            payload = r.payload or {}
+            vecs = r.vector or {}
+            fast = vecs.get("embedding_fast") if isinstance(vecs, dict) else None
+            full = vecs.get("embedding_full") if isinstance(vecs, dict) else None
+
+            if (
+                payload.get("original_id") == str(expected_chunk.id)
+                and payload.get("document_id") == document_id
+                and payload.get("workspace_id") == workspace_id
+                and len(fast or []) == 384
+                and len(full or []) == 1024
+            ):
+                landed_valid_ids.add(pid)
+        return landed_valid_ids
     except Exception as qe:
         logger.warning("Failed point retrieval during timeout read-back: %s", qe)
         return set()
+
+
+def verify_qdrant_post_write(
+    client: QdrantClient,
+    collection_name: str,
+    workspace_id: str,
+    document_id: str,
+    expected_point_map: dict[str, Any],
+    wait: bool = True,
+    require_verified_provenance: bool = False,
+) -> tuple[bool, str]:
+    """Strict post-write verification: exact IDs, vector dimensions, and payloads.
+    
+    Returns (True, success_message) or (False, error_message).
+    """
+    logger.info("Performing post-write verification against Qdrant collection %s...", collection_name)
+    flt = qmodels.Filter(
+        must=[
+            qmodels.FieldCondition(key="workspace_id", match=qmodels.MatchValue(value=workspace_id)),
+            qmodels.FieldCondition(key="document_id", match=qmodels.MatchValue(value=document_id)),
+        ]
+    )
+
+    final_records = []
+    max_polls = 1 if wait else 5
+    for poll in range(max_polls):
+        final_records = []
+        offset = None
+        while True:
+            records, next_offset = client.scroll(
+                collection_name=collection_name,
+                scroll_filter=flt,
+                limit=250,
+                with_payload=True,
+                with_vectors=True,
+                offset=offset,
+            )
+            final_records.extend(records)
+            if next_offset is None:
+                break
+            offset = next_offset
+
+        if len(final_records) >= len(expected_point_map) or wait:
+            break
+        logger.info("Eventual consistency poll %d/%d: %d/%d points visible...", poll + 1, max_polls, len(final_records), len(expected_point_map))
+        time.sleep(2.0)
+
+    found_ids = {str(r.id) for r in final_records}
+    expected_ids = set(expected_point_map.keys())
+
+    missing = expected_ids - found_ids
+    unexpected = found_ids - expected_ids
+
+    if missing:
+        msg = f"Post-write verification failed: {len(missing)} points remain missing in Qdrant"
+        logger.error(msg)
+        return False, msg
+
+    if unexpected:
+        msg = f"Post-write verification failed: {len(unexpected)} unexpected points found in Qdrant"
+        logger.error(msg)
+        return False, msg
+
+    for r in final_records:
+        pid = str(r.id)
+        expected_chunk = expected_point_map[pid]
+        payload = r.payload or {}
+        orig_id = payload.get("original_id")
+        p_doc = payload.get("document_id")
+        p_ws = payload.get("workspace_id")
+
+        if orig_id != str(expected_chunk.id) or p_doc != document_id or p_ws != workspace_id:
+            msg = f"Post-write verification failed: Point {pid} has invalid payload {payload}"
+            logger.error(msg)
+            return False, msg
+
+        if require_verified_provenance:
+            fast_model = payload.get("fast_model") or payload.get("model_fast")
+            full_model = payload.get("full_model") or payload.get("model_full")
+            if not fast_model or not full_model:
+                msg = f"Post-write verification failed: Point {pid} lacks verified model provenance (fast_model={fast_model}, full_model={full_model})"
+                logger.error(msg)
+                return False, msg
+
+        vecs = r.vector or {}
+        fast = vecs.get("embedding_fast") if isinstance(vecs, dict) else None
+        full = vecs.get("embedding_full") if isinstance(vecs, dict) else None
+        if len(fast or []) != 384 or len(full or []) != 1024:
+            msg = f"Post-write verification failed: Point {pid} has invalid vector dimensions fast={len(fast or [])}, full={len(full or [])}"
+            logger.error(msg)
+            return False, msg
+
+    success_msg = f"Post-write verification succeeded: all {len(found_ids)} points verified in Qdrant with valid payloads and 384/1024 dual vectors"
+    logger.info(success_msg)
+    return True, success_msg
 
 
 def main():
@@ -184,6 +470,12 @@ def main():
     parser.add_argument("--batch-size", type=int, default=25, help="Upsert batch size")
     parser.add_argument("--wait", action="store_true", default=True, help="Whether to wait for Qdrant commit ack (default: True)")
     parser.add_argument("--no-wait", action="store_false", dest="wait", help="Do not wait for Qdrant commit ack")
+    parser.add_argument(
+        "--allow-unresolved-provenance",
+        action="store_true",
+        default=False,
+        help="Skip existing points that match ID, payload, and 384/1024 dimensions even if model provenance is unverified in store payload",
+    )
     parser.add_argument("--execute", action="store_true", default=False, help="Authorize execution of paid embedding calls")
     args = parser.parse_args()
 
@@ -194,10 +486,10 @@ def main():
         logger.error("Source CSV file not found: %s", args.csv_path)
         sys.exit(1)
 
-    # 1. Reject source/version mismatches against DocumentSnapshot
+    # 1. Reject source/version mismatches against DocumentSnapshot in configured boundary repo
     try:
         source_version = verify_source_version(csv_path, args.workspace_id, args.document_id)
-    except ValueError as ve:
+    except Exception as ve:
         logger.error("Preflight check failed: %s", ve)
         sys.exit(1)
 
@@ -206,11 +498,13 @@ def main():
     parsed = parse_file(csv_path, document_id=args.document_id, filename=csv_path.name, workspace_id=args.workspace_id)
     all_chunks = list(parsed.chunks)
     logger.info("Total parsed chunks: %d", len(all_chunks))
+    expected_chunk_ids = {str(ch.id) for ch in all_chunks}
 
-    # 3. Confirm chunk records and metadata exist in DynamoDB
-    ddb_ok = verify_dynamodb_chunk_records(args.workspace_id, args.document_id, len(all_chunks))
-    if not ddb_ok:
-        logger.error("Preflight check failed: chunk metadata is incomplete in DynamoDB")
+    # 3. Confirm chunk records and metadata exist in DynamoDB with exact provenance
+    try:
+        verify_dynamodb_chunk_records(args.workspace_id, args.document_id, expected_chunk_ids, expected_source_format="csv")
+    except Exception as ddb_err:
+        logger.error("Preflight check failed: %s", ddb_err)
         sys.exit(1)
 
     # 4. Map expected chunk IDs and point UUID5s
@@ -228,42 +522,65 @@ def main():
     )
     collection_name = "kre_chunks"
 
-    logger.info("Reading existing Qdrant points for workspace=%s doc=%s...", args.workspace_id, args.document_id)
-    existing_ids = get_existing_point_ids(
+    logger.info("Inspecting existing Qdrant points for workspace=%s doc=%s...", args.workspace_id, args.document_id)
+    inspection_results, unexpected_ids = inspect_existing_qdrant_points(
         client=qclient,
         collection_name=collection_name,
         workspace_id=args.workspace_id,
         document_id=args.document_id,
+        expected_point_map=expected_point_map,
     )
-    logger.info("Existing points in Qdrant: %d", len(existing_ids))
 
-    missing_chunks = []
-    for point_id, ch in expected_point_map.items():
-        if point_id not in existing_ids:
-            missing_chunks.append(ch)
+    missing_results = [r for r in inspection_results.values() if r.status == "missing"]
+    corrupted_results = [r for r in inspection_results.values() if r.status == "corrupted"]
+    unresolved_results = [r for r in inspection_results.values() if r.status == "valid_unresolved_provenance"]
+    verified_results = [r for r in inspection_results.values() if r.status == "valid_verified"]
 
-    missing_count = len(missing_chunks)
-    logger.info("Missing points to embed and upsert: %d", missing_count)
+    existing_total = len(inspection_results) - len(missing_results)
 
-    estimated_tokens = missing_count * 100
-    estimated_cost = (estimated_tokens / 1_000_000) * 0.02
+    # Determine candidate chunks for embedding
+    if args.allow_unresolved_provenance:
+        target_point_ids = {r.point_id for r in missing_results} | {r.point_id for r in corrupted_results}
+        skipped_count = len(verified_results) + len(unresolved_results)
+    else:
+        target_point_ids = {r.point_id for r in missing_results} | {r.point_id for r in corrupted_results} | {r.point_id for r in unresolved_results}
+        skipped_count = len(verified_results)
 
-    print("\n" + "=" * 60)
+    target_chunks = [expected_point_map[pid] for pid in target_point_ids]
+    target_count = len(target_chunks)
+
+    # Cost calculations
+    cost_missing_only = (len(missing_results) * 100 / 1_000_000) * 0.02
+    cost_target = (target_count * 100 / 1_000_000) * 0.02
+    cost_all_5000 = (len(all_chunks) * 100 / 1_000_000) * 0.02
+
+    print("\n" + "=" * 65)
     print("RESUME CANONICAL QDRANT INVENTORY REPORT")
-    print("=" * 60)
-    print(f"Workspace ID:          {args.workspace_id}")
-    print(f"Document ID:           {args.document_id}")
-    print(f"Source file:           {csv_path}")
-    print(f"Source version:        {source_version}")
-    print(f"Total corpus chunks:   {len(all_chunks)}")
-    print(f"Existing points:       {len(existing_ids)}")
-    print(f"Missing points:        {missing_count}")
-    print(f"Embedding model fast:  local BGE (bge-small-en-v1.5, 384 dims, $0.00)")
-    print(f"Embedding model full:  Amazon Titan V2 (1024 dims)")
-    print(f"Estimated paid calls:  {missing_count}")
-    print(f"Estimated tokens:      {estimated_tokens:,}")
-    print(f"Estimated cost:        ${estimated_cost:.4f} USD")
-    print("=" * 60 + "\n")
+    print("=" * 65)
+    print(f"Workspace ID:                     {args.workspace_id}")
+    print(f"Document ID:                      {args.document_id}")
+    print(f"Source file:                      {csv_path}")
+    print(f"Source version:                   {source_version}")
+    print(f"Total corpus chunks:              {len(all_chunks):,}")
+    print(f"Existing points in store:         {existing_total:,}")
+    print(f"  - Verified model provenance:    {len(verified_results):,}")
+    print(f"  - Unresolved provenance:        {len(unresolved_results):,}")
+    print(f"  - Corrupted (payload/vectors):  {len(corrupted_results):,}")
+    print(f"Missing points:                   {len(missing_results):,}")
+    print(f"Unexpected points:                {len(unexpected_ids):,}")
+    print(f"Skipped points:                   {skipped_count:,}")
+    print(f"Target points to embed/write:     {target_count:,}")
+    print(f"Allow unresolved provenance:      {args.allow_unresolved_provenance}")
+    print("-" * 65)
+    print(f"Embedding model fast:             local BGE (bge-small-en-v1.5, 384 dims, $0.00)")
+    print(f"Embedding model full:             Amazon Titan V2 (1024 dims, $0.02/1M tokens)")
+    print(f"Cost estimate (target {target_count:,} chunks):    ${cost_target:.4f} USD (~{target_count * 100:,} tokens)")
+    print(f"Cost estimate (missing only 4,950): ${cost_missing_only:.4f} USD (~{len(missing_results) * 100:,} tokens)")
+    print(f"Cost estimate (all 5,000 chunks):  ${cost_all_5000:.4f} USD (~{len(all_chunks) * 100:,} tokens)")
+    print("=" * 65 + "\n")
+
+    if unexpected_ids:
+        logger.warning("Found %d unexpected point IDs in collection: %s", len(unexpected_ids), list(unexpected_ids)[:5])
 
     if not args.execute:
         logger.warning(
@@ -272,12 +589,12 @@ def main():
         )
         return
 
-    logger.info("Starting bounded resume execution for %d missing chunks...", missing_count)
+    logger.info("Starting bounded resume execution for %d target chunks...", target_count)
     batch_size = args.batch_size
     upserted_count = 0
 
-    for i in range(0, missing_count, batch_size):
-        chunk_batch = missing_chunks[i : i + batch_size]
+    for i in range(0, target_count, batch_size):
+        chunk_batch = target_chunks[i : i + batch_size]
         embedded_batch = embed_chunks_dual(chunk_batch, provider="prod")
 
         points = []
@@ -292,6 +609,8 @@ def main():
                 "document_id": str(ch.document_id),
                 "workspace_id": str(ch.workspace_id),
                 "page_number": ch.page_number,
+                "fast_model": "BAAI/bge-small-en-v1.5",
+                "full_model": "amazon.titan-embed-text-v2:0",
             }
             points.append(qmodels.PointStruct(id=qdrant_uuid, vector=vectors, payload=payload))
 
@@ -308,14 +627,16 @@ def main():
                 upserted_count += len(points_to_upsert)
                 logger.info(
                     "Upserted batch %d-%d / %d (points=%d, wait=%s)",
-                    i, i + len(points_to_upsert), missing_count, len(points_to_upsert), args.wait
+                    i, i + len(points_to_upsert), target_count, len(points_to_upsert), args.wait
                 )
                 time.sleep(0.1)
                 break
             except Exception as qe:
                 logger.warning("Upsert attempt %d/3 error: %s", attempt + 1, qe)
                 # Read-back landed points on timeout or unknown outcome
-                landed_ids = retrieve_landed_point_ids(qclient, collection_name, batch_point_ids)
+                landed_ids = retrieve_landed_point_ids(
+                    qclient, collection_name, batch_point_ids, args.workspace_id, args.document_id, expected_point_map
+                )
                 if landed_ids:
                     logger.info("Timeout read-back found %d of %d points already committed", len(landed_ids), len(batch_point_ids))
                     points_to_upsert = [p for p in points_to_upsert if p.id not in landed_ids]
@@ -327,73 +648,23 @@ def main():
                     raise
                 time.sleep(2.0 * (attempt + 1))
 
+    logger.info("Batch upserts completed: successfully upserted %d points", upserted_count)
+
     # 5. Strict post-execution verification: exact IDs, vector dimensions, and payloads
-    logger.info("Verifying updated point count and vector payloads in Qdrant...")
-    final_records = []
-    flt = qmodels.Filter(
-        must=[
-            qmodels.FieldCondition(key="workspace_id", match=qmodels.MatchValue(value=args.workspace_id)),
-            qmodels.FieldCondition(key="document_id", match=qmodels.MatchValue(value=args.document_id)),
-        ]
+    ok, vmsg = verify_qdrant_post_write(
+        client=qclient,
+        collection_name=collection_name,
+        workspace_id=args.workspace_id,
+        document_id=args.document_id,
+        expected_point_map=expected_point_map,
+        wait=args.wait,
+        require_verified_provenance=not args.allow_unresolved_provenance,
     )
-    for poll in range(5):
-        final_records = []
-        offset = None
-        while True:
-            records, next_offset = qclient.scroll(
-                collection_name=collection_name,
-                scroll_filter=flt,
-                limit=250,
-                with_payload=True,
-                with_vectors=True,
-                offset=offset,
-            )
-            final_records.extend(records)
-            if next_offset is None:
-                break
-            offset = next_offset
-
-        if len(final_records) >= len(all_chunks) or args.wait:
-            break
-        logger.info("Eventual consistency poll %d/5: %d/%d points visible...", poll + 1, len(final_records), len(all_chunks))
-        time.sleep(2.0)
-
-    final_ids = {str(r.id) for r in final_records}
-    still_missing = set(expected_point_map.keys()) - final_ids
-    unexpected = final_ids - set(expected_point_map.keys())
-
-    # Verify vector dimensions and payload fields
-    vector_dims_valid = True
-    for r in final_records:
-        vecs = r.vector or {}
-        fast = vecs.get("embedding_fast") or []
-        full = vecs.get("embedding_full") or []
-        if len(fast) != 384 or len(full) != 1024:
-            vector_dims_valid = False
-            logger.error("Point %s has invalid vector dimensions: fast=%d, full=%d", r.id, len(fast), len(full))
-            break
-        payload = r.payload or {}
-        if not payload.get("original_id") or not payload.get("document_id"):
-            vector_dims_valid = False
-            logger.error("Point %s has invalid payload: %s", r.id, payload)
-            break
-
-    if still_missing:
-        logger.error("Verification failed: %d points remain missing in Qdrant", len(still_missing))
+    if not ok:
+        logger.error("Resume failed post-write verification: %s", vmsg)
         sys.exit(1)
 
-    if unexpected:
-        logger.error("Verification failed: %d unexpected points found in Qdrant", len(unexpected))
-        sys.exit(1)
-
-    if not vector_dims_valid:
-        logger.error("Verification failed: one or more points have invalid vectors or payloads")
-        sys.exit(1)
-
-    logger.info(
-        "Verification complete: Qdrant now holds all %d expected points for document %s with verified 384/1024 dual vectors and payloads",
-        len(final_ids), args.document_id
-    )
+    logger.info("Resume process completed successfully: %s", vmsg)
 
 
 if __name__ == "__main__":
