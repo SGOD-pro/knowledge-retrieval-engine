@@ -121,30 +121,40 @@ def embed_fast_local(text: str) -> list[float]:
         return _deterministic_vector(text, 384)
 
 
-def embed_fast_batch(texts: list[str]) -> list[list[float]]:
-    """Batch fast embeddings via BGE Lambda (or deterministic fallback in test mode)."""
+def embed_fast_batch_with_provenance(texts: list[str]) -> tuple[list[list[float]], str]:
+    """Batch fast embeddings via BGE Lambda with producing model provenance tracking."""
     if not texts:
-        return []
+        return [], "none"
 
     environment = settings.ENVIRONMENT
     t0 = time.perf_counter()
 
     if environment == "test":
         result = [_deterministic_vector(t, 384) for t in texts]
+        model_name = "fallback:deterministic"
     else:
         try:
             result = _call_bge_lambda_batch(texts)
+            model_name = "BAAI/bge-small-en-v1.5"
         except Exception as e:
             logger.warning("BGE Lambda batch unavailable (%s), falling back to deterministic fast embedding", e)
             result = [_deterministic_vector(t, 384) for t in texts]
+            model_name = "fallback:deterministic"
 
     logger.info(
-        "bge.batch_embed count=%d env=%s latency_ms=%.2f",
+        "bge.batch_embed count=%d env=%s model=%s latency_ms=%.2f",
         len(texts),
         environment,
+        model_name,
         (time.perf_counter() - t0) * 1000,
     )
-    return result
+    return result, model_name
+
+
+def embed_fast_batch(texts: list[str]) -> list[list[float]]:
+    """Batch fast embeddings via BGE Lambda (or deterministic fallback in test mode)."""
+    embeddings, _ = embed_fast_batch_with_provenance(texts)
+    return embeddings
 
 
 def _deterministic_vector(text: str, dim: int) -> list[float]:
@@ -187,20 +197,22 @@ def embed_chunks_dual(chunks: list[Chunk], provider: str | None = None) -> list[
     texts = [c.text for c in chunks]
 
     t0 = time.perf_counter()
-    fast_embeddings = embed_fast_batch(texts)
+    fast_embeddings, fast_model = embed_fast_batch_with_provenance(texts)
     logger.info(
-        "embed_service.fast_done count=%d latency_ms=%.2f",
+        "embed_service.fast_done count=%d model=%s latency_ms=%.2f",
         len(texts),
+        fast_model,
         (time.perf_counter() - t0) * 1000,
     )
 
-    from providers.embedding_provider import embed_batch as api_embed_batch
+    from providers.embedding_provider import embed_batch_with_provenance as api_embed_batch_with_provenance
 
     t1 = time.perf_counter()
-    full_embeddings = api_embed_batch(texts, provider=provider)
+    full_embeddings, full_model = api_embed_batch_with_provenance(texts, provider=provider)
     logger.info(
-        "embed_service.full_done count=%d latency_ms=%.2f",
+        "embed_service.full_done count=%d model=%s latency_ms=%.2f",
         len(texts),
+        full_model,
         (time.perf_counter() - t1) * 1000,
     )
 
@@ -224,6 +236,16 @@ def embed_chunks_dual(chunks: list[Chunk], provider: str | None = None) -> list[
             )
 
     return [
-        replace(chunk, embedding_fast=emb_fast, embedding_full=emb_full)
+        replace(
+            chunk,
+            embedding_fast=emb_fast,
+            embedding_full=emb_full,
+            metadata={
+                **(chunk.metadata or {}),
+                "fast_model": fast_model,
+                "full_model": full_model,
+                "embedding_provider": provider or getattr(settings, "MODEL_PROVIDER", "dev"),
+            },
+        )
         for chunk, emb_fast, emb_full in zip(chunks, fast_embeddings, full_embeddings)
     ]

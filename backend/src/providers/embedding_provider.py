@@ -155,17 +155,39 @@ def _deterministic_vector(text: str, dim: int) -> list[float]:
 def embed_batch(
     texts: Sequence[str], provider: str | None = None, max_retries: int = 3
 ) -> list[list[float]]:
+    if not texts:
+        return []
+
     from config import settings
     import os
 
-    if provider == "test" or (provider is None and (getattr(settings, "ENVIRONMENT", "") == "test" or os.environ.get("ENVIRONMENT") == "test")):
+    is_test_env = getattr(settings, "ENVIRONMENT", "") == "test" or os.environ.get("ENVIRONMENT") == "test"
+    if provider == "test" or (provider is None and is_test_env):
         return [_deterministic_vector(t, FULL_EMBEDDING_DIM) for t in texts]
 
     from concurrent.futures import ThreadPoolExecutor
 
     def _embed_single(text: str) -> list[float]:
-        return embed_text(text, provider=provider)
+        return embed_text(text, provider=provider, max_retries=max_retries)
 
     with ThreadPoolExecutor(max_workers=3) as executor:
         return list(executor.map(_embed_single, texts))
+
+
+def embed_batch_with_provenance(
+    texts: Sequence[str], provider: str | None = None, max_retries: int = 3
+) -> tuple[list[list[float]], str]:
+    """Batch API embeddings with producing model provenance tracking."""
+    if not texts:
+        return [], "none"
+
+    from config import settings
+    import os
+
+    is_test_env = getattr(settings, "ENVIRONMENT", "") == "test" or os.environ.get("ENVIRONMENT") == "test"
+    is_fallback = provider == "test" or is_test_env
+
+    embeddings = embed_batch(texts, provider=provider, max_retries=max_retries)
+    model_name = "fallback:deterministic" if is_fallback else get_embedding_model()
+    return embeddings, model_name
 

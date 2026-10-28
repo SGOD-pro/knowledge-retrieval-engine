@@ -53,6 +53,9 @@ from ingestion.parse_service import parse_file
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("resume_canonical_qdrant_points")
 
+SUPPORTED_FAST_MODELS = frozenset({"BAAI/bge-small-en-v1.5", "bge-small-en-v1.5"})
+SUPPORTED_FULL_MODELS = frozenset({"amazon.titan-embed-text-v2:0", "amazon.titan-embed-text-v2"})
+
 
 @dataclass
 class PointValidationResult:
@@ -269,7 +272,12 @@ def inspect_existing_qdrant_points(
 
             fast_model = payload.get("fast_model") or payload.get("model_fast")
             full_model = payload.get("full_model") or payload.get("model_full")
-            model_provenance_verified = bool(fast_model and full_model)
+            has_fast_tag = bool(fast_model)
+            has_full_tag = bool(full_model)
+
+            fast_compatible = fast_model in SUPPORTED_FAST_MODELS
+            full_compatible = full_model in SUPPORTED_FULL_MODELS
+            model_provenance_verified = fast_compatible and full_compatible
 
             if not identity_valid:
                 status = "corrupted"
@@ -282,9 +290,17 @@ def inspect_existing_qdrant_points(
                 full_len = len(full or []) if isinstance(full, (list, tuple)) else 0
                 status = "corrupted"
                 reason = f"Vector dimensions mismatch: fast={fast_len}/384, full={full_len}/1024"
-            elif model_provenance_verified:
-                status = "valid_verified"
-                reason = f"Verified fast_model={fast_model}, full_model={full_model}"
+            elif has_fast_tag or has_full_tag:
+                if model_provenance_verified:
+                    status = "valid_verified"
+                    reason = f"Verified fast_model={fast_model}, full_model={full_model}"
+                else:
+                    status = "corrupted"
+                    reason = (
+                        f"Incompatible or unverified model provenance: "
+                        f"fast_model={fast_model!r} (expected {sorted(SUPPORTED_FAST_MODELS)}), "
+                        f"full_model={full_model!r} (expected {sorted(SUPPORTED_FULL_MODELS)})"
+                    )
             else:
                 status = "valid_unresolved_provenance"
                 reason = "Valid geometry (384/1024) and payload, but model provenance is unverified in store payload"
@@ -330,10 +346,11 @@ def retrieve_landed_point_ids(
     workspace_id: str,
     document_id: str,
     expected_point_map: dict[str, Any],
+    require_verified_provenance: bool = False,
 ) -> set[str]:
     """Check which specific points from a batch actually landed in Qdrant after timeout.
     
-    Validates retrieved point payload and vector dimensions before considering them landed.
+    Validates retrieved point payload, vector dimensions, and model provenance before considering them landed.
     """
     try:
         records = client.retrieve(
@@ -353,12 +370,19 @@ def retrieve_landed_point_ids(
             fast = vecs.get("embedding_fast") if isinstance(vecs, dict) else None
             full = vecs.get("embedding_full") if isinstance(vecs, dict) else None
 
+            matches_prov = True
+            if require_verified_provenance:
+                p_fast = payload.get("fast_model") or payload.get("model_fast")
+                p_full = payload.get("full_model") or payload.get("model_full")
+                matches_prov = p_fast in SUPPORTED_FAST_MODELS and p_full in SUPPORTED_FULL_MODELS
+
             if (
                 payload.get("original_id") == str(expected_chunk.id)
                 and payload.get("document_id") == document_id
                 and payload.get("workspace_id") == workspace_id
                 and len(fast or []) == 384
                 and len(full or []) == 1024
+                and matches_prov
             ):
                 landed_valid_ids.add(pid)
         return landed_valid_ids
@@ -444,8 +468,11 @@ def verify_qdrant_post_write(
         if require_verified_provenance:
             fast_model = payload.get("fast_model") or payload.get("model_fast")
             full_model = payload.get("full_model") or payload.get("model_full")
-            if not fast_model or not full_model:
-                msg = f"Post-write verification failed: Point {pid} lacks verified model provenance (fast_model={fast_model}, full_model={full_model})"
+            if fast_model not in SUPPORTED_FAST_MODELS or full_model not in SUPPORTED_FULL_MODELS:
+                msg = (
+                    f"Post-write verification failed: Point {pid} lacks exact verified model provenance "
+                    f"(fast_model={fast_model!r}, full_model={full_model!r})"
+                )
                 logger.error(msg)
                 return False, msg
 
@@ -604,14 +631,27 @@ def main():
                 "embedding_fast": ch.embedding_fast,
                 "embedding_full": ch.embedding_full,
             }
+            ch_meta = getattr(ch, "metadata", {}) or {}
+            actual_fast = ch_meta.get("fast_model")
+            actual_full = ch_meta.get("full_model")
+
             payload = {
                 "original_id": str(ch.id),
                 "document_id": str(ch.document_id),
                 "workspace_id": str(ch.workspace_id),
                 "page_number": ch.page_number,
-                "fast_model": "BAAI/bge-small-en-v1.5",
-                "full_model": "amazon.titan-embed-text-v2:0",
             }
+            # Write exact canonical model if established; write fallback origin string otherwise for downstream validation
+            if actual_fast in SUPPORTED_FAST_MODELS:
+                payload["fast_model"] = actual_fast
+            elif actual_fast:
+                payload["fast_model"] = str(actual_fast)
+
+            if actual_full in SUPPORTED_FULL_MODELS:
+                payload["full_model"] = actual_full
+            elif actual_full:
+                payload["full_model"] = str(actual_full)
+
             points.append(qmodels.PointStruct(id=qdrant_uuid, vector=vectors, payload=payload))
 
         batch_point_ids = [p.id for p in points]
@@ -635,7 +675,13 @@ def main():
                 logger.warning("Upsert attempt %d/3 error: %s", attempt + 1, qe)
                 # Read-back landed points on timeout or unknown outcome
                 landed_ids = retrieve_landed_point_ids(
-                    qclient, collection_name, batch_point_ids, args.workspace_id, args.document_id, expected_point_map
+                    qclient,
+                    collection_name,
+                    batch_point_ids,
+                    args.workspace_id,
+                    args.document_id,
+                    expected_point_map,
+                    require_verified_provenance=not args.allow_unresolved_provenance,
                 )
                 if landed_ids:
                     logger.info("Timeout read-back found %d of %d points already committed", len(landed_ids), len(batch_point_ids))

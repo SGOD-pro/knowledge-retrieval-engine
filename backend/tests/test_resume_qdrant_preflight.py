@@ -616,7 +616,7 @@ def test_verify_qdrant_post_write_missing_provenance_when_required_fails():
         require_verified_provenance=True,
     )
     assert ok is False
-    assert "lacks verified model provenance" in msg
+    assert "lacks exact verified model provenance" in msg
 
 
 def test_verify_qdrant_post_write_verified_provenance_succeeds():
@@ -649,3 +649,241 @@ def test_verify_qdrant_post_write_verified_provenance_succeeds():
     )
     assert ok is True
     assert "all 1 points verified" in msg
+
+
+# ---------------------------------------------------------------------------
+# 5. Exact Model Provenance & Embedding Origin Tracing Tests
+# ---------------------------------------------------------------------------
+
+def test_inspect_existing_qdrant_points_wrong_fast_model_rejected():
+    chunk = DummyChunk("doc1:csv:row1", "doc1", "ws_1")
+    point_id = str(uuid.uuid5(uuid.NAMESPACE_OID, str(chunk.id)))
+    expected_map = {point_id: chunk}
+
+    mock_record = MagicMock()
+    mock_record.id = point_id
+    mock_record.payload = {
+        "original_id": str(chunk.id),
+        "document_id": "doc1",
+        "workspace_id": "ws_1",
+        "fast_model": "text-embedding-3-small",
+        "full_model": "amazon.titan-embed-text-v2:0",
+    }
+    mock_record.vector = {
+        "embedding_fast": [0.1] * 384,
+        "embedding_full": [0.2] * 1024,
+    }
+
+    mock_client = MagicMock()
+    mock_client.scroll.return_value = ([mock_record], None)
+
+    results, _ = inspect_existing_qdrant_points(
+        client=mock_client,
+        collection_name="kre_chunks",
+        workspace_id="ws_1",
+        document_id="doc1",
+        expected_point_map=expected_map,
+    )
+
+    assert results[point_id].status == "corrupted"
+    assert "Incompatible or unverified model provenance" in (results[point_id].reason or "")
+    assert results[point_id].model_provenance_verified is False
+
+
+def test_inspect_existing_qdrant_points_wrong_full_model_rejected():
+    chunk = DummyChunk("doc1:csv:row1", "doc1", "ws_1")
+    point_id = str(uuid.uuid5(uuid.NAMESPACE_OID, str(chunk.id)))
+    expected_map = {point_id: chunk}
+
+    mock_record = MagicMock()
+    mock_record.id = point_id
+    mock_record.payload = {
+        "original_id": str(chunk.id),
+        "document_id": "doc1",
+        "workspace_id": "ws_1",
+        "fast_model": "BAAI/bge-small-en-v1.5",
+        "full_model": "text-embedding-ada-002",
+    }
+    mock_record.vector = {
+        "embedding_fast": [0.1] * 384,
+        "embedding_full": [0.2] * 1024,
+    }
+
+    mock_client = MagicMock()
+    mock_client.scroll.return_value = ([mock_record], None)
+
+    results, _ = inspect_existing_qdrant_points(
+        client=mock_client,
+        collection_name="kre_chunks",
+        workspace_id="ws_1",
+        document_id="doc1",
+        expected_point_map=expected_map,
+    )
+
+    assert results[point_id].status == "corrupted"
+    assert "Incompatible or unverified model provenance" in (results[point_id].reason or "")
+    assert results[point_id].model_provenance_verified is False
+
+
+def test_inspect_existing_qdrant_points_fallback_model_tag_rejected():
+    chunk = DummyChunk("doc1:csv:row1", "doc1", "ws_1")
+    point_id = str(uuid.uuid5(uuid.NAMESPACE_OID, str(chunk.id)))
+    expected_map = {point_id: chunk}
+
+    mock_record = MagicMock()
+    mock_record.id = point_id
+    mock_record.payload = {
+        "original_id": str(chunk.id),
+        "document_id": "doc1",
+        "workspace_id": "ws_1",
+        "fast_model": "fallback:deterministic",
+        "full_model": "fallback:deterministic",
+    }
+    mock_record.vector = {
+        "embedding_fast": [0.1] * 384,
+        "embedding_full": [0.2] * 1024,
+    }
+
+    mock_client = MagicMock()
+    mock_client.scroll.return_value = ([mock_record], None)
+
+    results, _ = inspect_existing_qdrant_points(
+        client=mock_client,
+        collection_name="kre_chunks",
+        workspace_id="ws_1",
+        document_id="doc1",
+        expected_point_map=expected_map,
+    )
+
+    assert results[point_id].status == "corrupted"
+    assert "Incompatible or unverified model provenance" in (results[point_id].reason or "")
+    assert results[point_id].model_provenance_verified is False
+
+
+def test_embed_chunks_dual_records_model_provenance():
+    from ingestion.embed_service import embed_chunks_dual
+    from schemas.models import Chunk
+
+    chunk = Chunk(
+        id="c1",
+        document_id="doc1",
+        source_format="txt",
+        text="test content",
+        element_type="text",
+        workspace_id="ws_1",
+    )
+
+    with patch("ingestion.embed_service.embed_fast_batch_with_provenance") as mock_fast, \
+         patch("providers.embedding_provider.embed_batch_with_provenance") as mock_full:
+        mock_fast.return_value = ([[0.1] * 384], "BAAI/bge-small-en-v1.5")
+        mock_full.return_value = ([[0.2] * 1024], "amazon.titan-embed-text-v2:0")
+
+        results = embed_chunks_dual([chunk], provider="prod")
+
+    assert len(results) == 1
+    assert results[0].metadata is not None
+    assert results[0].metadata["fast_model"] == "BAAI/bge-small-en-v1.5"
+    assert results[0].metadata["full_model"] == "amazon.titan-embed-text-v2:0"
+    assert results[0].metadata["embedding_provider"] == "prod"
+
+
+def test_embed_chunks_dual_records_fallback_provenance():
+    from ingestion.embed_service import embed_chunks_dual
+    from schemas.models import Chunk
+
+    chunk = Chunk(
+        id="c1",
+        document_id="doc1",
+        source_format="txt",
+        text="test content",
+        element_type="text",
+        workspace_id="ws_1",
+    )
+
+    # In test environment, actual implementation should return fallback:deterministic
+    results = embed_chunks_dual([chunk], provider="test")
+
+    assert len(results) == 1
+    assert results[0].metadata is not None
+    assert results[0].metadata["fast_model"] == "fallback:deterministic"
+    assert results[0].metadata["full_model"] == "fallback:deterministic"
+    assert results[0].metadata["embedding_provider"] == "test"
+
+
+def test_embed_batch_with_provenance_rejects_test_environment_as_titan():
+    from providers.embedding_provider import embed_batch_with_provenance
+
+    # When ENVIRONMENT is test, even if provider="prod" is passed, it must not return Titan model identity
+    with patch("config.settings.ENVIRONMENT", "test"), patch.dict("os.environ", {"ENVIRONMENT": "test"}):
+        embeddings, model_name = embed_batch_with_provenance(["test line"], provider="prod")
+
+    assert model_name == "fallback:deterministic"
+    assert len(embeddings) == 1
+    assert len(embeddings[0]) == 1024
+
+
+def test_verify_qdrant_post_write_rejects_fallback_provenance():
+    chunk1 = DummyChunk("doc1:csv:row1", "doc1", "ws_1")
+    p1 = str(uuid.uuid5(uuid.NAMESPACE_OID, str(chunk1.id)))
+    expected_map = {p1: chunk1}
+
+    rec1 = MagicMock()
+    rec1.id = p1
+    rec1.payload = {
+        "original_id": str(chunk1.id),
+        "document_id": "doc1",
+        "workspace_id": "ws_1",
+        "fast_model": "fallback:deterministic",
+        "full_model": "fallback:deterministic",
+    }
+    rec1.vector = {"embedding_fast": [0.1] * 384, "embedding_full": [0.2] * 1024}
+
+    mock_client = MagicMock()
+    mock_client.scroll.return_value = ([rec1], None)
+
+    ok, msg = verify_qdrant_post_write(
+        client=mock_client,
+        collection_name="kre_chunks",
+        workspace_id="ws_1",
+        document_id="doc1",
+        expected_point_map=expected_map,
+        wait=True,
+        require_verified_provenance=True,
+    )
+    assert ok is False
+    assert "lacks exact verified model provenance" in msg
+
+
+def test_retrieve_landed_point_ids_rejects_fallback_provenance_when_required():
+    chunk1 = DummyChunk("doc1:csv:row1", "doc1", "ws_1")
+    p1 = str(uuid.uuid5(uuid.NAMESPACE_OID, str(chunk1.id)))
+    expected_map = {p1: chunk1}
+
+    rec1 = MagicMock()
+    rec1.id = p1
+    rec1.payload = {
+        "original_id": str(chunk1.id),
+        "document_id": "doc1",
+        "workspace_id": "ws_1",
+        "fast_model": "fallback:deterministic",
+        "full_model": "fallback:deterministic",
+    }
+    rec1.vector = {"embedding_fast": [0.1] * 384, "embedding_full": [0.2] * 1024}
+
+    mock_client = MagicMock()
+    mock_client.retrieve.return_value = [rec1]
+
+    landed = retrieve_landed_point_ids(
+        client=mock_client,
+        collection_name="kre_chunks",
+        point_ids=[p1],
+        workspace_id="ws_1",
+        document_id="doc1",
+        expected_point_map=expected_map,
+        require_verified_provenance=True,
+    )
+    assert p1 not in landed
+    assert len(landed) == 0
+
+
+
