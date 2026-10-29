@@ -53,7 +53,7 @@ def embed_text_with_provenance(
     import os
 
     is_test_env = getattr(settings, "ENVIRONMENT", "") == "test" or os.environ.get("ENVIRONMENT") == "test"
-    if provider == "test" or (provider is None and is_test_env):
+    if provider == "test" or is_test_env:
         return _deterministic_vector(text, dim), "fallback:deterministic"
 
     last_err = None
@@ -169,13 +169,6 @@ def embed_batch_with_provenance(
     """Batch API embeddings with producing model provenance tracking from actual execution."""
     if not texts:
         return [], "none"
-
-    from config import settings
-    import os
-
-    is_test_env = getattr(settings, "ENVIRONMENT", "") == "test" or os.environ.get("ENVIRONMENT") == "test"
-    if provider == "test" or (provider is None and is_test_env):
-        return [_deterministic_vector(t, FULL_EMBEDDING_DIM) for t in texts], "fallback:deterministic"
 
     from concurrent.futures import ThreadPoolExecutor
 
