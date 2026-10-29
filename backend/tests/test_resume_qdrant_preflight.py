@@ -30,7 +30,9 @@ from resume_canonical_qdrant_points import (
     PointValidationResult,
     inspect_existing_qdrant_points,
     retrieve_landed_point_ids,
+    validate_batch_before_upsert,
     verify_dynamodb_chunk_records,
+    verify_provider_availability,
     verify_qdrant_post_write,
     verify_source_version,
 )
@@ -813,9 +815,9 @@ def test_embed_chunks_dual_records_fallback_provenance():
 def test_embed_batch_with_provenance_rejects_test_environment_as_titan():
     from providers.embedding_provider import embed_batch_with_provenance
 
-    # When ENVIRONMENT is test, even if provider="prod" is passed, it must not return Titan model identity
+    # When provider is test (or environment test with default provider), it returns fallback provenance
     with patch("config.settings.ENVIRONMENT", "test"), patch.dict("os.environ", {"ENVIRONMENT": "test"}):
-        embeddings, model_name = embed_batch_with_provenance(["test line"], provider="prod")
+        embeddings, model_name = embed_batch_with_provenance(["test line"], provider="test")
 
     assert model_name == "fallback:deterministic"
     assert len(embeddings) == 1
@@ -884,6 +886,382 @@ def test_retrieve_landed_point_ids_rejects_fallback_provenance_when_required():
     )
     assert p1 not in landed
     assert len(landed) == 0
+
+
+# ---------------------------------------------------------------------------
+# 6. Pre-upsert Validation & Provider Availability Preflight Tests
+# ---------------------------------------------------------------------------
+
+class DummyPointStruct:
+    def __init__(self, id: str, vector: dict, payload: dict):
+        self.id = id
+        self.vector = vector
+        self.payload = payload
+
+
+def test_validate_batch_before_upsert_valid_succeeds():
+    chunk = DummyChunk("doc1:csv:row1", "doc1", "ws_1")
+    p1 = str(uuid.uuid5(uuid.NAMESPACE_OID, str(chunk.id)))
+    expected_map = {p1: chunk}
+
+    point = DummyPointStruct(
+        id=p1,
+        vector={"embedding_fast": [0.1] * 384, "embedding_full": [0.2] * 1024},
+        payload={
+            "original_id": str(chunk.id),
+            "document_id": "doc1",
+            "workspace_id": "ws_1",
+            "page_number": None,
+            "fast_model": "BAAI/bge-small-en-v1.5",
+            "full_model": "amazon.titan-embed-text-v2:0",
+        },
+    )
+
+    ok, reason = validate_batch_before_upsert(
+        points=[point],
+        chunk_batch=[chunk],
+        workspace_id="ws_1",
+        document_id="doc1",
+        expected_point_map=expected_map,
+    )
+    assert ok is True
+    assert "All 1 points in batch verified for upsert" in reason
+
+
+def test_validate_batch_before_upsert_bge_failure_fallback_rejected():
+    chunk = DummyChunk("doc1:csv:row1", "doc1", "ws_1")
+    p1 = str(uuid.uuid5(uuid.NAMESPACE_OID, str(chunk.id)))
+    expected_map = {p1: chunk}
+
+    point = DummyPointStruct(
+        id=p1,
+        vector={"embedding_fast": [0.1] * 384, "embedding_full": [0.2] * 1024},
+        payload={
+            "original_id": str(chunk.id),
+            "document_id": "doc1",
+            "workspace_id": "ws_1",
+            "page_number": None,
+            "fast_model": "fallback:deterministic",
+            "full_model": "amazon.titan-embed-text-v2:0",
+        },
+    )
+
+    ok, reason = validate_batch_before_upsert(
+        points=[point],
+        chunk_batch=[chunk],
+        workspace_id="ws_1",
+        document_id="doc1",
+        expected_point_map=expected_map,
+    )
+    assert ok is False
+    assert "invalid or fallback fast_model provenance" in reason
+
+
+def test_validate_batch_before_upsert_test_mode_fallback_rejected():
+    chunk = DummyChunk("doc1:csv:row1", "doc1", "ws_1")
+    p1 = str(uuid.uuid5(uuid.NAMESPACE_OID, str(chunk.id)))
+    expected_map = {p1: chunk}
+
+    point = DummyPointStruct(
+        id=p1,
+        vector={"embedding_fast": [0.1] * 384, "embedding_full": [0.2] * 1024},
+        payload={
+            "original_id": str(chunk.id),
+            "document_id": "doc1",
+            "workspace_id": "ws_1",
+            "page_number": None,
+            "fast_model": "BAAI/bge-small-en-v1.5",
+            "full_model": "fallback:deterministic",
+        },
+    )
+
+    ok, reason = validate_batch_before_upsert(
+        points=[point],
+        chunk_batch=[chunk],
+        workspace_id="ws_1",
+        document_id="doc1",
+        expected_point_map=expected_map,
+    )
+    assert ok is False
+    assert "invalid, fallback, or mixed full_model provenance" in reason
+
+
+def test_validate_batch_before_upsert_wrong_model_rejected():
+    chunk = DummyChunk("doc1:csv:row1", "doc1", "ws_1")
+    p1 = str(uuid.uuid5(uuid.NAMESPACE_OID, str(chunk.id)))
+    expected_map = {p1: chunk}
+
+    point = DummyPointStruct(
+        id=p1,
+        vector={"embedding_fast": [0.1] * 384, "embedding_full": [0.2] * 1024},
+        payload={
+            "original_id": str(chunk.id),
+            "document_id": "doc1",
+            "workspace_id": "ws_1",
+            "page_number": None,
+            "fast_model": "BAAI/bge-small-en-v1.5",
+            "full_model": "text-embedding-ada-002",
+        },
+    )
+
+    ok, reason = validate_batch_before_upsert(
+        points=[point],
+        chunk_batch=[chunk],
+        workspace_id="ws_1",
+        document_id="doc1",
+        expected_point_map=expected_map,
+    )
+    assert ok is False
+    assert "invalid, fallback, or mixed full_model provenance" in reason
+
+
+def test_validate_batch_before_upsert_mixed_batch_rejected():
+    chunk = DummyChunk("doc1:csv:row1", "doc1", "ws_1")
+    p1 = str(uuid.uuid5(uuid.NAMESPACE_OID, str(chunk.id)))
+    expected_map = {p1: chunk}
+
+    point = DummyPointStruct(
+        id=p1,
+        vector={"embedding_fast": [0.1] * 384, "embedding_full": [0.2] * 1024},
+        payload={
+            "original_id": str(chunk.id),
+            "document_id": "doc1",
+            "workspace_id": "ws_1",
+            "page_number": None,
+            "fast_model": "BAAI/bge-small-en-v1.5",
+            "full_model": "mixed:amazon.titan-embed-text-v2:0,fallback:deterministic",
+        },
+    )
+
+    ok, reason = validate_batch_before_upsert(
+        points=[point],
+        chunk_batch=[chunk],
+        workspace_id="ws_1",
+        document_id="doc1",
+        expected_point_map=expected_map,
+    )
+    assert ok is False
+    assert "invalid, fallback, or mixed full_model provenance" in reason
+
+
+def test_validate_batch_before_upsert_incomplete_batch_rejected():
+    chunk1 = DummyChunk("doc1:csv:row1", "doc1", "ws_1")
+    chunk2 = DummyChunk("doc1:csv:row2", "doc1", "ws_1")
+    p1 = str(uuid.uuid5(uuid.NAMESPACE_OID, str(chunk1.id)))
+    expected_map = {p1: chunk1}
+
+    point1 = DummyPointStruct(
+        id=p1,
+        vector={"embedding_fast": [0.1] * 384, "embedding_full": [0.2] * 1024},
+        payload={
+            "original_id": str(chunk1.id),
+            "document_id": "doc1",
+            "workspace_id": "ws_1",
+            "fast_model": "BAAI/bge-small-en-v1.5",
+            "full_model": "amazon.titan-embed-text-v2:0",
+        },
+    )
+
+    # 1 point for 2 chunks -> incomplete
+    ok, reason = validate_batch_before_upsert(
+        points=[point1],
+        chunk_batch=[chunk1, chunk2],
+        workspace_id="ws_1",
+        document_id="doc1",
+        expected_point_map=expected_map,
+    )
+    assert ok is False
+    assert "Incomplete batch" in reason
+
+
+def test_validate_batch_before_upsert_missing_tags_rejected():
+    chunk = DummyChunk("doc1:csv:row1", "doc1", "ws_1")
+    p1 = str(uuid.uuid5(uuid.NAMESPACE_OID, str(chunk.id)))
+    expected_map = {p1: chunk}
+
+    point = DummyPointStruct(
+        id=p1,
+        vector={"embedding_fast": [0.1] * 384, "embedding_full": [0.2] * 1024},
+        payload={
+            "original_id": str(chunk.id),
+            "document_id": "doc1",
+            "workspace_id": "ws_1",
+            # missing fast_model and full_model
+        },
+    )
+
+    ok, reason = validate_batch_before_upsert(
+        points=[point],
+        chunk_batch=[chunk],
+        workspace_id="ws_1",
+        document_id="doc1",
+        expected_point_map=expected_map,
+    )
+    assert ok is False
+    assert "lacks fast_model provenance tag" in reason
+
+
+def test_validate_batch_before_upsert_dimensions_mismatch_rejected():
+    chunk = DummyChunk("doc1:csv:row1", "doc1", "ws_1")
+    p1 = str(uuid.uuid5(uuid.NAMESPACE_OID, str(chunk.id)))
+    expected_map = {p1: chunk}
+
+    point = DummyPointStruct(
+        id=p1,
+        vector={"embedding_fast": [0.1] * 128, "embedding_full": [0.2] * 1024},
+        payload={
+            "original_id": str(chunk.id),
+            "document_id": "doc1",
+            "workspace_id": "ws_1",
+            "fast_model": "BAAI/bge-small-en-v1.5",
+            "full_model": "amazon.titan-embed-text-v2:0",
+        },
+    )
+
+    ok, reason = validate_batch_before_upsert(
+        points=[point],
+        chunk_batch=[chunk],
+        workspace_id="ws_1",
+        document_id="doc1",
+        expected_point_map=expected_map,
+    )
+    assert ok is False
+    assert "fast embedding dimension invalid" in reason
+
+
+def test_validate_batch_before_upsert_identity_mismatch_rejected():
+    chunk = DummyChunk("doc1:csv:row1", "doc1", "ws_1")
+    wrong_id = "00000000-0000-0000-0000-000000000000"
+    expected_map = {wrong_id: chunk}
+
+    point = DummyPointStruct(
+        id=wrong_id,
+        vector={"embedding_fast": [0.1] * 384, "embedding_full": [0.2] * 1024},
+        payload={
+            "original_id": str(chunk.id),
+            "document_id": "doc1",
+            "workspace_id": "ws_1",
+            "fast_model": "BAAI/bge-small-en-v1.5",
+            "full_model": "amazon.titan-embed-text-v2:0",
+        },
+    )
+
+    ok, reason = validate_batch_before_upsert(
+        points=[point],
+        chunk_batch=[chunk],
+        workspace_id="ws_1",
+        document_id="doc1",
+        expected_point_map=expected_map,
+    )
+    assert ok is False
+    assert "Point ID mismatch" in reason
+
+
+def test_validate_batch_before_upsert_missing_from_expected_point_map_rejected():
+    chunk = DummyChunk("doc1:csv:row1", "doc1", "ws_1")
+    p1 = str(uuid.uuid5(uuid.NAMESPACE_OID, str(chunk.id)))
+    # expected_map is empty -> point not found in expected point map
+    expected_map = {}
+
+    point = DummyPointStruct(
+        id=p1,
+        vector={"embedding_fast": [0.1] * 384, "embedding_full": [0.2] * 1024},
+        payload={
+            "original_id": str(chunk.id),
+            "document_id": "doc1",
+            "workspace_id": "ws_1",
+            "fast_model": "BAAI/bge-small-en-v1.5",
+            "full_model": "amazon.titan-embed-text-v2:0",
+        },
+    )
+
+    ok, reason = validate_batch_before_upsert(
+        points=[point],
+        chunk_batch=[chunk],
+        workspace_id="ws_1",
+        document_id="doc1",
+        expected_point_map=expected_map,
+    )
+    assert ok is False
+    assert "not found in expected point map" in reason
+
+
+def test_embed_batch_with_provenance_mixed_batch_returns_mixed_tag():
+    from providers.embedding_provider import embed_batch_with_provenance
+
+    def _mock_single(text, provider=None, max_retries=5):
+        if text == "first":
+            return [0.1] * 1024, "amazon.titan-embed-text-v2:0"
+        return [0.2] * 1024, "fallback:deterministic"
+
+    with patch("config.settings.ENVIRONMENT", "dev"), patch.dict("os.environ", {"ENVIRONMENT": "dev"}):
+        with patch("providers.embedding_provider.embed_text_with_provenance", side_effect=_mock_single):
+            vecs, model = embed_batch_with_provenance(["first", "second"], provider="prod")
+
+    assert len(vecs) == 2
+    assert model == "mixed:amazon.titan-embed-text-v2:0,fallback:deterministic"
+
+
+def test_embed_text_with_provenance_executed_model():
+    from providers.embedding_provider import embed_text_with_provenance
+    import io
+    import json
+
+    mock_client = MagicMock()
+    mock_body = MagicMock()
+    mock_body.read.return_value = json.dumps({
+        "inputTextTokenCount": 10,
+        "embedding": [0.1] * 1024,
+    }).encode("utf-8")
+    mock_client.invoke_model.return_value = {"body": mock_body}
+
+    with patch("config.settings.ENVIRONMENT", "dev"), patch.dict("os.environ", {"ENVIRONMENT": "dev"}):
+        with patch("aws.infra.get_client", return_value=mock_client):
+            vec, model_name = embed_text_with_provenance("sample text", provider="prod")
+
+    assert len(vec) == 1024
+    assert model_name == "amazon.titan-embed-text-v2:0"
+    mock_client.invoke_model.assert_called_once()
+    assert mock_client.invoke_model.call_args[1]["modelId"] == "amazon.titan-embed-text-v2:0"
+
+
+def test_verify_provider_availability_fails_closed_in_test_env():
+    with patch("config.settings.ENVIRONMENT", "test"), patch.dict("os.environ", {"ENVIRONMENT": "test"}):
+        ok, msg, _ = verify_provider_availability()
+    assert ok is False
+    assert "ENVIRONMENT is configured as 'test'" in msg
+
+
+def test_verify_provider_availability_fails_closed_on_lambda_error():
+    mock_lam = MagicMock()
+    mock_lam.get_function_configuration.side_effect = RuntimeError("ResourceNotFoundException")
+
+    with patch("config.settings.ENVIRONMENT", "dev"), patch.dict("os.environ", {"ENVIRONMENT": "dev"}):
+        with patch("aws.infra.get_client", return_value=mock_lam):
+            ok, msg, _ = verify_provider_availability(require_bge_lambda=True, require_bedrock=False)
+    assert ok is False
+    assert "Unable to verify BGE Lambda" in msg
+
+
+def test_verify_provider_availability_success():
+    mock_lam = MagicMock()
+    mock_lam.get_function_configuration.return_value = {"State": "Active"}
+    mock_sts = MagicMock()
+    mock_sts.get_caller_identity.return_value = {"Arn": "arn:aws:iam::123456:user/tester"}
+
+    def _get_client_mock(service):
+        if service == "lambda":
+            return mock_lam
+        if service == "sts":
+            return mock_sts
+        return MagicMock()
+
+    with patch("config.settings.ENVIRONMENT", "dev"), patch.dict("os.environ", {"ENVIRONMENT": "dev"}):
+        with patch("aws.infra.get_client", side_effect=_get_client_mock):
+            ok, msg, details = verify_provider_availability(require_bge_lambda=True, require_bedrock=True)
+    assert ok is True
+    assert details["bge_lambda_state"] == "Active"
+    assert "Provider preflight verified" in msg
 
 
 

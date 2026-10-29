@@ -489,6 +489,145 @@ def verify_qdrant_post_write(
     return True, success_msg
 
 
+def validate_batch_before_upsert(
+    points: list[Any],
+    chunk_batch: list[Any],
+    workspace_id: str,
+    document_id: str,
+    expected_point_map: dict[str, Any],
+) -> tuple[bool, str]:
+    """Validate produced vectors, model provenance, and point payload before Qdrant upsert.
+
+    Guarantees no invalid, fallback, mixed, or unverified vector is ever written to Qdrant.
+    """
+    if len(points) != len(chunk_batch):
+        return False, f"Incomplete batch: points count ({len(points)}) != chunks count ({len(chunk_batch)})"
+
+    for p, ch in zip(points, chunk_batch):
+        expected_id = str(uuid.uuid5(uuid.NAMESPACE_OID, str(ch.id)))
+        if getattr(p, "id", None) != expected_id:
+            return False, f"Point ID mismatch: point.id={getattr(p, 'id', None)} != expected={expected_id}"
+
+        if expected_id not in expected_point_map:
+            return False, f"Point ID {expected_id} not found in expected point map"
+        if str(expected_point_map[expected_id].id) != str(ch.id):
+            return False, f"Point ID {expected_id} chunk ID mismatch in expected point map"
+
+        payload = getattr(p, "payload", {}) or {}
+        p_orig = payload.get("original_id")
+        p_doc = payload.get("document_id")
+        p_ws = payload.get("workspace_id")
+        if p_orig != str(ch.id) or p_doc != document_id or p_ws != workspace_id:
+            return False, f"Payload identity mismatch for point {p.id}: orig={p_orig}, doc={p_doc}, ws={p_ws}"
+
+        vecs = getattr(p, "vector", {}) or {}
+        fast = vecs.get("embedding_fast") if isinstance(vecs, dict) else None
+        full = vecs.get("embedding_full") if isinstance(vecs, dict) else None
+
+        if not isinstance(fast, (list, tuple)) or len(fast) != 384:
+            return (
+                False,
+                f"Point {p.id} fast embedding dimension invalid: "
+                f"{len(fast or []) if isinstance(fast, (list, tuple)) else 'none'} != 384",
+            )
+        if not isinstance(full, (list, tuple)) or len(full) != 1024:
+            return (
+                False,
+                f"Point {p.id} full embedding dimension invalid: "
+                f"{len(full or []) if isinstance(full, (list, tuple)) else 'none'} != 1024",
+            )
+
+        fast_model = payload.get("fast_model") or payload.get("model_fast")
+        full_model = payload.get("full_model") or payload.get("model_full")
+
+        if not fast_model:
+            return False, f"Point {p.id} lacks fast_model provenance tag"
+        if str(fast_model).startswith("fallback") or fast_model not in SUPPORTED_FAST_MODELS:
+            return (
+                False,
+                f"Point {p.id} has invalid or fallback fast_model provenance: {fast_model!r} "
+                f"(expected {sorted(SUPPORTED_FAST_MODELS)})",
+            )
+
+        if not full_model:
+            return False, f"Point {p.id} lacks full_model provenance tag"
+        if (
+            str(full_model).startswith("fallback")
+            or str(full_model).startswith("mixed")
+            or str(full_model).startswith("mock")
+            or full_model not in SUPPORTED_FULL_MODELS
+        ):
+            return (
+                False,
+                f"Point {p.id} has invalid, fallback, or mixed full_model provenance: {full_model!r} "
+                f"(expected {sorted(SUPPORTED_FULL_MODELS)})",
+            )
+
+    return True, f"All {len(points)} points in batch verified for upsert"
+
+
+def verify_provider_availability(
+    require_bge_lambda: bool = True,
+    require_bedrock: bool = True,
+) -> tuple[bool, str, dict[str, Any]]:
+    """Read-only preflight check verifying that required embedding providers are reachable and configured."""
+    from config import settings
+    import os
+
+    details: dict[str, Any] = {}
+    is_test_env = getattr(settings, "ENVIRONMENT", "") == "test" or os.environ.get("ENVIRONMENT") == "test"
+    if is_test_env:
+        msg = "Preflight check failed: ENVIRONMENT is configured as 'test'. Live provider execution disabled."
+        logger.error(msg)
+        return False, msg, details
+
+    from aws.infra import get_client
+
+    if require_bge_lambda:
+        func_name = getattr(settings, "BGE_EMBEDDING_LAMBDA_NAME", "") or "bge-text-embeder"
+        details["bge_lambda_function"] = func_name
+        try:
+            lam = get_client("lambda")
+            config = lam.get_function_configuration(FunctionName=func_name)
+            state = config.get("State", "Unknown")
+            details["bge_lambda_state"] = state
+            if state != "Active":
+                msg = f"Preflight check failed: BGE Lambda {func_name!r} state is {state!r} (expected 'Active')"
+                logger.error(msg)
+                return False, msg, details
+        except Exception as e:
+            msg = f"Preflight check failed: Unable to verify BGE Lambda {func_name!r}: {e}"
+            logger.error(msg)
+            return False, msg, details
+
+    if require_bedrock:
+        model_id = getattr(settings, "PROD_EMBEDDING_MODEL", "")
+        details["bedrock_model_id"] = model_id
+        if model_id not in SUPPORTED_FULL_MODELS:
+            msg = (
+                f"Preflight check failed: Configured PROD_EMBEDDING_MODEL {model_id!r} not in supported "
+                f"models {sorted(SUPPORTED_FULL_MODELS)}"
+            )
+            logger.error(msg)
+            return False, msg, details
+        try:
+            sts = get_client("sts")
+            ident = sts.get_caller_identity()
+            arn = ident.get("Arn", "unknown")
+            details["aws_caller_arn"] = arn
+        except Exception as e:
+            msg = f"Preflight check failed: AWS authentication check failed: {e}"
+            logger.error(msg)
+            return False, msg, details
+
+    msg = (
+        f"Provider preflight verified: BGE Lambda={details.get('bge_lambda_function')} ({details.get('bge_lambda_state')}), "
+        f"Bedrock={details.get('bedrock_model_id')} (Caller={details.get('aws_caller_arn')})"
+    )
+    logger.info(msg)
+    return True, msg, details
+
+
 def main():
     parser = argparse.ArgumentParser(description="Bounded idempotent resume for missing Qdrant points.")
     parser.add_argument("--workspace-id", default="ws_canonical_comparison_0004", help="Target workspace ID")
@@ -581,6 +720,9 @@ def main():
     cost_target = (target_count * 100 / 1_000_000) * 0.02
     cost_all_5000 = (len(all_chunks) * 100 / 1_000_000) * 0.02
 
+    # Provider availability preflight (read-only)
+    provider_ok, provider_msg, provider_details = verify_provider_availability()
+
     print("\n" + "=" * 65)
     print("RESUME CANONICAL QDRANT INVENTORY REPORT")
     print("=" * 65)
@@ -599,6 +741,14 @@ def main():
     print(f"Target points to embed/write:     {target_count:,}")
     print(f"Allow unresolved provenance:      {args.allow_unresolved_provenance}")
     print("-" * 65)
+    print(f"Provider preflight status:        {'VERIFIED AVAILABLE' if provider_ok else 'UNAVAILABLE / BLOCKED'}")
+    if provider_ok:
+        print(f"  - BGE Lambda function:          {provider_details.get('bge_lambda_function')} ({provider_details.get('bge_lambda_state')})")
+        print(f"  - Bedrock target model:         {provider_details.get('bedrock_model_id')}")
+        print(f"  - AWS caller identity:          {provider_details.get('aws_caller_arn')}")
+    else:
+        print(f"  - Preflight reason:             {provider_msg}")
+    print("-" * 65)
     print(f"Embedding model fast:             local BGE (bge-small-en-v1.5, 384 dims, $0.00)")
     print(f"Embedding model full:             Amazon Titan V2 (1024 dims, $0.02/1M tokens)")
     print(f"Cost estimate (target {target_count:,} chunks):    ${cost_target:.4f} USD (~{target_count * 100:,} tokens)")
@@ -616,11 +766,16 @@ def main():
         )
         return
 
+    if not provider_ok:
+        logger.error("Provider availability preflight failed. Halting before executing paid calls or writes: %s", provider_msg)
+        sys.exit(1)
+
     logger.info("Starting bounded resume execution for %d target chunks...", target_count)
     batch_size = args.batch_size
     upserted_count = 0
+    completed_batches = 0
 
-    for i in range(0, target_count, batch_size):
+    for batch_idx, i in enumerate(range(0, target_count, batch_size)):
         chunk_batch = target_chunks[i : i + batch_size]
         embedded_batch = embed_chunks_dual(chunk_batch, provider="prod")
 
@@ -657,6 +812,33 @@ def main():
         batch_point_ids = [p.id for p in points]
         points_to_upsert = list(points)
 
+        # Pre-upsert batch validation gate
+        is_valid_batch, batch_reason = validate_batch_before_upsert(
+            points=points_to_upsert,
+            chunk_batch=chunk_batch,
+            workspace_id=args.workspace_id,
+            document_id=args.document_id,
+            expected_point_map=expected_point_map,
+        )
+        if not is_valid_batch:
+            logger.error(
+                "PRE-UPSERT VALIDATION REJECTED batch %d (chunks %d-%d / %d): %s",
+                batch_idx + 1,
+                i,
+                i + len(chunk_batch),
+                target_count,
+                batch_reason,
+            )
+            logger.error(
+                "RESUME HALTED TO PREVENT STORE CONTAMINATION. "
+                "Completed batches: %d, Completed points: %d, Safe resume offset: %d, Remaining chunks: %d",
+                completed_batches,
+                upserted_count,
+                i,
+                target_count - upserted_count,
+            )
+            sys.exit(1)
+
         for attempt in range(3):
             try:
                 qclient.upsert(
@@ -665,6 +847,7 @@ def main():
                     wait=args.wait,
                 )
                 upserted_count += len(points_to_upsert)
+                completed_batches += 1
                 logger.info(
                     "Upserted batch %d-%d / %d (points=%d, wait=%s)",
                     i, i + len(points_to_upsert), target_count, len(points_to_upsert), args.wait
@@ -687,6 +870,8 @@ def main():
                     logger.info("Timeout read-back found %d of %d points already committed", len(landed_ids), len(batch_point_ids))
                     points_to_upsert = [p for p in points_to_upsert if p.id not in landed_ids]
                     if not points_to_upsert:
+                        upserted_count += len(batch_point_ids)
+                        completed_batches += 1
                         logger.info("All batch points landed despite timeout, continuing")
                         break
                 if attempt == 2:

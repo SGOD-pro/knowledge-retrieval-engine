@@ -35,7 +35,7 @@ def test_embed_chunks_dual_fails_loudly_on_api_error():
     instead of silently returning None or zero-padded vectors."""
     chunks = [_make_sample_chunk()]
     with patch(
-        "providers.embedding_provider.embed_batch",
+        "providers.embedding_provider.embed_batch_with_provenance",
         side_effect=RuntimeError("Bedrock Titan API Timeout"),
     ):
         with pytest.raises(RuntimeError, match="Bedrock Titan API Timeout"):
@@ -48,7 +48,7 @@ def test_embed_batch_rejects_zero_padding():
 
     # In dev mode, embed_batch should NOT return 1024-dim vectors where the last 640 dims are all 0.0
     with patch(
-        "providers.embedding_provider.embed_text", side_effect=RuntimeError("API down")
+        "providers.embedding_provider.embed_text_with_provenance", side_effect=RuntimeError("API down")
     ):
         with pytest.raises(RuntimeError):
             embed_batch(["Some text"], provider="dev")

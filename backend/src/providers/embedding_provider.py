@@ -43,22 +43,23 @@ def get_embedding_dimension(provider: str | None = None) -> int:
     return FULL_EMBEDDING_DIM
 
 
-def embed_text(
+def embed_text_with_provenance(
     text: str, provider: str | None = None, max_retries: int = 5
-) -> list[float]:
-    """Generate a 1024-dim embedding vector using Bedrock API.
-    Fallback: Deterministic pseudo-embedding when API keys are absent.
-    """
+) -> tuple[list[float], str]:
+    """Generate a 1024-dim embedding vector using Bedrock API with producing model tracking."""
     dim = FULL_EMBEDDING_DIM
 
     from config import settings
     import os
 
-    if provider == "test" or getattr(settings, "ENVIRONMENT", "") == "test" or os.environ.get("ENVIRONMENT") == "test":
-        return _deterministic_vector(text, dim)
+    is_test_env = getattr(settings, "ENVIRONMENT", "") == "test" or os.environ.get("ENVIRONMENT") == "test"
+    if provider == "test" or (provider is None and is_test_env):
+        return _deterministic_vector(text, dim), "fallback:deterministic"
 
     last_err = None
     import time
+
+    target_model = get_embedding_model()
 
     for attempt in range(max_retries):
         try:
@@ -70,7 +71,7 @@ def embed_text(
             truncated_text = text[:30000]
 
             response = client.invoke_model(
-                modelId=get_embedding_model(),
+                modelId=target_model,
                 contentType="application/json",
                 accept="application/json",
                 body=json.dumps(
@@ -104,8 +105,8 @@ def embed_text(
                 norm = np.linalg.norm(arr)
                 if norm > 0:
                     arr = arr / norm
-                return arr.tolist()
-            return vec
+                return arr.tolist(), target_model
+            return (vec or []), target_model
         except Exception as e:
             last_err = e
             if "ThrottlingException" in str(e) or "Too many requests" in str(e):
@@ -122,11 +123,21 @@ def embed_text(
                 break
 
     if provider == "test" or (provider is None and settings.ENVIRONMENT == "test"):
-        return _deterministic_vector(text, dim)
+        return _deterministic_vector(text, dim), "fallback:deterministic"
 
     raise RuntimeError(
         f"API embedding failed: {last_err}. Check rate limits or API key."
     )
+
+
+def embed_text(
+    text: str, provider: str | None = None, max_retries: int = 5
+) -> list[float]:
+    """Generate a 1024-dim embedding vector using Bedrock API.
+    Fallback: Deterministic pseudo-embedding when API keys are absent.
+    """
+    vec, _ = embed_text_with_provenance(text, provider=provider, max_retries=max_retries)
+    return vec
 
 
 def _deterministic_vector(text: str, dim: int) -> list[float]:
@@ -152,32 +163,10 @@ def _deterministic_vector(text: str, dim: int) -> list[float]:
     return vector
 
 
-def embed_batch(
-    texts: Sequence[str], provider: str | None = None, max_retries: int = 3
-) -> list[list[float]]:
-    if not texts:
-        return []
-
-    from config import settings
-    import os
-
-    is_test_env = getattr(settings, "ENVIRONMENT", "") == "test" or os.environ.get("ENVIRONMENT") == "test"
-    if provider == "test" or (provider is None and is_test_env):
-        return [_deterministic_vector(t, FULL_EMBEDDING_DIM) for t in texts]
-
-    from concurrent.futures import ThreadPoolExecutor
-
-    def _embed_single(text: str) -> list[float]:
-        return embed_text(text, provider=provider, max_retries=max_retries)
-
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        return list(executor.map(_embed_single, texts))
-
-
 def embed_batch_with_provenance(
     texts: Sequence[str], provider: str | None = None, max_retries: int = 3
 ) -> tuple[list[list[float]], str]:
-    """Batch API embeddings with producing model provenance tracking."""
+    """Batch API embeddings with producing model provenance tracking from actual execution."""
     if not texts:
         return [], "none"
 
@@ -185,9 +174,29 @@ def embed_batch_with_provenance(
     import os
 
     is_test_env = getattr(settings, "ENVIRONMENT", "") == "test" or os.environ.get("ENVIRONMENT") == "test"
-    is_fallback = provider == "test" or is_test_env
+    if provider == "test" or (provider is None and is_test_env):
+        return [_deterministic_vector(t, FULL_EMBEDDING_DIM) for t in texts], "fallback:deterministic"
 
-    embeddings = embed_batch(texts, provider=provider, max_retries=max_retries)
-    model_name = "fallback:deterministic" if is_fallback else get_embedding_model()
-    return embeddings, model_name
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _embed_single(text: str) -> tuple[list[float], str]:
+        return embed_text_with_provenance(text, provider=provider, max_retries=max_retries)
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        results = list(executor.map(_embed_single, texts))
+
+    vectors = [r[0] for r in results]
+    models = {r[1] for r in results}
+
+    if len(models) == 1:
+        return vectors, next(iter(models))
+    return vectors, "mixed:" + ",".join(sorted(models))
+
+
+def embed_batch(
+    texts: Sequence[str], provider: str | None = None, max_retries: int = 3
+) -> list[list[float]]:
+    """Generate batch embeddings via Bedrock API."""
+    vecs, _ = embed_batch_with_provenance(texts, provider=provider, max_retries=max_retries)
+    return vecs
 
