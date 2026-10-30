@@ -642,6 +642,12 @@ def main():
         default=False,
         help="Skip existing points that match ID, payload, and 384/1024 dimensions even if model provenance is unverified in store payload",
     )
+    parser.add_argument(
+        "--max-batches",
+        type=int,
+        default=None,
+        help="Maximum number of batches to process before halting (useful for sample batch verification)",
+    )
     parser.add_argument("--execute", action="store_true", default=False, help="Authorize execution of paid embedding calls")
     args = parser.parse_args()
 
@@ -712,7 +718,7 @@ def main():
         target_point_ids = {r.point_id for r in missing_results} | {r.point_id for r in corrupted_results} | {r.point_id for r in unresolved_results}
         skipped_count = len(verified_results)
 
-    target_chunks = [expected_point_map[pid] for pid in target_point_ids]
+    target_chunks = [ch for ch in all_chunks if str(uuid.uuid5(uuid.NAMESPACE_OID, str(ch.id))) in target_point_ids]
     target_count = len(target_chunks)
 
     # Cost calculations
@@ -774,10 +780,28 @@ def main():
     batch_size = args.batch_size
     upserted_count = 0
     completed_batches = 0
+    completed_point_ids: list[str] = []
+    total_planned_batches = (target_count + batch_size - 1) // batch_size
 
     for batch_idx, i in enumerate(range(0, target_count, batch_size)):
+        if args.max_batches is not None and batch_idx >= args.max_batches:
+            logger.info("Reached maximum requested batches (%d). Halting bounded execution.", args.max_batches)
+            break
+
         chunk_batch = target_chunks[i : i + batch_size]
-        embedded_batch = embed_chunks_dual(chunk_batch, provider="prod")
+        try:
+            embedded_batch = embed_chunks_dual(chunk_batch, provider="prod")
+        except Exception as embed_err:
+            logger.error(
+                "Embedding failed at batch %d (offset %d): %s. Completed %d points across %d batches.",
+                batch_idx + 1,
+                i,
+                embed_err,
+                len(completed_point_ids),
+                completed_batches,
+            )
+            logger.error("Completed point IDs: %s", completed_point_ids)
+            raise
 
         points = []
         for ch in embedded_batch:
@@ -837,6 +861,7 @@ def main():
                 i,
                 target_count - upserted_count,
             )
+            logger.error("Completed point IDs: %s", completed_point_ids)
             sys.exit(1)
 
         for attempt in range(3):
@@ -848,6 +873,7 @@ def main():
                 )
                 upserted_count += len(points_to_upsert)
                 completed_batches += 1
+                completed_point_ids.extend(batch_point_ids)
                 logger.info(
                     "Upserted batch %d-%d / %d (points=%d, wait=%s)",
                     i, i + len(points_to_upsert), target_count, len(points_to_upsert), args.wait
@@ -872,14 +898,49 @@ def main():
                     if not points_to_upsert:
                         upserted_count += len(batch_point_ids)
                         completed_batches += 1
+                        completed_point_ids.extend(batch_point_ids)
                         logger.info("All batch points landed despite timeout, continuing")
                         break
                 if attempt == 2:
-                    logger.error("Batch %d failed after 3 attempts", i)
+                    logger.error(
+                        "Batch %d failed after 3 attempts. Completed %d points across %d batches.",
+                        batch_idx + 1,
+                        len(completed_point_ids),
+                        completed_batches,
+                    )
+                    logger.error("Completed point IDs: %s", completed_point_ids)
                     raise
                 time.sleep(2.0 * (attempt + 1))
 
     logger.info("Batch upserts completed: successfully upserted %d points", upserted_count)
+
+    is_partial_run = args.max_batches is not None and completed_batches < total_planned_batches
+    if is_partial_run:
+        logger.info(
+            "Sample run of %d batch(es) completed (%d points upserted). Performing sample read-back verification...",
+            completed_batches,
+            upserted_count,
+        )
+        sample_point_ids = completed_point_ids
+        landed_sample_ids = retrieve_landed_point_ids(
+            qclient,
+            collection_name,
+            sample_point_ids,
+            args.workspace_id,
+            args.document_id,
+            expected_point_map,
+            require_verified_provenance=not args.allow_unresolved_provenance,
+        )
+        if len(landed_sample_ids) != len(sample_point_ids):
+            missing_sample = set(sample_point_ids) - landed_sample_ids
+            msg = f"Sample batch verification failed: {len(missing_sample)} of {len(sample_point_ids)} points failed read-back verification"
+            logger.error(msg)
+            sys.exit(1)
+        logger.info(
+            "Sample batch verification verified: all %d sample points confirmed in Qdrant with valid provenance.",
+            len(landed_sample_ids),
+        )
+        return
 
     # 5. Strict post-execution verification: exact IDs, vector dimensions, and payloads
     ok, vmsg = verify_qdrant_post_write(
@@ -896,6 +957,21 @@ def main():
         sys.exit(1)
 
     logger.info("Resume process completed successfully: %s", vmsg)
+    from providers.embedding_provider import _token_counter
+    actual_tokens = _token_counter.get("embed_input_tokens", 0)
+    actual_calls = _token_counter.get("embed_calls", 0)
+    actual_cost = (actual_tokens / 1_000_000) * 0.02
+    print("\n" + "=" * 65)
+    print("RESUME EXECUTION SUMMARY")
+    print("=" * 65)
+    print(f"Target points upserted:          {upserted_count:,}")
+    print(f"Total batches completed:         {completed_batches:,}")
+    print(f"BGE Lambda batch calls:          {completed_batches:,}")
+    print(f"Bedrock Titan embed calls:       {actual_calls:,}")
+    print(f"Bedrock Titan input tokens:      {actual_tokens:,}")
+    print(f"Observed Bedrock cost:           ${actual_cost:.4f} USD")
+    print(f"Qdrant post-write verification:  {vmsg}")
+    print("=" * 65 + "\n")
 
 
 if __name__ == "__main__":
