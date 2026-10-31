@@ -37,6 +37,7 @@ ROOT_DIR = BACKEND_DIR.parent
 sys.path.insert(0, str(SRC_DIR))
 sys.path.insert(0, str(BACKEND_DIR))
 
+from config import settings
 from modules.query.query_service import QueryService
 from modules.query.query_repository import QueryRepository
 from schemas.models import QueryRequest
@@ -251,7 +252,6 @@ def get_reranker_policy() -> str:
     """Return effective configured reranker provider, model, and fallback policy."""
     if os.environ.get("RERANKER_POLICY"):
         return os.environ["RERANKER_POLICY"]
-    from config import settings
 
     model = getattr(
         settings,
@@ -277,414 +277,415 @@ def run_benchmark(
     """
     orig_page_index = getattr(settings, "PAGEINDEX_ENABLED", True)
     orig_okf = getattr(settings, "OKF_ENABLED", True)
-    if page_index is not None:
-        settings.PAGEINDEX_ENABLED = page_index
-    if okf is not None:
-        settings.OKF_ENABLED = okf
-
-    logger.info(
-        "Strategy configuration: PAGEINDEX_ENABLED=%s OKF_ENABLED=%s",
-        settings.PAGEINDEX_ENABLED,
-        settings.OKF_ENABLED,
-    )
-
-    if not allow_dirty:
-        verify_clean_worktree()
-
-    verify_live_providers()
-
-    from db.table_store import get_shared_table_store
-    durable_store = get_shared_table_store(require_durable=True)
-    logger.info("Durable TableStore backend verified: %s", type(durable_store).__name__)
-
-    test_file = ROOT_DIR / test_path
-    if not test_file.exists():
-        raise FileNotFoundError(f"Test suite file not found: {test_file}")
-
-    suite_sha256 = compute_file_sha256(test_file)
-
-    with open(test_file, "r", encoding="utf-8") as f:
-        test_data = json.load(f)
-
-    questions = test_data["questions"]
-    documents_meta = test_data.get("documents", [])
-
-    corpus_manifest_sha256, file_hashes = compute_corpus_manifest_hash(documents_meta)
-    commit_sha = get_current_commit_sha()
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-
-    # Invalidate in-process cache for cold benchmark
-    if benchmark_type == "cold":
-        invalidate_chunk_cache()
-
-    repo = QueryRepository()
-    all_ws_chunks = repo.get_all_chunks(workspace_id=workspace_id)
-    if not all_ws_chunks:
-        raise RuntimeError(f"No chunks found in workspace '{workspace_id}'. Workspace must be ingested prior to running benchmark.")
-
-    doc_id_map = {d["doc_id"]: d["filename"] for d in documents_meta}
-
-    if not GROUND_TRUTH_FILE.exists():
-        raise FileNotFoundError(f"Evaluator ground truth file not found: {GROUND_TRUTH_FILE}")
-
-    with open(GROUND_TRUTH_FILE, "r", encoding="utf-8") as f:
-        ground_truth_data = json.load(f)
-
-    structured_ground_truth, unscorable_qids = resolve_ground_truth_chunk_ids(
-        ground_truth_data, all_ws_chunks, doc_id_map
-    )
-    if unscorable_qids:
-        logger.error("UNSCORABLE_GROUND_TRUTH detected on queries: %s", unscorable_qids)
-        raise RuntimeError(f"Benchmark failed: {len(unscorable_qids)} UNSCORABLE_GROUND_TRUTH queries cannot resolve locators.")
-
-    service = QueryService(repo=repo)
-
-    logger.info(
-        "Starting canonical 60-question benchmark (commit=%s, workspace=%s, type=%s, suite_hash=%s)",
-        commit_sha[:8],
-        workspace_id,
-        benchmark_type,
-        suite_sha256[:8],
-    )
-
-    query_results = []
-    total_q = len(questions)
-
-    refusal_total = 0
-    refusal_correct = 0
-    no_evidence_total = 0
-    false_answer_count = 0
-    unsupported_citation_count = 0
-    structured_agg_total = 0
-    structured_agg_correct = 0
-    premise_correction_total = 0
-    premise_correction_correct = 0
-    infra_failure_count = 0
-
-    all_recalls = []
-    all_precisions = []
-    all_mrrs = []
-    all_ndcgs = []
-    all_latencies = []
-    llm_call_count = 0
-
-    for idx, q in enumerate(questions, 1):
-        qid = q["id"]
-        category = q.get("category", "")
-        q_text = q["question"]
-        expected_ans = q.get("expected_answer")
-        is_hallucination = q.get("hallucination_check", False)
-
-        req = QueryRequest(
-            query=q_text,
-            workspace_id=workspace_id,
-            cache=False,
-            benchmark_mode=True,
-        )
-
-        t_start = time.perf_counter()
-        resp = service.execute_query(req)
-        query_latency_ms = (time.perf_counter() - t_start) * 1000.0
-        all_latencies.append(query_latency_ms)
-
-        # Assert response was NOT cached
-        assert not resp.get("cached", False), f"Query {qid} returned cached response in benchmark_mode"
-
-        if resp.get("status") == "error" or resp.get("error_code"):
-            infra_failure_count += 1
-
-        ans_raw = resp.get("answer", "")
-        if isinstance(ans_raw, (dict, list)):
-            ans_text = json.dumps(ans_raw)
-        else:
-            ans_text = str(ans_raw or "")
-        candidates = resp.get("retrieval_candidates", {})
-        reranked_ids = resp.get("reranked_chunk_ids") or candidates.get("reranked", [])
-        compressed_ids = set(resp.get("compressed_context_chunk_ids") or candidates.get("compressed_context", []))
-        llm_cited_ids = resp.get("llm_cited_chunk_ids") or candidates.get("llm_citations", [])
-        top_citations = resp.get("citations", [])
-        final_citation_ids = resp.get("final_citation_chunk_ids") or [
-            str(c.get("chunk_id")) for c in top_citations if c.get("chunk_id")
-        ]
-
-        gt_entry = ground_truth_data.get(qid, {})
-        contract = gt_entry.get("answer_contract", {})
-        contract_type = contract.get("contract_type", "semantic")
-        question_type = gt_entry.get("question_type") or ("structured_aggregate" if contract_type == "structured_aggregate" else "retrieval")
-
-        # Evaluate retrieval metrics against resolved structured ground truth
-        rel_ids = structured_ground_truth.get(qid, set())
-        has_positive_evidence = len(rel_ids) > 0
-
-        if question_type == "structured_aggregate":
-            structured_agg_total += 1
-            ret_metrics = {
-                "recall_at_5": None,
-                "precision_at_3": None,
-                "mrr_at_5": None,
-                "ndcg_at_5": None,
-                "note": "excluded_structured_aggregate",
-            }
-        elif has_positive_evidence:
-            ret_metrics = compute_retrieval_metrics(reranked_ids, rel_ids)
-            all_recalls.append(ret_metrics["recall_at_5"])
-            all_precisions.append(ret_metrics["precision_at_3"])
-            all_mrrs.append(ret_metrics["mrr_at_5"])
-            all_ndcgs.append(ret_metrics["ndcg_at_5"])
-        else:
-            # Exclude no-evidence queries from retrieval aggregate metrics
-            ret_metrics = {
-                "recall_at_5": None,
-                "precision_at_3": None,
-                "mrr_at_5": None,
-                "ndcg_at_5": None,
-                "note": "excluded_no_positive_evidence",
-            }
-            no_evidence_total += 1
-
-        refusal_indicators = [
-            "couldn't find any relevant",
-            "not found",
-            "does not contain",
-            "not mentioned",
-            "no information",
-            "cannot find",
-            "absent",
-            "no positive source",
-        ]
-        ans_is_refusal = any(ind in ans_text.lower() for ind in refusal_indicators) or ans_text.strip() == "NOT_FOUND"
-
-        is_infra_error = (resp.get("status") == "error" or bool(resp.get("error_code")))
-        is_correct = False
-        is_refusal = False
-        if contract_type == "refusal":
-            refusal_total += 1
-            if is_infra_error:
-                # Requirement 15: Infrastructure failure is scored as incorrect or unmeasured, never as a correct refusal
-                is_correct = False
-                is_refusal = False
-                false_answer_count += 1
-            elif ans_is_refusal:
-                refusal_correct += 1
-                is_correct = True
-                is_refusal = True
-            else:
-                false_answer_count += 1
-            if len(top_citations) > 0 and not is_infra_error:
-                unsupported_citation_count += 1
-        elif contract_type == "numeric":
-            is_correct = grade_structured_numeric(ans_text, contract)
-            if question_type == "structured_aggregate" and is_correct:
-                structured_agg_correct += 1
-        elif contract_type == "json_schema":
-            is_correct = grade_structured_json(ans_text, contract)
-        elif contract_type == "premise_correction":
-            refusal_total += 1
-            premise_correction_total += 1
-            is_correct = grade_structured_premise(ans_text, contract)
-            if is_correct:
-                refusal_correct += 1
-                premise_correction_correct += 1
-        else:
-            if expected_ans:
-                relevancy = compute_answer_relevancy(ans_text, expected_ans)
-                c_match = content_match(ans_text, expected_ans)
-                is_correct = c_match and relevancy >= 0.40
-
-        # Check citations validity against compressed context and ground truth
-        cit_val = validate_citations(
-            top_citations,
-            context_chunk_ids=compressed_ids if compressed_ids else None,
-            ground_truth_chunk_ids=rel_ids if rel_ids else None,
-        )
-
-        executed_path = resp.get("executed_path", "full")
-        gen_calls = resp.get("generation_calls", 0)
-        if gen_calls > 0:
-            llm_call_count += 1
-
-        res_entry = {
-            "id": qid,
-            "category": category,
-            "question": q_text,
-            "expected_answer": expected_ans,
-            "answer": ans_text,
-            "is_correct": is_correct,
-            "is_refusal": is_refusal,
-            "executed_path": executed_path,
-            "planned_path": resp.get("planned_path", "full"),
-            "reranker_mode": resp.get("reranker_mode", "remote_success"),
-            "retrieval_metrics": ret_metrics,
-            "citation_validity": cit_val,
-            "latency_ms": round(query_latency_ms, 2),
-            "reranked_chunk_ids": reranked_ids,
-            "compressed_context_chunk_ids": list(compressed_ids),
-            "llm_cited_chunk_ids": llm_cited_ids,
-            "final_citation_chunk_ids": final_citation_ids,
-            "bedrock_embedding_calls": resp.get("bedrock_embedding_calls", 0),
-            "bge_lambda_calls": resp.get("bge_lambda_calls", 0),
-            "reranker_remote_calls": resp.get("reranker_remote_calls", 0),
-            "generation_calls": gen_calls,
-            "citations": top_citations,
-        }
-        query_results.append(res_entry)
+    try:
+        if page_index is not None:
+            settings.PAGEINDEX_ENABLED = page_index
+        if okf is not None:
+            settings.OKF_ENABLED = okf
 
         logger.info(
-            "[%02d/%02d] %s (%s): %s | Path=%s | Reranker=%s | Latency=%.1fms",
-            idx,
-            total_q,
-            qid,
-            category,
-            "PASS" if is_correct else "FAIL",
-            executed_path,
-            resp.get("reranker_mode", "remote_success"),
-            query_latency_ms,
+            "Strategy configuration: PAGEINDEX_ENABLED=%s OKF_ENABLED=%s",
+            settings.PAGEINDEX_ENABLED,
+            settings.OKF_ENABLED,
         )
 
-    # Compute aggregate metrics with strict denominator handling
-    pos_count = len(all_recalls)
-    overall_acc = round(sum(1 for r in query_results if r["is_correct"]) / total_q, 4)
-    refusal_acc = round(refusal_correct / max(1, refusal_total), 4) if refusal_total > 0 else 1.0
-    avg_recall_5 = round(sum(all_recalls) / pos_count, 4) if pos_count > 0 else 0.0
-    avg_precision_3 = round(sum(all_precisions) / pos_count, 4) if pos_count > 0 else 0.0
-    avg_mrr_5 = round(sum(all_mrrs) / pos_count, 4) if pos_count > 0 else 0.0
-    avg_ndcg_5 = round(sum(all_ndcgs) / pos_count, 4) if pos_count > 0 else 0.0
-    llm_act_rate = round(llm_call_count / total_q, 4)
+        if not allow_dirty:
+            verify_clean_worktree()
 
-    false_answer_rate = round(false_answer_count / max(1, no_evidence_total), 4) if no_evidence_total > 0 else 0.0
-    unsupported_cit_rate = round(unsupported_citation_count / max(1, no_evidence_total), 4) if no_evidence_total > 0 else 0.0
+        verify_live_providers()
 
-    from providers.bedrock_models import get_embedding_model, get_llm_model
+        from db.table_store import get_shared_table_store
+        durable_store = get_shared_table_store(require_durable=True)
+        logger.info("Durable TableStore backend verified: %s", type(durable_store).__name__)
 
-    manifest = {
-        "commit_sha": commit_sha,
-        "baseline_commit_sha": commit_sha,  # Set self as baseline commit if creating initial baseline
-        "timestamp": timestamp,
-        "workspace_id": workspace_id,
-        "benchmark_type": benchmark_type,
-        "runner_version": "2.1.0",
-        "scorer_version": "2.1.0",
-        "test_suite_name": test_data.get("test_suite_name", "canonical_60"),
-        "test_suite_sha256": suite_sha256,
-        "corpus_manifest_sha256": corpus_manifest_sha256,
-        "corpus_file_hashes": file_hashes,
-        "embedding_model": get_embedding_model(),
-        "llm_model": get_llm_model(),
-        "reranker_policy": get_reranker_policy(),
-        "strategies": {
-            "page_index_enabled": bool(getattr(settings, "PAGEINDEX_ENABLED", True)),
-            "okf_enabled": bool(getattr(settings, "OKF_ENABLED", True)),
-            "page_index_weight": float(getattr(settings, "PAGEINDEX_STRUCTURAL_WEIGHT", 1.1)),
-            "okf_fusion_weight": float(getattr(settings, "OKF_FUSION_WEIGHT", 1.15)),
-        },
-        "cache_mode": "bypass_exact_and_semantic",
-        "total_questions": total_q,
-        "denominators": {
-            "total_questions": total_q,
-            "answerable_retrieval_questions": pos_count,
-            "answerable_structured_aggregate_questions": structured_agg_total,
-            "refusal_questions": max(0, refusal_total - premise_correction_total),
-            "premise_correction_questions": premise_correction_total,
-            "no_evidence_questions": no_evidence_total,
-            "infrastructure_failures": infra_failure_count,
-            "positive_evidence_questions": pos_count,
-            "refusal_evaluated_questions": refusal_total,
-        },
-        "metrics": {
-            "overall_accuracy": overall_acc,
-            "refusal_accuracy": refusal_acc,
-            "grounded_recall_at_5": avg_recall_5,
-            "precision_at_3": avg_precision_3,
-            "mrr_at_5": avg_mrr_5,
-            "ndcg_at_5": avg_ndcg_5,
-            "llm_activation_rate": llm_act_rate,
-            "no_evidence_metrics": {
-                "false_answer_rate": false_answer_rate,
-                "unsupported_citation_rate": unsupported_cit_rate,
-            },
-        },
-        "query_latency_distribution_ms": {
-            "min": round(min(all_latencies), 2),
-            "max": round(max(all_latencies), 2),
-            "mean": round(sum(all_latencies) / len(all_latencies), 2),
-            "note": "Latency targets (<400ms fast / <4000ms full) are verified via dedicated backend/scripts/run_latency_harness.py (200 runs)",
-        },
-    }
+        test_file = ROOT_DIR / test_path
+        if not test_file.exists():
+            raise FileNotFoundError(f"Test suite file not found: {test_file}")
 
-    # Write report files to immutable directory
-    report_dir = BACKEND_DIR / "reports" / commit_sha / timestamp
-    report_dir.mkdir(parents=True, exist_ok=True)
+        suite_sha256 = compute_file_sha256(test_file)
 
-    manifest_path = report_dir / "manifest.json"
-    with open(manifest_path, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2)
+        with open(test_file, "r", encoding="utf-8") as f:
+            test_data = json.load(f)
 
-    details_path = report_dir / "query_details.json"
-    with open(details_path, "w", encoding="utf-8") as f:
-        json.dump(query_results, f, indent=2)
+        questions = test_data["questions"]
+        documents_meta = test_data.get("documents", [])
 
-    summary_md_path = report_dir / "summary.md"
-    summary_md = f"""# Canonical 60-Question Benchmark Report
+        corpus_manifest_sha256, file_hashes = compute_corpus_manifest_hash(documents_meta)
+        commit_sha = get_current_commit_sha()
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
 
-- **Commit SHA**: `{commit_sha}`
-- **Timestamp**: `{timestamp}`
-- **Workspace**: `{workspace_id}`
-- **Benchmark Type**: `{benchmark_type}`
-- **Test Suite SHA-256**: `{suite_sha256}`
-- **Corpus Manifest SHA-256**: `{corpus_manifest_sha256}`
+        # Invalidate in-process cache for cold benchmark
+        if benchmark_type == "cold":
+            invalidate_chunk_cache()
 
-## Question Breakdown & Truthful Denominators
-- **Total Questions**: {total_q}
-- **Answerable Retrieval Questions**: {pos_count}
-- **Answerable Structured Aggregate Questions**: {structured_agg_total}
-- **Refusal / No-Evidence Questions**: {no_evidence_total}
-- **Premise Correction Questions**: {premise_correction_total}
-- **Infrastructure Failures**: {infra_failure_count}
+        repo = QueryRepository()
+        all_ws_chunks = repo.get_all_chunks(workspace_id=workspace_id)
+        if not all_ws_chunks:
+            raise RuntimeError(f"No chunks found in workspace '{workspace_id}'. Workspace must be ingested prior to running benchmark.")
 
-## Quality & Accuracy Metrics
+        doc_id_map = {d["doc_id"]: d["filename"] for d in documents_meta}
 
-| Metric | Measured | Target | Status |
-| :--- | :--- | :--- | :--- |
-| **Overall Accuracy** | {overall_acc * 100:.1f}% | > 80.0% | {'PASS' if overall_acc >= 0.80 else 'FAIL'} |
-| **Refusal Accuracy** | {refusal_acc * 100:.1f}% | > 85.0% | {'PASS' if refusal_acc >= 0.85 else 'FAIL'} |
-| **Grounded Recall@5** | {avg_recall_5 * 100:.1f}% | > 85.0% | {'PASS' if avg_recall_5 >= 0.85 else 'FAIL'} |
-| **Precision@3** | {avg_precision_3 * 100:.1f}% | > 60.0% | {'PASS' if avg_precision_3 >= 0.60 else 'FAIL'} |
-| **MRR@5** | {avg_mrr_5:.4f} | > 0.7500 | {'PASS' if avg_mrr_5 >= 0.75 else 'FAIL'} |
-| **nDCG@5** | {avg_ndcg_5:.4f} | > 0.7500 | {'PASS' if avg_ndcg_5 >= 0.75 else 'FAIL'} |
-| **LLM Activation Rate** | {llm_act_rate * 100:.1f}% | < 60.0% | {'PASS' if llm_act_rate <= 0.60 else 'FAIL'} |
+        if not GROUND_TRUTH_FILE.exists():
+            raise FileNotFoundError(f"Evaluator ground truth file not found: {GROUND_TRUTH_FILE}")
 
-> **Note on Latency**: Single 60-query pass provides directional latency only. Formal p95 warm/cold validation is performed via `backend/scripts/run_latency_harness.py`.
-"""
-    with open(summary_md_path, "w", encoding="utf-8") as f:
-        f.write(summary_md)
+        with open(GROUND_TRUTH_FILE, "r", encoding="utf-8") as f:
+            ground_truth_data = json.load(f)
 
-    logger.info("Saved benchmark report to %s", report_dir)
+        structured_ground_truth, unscorable_qids = resolve_ground_truth_chunk_ids(
+            ground_truth_data, all_ws_chunks, doc_id_map
+        )
+        if unscorable_qids:
+            logger.error("UNSCORABLE_GROUND_TRUTH detected on queries: %s", unscorable_qids)
+            raise RuntimeError(f"Benchmark failed: {len(unscorable_qids)} UNSCORABLE_GROUND_TRUTH queries cannot resolve locators.")
 
-    # Baseline comparison if baseline path provided
-    if baseline_path:
-        b_path = Path(baseline_path)
-        if not b_path.exists():
-            logger.warning("Baseline manifest not found at %s", baseline_path)
-        else:
-            with open(b_path, "r", encoding="utf-8") as f:
-                baseline_manifest = json.load(f)
-            manifest["baseline_commit_sha"] = baseline_manifest.get("commit_sha")
-            cmp_res = compare_manifests(manifest, baseline_manifest)
-            logger.info("=== Comparison Result against %s ===", baseline_path)
-            logger.info("Status: %s", cmp_res["status"])
-            if not cmp_res["comparable"]:
-                for mismatch in cmp_res.get("mismatches", []):
-                    logger.warning("  Mismatch: %s", mismatch)
+        service = QueryService(repo=repo)
+
+        logger.info(
+            "Starting canonical 60-question benchmark (commit=%s, workspace=%s, type=%s, suite_hash=%s)",
+            commit_sha[:8],
+            workspace_id,
+            benchmark_type,
+            suite_sha256[:8],
+        )
+
+        query_results = []
+        total_q = len(questions)
+
+        refusal_total = 0
+        refusal_correct = 0
+        no_evidence_total = 0
+        false_answer_count = 0
+        unsupported_citation_count = 0
+        structured_agg_total = 0
+        structured_agg_correct = 0
+        premise_correction_total = 0
+        premise_correction_correct = 0
+        infra_failure_count = 0
+
+        all_recalls = []
+        all_precisions = []
+        all_mrrs = []
+        all_ndcgs = []
+        all_latencies = []
+        llm_call_count = 0
+
+        for idx, q in enumerate(questions, 1):
+            qid = q["id"]
+            category = q.get("category", "")
+            q_text = q["question"]
+            expected_ans = q.get("expected_answer")
+            is_hallucination = q.get("hallucination_check", False)
+
+            req = QueryRequest(
+                query=q_text,
+                workspace_id=workspace_id,
+                cache=False,
+                benchmark_mode=True,
+            )
+
+            t_start = time.perf_counter()
+            resp = service.execute_query(req)
+            query_latency_ms = (time.perf_counter() - t_start) * 1000.0
+            all_latencies.append(query_latency_ms)
+
+            # Assert response was NOT cached
+            assert not resp.get("cached", False), f"Query {qid} returned cached response in benchmark_mode"
+
+            if resp.get("status") == "error" or resp.get("error_code"):
+                infra_failure_count += 1
+
+            ans_raw = resp.get("answer", "")
+            if isinstance(ans_raw, (dict, list)):
+                ans_text = json.dumps(ans_raw)
             else:
-                for k, v in cmp_res.get("deltas", {}).items():
-                    logger.info("  %s: %+.4f", k, v)
+                ans_text = str(ans_raw or "")
+            candidates = resp.get("retrieval_candidates", {})
+            reranked_ids = resp.get("reranked_chunk_ids") or candidates.get("reranked", [])
+            compressed_ids = set(resp.get("compressed_context_chunk_ids") or candidates.get("compressed_context", []))
+            llm_cited_ids = resp.get("llm_cited_chunk_ids") or candidates.get("llm_citations", [])
+            top_citations = resp.get("citations", [])
+            final_citation_ids = resp.get("final_citation_chunk_ids") or [
+                str(c.get("chunk_id")) for c in top_citations if c.get("chunk_id")
+            ]
 
-    if page_index is not None:
-        settings.PAGEINDEX_ENABLED = orig_page_index
-    if okf is not None:
-        settings.OKF_ENABLED = orig_okf
+            gt_entry = ground_truth_data.get(qid, {})
+            contract = gt_entry.get("answer_contract", {})
+            contract_type = contract.get("contract_type", "semantic")
+            question_type = gt_entry.get("question_type") or ("structured_aggregate" if contract_type == "structured_aggregate" else "retrieval")
 
-    return manifest
+            # Evaluate retrieval metrics against resolved structured ground truth
+            rel_ids = structured_ground_truth.get(qid, set())
+            has_positive_evidence = len(rel_ids) > 0
+
+            if question_type == "structured_aggregate":
+                structured_agg_total += 1
+                ret_metrics = {
+                    "recall_at_5": None,
+                    "precision_at_3": None,
+                    "mrr_at_5": None,
+                    "ndcg_at_5": None,
+                    "note": "excluded_structured_aggregate",
+                }
+            elif has_positive_evidence:
+                ret_metrics = compute_retrieval_metrics(reranked_ids, rel_ids)
+                all_recalls.append(ret_metrics["recall_at_5"])
+                all_precisions.append(ret_metrics["precision_at_3"])
+                all_mrrs.append(ret_metrics["mrr_at_5"])
+                all_ndcgs.append(ret_metrics["ndcg_at_5"])
+            else:
+                # Exclude no-evidence queries from retrieval aggregate metrics
+                ret_metrics = {
+                    "recall_at_5": None,
+                    "precision_at_3": None,
+                    "mrr_at_5": None,
+                    "ndcg_at_5": None,
+                    "note": "excluded_no_positive_evidence",
+                }
+                no_evidence_total += 1
+
+            refusal_indicators = [
+                "couldn't find any relevant",
+                "not found",
+                "does not contain",
+                "not mentioned",
+                "no information",
+                "cannot find",
+                "absent",
+                "no positive source",
+            ]
+            ans_is_refusal = any(ind in ans_text.lower() for ind in refusal_indicators) or ans_text.strip() == "NOT_FOUND"
+
+            is_infra_error = (resp.get("status") == "error" or bool(resp.get("error_code")))
+            is_correct = False
+            is_refusal = False
+            if contract_type == "refusal":
+                refusal_total += 1
+                if is_infra_error:
+                    # Requirement 15: Infrastructure failure is scored as incorrect or unmeasured, never as a correct refusal
+                    is_correct = False
+                    is_refusal = False
+                    false_answer_count += 1
+                elif ans_is_refusal:
+                    refusal_correct += 1
+                    is_correct = True
+                    is_refusal = True
+                else:
+                    false_answer_count += 1
+                if len(top_citations) > 0 and not is_infra_error:
+                    unsupported_citation_count += 1
+            elif contract_type == "numeric":
+                is_correct = grade_structured_numeric(ans_text, contract)
+                if question_type == "structured_aggregate" and is_correct:
+                    structured_agg_correct += 1
+            elif contract_type == "json_schema":
+                is_correct = grade_structured_json(ans_text, contract)
+            elif contract_type == "premise_correction":
+                refusal_total += 1
+                premise_correction_total += 1
+                is_correct = grade_structured_premise(ans_text, contract)
+                if is_correct:
+                    refusal_correct += 1
+                    premise_correction_correct += 1
+            else:
+                if expected_ans:
+                    relevancy = compute_answer_relevancy(ans_text, expected_ans)
+                    c_match = content_match(ans_text, expected_ans)
+                    is_correct = c_match and relevancy >= 0.40
+
+            # Check citations validity against compressed context and ground truth
+            cit_val = validate_citations(
+                top_citations,
+                context_chunk_ids=compressed_ids if compressed_ids else None,
+                ground_truth_chunk_ids=rel_ids if rel_ids else None,
+            )
+
+            executed_path = resp.get("executed_path", "full")
+            gen_calls = resp.get("generation_calls", 0)
+            if gen_calls > 0:
+                llm_call_count += 1
+
+            res_entry = {
+                "id": qid,
+                "category": category,
+                "question": q_text,
+                "expected_answer": expected_ans,
+                "answer": ans_text,
+                "is_correct": is_correct,
+                "is_refusal": is_refusal,
+                "executed_path": executed_path,
+                "planned_path": resp.get("planned_path", "full"),
+                "reranker_mode": resp.get("reranker_mode", "remote_success"),
+                "retrieval_metrics": ret_metrics,
+                "citation_validity": cit_val,
+                "latency_ms": round(query_latency_ms, 2),
+                "reranked_chunk_ids": reranked_ids,
+                "compressed_context_chunk_ids": list(compressed_ids),
+                "llm_cited_chunk_ids": llm_cited_ids,
+                "final_citation_chunk_ids": final_citation_ids,
+                "bedrock_embedding_calls": resp.get("bedrock_embedding_calls", 0),
+                "bge_lambda_calls": resp.get("bge_lambda_calls", 0),
+                "reranker_remote_calls": resp.get("reranker_remote_calls", 0),
+                "generation_calls": gen_calls,
+                "citations": top_citations,
+            }
+            query_results.append(res_entry)
+
+            logger.info(
+                "[%02d/%02d] %s (%s): %s | Path=%s | Reranker=%s | Latency=%.1fms",
+                idx,
+                total_q,
+                qid,
+                category,
+                "PASS" if is_correct else "FAIL",
+                executed_path,
+                resp.get("reranker_mode", "remote_success"),
+                query_latency_ms,
+            )
+
+        # Compute aggregate metrics with strict denominator handling
+        pos_count = len(all_recalls)
+        overall_acc = round(sum(1 for r in query_results if r["is_correct"]) / total_q, 4)
+        refusal_acc = round(refusal_correct / max(1, refusal_total), 4) if refusal_total > 0 else 1.0
+        avg_recall_5 = round(sum(all_recalls) / pos_count, 4) if pos_count > 0 else 0.0
+        avg_precision_3 = round(sum(all_precisions) / pos_count, 4) if pos_count > 0 else 0.0
+        avg_mrr_5 = round(sum(all_mrrs) / pos_count, 4) if pos_count > 0 else 0.0
+        avg_ndcg_5 = round(sum(all_ndcgs) / pos_count, 4) if pos_count > 0 else 0.0
+        llm_act_rate = round(llm_call_count / total_q, 4)
+
+        false_answer_rate = round(false_answer_count / max(1, no_evidence_total), 4) if no_evidence_total > 0 else 0.0
+        unsupported_cit_rate = round(unsupported_citation_count / max(1, no_evidence_total), 4) if no_evidence_total > 0 else 0.0
+
+        from providers.bedrock_models import get_embedding_model, get_llm_model
+
+        manifest = {
+            "commit_sha": commit_sha,
+            "baseline_commit_sha": commit_sha,  # Set self as baseline commit if creating initial baseline
+            "timestamp": timestamp,
+            "workspace_id": workspace_id,
+            "benchmark_type": benchmark_type,
+            "runner_version": "2.1.0",
+            "scorer_version": "2.1.0",
+            "test_suite_name": test_data.get("test_suite_name", "canonical_60"),
+            "test_suite_sha256": suite_sha256,
+            "corpus_manifest_sha256": corpus_manifest_sha256,
+            "corpus_file_hashes": file_hashes,
+            "embedding_model": get_embedding_model(),
+            "llm_model": get_llm_model(),
+            "reranker_policy": get_reranker_policy(),
+            "strategies": {
+                "page_index_enabled": bool(getattr(settings, "PAGEINDEX_ENABLED", True)),
+                "okf_enabled": bool(getattr(settings, "OKF_ENABLED", True)),
+                "page_index_weight": float(getattr(settings, "PAGEINDEX_STRUCTURAL_WEIGHT", 1.1)),
+                "okf_fusion_weight": float(getattr(settings, "OKF_FUSION_WEIGHT", 1.15)),
+            },
+            "cache_mode": "bypass_exact_and_semantic",
+            "total_questions": total_q,
+            "denominators": {
+                "total_questions": total_q,
+                "answerable_retrieval_questions": pos_count,
+                "answerable_structured_aggregate_questions": structured_agg_total,
+                "refusal_questions": max(0, refusal_total - premise_correction_total),
+                "premise_correction_questions": premise_correction_total,
+                "no_evidence_questions": no_evidence_total,
+                "infrastructure_failures": infra_failure_count,
+                "positive_evidence_questions": pos_count,
+                "refusal_evaluated_questions": refusal_total,
+            },
+            "metrics": {
+                "overall_accuracy": overall_acc,
+                "refusal_accuracy": refusal_acc,
+                "grounded_recall_at_5": avg_recall_5,
+                "precision_at_3": avg_precision_3,
+                "mrr_at_5": avg_mrr_5,
+                "ndcg_at_5": avg_ndcg_5,
+                "llm_activation_rate": llm_act_rate,
+                "no_evidence_metrics": {
+                    "false_answer_rate": false_answer_rate,
+                    "unsupported_citation_rate": unsupported_cit_rate,
+                },
+            },
+            "query_latency_distribution_ms": {
+                "min": round(min(all_latencies), 2),
+                "max": round(max(all_latencies), 2),
+                "mean": round(sum(all_latencies) / len(all_latencies), 2),
+                "note": "Latency targets (<400ms fast / <4000ms full) are verified via dedicated backend/scripts/run_latency_harness.py (200 runs)",
+            },
+        }
+
+        # Write report files to immutable directory
+        report_dir = BACKEND_DIR / "reports" / commit_sha / timestamp
+        report_dir.mkdir(parents=True, exist_ok=True)
+
+        manifest_path = report_dir / "manifest.json"
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2)
+
+        details_path = report_dir / "query_details.json"
+        with open(details_path, "w", encoding="utf-8") as f:
+            json.dump(query_results, f, indent=2)
+
+        summary_md_path = report_dir / "summary.md"
+        summary_md = f"""# Canonical 60-Question Benchmark Report
+
+    - **Commit SHA**: `{commit_sha}`
+    - **Timestamp**: `{timestamp}`
+    - **Workspace**: `{workspace_id}`
+    - **Benchmark Type**: `{benchmark_type}`
+    - **Test Suite SHA-256**: `{suite_sha256}`
+    - **Corpus Manifest SHA-256**: `{corpus_manifest_sha256}`
+
+    ## Question Breakdown & Truthful Denominators
+    - **Total Questions**: {total_q}
+    - **Answerable Retrieval Questions**: {pos_count}
+    - **Answerable Structured Aggregate Questions**: {structured_agg_total}
+    - **Refusal / No-Evidence Questions**: {no_evidence_total}
+    - **Premise Correction Questions**: {premise_correction_total}
+    - **Infrastructure Failures**: {infra_failure_count}
+
+    ## Quality & Accuracy Metrics
+
+    | Metric | Measured | Target | Status |
+    | :--- | :--- | :--- | :--- |
+    | **Overall Accuracy** | {overall_acc * 100:.1f}% | > 80.0% | {'PASS' if overall_acc >= 0.80 else 'FAIL'} |
+    | **Refusal Accuracy** | {refusal_acc * 100:.1f}% | > 85.0% | {'PASS' if refusal_acc >= 0.85 else 'FAIL'} |
+    | **Grounded Recall@5** | {avg_recall_5 * 100:.1f}% | > 85.0% | {'PASS' if avg_recall_5 >= 0.85 else 'FAIL'} |
+    | **Precision@3** | {avg_precision_3 * 100:.1f}% | > 60.0% | {'PASS' if avg_precision_3 >= 0.60 else 'FAIL'} |
+    | **MRR@5** | {avg_mrr_5:.4f} | > 0.7500 | {'PASS' if avg_mrr_5 >= 0.75 else 'FAIL'} |
+    | **nDCG@5** | {avg_ndcg_5:.4f} | > 0.7500 | {'PASS' if avg_ndcg_5 >= 0.75 else 'FAIL'} |
+    | **LLM Activation Rate** | {llm_act_rate * 100:.1f}% | < 60.0% | {'PASS' if llm_act_rate <= 0.60 else 'FAIL'} |
+
+    > **Note on Latency**: Single 60-query pass provides directional latency only. Formal p95 warm/cold validation is performed via `backend/scripts/run_latency_harness.py`.
+    """
+        with open(summary_md_path, "w", encoding="utf-8") as f:
+            f.write(summary_md)
+
+        logger.info("Saved benchmark report to %s", report_dir)
+
+        # Baseline comparison if baseline path provided
+        if baseline_path:
+            b_path = Path(baseline_path)
+            if not b_path.exists():
+                logger.warning("Baseline manifest not found at %s", baseline_path)
+            else:
+                with open(b_path, "r", encoding="utf-8") as f:
+                    baseline_manifest = json.load(f)
+                manifest["baseline_commit_sha"] = baseline_manifest.get("commit_sha")
+                cmp_res = compare_manifests(manifest, baseline_manifest)
+                logger.info("=== Comparison Result against %s ===", baseline_path)
+                logger.info("Status: %s", cmp_res["status"])
+                if not cmp_res["comparable"]:
+                    for mismatch in cmp_res.get("mismatches", []):
+                        logger.warning("  Mismatch: %s", mismatch)
+                else:
+                    for k, v in cmp_res.get("deltas", {}).items():
+                        logger.info("  %s: %+.4f", k, v)
+
+        return manifest
+    finally:
+        if page_index is not None:
+            settings.PAGEINDEX_ENABLED = orig_page_index
+        if okf is not None:
+            settings.OKF_ENABLED = orig_okf
 
 
 if __name__ == "__main__":
