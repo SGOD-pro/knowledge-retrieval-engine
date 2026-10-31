@@ -186,7 +186,7 @@ class QueryResponse(BaseModel):
     okf_latency_ms: float = 0.0
     okf_entity_state: str = "none"
     okf_property_state: str = "none"
-    reranker_mode: str = "remote_success"
+    reranker_mode: str = "bypassed"
 
 
 # --- System Benchmark Models ---

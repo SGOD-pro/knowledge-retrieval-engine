@@ -630,6 +630,7 @@ class DynamoDBTableStore:
         predicates: list[Predicate] | None = None,
         limit: int | None = None,
         version: str | None = None,
+        max_scan_items: int | None = None,
     ) -> list[TableRow]:
         ver = version or self.get_active_version(table_id, workspace_id)
         if not ver:
@@ -637,6 +638,7 @@ class DynamoDBTableStore:
 
         table_pk = f"TABLE#{workspace_id}#{table_id}#V#{ver}"
         results: list[TableRow] = []
+        scanned_count = 0
 
         query_kwargs: dict[str, Any] = {
             "KeyConditionExpression": Key("PK").eq(table_pk) & Key("SK").begins_with("ROW#"),
@@ -644,7 +646,9 @@ class DynamoDBTableStore:
 
         while True:
             resp = self.table.query(**query_kwargs)
-            for item in resp.get("Items", []):
+            items = resp.get("Items", [])
+            scanned_count += len(items)
+            for item in items:
                 if item.get("is_header"):
                     continue
                 cells = _json_to_cells(item.get("cells_json", "[]"))
@@ -663,6 +667,8 @@ class DynamoDBTableStore:
                     break
 
             if limit is not None and len(results) >= limit:
+                break
+            if max_scan_items is not None and scanned_count >= max_scan_items:
                 break
 
             last_key = resp.get("LastEvaluatedKey")

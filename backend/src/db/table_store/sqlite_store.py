@@ -891,6 +891,7 @@ class SQLiteTableStore:
         predicates: list[Predicate] | None = None,
         limit: int | None = None,
         version: str | None = None,
+        max_scan_items: int | None = None,
     ) -> list[TableRow]:
         if not workspace_id:
             return []
@@ -911,7 +912,9 @@ class SQLiteTableStore:
             )
 
         matched_rows: list[TableRow] = []
+        scanned_count = 0
         for db_row in cur:
+            scanned_count += 1
             if db_row["is_header"]:
                 continue
             cells = _json_to_cells(db_row["cells_json"])
@@ -929,6 +932,8 @@ class SQLiteTableStore:
                 )
             )
             if limit is not None and len(matched_rows) >= limit:
+                break
+            if max_scan_items is not None and scanned_count >= max_scan_items:
                 break
 
         return matched_rows

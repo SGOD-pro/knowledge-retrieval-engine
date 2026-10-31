@@ -56,6 +56,7 @@ class TableStore(Protocol):
         predicates: list[Predicate] | None = None,
         limit: int | None = None,
         version: str | None = None,
+        max_scan_items: int | None = None,
     ) -> list[TableRow]:
         """Query rows matching predicates with optional limit."""
         ...

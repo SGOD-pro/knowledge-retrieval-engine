@@ -216,7 +216,7 @@ class QueryService:
                 "cached": False,
                 "document_ids": target_doc_ids or [],
                 "retrieval_candidates": {},
-                "reranker_mode": "remote_success",
+                "reranker_mode": "bypassed",
             }
 
         t1 = time.perf_counter()
@@ -291,7 +291,9 @@ class QueryService:
             retrieval_candidates["okf_entity_state"] = getattr(response, "okf_entity_state", "none")
         if "okf_property_state" not in retrieval_candidates:
             retrieval_candidates["okf_property_state"] = getattr(response, "okf_property_state", "none")
-        reranker_mode = getattr(response, "reranker_mode", "remote_success")
+        reranker_mode = getattr(response, "reranker_mode", "bypassed")
+        if executed_path in ("fast", "structured_aggregate"):
+            reranker_mode = "bypassed"
 
         logger.info(
             "query.cost_tracking path=%s input_tokens=%d output_tokens=%d total_tokens=%d latency_ms=%.2f",

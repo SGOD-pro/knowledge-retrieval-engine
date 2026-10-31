@@ -68,15 +68,25 @@ class StrategyRouter:
             )
 
         # 2. Structured table query (aggregation, range, comparison, sum, count, delta)
-        # Distinguish numeric aggregation from qualitative narrative discussion
+        # Distinguish numeric aggregation from qualitative narrative discussion and document-internal tables
         is_qualitative = bool(re.search(r"\b(describe|explain|discuss|opinion|morale|sentiment|narrative|qualitative)\b", q_lower))
+        is_tabular_file_explicit = bool(
+            re.search(r'\.(?:csv|xlsx?|tsv)\b', q_lower)
+            or re.search(r'\b(?:spreadsheet|survay|dataset)\b', q_lower)
+        )
+        is_document_content_ref = bool(
+            re.search(r'\b(?:table|figure|fig\.|chart)\s+\d+\b', q_lower)
+            or re.search(r'\b(?:paper|article|report|study|section|pdf|document)\b', q_lower)
+        )
+        is_internal_doc_table = is_document_content_ref and not is_tabular_file_explicit
+
         table_keywords = r"\b(total\s+(?:of|across|in|for|amount|income|revenue|sales|expenditure|expenses|number|count|assets|value|cost|tax|profit|funding|budget|headcount|rows?|records?)|sum of|average|mean of|earliest and latest|how did.*change from|percentage change|difference between|min\b|max\b|minimum|maximum|highest\s+(?:value|amount|number|rate)|lowest\s+(?:value|amount|number|rate))\b"
         has_table_agg = bool(re.search(table_keywords, q_lower))
-        has_table_target = bool(
+        has_table_target = not is_internal_doc_table and bool(
             re.search(r"\b(table|survey|dataset|sheet|spreadsheet|file|columns?|rows?|records?|fields?|industr(y|ies)|variable|code|income|expenditure|sales|year|date|period)\b|\.(?:csv|xlsx|tsv)", q_lower)
         )
         plan_is_structured = bool(
-            plan and (
+            plan and not is_internal_doc_table and (
                 getattr(plan, "use_structured_aggregate", False)
                 or getattr(plan, "primary_intent", None) in (QueryIntent.AGGREGATION, QueryIntent.CALCULATION, QueryIntent.COMPARISON)
             )

@@ -284,18 +284,29 @@ class Planner:
         # Rule 3d — STRUCTURED AGGREGATE PATH
         # Column-wide min/max/range or entity deltas across years/periods
         # (e.g. earliest/latest Year, how did total income change from 2024 to 2025)
-        # Excludes multi-document queries and premise verification questions.
+        # Excludes multi-document queries, premise verification questions,
+        # and document-internal tables (e.g. Table 1 in an academic paper).
         q_lower = query.lower()
         is_multi_doc = bool(re.search(r'\b(?:using\s+\w+.*and|balance sheet.*and|uploaded.*and)\b', q_lower))
         is_premise_check = bool(re.search(r',\s*right\??', q_lower)) or "check against" in q_lower
 
-        is_structured_candidate = not (is_multi_doc or is_premise_check) and (
+        is_tabular_file_explicit = bool(
+            re.search(r'\.(?:csv|xlsx?|tsv)\b', q_lower)
+            or re.search(r'\b(?:spreadsheet|survay|dataset)\b', q_lower)
+        )
+        is_document_content_ref = bool(
+            re.search(r'\b(?:table|figure|fig\.|chart)\s+\d+\b', q_lower)
+            or re.search(r'\b(?:paper|article|report|study|section|pdf|document)\b', q_lower)
+        )
+        is_internal_doc_table = is_document_content_ref and not is_tabular_file_explicit
+
+        is_structured_candidate = not (is_multi_doc or is_premise_check or is_internal_doc_table) and (
             bool(re.search(r'\b(?:earliest|latest|min|max|minimum|maximum)\b', q_lower))
             or bool(re.search(r'\bhow did (?:total )?\w+ change from \d{4} to \d{4}\b', q_lower))
             or bool(re.search(r'\b(?:change from \d{4} to \d{4}|total income change)\b', q_lower))
             or bool(re.search(r'\b(?:total|sum|average|avg|count)\b', q_lower))
         )
-        has_table_or_file = (
+        has_table_or_file = not is_internal_doc_table and (
             flags["format_flag"]
             or bool(re.search(r'\b(?:csv|table|survay|dataset|rows?|records?)\b', q_lower))
             or bool(re.search(r'\bfrom \d{4} to \d{4}\b', q_lower))

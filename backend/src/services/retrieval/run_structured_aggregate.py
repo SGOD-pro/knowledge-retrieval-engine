@@ -65,6 +65,7 @@ def execute(state: dict[str, Any]) -> dict[str, Any]:
             "status": "error",
             "error_code": "incomplete_data",
             "error": f"Table data is incomplete: {e}",
+            "reranker_mode": "bypassed",
             "stage_timings": {**existing_timings, "structured_aggregate_ms": latency_ms},
         }
     except AmbiguousBindingError as e:
@@ -76,6 +77,7 @@ def execute(state: dict[str, Any]) -> dict[str, Any]:
             "status": "clarification_needed",
             "error_code": "ambiguous_binding",
             "error": str(e),
+            "reranker_mode": "bypassed",
             "stage_timings": {**existing_timings, "structured_aggregate_ms": latency_ms},
         }
     except StorageFailureError as e:
@@ -87,6 +89,7 @@ def execute(state: dict[str, Any]) -> dict[str, Any]:
             "status": "error",
             "error_code": "storage_failure",
             "error": str(e),
+            "reranker_mode": "bypassed",
             "stage_timings": {**existing_timings, "structured_aggregate_ms": latency_ms},
         }
     except UnresolvedFilterError as e:
@@ -98,6 +101,7 @@ def execute(state: dict[str, Any]) -> dict[str, Any]:
             "status": "error",
             "error_code": "unresolved_filter",
             "error": f"Required filter could not be resolved: {e}",
+            "reranker_mode": "bypassed",
             "stage_timings": {**existing_timings, "structured_aggregate_ms": latency_ms},
         }
     except UnsupportedQueryError as e:
@@ -105,6 +109,7 @@ def execute(state: dict[str, Any]) -> dict[str, Any]:
         logger.info("structured_aggregate.unsupported query='%s' reason=%s", query[:60], e)
         return {
             "executed_path": "structured_aggregate_fallback",
+            "reranker_mode": "bypassed",
             "stage_timings": {**existing_timings, "structured_aggregate_ms": latency_ms},
         }
 
@@ -112,6 +117,7 @@ def execute(state: dict[str, Any]) -> dict[str, Any]:
         latency_ms = (time.perf_counter() - t0) * 1000.0
         return {
             "executed_path": "structured_aggregate_fallback",
+            "reranker_mode": "bypassed",
             "stage_timings": {**existing_timings, "structured_aggregate_ms": latency_ms},
         }
 
@@ -149,6 +155,8 @@ def execute(state: dict[str, Any]) -> dict[str, Any]:
         citation_payload=citation,
     )
 
+    is_refusal = (result.selection_count == 0)
+
     return {
         "final_answer": result.answer_text,
         "citations": [citation],
@@ -160,6 +168,8 @@ def execute(state: dict[str, Any]) -> dict[str, Any]:
         "execution_result": result,
         "executed_path": "structured_aggregate",
         "status": "success",
+        "is_refusal": is_refusal,
         "retrieval_candidates": {"structured_rows": result.row_ids},
+        "reranker_mode": "bypassed",
         "stage_timings": {**existing_timings, "structured_aggregate_ms": latency_ms},
     }

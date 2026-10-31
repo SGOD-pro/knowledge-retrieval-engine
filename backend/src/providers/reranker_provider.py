@@ -34,6 +34,8 @@ _last_request_time = 0.0
 REQUEST_INTERVAL_SECONDS = 0.2  # Max 5 requests per second
 
 _reranker_counter = {"reranker_calls": 0}
+_last_reranker_mode: str = "bypassed"
+_mode_lock = threading.Lock()
 
 
 def reset_reranker_counter() -> None:
@@ -42,6 +44,17 @@ def reset_reranker_counter() -> None:
 
 def get_reranker_counter() -> dict:
     return dict(_reranker_counter)
+
+
+def get_last_reranker_mode() -> str:
+    with _mode_lock:
+        return _last_reranker_mode
+
+
+def set_last_reranker_mode(mode: str) -> None:
+    global _last_reranker_mode
+    with _mode_lock:
+        _last_reranker_mode = mode
 
 _session: requests.Session | None = None
 _session_lock = threading.Lock()
@@ -320,6 +333,7 @@ def rerank_documents(
     documents list. Higher = more relevant.
     """
     if not documents:
+        set_last_reranker_mode("bypassed")
         return []
 
     t0 = time.perf_counter()
@@ -332,6 +346,7 @@ def rerank_documents(
                 if _circuit_breaker_tripped:
                     _circuit_breaker_tripped = False
                     logger.info("reranker.circuit_breaker_closed — probe succeeded, service recovered")
+            set_last_reranker_mode("remote_success")
             logger.info(
                 "reranker.openrouter.latency_ms=%.2f doc_count=%d avg_score=%.4f",
                 latency_ms,
@@ -348,5 +363,7 @@ def rerank_documents(
             )
 
     # Deterministic fallback (zero API call, immediate p50 < 2ms)
-    logger.info("reranker.mode=lexical_bm25_fallback")
+    fallback_mode = "circuit_open_lexical_fallback"
+    set_last_reranker_mode(fallback_mode)
+    logger.info("reranker.mode=%s", fallback_mode)
     return _term_coverage_fallback(query, documents)

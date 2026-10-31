@@ -731,13 +731,11 @@ def run_reranker(state: PipelineState):
             "okf_entity_state": "none",
             "okf_property_state": "none",
         })
-        return {"top_chunks": [], "retrieval_candidates": cands, "reranker_mode": "remote_success"}
+        return {"top_chunks": [], "retrieval_candidates": cands, "reranker_mode": "bypassed"}
 
-    from providers.reranker_provider import _is_circuit_open
-    circuit_open = _is_circuit_open()
-    reranker_mode = "circuit_open_lexical_fallback" if circuit_open else "remote_success"
-
+    from providers.reranker_provider import get_last_reranker_mode
     top_chunks = rerank(state["query"], merged, top_k=6)
+    reranker_mode = get_last_reranker_mode()
     latency_ms = (time.perf_counter() - t0) * 1000.0
     logger.info(
         "reranker.latency_ms=%.2f reranker.input_count=%d reranker.output_count=%d mode=%s",
@@ -1540,7 +1538,7 @@ class Pipeline:
             "graph_chunks": [],
             "top_chunks": [],
             "retrieval_candidates": {},
-            "reranker_mode": "remote_success",
+            "reranker_mode": "bypassed",
             "compressed_text": "",
             "context_snippet": "",
             "final_answer": "",
@@ -1613,7 +1611,7 @@ class Pipeline:
                 self.stages = plan.stages if plan else []
                 self.planned_path = state.get("planned_path", "fast" if (plan and plan.fast_path) else "full")
                 self.structured_aggregate = (self.executed_path == "structured_aggregate")
-                self.reranker_mode = state.get("reranker_mode", "remote_success")
+                self.reranker_mode = state.get("reranker_mode", "bypassed")
                 self.retrieval_candidates = state.get("retrieval_candidates", {})
                 self.structural_candidates = state.get("structural_candidates", [])
                 self.structural_candidate_ids = state.get("structural_candidate_ids", [])

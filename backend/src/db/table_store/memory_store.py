@@ -238,6 +238,7 @@ class MemoryTableStore:
         predicates: list[Predicate] | None = None,
         limit: int | None = None,
         version: str | None = None,
+        max_scan_items: int | None = None,
     ) -> list[TableRow]:
         _, _, _, rows_matched, _ = self._execute_pass(
             table_id=table_id,

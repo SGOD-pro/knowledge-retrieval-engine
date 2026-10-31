@@ -175,9 +175,29 @@ class StructuredQueryService:
             if re.search(pattern, q_lower):
                 return (tid, meta, ver)
 
+        # Document table indicators: references to numbered tables/figures/charts in narrative papers/reports
+        is_tabular_explicit = bool(
+            re.search(r'\.(?:csv|xlsx?|tsv)\b', q_lower)
+            or re.search(r'\b(?:spreadsheet|survay|dataset)\b', q_lower)
+        )
+        is_doc_ref = bool(
+            re.search(r'\b(?:table|figure|fig\.|chart)\s+\d+\b', q_lower)
+            or re.search(r'\b(?:paper|article|report|study|section|pdf|document)\b', q_lower)
+        )
+        is_internal_doc_table = is_doc_ref and not is_tabular_explicit
+
+        # If query is targeting an internal document table/figure and does not name a spreadsheet,
+        # never bind a tabular store table.
+        if is_internal_doc_table:
+            return None
+
         # 2. Single candidate in scope
         if len(candidate_tables) == 1:
-            return candidate_tables[0]
+            scored_single = self._score_candidate_tables(candidate_tables, query, workspace_id)
+            if scored_single and scored_single[0][0] > 0:
+                return candidate_tables[0]
+            # If the single candidate has zero match to the query, do not bind it
+            return None
 
         # 3. Multiple candidate tables: score and disambiguate
         scored = self._score_candidate_tables(candidate_tables, query, workspace_id)
@@ -242,8 +262,20 @@ class StructuredQueryService:
                 scored.append((score, item))
                 continue
 
+            if tid.lower() in q_lower:
+                score += 15.0
+
+            has_temporal = False
+            has_metric = False
+
             for col in schema.columns:
                 c_name = col.name.lower()
+                dtype = self._normalize_dtype(col.inferred_dtype)
+                if c_name in ("year", "date", "period", "time") or "year" in c_name:
+                    has_temporal = True
+                elif dtype in {"decimal", "integer", "percentage", "currency"}:
+                    has_metric = True
+
                 for w in q_words:
                     if w in c_name or c_name in w:
                         score += 3.0
@@ -252,9 +284,10 @@ class StructuredQueryService:
                     elif w.endswith("s") and w[:-1] in c_name:
                         score += 3.0
 
-                dtype = self._normalize_dtype(col.inferred_dtype)
-                if dtype in {"decimal", "integer", "percentage", "currency"}:
-                    score += 2.0
+            if has_temporal:
+                score += 1.0
+            if has_metric:
+                score += 2.0
 
             if explicit_terms:
                 try:
@@ -446,14 +479,14 @@ class StructuredQueryService:
         for m in re.finditer(r'\bfor\s+([A-Za-z0-9_]+(?:\s+[A-Za-z0-9_]+)?)\b', query, re.IGNORECASE):
             target = m.group(1).strip()
             tokens = target.split()
+            if len(tokens) > 1 and tokens[0].lower() in {"the", "a", "an", "this", "that"}:
+                target = " ".join(tokens[1:]).strip()
             if len(tokens) > 1 and tokens[-1].lower() in SKIP_FILTER_WORDS:
                 target = " ".join(tokens[:-1]).strip()
-            if len(tokens) > 1 and tokens[0].lower() in SKIP_FILTER_WORDS:
-                target = " ".join(tokens[1:]).strip()
-            t_lower = target.lower()
-            if t_lower not in SKIP_FILTER_WORDS and not re.fullmatch(r'20\d{2}|19\d{2}', target):
+            t_lower = target.lower().strip()
+            if t_lower and t_lower not in SKIP_FILTER_WORDS and not re.fullmatch(r'20\d{2}|19\d{2}', target):
                 if not table_name or (t_lower != table_name and t_lower not in (table_csv, table_xlsx)):
-                    explicit_requirements.append(target)
+                    explicit_requirements.append(target.strip())
 
         # 2. Quoted strings
         for q_str in re.findall(r'["\']([^"\']+)["\']', query):
@@ -642,7 +675,7 @@ class StructuredQueryService:
         # 5. Bind candidate terms against table data (probe rows first, then store query)
         try:
             probe_rows = self.store.query_rows(
-                table_id, workspace_id, predicates=[], limit=200, version=version
+                table_id, workspace_id, predicates=[], limit=500, version=version
             )
         except Exception:
             probe_rows = []
@@ -679,17 +712,19 @@ class StructuredQueryService:
                     for col in schema.columns:
                         if col.col_index in already_bound:
                             continue
+                        dtype_str = self._normalize_dtype(col.inferred_dtype)
+                        is_numeric = dtype_str in {"integer", "decimal"}
+                        if is_numeric and not cand.isdigit():
+                            continue
                         try:
-                            val_pred: Any = cand
-                            dtype_str = self._normalize_dtype(col.inferred_dtype)
-                            if dtype_str in {"integer", "decimal"} and cand.isdigit():
-                                val_pred = int(cand)
+                            val_pred: Any = int(cand) if (is_numeric and cand.isdigit()) else cand
                             matching = self.store.query_rows(
                                 table_id,
                                 workspace_id,
                                 predicates=[Predicate(column_index=col.col_index, op=PredicateOp.EQ, value=val_pred)],
                                 limit=1,
                                 version=version,
+                                max_scan_items=500,
                             )
                             if matching:
                                 matched_val = matching[0].cells[col.col_index].normalized_value
@@ -862,7 +897,7 @@ class StructuredQueryService:
         # Check probe rows first (fast in-memory check)
         try:
             probe_rows = self.store.query_rows(
-                table_id, workspace_id, predicates=[], limit=200, version=version
+                table_id, workspace_id, predicates=[], limit=500, version=version
             )
         except Exception:
             probe_rows = []
@@ -891,8 +926,8 @@ class StructuredQueryService:
                 if bound:
                     break
 
-            # If not found in first 200 probe rows, query store directly with predicate
-            # (supports categorical/entity values located outside the first 200 rows, e.g. COHORT_DEEP at row 250).
+            # If not found in first probe rows, query store directly with predicate
+            # (supports categorical/entity values located outside the first 500 rows).
             # Restrict deep store search to explicit requirements; do NOT scan 60,000 rows for table names or non-entity tokens.
             if not bound and explicit_requirements:
                 is_explicit = any(
@@ -907,17 +942,19 @@ class StructuredQueryService:
                     for col in schema.columns:
                         if col.col_index in already_bound:
                             continue
+                        dtype_str = self._normalize_dtype(col.inferred_dtype)
+                        is_numeric = dtype_str in {"integer", "decimal"}
+                        if is_numeric and not cand.isdigit():
+                            continue
                         try:
-                            val_pred = cand
-                            dtype_str = self._normalize_dtype(col.inferred_dtype)
-                            if dtype_str in {"integer", "decimal"} and cand.isdigit():
-                                val_pred = int(cand)
+                            val_pred: Any = int(cand) if (is_numeric and cand.isdigit()) else cand
                             matching = self.store.query_rows(
                                 table_id,
                                 workspace_id,
                                 predicates=[Predicate(column_index=col.col_index, op=PredicateOp.EQ, value=val_pred)],
                                 limit=1,
                                 version=version,
+                                max_scan_items=500,
                             )
                             if matching:
                                 matched_val = str(matching[0].cells[col.col_index].normalized_value).strip()
@@ -957,9 +994,27 @@ class StructuredQueryService:
             raise StorageFailureError(f"Failed to query rows: {e}") from e
 
         if not rows_start or not rows_end:
-            raise UnresolvedFilterError(
+            missing_period = year_start if not rows_start else year_end
+            return StructuredQueryResult(
+                answer_text=f"No rows matched the requested filters for year {missing_period} in table '{table_id}'.",
+                operator="compare",
+                target_column=val_col_name,
+                predicate_columns=pred_cols,
+                predicate_values=pred_vals,
+                selection_count=0,
+                total_rows_in_table=total_rows,
+                result_value=Decimal(0),
+                secondary_value=None,
+                row_ids=[],
+                row_indices=[],
+                selection_hash="0" * 16,
+                schema_binding_confidence=1.0,
+                overall_confidence=1.0,
                 table_id=table_id,
-                filter_values=pred_vals,
+                document_id=document_id,
+                document_version=version,
+                workspace_id=workspace_id,
+                unit=None,
             )
 
         if len(rows_start) > 1 or len(rows_end) > 1:
@@ -1115,7 +1170,7 @@ class StructuredQueryService:
 
         res_val = val if val is not None else Decimal(0)
         if count == 0:
-            answer_text = f"The {op.value} for {col_name} is 0 (0 matching rows)."
+            answer_text = f"No rows matched the requested filters in table '{table_id}' (0 matching rows)."
         else:
             answer_text = f"The {op.value} for {col_name} is {res_val}."
 
