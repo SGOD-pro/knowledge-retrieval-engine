@@ -38,6 +38,7 @@ sys.path.insert(0, str(SRC_DIR))
 sys.path.insert(0, str(BACKEND_DIR))
 
 from config import settings
+from ingestion.parse_service import generate_deterministic_doc_id
 from modules.query.query_service import QueryService
 from modules.query.query_repository import QueryRepository
 from schemas.models import QueryRequest
@@ -323,7 +324,26 @@ def run_benchmark(
         if not all_ws_chunks:
             raise RuntimeError(f"No chunks found in workspace '{workspace_id}'. Workspace must be ingested prior to running benchmark.")
 
-        doc_id_map = {d["doc_id"]: d["filename"] for d in documents_meta}
+        # Resolve document ID mapping for the target workspace
+        # Priority 1: Deterministic workspace-scoped doc IDs for documents in documents_meta
+        # Priority 2: Overlay documents discovered directly in the workspace repository
+        doc_id_map: dict[str, str] = {}
+        for d in documents_meta:
+            fname = d["filename"]
+            scoped_did = generate_deterministic_doc_id(fname, workspace_id)
+            doc_id_map[fname] = scoped_did
+            doc_id_map[scoped_did] = fname
+
+        try:
+            ws_docs = repo.get_workspace_documents(workspace_id, limit=100).get("documents", [])
+            for doc_item in ws_docs:
+                did = doc_item.get("id")
+                fname = doc_item.get("filename")
+                if did and fname:
+                    doc_id_map[fname] = did
+                    doc_id_map[did] = fname
+        except Exception as e:
+            logger.warning("Could not query workspace documents for doc_id_map: %s", e)
 
         if not GROUND_TRUTH_FILE.exists():
             raise FileNotFoundError(f"Evaluator ground truth file not found: {GROUND_TRUTH_FILE}")

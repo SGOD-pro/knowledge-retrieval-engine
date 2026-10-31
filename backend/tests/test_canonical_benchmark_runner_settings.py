@@ -14,8 +14,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from config import settings
+from ingestion.parse_service import generate_deterministic_doc_id
 from scripts.run_canonical_60_benchmark import (
     get_reranker_policy,
+    resolve_ground_truth_chunk_ids,
     run_benchmark,
     settings as runner_settings,
 )
@@ -183,3 +185,128 @@ def test_run_benchmark_unmodified_when_flags_none(tmp_path: Path):
     assert captured.get("okf") is True
     assert settings.PAGEINDEX_ENABLED is True
     assert settings.OKF_ENABLED is True
+
+
+def test_resolve_ground_truth_chunk_ids_with_workspace_scoped_doc_ids():
+    """Verify locator resolution succeeds with workspace-scoped deterministic doc IDs."""
+    ws = "ws_test_scoped_001"
+    filename = "sample.pdf"
+    scoped_did = generate_deterministic_doc_id(filename, ws)
+    stale_static_did = "stale-static-uuid-1111"
+
+    chunk_match = MagicMock(id="c1", document_id=scoped_did, page_number=2, location_reference="Page 2")
+    chunk_other = MagicMock(id="c2", document_id=scoped_did, page_number=5, location_reference="Page 5")
+    chunks = [chunk_match, chunk_other]
+
+    gt_data = {
+        "Q_test": {
+            "question_type": "retrieval",
+            "relevant_evidence": [
+                {
+                    "source_filename": filename,
+                    "locator_type": "pdf_page",
+                    "locator": "2",
+                }
+            ],
+        }
+    }
+
+    # Case A: Mapping contains only stale static ID -> unscorable
+    stale_map = {stale_static_did: filename}
+    resolved, unscorable = resolve_ground_truth_chunk_ids(gt_data, chunks, stale_map)
+    assert "Q_test" in unscorable
+    assert len(resolved["Q_test"]) == 0
+
+    # Case B: Mapping contains scoped deterministic doc ID -> successfully resolved
+    scoped_map = {scoped_did: filename}
+    resolved, unscorable = resolve_ground_truth_chunk_ids(gt_data, chunks, scoped_map)
+    assert len(unscorable) == 0
+    assert resolved["Q_test"] == {"c1"}
+
+
+def test_run_benchmark_resolves_workspace_scoped_documents_offline(tmp_path: Path):
+    """Verify run_benchmark successfully resolves locators in non-default workspaces."""
+    ws = "ws_custom_benchmark_0002"
+    filename = "doc1.pdf"
+    scoped_did = generate_deterministic_doc_id(filename, ws)
+
+    dummy_suite = {
+        "test_suite_name": "dummy_workspace_scoped_test",
+        "documents": [{"doc_id": "historical-static-id", "filename": filename}],
+        "questions": [
+            {
+                "id": "q1",
+                "category": "factual",
+                "question": "What is the answer?",
+                "expected_answer": "100",
+            }
+        ],
+    }
+    suite_file = tmp_path / "test_suite.json"
+    suite_file.write_text(json.dumps(dummy_suite), encoding="utf-8")
+
+    dummy_gt = {
+        "q1": {
+            "question_type": "retrieval",
+            "relevant_evidence": [
+                {
+                    "source_filename": filename,
+                    "locator_type": "pdf_page",
+                    "locator": "1",
+                }
+            ],
+            "answer_contract": {"contract_type": "semantic"},
+        }
+    }
+    gt_file = tmp_path / "ground_truth.json"
+    gt_file.write_text(json.dumps(dummy_gt), encoding="utf-8")
+
+    mock_service_instance = MagicMock()
+    mock_service_instance.execute_query.return_value = {
+        "answer": "100",
+        "cached": False,
+        "status": "success",
+        "citations": [],
+        "retrieval_candidates": {"reranked": [], "compressed_context": [], "llm_citations": []},
+        "reranked_chunk_ids": [],
+        "compressed_context_chunk_ids": [],
+        "llm_cited_chunk_ids": [],
+        "final_citation_chunk_ids": [],
+        "executed_path": "fast",
+        "planned_path": "fast",
+        "reranker_mode": "remote_success",
+        "bedrock_embedding_calls": 0,
+        "bge_lambda_calls": 1,
+        "reranker_remote_calls": 0,
+        "generation_calls": 0,
+    }
+
+    mock_repo_instance = MagicMock()
+    mock_repo_instance.get_all_chunks.return_value = [
+        MagicMock(id="c_page_1", document_id=scoped_did, page_number=1, location_reference="Page 1")
+    ]
+    mock_repo_instance.get_workspace_documents.return_value = {
+        "documents": [{"id": scoped_did, "filename": filename}]
+    }
+
+    with patch("scripts.run_canonical_60_benchmark.verify_live_providers"), \
+         patch("db.table_store.get_shared_table_store", return_value=MagicMock()), \
+         patch("scripts.run_canonical_60_benchmark.compute_corpus_manifest_hash", return_value=("hash456", {filename: "h1"})), \
+         patch("scripts.run_canonical_60_benchmark.QueryRepository", return_value=mock_repo_instance), \
+         patch("scripts.run_canonical_60_benchmark.QueryService", return_value=mock_service_instance), \
+         patch("scripts.run_canonical_60_benchmark.GROUND_TRUTH_FILE", gt_file), \
+         patch("scripts.run_canonical_60_benchmark.ROOT_DIR", tmp_path), \
+         patch("scripts.run_canonical_60_benchmark.BACKEND_DIR", tmp_path):
+
+        manifest = run_benchmark(
+            workspace_id=ws,
+            allow_dirty=True,
+            test_path="test_suite.json",
+            page_index=False,
+            okf=False,
+        )
+
+    assert manifest["workspace_id"] == ws
+    assert manifest["total_questions"] == 1
+    assert manifest["denominators"]["answerable_retrieval_questions"] == 1
+
