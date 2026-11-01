@@ -491,11 +491,11 @@ def test_workspace_isolation_budget_ledger():
 
 
 # -----------------------------------------------------------------------------
-# 8. Throttling Retry within Active Lease
+# 8. Throttling Retry with Separate Durable Reservation & Two-Call Ceiling
 # -----------------------------------------------------------------------------
 
 def test_throttling_retry_within_lease():
-    """Verify HTTP 429 throttling retry uses the same reservation slot within active lease."""
+    """Verify HTTP 429 throttling retry makes a separate atomic durable reservation and preserves two-call ceiling."""
     repo = InMemoryOkfRepository()
     ws = "ws_retry"
     doc = "doc_ret"
@@ -520,11 +520,128 @@ def test_throttling_retry_within_lease():
         manifest = builder.extract_and_persist(ws, doc, ver, "pdf", [ch])
 
     assert len(manifest.assertions) == 1
-    # Total model calls reserved should be 1 (retry stayed within the same reservation permit)
+    # Both attempt 0 and attempt 1 must each have an atomic durable reservation:
     ledger = repo.get_budget_ledger(ws, doc, ver)
     assert ledger is not None
-    assert ledger.reserved_calls == 1
+    assert ledger.reserved_calls == 2
     assert ledger.completed_calls == 1
+
+    # Exactly 2 actual provider dispatches occurred
+    assert mock_bedrock.converse.call_count == 2
+
+    # A separate process or worker trying to reserve the same document version is DENIED
+    other_res = repo.reserve_extraction_budget(
+        workspace_id=ws,
+        document_id=doc,
+        document_version=ver,
+        worker_id="worker_other",
+        estimated_prompt_tokens=200,
+        max_output_tokens=100,
+        max_calls=2,
+    )
+    assert other_res.granted is False
+    assert other_res.reason == "calls_exhausted"
+
+
+def test_duplicate_reconciliation_is_idempotent(tmp_path: Path):
+    """Verify that calling reconcile_extraction_budget multiple times with the same fence_token is idempotent."""
+    for repo in [InMemoryOkfRepository(), SQLiteOkfRepository(db_path=str(tmp_path / "dup.db"))]:
+        ws, doc, ver = "ws_dup", "doc_dup", "v1"
+        res = repo.reserve_extraction_budget(ws, doc, ver, "worker_1", 500, 300)
+        assert res.granted is True
+
+        # First reconciliation
+        rec1 = repo.reconcile_extraction_budget(ws, doc, ver, "worker_1", res.fence_token, 400, 100)
+        assert rec1.reconciled is True
+        assert rec1.fenced_out is False
+        assert rec1.ledger.completed_calls == 1
+        assert rec1.ledger.spent_tokens == 500
+
+        # Second (duplicate) reconciliation with identical fence_token
+        rec2 = repo.reconcile_extraction_budget(ws, doc, ver, "worker_1", res.fence_token, 400, 100)
+        assert rec2.reconciled is True
+        assert rec2.fenced_out is False
+        assert rec2.reason == "already_reconciled"
+        # Completed calls and spent tokens must NOT be double-counted!
+        assert rec2.ledger.completed_calls == 1
+        assert rec2.ledger.spent_tokens == 500
+
+
+def test_stale_worker_duplicate_reconciliation_is_idempotent(tmp_path: Path):
+    """Verify that a fenced-out stale worker reconciling multiple times does not double-count tokens."""
+    for repo in [InMemoryOkfRepository(), SQLiteOkfRepository(db_path=str(tmp_path / "stale_dup.db"))]:
+        ws, doc, ver = "ws_stale_dup", "doc_stale_dup", "v1"
+        res1 = repo.reserve_extraction_budget(ws, doc, ver, "worker_1", 500, 300, lease_duration_s=0.01)
+        time.sleep(0.02)
+        # Worker 2 supersedes
+        res2 = repo.reserve_extraction_budget(ws, doc, ver, "worker_2", 500, 300)
+        assert res2.granted is True
+
+        # Worker 1 returns late (first time)
+        rec1 = repo.reconcile_extraction_budget(ws, doc, ver, "worker_1", res1.fence_token, 400, 100)
+        assert rec1.fenced_out is True
+        assert rec1.ledger.spent_tokens == 500
+
+        # Worker 1 duplicate reconciliation call (second time)
+        rec2 = repo.reconcile_extraction_budget(ws, doc, ver, "worker_1", res1.fence_token, 400, 100)
+        # Spent tokens must NOT add 500 again!
+        assert rec2.ledger.spent_tokens == 500
+
+
+def test_separate_processes_throttling_retry_contention_sqlite(tmp_path: Path):
+    """LIVE OS PROCESS EVIDENCE:
+    Verify that when worker 1 retries after 429 and worker 2 concurrently attempts reservation,
+    the durable ledger enforces exactly 2 dispatches and denies worker 2 on disk.
+    """
+    db_file = tmp_path / "retry_contention.db"
+    repo = SQLiteOkfRepository(db_path=str(db_file))
+    ws, doc, ver = "ws_retry_proc", "doc_rp", "v1"
+
+    # Worker 1 attempt 0
+    res1 = repo.reserve_extraction_budget(ws, doc, ver, worker_id="worker_1", estimated_prompt_tokens=500, max_output_tokens=300)
+    assert res1.granted is True
+    assert res1.call_number == 1
+    assert res1.fence_token == 1
+
+    # Worker 1 attempt 1 (retry) makes separate durable reservation
+    res2 = repo.reserve_extraction_budget(ws, doc, ver, worker_id="worker_1", estimated_prompt_tokens=500, max_output_tokens=300)
+    assert res2.granted is True
+    assert res2.call_number == 2
+    assert res2.fence_token == 2
+
+    # Worker 2 attempts reservation in a separate process
+    manager = multiprocessing.Manager()
+    results = manager.dict()
+    p = multiprocessing.Process(
+        target=_worker_reserve_sqlite,
+        args=(str(db_file), ws, doc, ver, "worker_2", results),
+    )
+    p.start()
+    p.join(timeout=5.0)
+
+    # Worker 2 MUST be denied on disk
+    w2_res = results.get("worker_2")
+    assert w2_res is not None
+    assert w2_res["granted"] is False
+    assert w2_res["reason"] == "calls_exhausted"
+
+
+def test_storage_reservation_failure_zero_dispatches():
+    """Verify that if repository reservation fails, zero provider calls are dispatched and baseline is preserved."""
+    repo = InMemoryOkfRepository()
+    ws, doc, ver = "ws_stor_fail", "doc_sf", "v1"
+
+    mock_bedrock = MagicMock()
+    ch = Chunk(id="c1", document_id=doc, source_format="pdf", text="Text", page_number=1, element_type="paragraph")
+    builder = OkfBuilder(repo=repo, bedrock_client=mock_bedrock)
+
+    with patch.object(repo, "reserve_extraction_budget", return_value=ExtractionReservationResult(granted=False, reason="storage_error")):
+        manifest = builder.extract_and_persist(ws, doc, ver, "pdf", [ch])
+
+    # Zero converse calls must be made
+    mock_bedrock.converse.assert_not_called()
+    assert manifest.status == "failed"
+    assert len(manifest.assertions) == 0
 
 
 # -----------------------------------------------------------------------------
@@ -579,11 +696,11 @@ def test_authoritative_request_token_count_failure_fails_closed():
 
 def test_dynamodb_repository_budget_ledger_stubbed():
     """MOCKED EVIDENCE (DynamoDB Stubbed Integration):
-    Proves DynamoDBOkfRepository executes correct update_item expressions and condition handling.
+    Proves DynamoDBOkfRepository executes correct update_item expressions and condition handling via Stubber.
+    NOTE: This is mocked test evidence using botocore Stubber, and does not prove live AWS cloud behavior.
     """
     import boto3
     client = boto3.client("dynamodb", region_name="us-east-1")
-    stubber = Stubber(client)
 
     repo = DynamoDBOkfRepository(table_name="kre_okf_facts")
     repo._client = client
@@ -601,6 +718,7 @@ def test_dynamodb_repository_budget_ledger_stubbed():
             "lease_owner_id": "worker_stub",
             "lease_expires_at": int(time.time() + 15),
             "fence_token": 1,
+            "reconciled_fences": [],
             "status": "active",
             "updated_at": "2026-11-01T12:00:00Z",
         }

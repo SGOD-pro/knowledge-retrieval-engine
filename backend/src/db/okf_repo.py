@@ -437,15 +437,6 @@ class InMemoryOkfRepository:
                         reason="already_exhausted",
                         ledger=ledger,
                     )
-                if ledger.lease_expires_at > now and ledger.lease_owner_id != worker_id:
-                    return ExtractionReservationResult(
-                        granted=False,
-                        fence_token=ledger.fence_token,
-                        call_number=ledger.reserved_calls,
-                        remaining_calls=max(0, max_calls - ledger.reserved_calls),
-                        reason="active_lease_held",
-                        ledger=ledger,
-                    )
                 if ledger.reserved_calls >= max_calls:
                     updated = OkfBudgetLedger(
                         workspace_id=workspace_id,
@@ -458,6 +449,7 @@ class InMemoryOkfRepository:
                         lease_owner_id=ledger.lease_owner_id,
                         lease_expires_at=ledger.lease_expires_at,
                         fence_token=ledger.fence_token,
+                        reconciled_fences=ledger.reconciled_fences,
                         status="exhausted",
                         updated_at=_now_utc(),
                     )
@@ -482,6 +474,7 @@ class InMemoryOkfRepository:
                         lease_owner_id=ledger.lease_owner_id,
                         lease_expires_at=ledger.lease_expires_at,
                         fence_token=ledger.fence_token,
+                        reconciled_fences=ledger.reconciled_fences,
                         status="exhausted",
                         updated_at=_now_utc(),
                     )
@@ -493,6 +486,15 @@ class InMemoryOkfRepository:
                         remaining_calls=0,
                         reason="tokens_exhausted",
                         ledger=updated,
+                    )
+                if ledger.lease_expires_at > now and ledger.lease_owner_id != worker_id:
+                    return ExtractionReservationResult(
+                        granted=False,
+                        fence_token=ledger.fence_token,
+                        call_number=ledger.reserved_calls,
+                        remaining_calls=max(0, max_calls - ledger.reserved_calls),
+                        reason="active_lease_held",
+                        ledger=ledger,
                     )
 
                 new_calls = ledger.reserved_calls + 1
@@ -509,6 +511,7 @@ class InMemoryOkfRepository:
                     lease_owner_id=worker_id,
                     lease_expires_at=now + lease_duration_s,
                     fence_token=new_fence,
+                    reconciled_fences=ledger.reconciled_fences,
                     status="active",
                     updated_at=_now_utc(),
                 )
@@ -533,6 +536,7 @@ class InMemoryOkfRepository:
                     lease_owner_id=worker_id,
                     lease_expires_at=now + lease_duration_s,
                     fence_token=1,
+                    reconciled_fences=(),
                     status="active",
                     updated_at=_now_utc(),
                 )
@@ -567,10 +571,18 @@ class InMemoryOkfRepository:
                     reason="not_found",
                     ledger=None,
                 )
+            if fence_token in ledger.reconciled_fences:
+                return ExtractionReconciliationResult(
+                    reconciled=True,
+                    fenced_out=False,
+                    reason="already_reconciled",
+                    ledger=ledger,
+                )
             now = time.time()
             actual_total = actual_prompt_tokens + actual_output_tokens
 
             if ledger.fence_token != fence_token or ledger.lease_owner_id != worker_id or ledger.lease_expires_at < now:
+                new_reconciled = ledger.reconciled_fences + (fence_token,)
                 updated_spent = ledger.spent_tokens + actual_total
                 stale_status = "exhausted" if ledger.reserved_calls >= 2 else ledger.status
                 fenced_ledger = OkfBudgetLedger(
@@ -584,6 +596,7 @@ class InMemoryOkfRepository:
                     lease_owner_id=ledger.lease_owner_id if ledger.fence_token != fence_token else None,
                     lease_expires_at=ledger.lease_expires_at if ledger.fence_token != fence_token else 0.0,
                     fence_token=ledger.fence_token,
+                    reconciled_fences=new_reconciled,
                     status=stale_status,
                     updated_at=_now_utc(),
                 )
@@ -597,6 +610,7 @@ class InMemoryOkfRepository:
 
             new_completed = ledger.completed_calls + 1
             new_spent = ledger.spent_tokens + actual_total
+            new_reconciled = ledger.reconciled_fences + (fence_token,)
             reconciled_ledger = OkfBudgetLedger(
                 workspace_id=workspace_id,
                 document_id=document_id,
@@ -608,6 +622,7 @@ class InMemoryOkfRepository:
                 lease_owner_id=None,
                 lease_expires_at=0.0,
                 fence_token=ledger.fence_token,
+                reconciled_fences=new_reconciled,
                 status=status,
                 updated_at=_now_utc(),
             )
@@ -635,8 +650,11 @@ class InMemoryOkfRepository:
             ledger = self._ledgers.get(key)
             if ledger is None:
                 return
+            if fence_token in ledger.reconciled_fences:
+                return
             actual_spent = prompt_tokens_spent + output_tokens_spent
             new_spent = ledger.spent_tokens + actual_spent
+            new_reconciled = ledger.reconciled_fences + (fence_token,)
             new_status = "exhausted" if ledger.reserved_calls >= 2 else ledger.status
             lease_owner = None if ledger.lease_owner_id == worker_id else ledger.lease_owner_id
             lease_exp = 0.0 if ledger.lease_owner_id == worker_id else ledger.lease_expires_at
@@ -651,6 +669,7 @@ class InMemoryOkfRepository:
                 lease_owner_id=lease_owner,
                 lease_expires_at=lease_exp,
                 fence_token=ledger.fence_token,
+                reconciled_fences=new_reconciled,
                 status=new_status,
                 updated_at=_now_utc(),
             )
@@ -1022,15 +1041,6 @@ class SQLiteOkfRepository:
                             reason="already_exhausted",
                             ledger=ledger,
                         )
-                    if ledger.lease_expires_at > now and ledger.lease_owner_id != worker_id:
-                        return ExtractionReservationResult(
-                            granted=False,
-                            fence_token=ledger.fence_token,
-                            call_number=ledger.reserved_calls,
-                            remaining_calls=max(0, max_calls - ledger.reserved_calls),
-                            reason="active_lease_held",
-                            ledger=ledger,
-                        )
                     if ledger.reserved_calls >= max_calls:
                         updated = OkfBudgetLedger(
                             workspace_id=workspace_id,
@@ -1043,6 +1053,7 @@ class SQLiteOkfRepository:
                             lease_owner_id=ledger.lease_owner_id,
                             lease_expires_at=ledger.lease_expires_at,
                             fence_token=ledger.fence_token,
+                            reconciled_fences=ledger.reconciled_fences,
                             status="exhausted",
                             updated_at=_now_utc(),
                         )
@@ -1081,6 +1092,7 @@ class SQLiteOkfRepository:
                             lease_owner_id=ledger.lease_owner_id,
                             lease_expires_at=ledger.lease_expires_at,
                             fence_token=ledger.fence_token,
+                            reconciled_fences=ledger.reconciled_fences,
                             status="exhausted",
                             updated_at=_now_utc(),
                         )
@@ -1107,6 +1119,15 @@ class SQLiteOkfRepository:
                             reason="tokens_exhausted",
                             ledger=updated,
                         )
+                    if ledger.lease_expires_at > now and ledger.lease_owner_id != worker_id:
+                        return ExtractionReservationResult(
+                            granted=False,
+                            fence_token=ledger.fence_token,
+                            call_number=ledger.reserved_calls,
+                            remaining_calls=max(0, max_calls - ledger.reserved_calls),
+                            reason="active_lease_held",
+                            ledger=ledger,
+                        )
 
                     new_calls = ledger.reserved_calls + 1
                     new_fence = ledger.fence_token + 1
@@ -1122,6 +1143,7 @@ class SQLiteOkfRepository:
                         lease_owner_id=worker_id,
                         lease_expires_at=now + lease_duration_s,
                         fence_token=new_fence,
+                        reconciled_fences=ledger.reconciled_fences,
                         status="active",
                         updated_at=_now_utc(),
                     )
@@ -1160,6 +1182,7 @@ class SQLiteOkfRepository:
                         lease_owner_id=worker_id,
                         lease_expires_at=now + lease_duration_s,
                         fence_token=1,
+                        reconciled_fences=(),
                         status="active",
                         updated_at=_now_utc(),
                     )
@@ -1215,10 +1238,18 @@ class SQLiteOkfRepository:
                         ledger=None,
                     )
                 ledger = OkfBudgetLedger(**json.loads(row["data_json"]))
+                if fence_token in ledger.reconciled_fences:
+                    return ExtractionReconciliationResult(
+                        reconciled=True,
+                        fenced_out=False,
+                        reason="already_reconciled",
+                        ledger=ledger,
+                    )
                 now = time.time()
                 actual_total = actual_prompt_tokens + actual_output_tokens
 
                 if ledger.fence_token != fence_token or ledger.lease_owner_id != worker_id or ledger.lease_expires_at < now:
+                    new_reconciled = ledger.reconciled_fences + (fence_token,)
                     updated_spent = ledger.spent_tokens + actual_total
                     stale_status = "exhausted" if ledger.reserved_calls >= 2 else ledger.status
                     fenced_ledger = OkfBudgetLedger(
@@ -1232,6 +1263,7 @@ class SQLiteOkfRepository:
                         lease_owner_id=ledger.lease_owner_id if ledger.fence_token != fence_token else None,
                         lease_expires_at=ledger.lease_expires_at if ledger.fence_token != fence_token else 0.0,
                         fence_token=ledger.fence_token,
+                        reconciled_fences=new_reconciled,
                         status=stale_status,
                         updated_at=_now_utc(),
                     )
@@ -1259,6 +1291,7 @@ class SQLiteOkfRepository:
 
                 new_completed = ledger.completed_calls + 1
                 new_spent = ledger.spent_tokens + actual_total
+                new_reconciled = ledger.reconciled_fences + (fence_token,)
                 reconciled_ledger = OkfBudgetLedger(
                     workspace_id=workspace_id,
                     document_id=document_id,
@@ -1270,6 +1303,7 @@ class SQLiteOkfRepository:
                     lease_owner_id=None,
                     lease_expires_at=0.0,
                     fence_token=ledger.fence_token,
+                    reconciled_fences=new_reconciled,
                     status=status,
                     updated_at=_now_utc(),
                 )
@@ -1318,8 +1352,11 @@ class SQLiteOkfRepository:
                 if not row:
                     return
                 ledger = OkfBudgetLedger(**json.loads(row["data_json"]))
+                if fence_token in ledger.reconciled_fences:
+                    return
                 actual_spent = prompt_tokens_spent + output_tokens_spent
                 new_spent = ledger.spent_tokens + actual_spent
+                new_reconciled = ledger.reconciled_fences + (fence_token,)
                 new_status = "exhausted" if ledger.reserved_calls >= 2 else ledger.status
                 lease_owner = None if ledger.lease_owner_id == worker_id else ledger.lease_owner_id
                 lease_exp = 0.0 if ledger.lease_owner_id == worker_id else ledger.lease_expires_at
@@ -1334,6 +1371,7 @@ class SQLiteOkfRepository:
                     lease_owner_id=lease_owner,
                     lease_expires_at=lease_exp,
                     fence_token=ledger.fence_token,
+                    reconciled_fences=new_reconciled,
                     status=new_status,
                     updated_at=_now_utc(),
                 )
@@ -1755,6 +1793,8 @@ class DynamoDBOkfRepository:
                 ReturnValues="ALL_NEW",
             )
             attrs = resp.get("Attributes", {})
+            raw_rf = attrs.get("reconciled_fences", [])
+            reconciled_fences = tuple(int(x) for x in raw_rf) if raw_rf else ()
             ledger = OkfBudgetLedger(
                 workspace_id=workspace_id,
                 document_id=document_id,
@@ -1766,6 +1806,7 @@ class DynamoDBOkfRepository:
                 lease_owner_id=attrs.get("lease_owner_id"),
                 lease_expires_at=float(attrs.get("lease_expires_at", 0.0)),
                 fence_token=int(attrs.get("fence_token", 1)),
+                reconciled_fences=reconciled_fences,
                 status=attrs.get("status", "active"),
                 updated_at=attrs.get("updated_at", _now_utc()),
             )
@@ -1792,12 +1833,12 @@ class DynamoDBOkfRepository:
                         reason = "already_completed"
                     elif curr.status == "exhausted":
                         reason = "already_exhausted"
-                    elif curr.lease_expires_at > now and curr.lease_owner_id != worker_id:
-                        reason = "active_lease_held"
                     elif curr.reserved_calls >= max_calls:
                         reason = "calls_exhausted"
                     elif curr.spent_tokens + est_tokens > max_total_tokens:
                         reason = "tokens_exhausted"
+                    elif curr.lease_expires_at > now and curr.lease_owner_id != worker_id:
+                        reason = "active_lease_held"
                     else:
                         reason = "calls_exhausted"
                     return ExtractionReservationResult(
@@ -1832,6 +1873,15 @@ class DynamoDBOkfRepository:
         actual_total = actual_prompt_tokens + actual_output_tokens
         now = time.time()
 
+        curr = self.get_budget_ledger(workspace_id, document_id, document_version, consistent_read=True)
+        if curr is not None and fence_token in curr.reconciled_fences:
+            return ExtractionReconciliationResult(
+                reconciled=True,
+                fenced_out=False,
+                reason="already_reconciled",
+                ledger=curr,
+            )
+
         try:
             resp = table.update_item(
                 Key={"PK": pk, "SK": sk},
@@ -1840,6 +1890,7 @@ class DynamoDBOkfRepository:
                     "#spent = #spent + :actual_tokens, "
                     "#lexp = :zero, "
                     "#st = :new_status, "
+                    "#rf = list_append(if_not_exists(#rf, :empty_list), :ft_list), "
                     "updated_at = :now_iso"
                 ),
                 ConditionExpression="#ft = :expected_ft AND #lown = :wid AND #lexp >= :now",
@@ -1850,6 +1901,7 @@ class DynamoDBOkfRepository:
                     "#st": "status",
                     "#ft": "fence_token",
                     "#lown": "lease_owner_id",
+                    "#rf": "reconciled_fences",
                 },
                 ExpressionAttributeValues={
                     ":one": 1,
@@ -1859,11 +1911,15 @@ class DynamoDBOkfRepository:
                     ":expected_ft": fence_token,
                     ":wid": worker_id,
                     ":now": int(now),
+                    ":empty_list": [],
+                    ":ft_list": [fence_token],
                     ":now_iso": _now_utc(),
                 },
                 ReturnValues="ALL_NEW",
             )
             attrs = resp.get("Attributes", {})
+            raw_rf = attrs.get("reconciled_fences", [])
+            reconciled_fences = tuple(int(x) for x in raw_rf) if raw_rf else ()
             ledger = OkfBudgetLedger(
                 workspace_id=workspace_id,
                 document_id=document_id,
@@ -1875,6 +1931,7 @@ class DynamoDBOkfRepository:
                 lease_owner_id=attrs.get("lease_owner_id"),
                 lease_expires_at=float(attrs.get("lease_expires_at", 0.0)),
                 fence_token=int(attrs.get("fence_token", 0)),
+                reconciled_fences=reconciled_fences,
                 status=attrs.get("status", status),
                 updated_at=attrs.get("updated_at", _now_utc()),
             )
@@ -1893,13 +1950,23 @@ class DynamoDBOkfRepository:
                 is_cond = True
 
             if is_cond:
+                curr = self.get_budget_ledger(workspace_id, document_id, document_version, consistent_read=True)
+                if curr is not None and fence_token in curr.reconciled_fences:
+                    return ExtractionReconciliationResult(
+                        reconciled=True,
+                        fenced_out=False,
+                        reason="already_reconciled",
+                        ledger=curr,
+                    )
                 try:
                     table.update_item(
                         Key={"PK": pk, "SK": sk},
-                        UpdateExpression="SET #spent = #spent + :actual_tokens, updated_at = :now_iso",
-                        ExpressionAttributeNames={"#spent": "spent_tokens"},
+                        UpdateExpression="SET #spent = #spent + :actual_tokens, #rf = list_append(if_not_exists(#rf, :empty_list), :ft_list), updated_at = :now_iso",
+                        ExpressionAttributeNames={"#spent": "spent_tokens", "#rf": "reconciled_fences"},
                         ExpressionAttributeValues={
                             ":actual_tokens": actual_total,
+                            ":empty_list": [],
+                            ":ft_list": [fence_token],
                             ":now_iso": _now_utc(),
                         },
                     )
@@ -1936,21 +2003,29 @@ class DynamoDBOkfRepository:
         sk = f"BUDGET#DOC#{document_id}#VER#{document_version}"
         actual_spent = prompt_tokens_spent + output_tokens_spent
 
+        curr = self.get_budget_ledger(workspace_id, document_id, document_version, consistent_read=True)
+        if curr is not None and fence_token in curr.reconciled_fences:
+            return
+
         try:
             table.update_item(
                 Key={"PK": pk, "SK": sk},
                 UpdateExpression=(
                     "SET #spent = #spent + :spent, "
                     "#lexp = :zero, "
+                    "#rf = list_append(if_not_exists(#rf, :empty_list), :ft_list), "
                     "updated_at = :now_iso"
                 ),
                 ExpressionAttributeNames={
                     "#spent": "spent_tokens",
                     "#lexp": "lease_expires_at",
+                    "#rf": "reconciled_fences",
                 },
                 ExpressionAttributeValues={
                     ":spent": actual_spent,
                     ":zero": 0,
+                    ":empty_list": [],
+                    ":ft_list": [fence_token],
                     ":now_iso": _now_utc(),
                 },
             )
@@ -1976,6 +2051,8 @@ class DynamoDBOkfRepository:
             item = resp.get("Item")
             if not item:
                 return None
+            raw_rf = item.get("reconciled_fences", [])
+            reconciled_fences = tuple(int(x) for x in raw_rf) if raw_rf else ()
             return OkfBudgetLedger(
                 workspace_id=workspace_id,
                 document_id=document_id,
@@ -1987,6 +2064,7 @@ class DynamoDBOkfRepository:
                 lease_owner_id=item.get("lease_owner_id"),
                 lease_expires_at=float(item.get("lease_expires_at", 0.0)),
                 fence_token=int(item.get("fence_token", 0)),
+                reconciled_fences=reconciled_fences,
                 status=item.get("status", "active"),
                 updated_at=item.get("updated_at", _now_utc()),
             )

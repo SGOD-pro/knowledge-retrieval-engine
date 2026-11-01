@@ -145,6 +145,7 @@ class OkfBudgetLedger(BaseModel):
     lease_owner_id: str | None = Field(default=None, max_length=128)
     lease_expires_at: float = Field(default=0.0, ge=0.0)
     fence_token: int = Field(default=0, ge=0)
+    reconciled_fences: tuple[int, ...] = Field(default_factory=tuple)
     status: Literal["active", "completed", "exhausted", "failed"] = "active"
     updated_at: str
 
@@ -175,7 +176,7 @@ class ExtractionReconciliationResult(BaseModel):
 
     reconciled: bool
     fenced_out: bool = False
-    reason: Literal["reconciled", "fenced_out", "not_found", "storage_error"]
+    reason: Literal["reconciled", "already_reconciled", "fenced_out", "not_found", "storage_error"]
     ledger: OkfBudgetLedger | None = None
 
 

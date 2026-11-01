@@ -876,6 +876,8 @@ class OkfBuilder:
     ) -> None:
         self.repo = repo or get_okf_repo()
         self._bedrock_client = bedrock_client
+        if self._bedrock_client is not None:
+            disable_client_retries(self._bedrock_client)
         self.provider_controller = provider_controller or get_okf_provider_controller()
         self.worker_id = worker_id or f"worker_{os.getpid()}_{uuid.uuid4().hex[:8]}"
 
@@ -1522,33 +1524,32 @@ class OkfBuilder:
             logger.warning("Bedrock OKF call rejected: %s", budget.exhaustion_reason)
             return "", {"input_tokens": 0, "output_tokens": 0}
 
-        # Atomically reserve call permit and token allowance on durable repository ledger
-        ver = getattr(budget, "document_version", "v1")
-        reservation_fence = 0
-        if hasattr(self.repo, "reserve_extraction_budget"):
-            durable_res = self.repo.reserve_extraction_budget(
-                workspace_id=workspace_id,
-                document_id=document_id,
-                document_version=ver,
-                worker_id=getattr(self, "worker_id", f"worker_{os.getpid()}"),
-                estimated_prompt_tokens=estimated_prompt_tokens,
-                max_output_tokens=max_output_tokens,
-                max_calls=budget.max_calls,
-                max_total_tokens=budget.max_input_tokens + budget.max_output_tokens,
-                lease_duration_s=15.0,
-            )
-            if not durable_res.granted:
-                budget.exhausted = True
-                budget.exhaustion_reason = durable_res.reason
-                logger.warning(
-                    "okf_builder.durable_reservation_denied ws=%s doc=%s ver=%s reason=%s",
-                    workspace_id, document_id, ver, durable_res.reason,
-                )
-                return "", {"input_tokens": 0, "output_tokens": 0}
-            reservation_fence = durable_res.fence_token
-
         # Test environment fallback
         if client is None:
+            ver = getattr(budget, "document_version", "v1")
+            reservation_fence = 0
+            if hasattr(self.repo, "reserve_extraction_budget"):
+                durable_res = self.repo.reserve_extraction_budget(
+                    workspace_id=workspace_id,
+                    document_id=document_id,
+                    document_version=ver,
+                    worker_id=getattr(self, "worker_id", f"worker_{os.getpid()}"),
+                    estimated_prompt_tokens=estimated_prompt_tokens,
+                    max_output_tokens=max_output_tokens,
+                    max_calls=budget.max_calls,
+                    max_total_tokens=budget.max_input_tokens + budget.max_output_tokens,
+                    lease_duration_s=15.0,
+                )
+                if not durable_res.granted:
+                    budget.exhausted = True
+                    budget.exhaustion_reason = durable_res.reason
+                    logger.warning(
+                        "okf_builder.durable_reservation_denied ws=%s doc=%s ver=%s reason=%s",
+                        workspace_id, document_id, ver, durable_res.reason,
+                    )
+                    return "", {"input_tokens": 0, "output_tokens": 0}
+                reservation_fence = durable_res.fence_token
+
             if not budget.reserve_call(estimated_prompt_tokens, max_output_tokens):
                 logger.warning(
                     "okf_builder.test_mode_budget_exhausted calls=%d reason=%s",
@@ -1581,16 +1582,6 @@ class OkfBuilder:
                     "okf_builder.call_budget_exceeded attempt=%d reason=%s",
                     attempt, budget.exhaustion_reason,
                 )
-                if hasattr(self.repo, "fail_extraction_budget"):
-                    self.repo.fail_extraction_budget(
-                        workspace_id=workspace_id,
-                        document_id=document_id,
-                        document_version=ver,
-                        worker_id=getattr(self, "worker_id", f"worker_{os.getpid()}"),
-                        fence_token=reservation_fence,
-                        error_reason=budget.exhaustion_reason,
-                        prompt_tokens_spent=estimated_prompt_tokens,
-                    )
                 return "", {"input_tokens": 0, "output_tokens": 0}
 
             if not budget.reserve_call(estimated_prompt_tokens, max_output_tokens):
@@ -1598,17 +1589,33 @@ class OkfBuilder:
                     "okf_builder.call_budget_exceeded attempt=%d reason=%s",
                     attempt, budget.exhaustion_reason,
                 )
-                if hasattr(self.repo, "fail_extraction_budget"):
-                    self.repo.fail_extraction_budget(
-                        workspace_id=workspace_id,
-                        document_id=document_id,
-                        document_version=ver,
-                        worker_id=getattr(self, "worker_id", f"worker_{os.getpid()}"),
-                        fence_token=reservation_fence,
-                        error_reason=budget.exhaustion_reason,
-                        prompt_tokens_spent=estimated_prompt_tokens,
-                    )
                 return "", {"input_tokens": 0, "output_tokens": 0}
+
+            # Atomically reserve separate call permit and token allowance on durable repository ledger
+            # for EVERY actual dispatch attempt, including throttling retries (AC-3)
+            ver = getattr(budget, "document_version", "v1")
+            reservation_fence = 0
+            if hasattr(self.repo, "reserve_extraction_budget"):
+                durable_res = self.repo.reserve_extraction_budget(
+                    workspace_id=workspace_id,
+                    document_id=document_id,
+                    document_version=ver,
+                    worker_id=getattr(self, "worker_id", f"worker_{os.getpid()}"),
+                    estimated_prompt_tokens=estimated_prompt_tokens,
+                    max_output_tokens=max_output_tokens,
+                    max_calls=budget.max_calls,
+                    max_total_tokens=budget.max_input_tokens + budget.max_output_tokens,
+                    lease_duration_s=15.0,
+                )
+                if not durable_res.granted:
+                    budget.exhausted = True
+                    budget.exhaustion_reason = durable_res.reason
+                    logger.warning(
+                        "okf_builder.durable_reservation_denied attempt=%d ws=%s doc=%s ver=%s reason=%s",
+                        attempt, workspace_id, document_id, ver, durable_res.reason,
+                    )
+                    return "", {"input_tokens": 0, "output_tokens": 0}
+                reservation_fence = durable_res.fence_token
 
             call_timeout = max(0.001, budget.max_elapsed_s - (time.perf_counter() - budget.started_at))
             try:
