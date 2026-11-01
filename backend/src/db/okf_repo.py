@@ -7,18 +7,22 @@ Supports in-memory test storage, durable SQLite persistence, and DynamoDB.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 import logging
 import os
-from pathlib import Path
 import sqlite3
 import threading
 import time
+from pathlib import Path
 from typing import Any, Protocol, Sequence, runtime_checkable
 
 from config import settings
 from src.schemas.contracts.boundary import StorageUnavailableError
 from src.schemas.contracts.okf import (
+    ExtractionReconciliationResult,
+    ExtractionReservationResult,
+    OkfBudgetLedger,
     OkfEntityRecord,
     OkfManifest,
     OkfPropertyAssertion,
@@ -27,6 +31,10 @@ from src.schemas.contracts.okf import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _now_utc() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def create_dedicated_storage_config(connect_timeout: float = 0.030, read_timeout: float = 0.040):
@@ -138,6 +146,59 @@ class OkfRepositoryBase(Protocol):
         """Delete all entities and assertions for a document or document version."""
         ...
 
+    def reserve_extraction_budget(
+        self,
+        workspace_id: str,
+        document_id: str,
+        document_version: str,
+        worker_id: str,
+        estimated_prompt_tokens: int,
+        max_output_tokens: int = 600,
+        max_calls: int = 2,
+        max_total_tokens: int = 5200,
+        lease_duration_s: float = 15.0,
+    ) -> ExtractionReservationResult:
+        """Atomically reserve an extraction call permit and token allocation."""
+        ...
+
+    def reconcile_extraction_budget(
+        self,
+        workspace_id: str,
+        document_id: str,
+        document_version: str,
+        worker_id: str,
+        fence_token: int,
+        actual_prompt_tokens: int,
+        actual_output_tokens: int,
+        status: str = "active",
+    ) -> ExtractionReconciliationResult:
+        """Reconcile completed extraction call against durable ledger and release lease."""
+        ...
+
+    def fail_extraction_budget(
+        self,
+        workspace_id: str,
+        document_id: str,
+        document_version: str,
+        worker_id: str,
+        fence_token: int,
+        error_reason: str,
+        prompt_tokens_spent: int = 0,
+        output_tokens_spent: int = 0,
+    ) -> None:
+        """Record failed or timed out extraction call, releasing lease while retaining reservation."""
+        ...
+
+    def get_budget_ledger(
+        self,
+        workspace_id: str,
+        document_id: str,
+        document_version: str,
+        consistent_read: bool = True,
+    ) -> OkfBudgetLedger | None:
+        """Retrieve durable budget ledger using strongly consistent reads."""
+        ...
+
     def reset_fixtures(self) -> None:
         """Reset all fixtures in memory / storage."""
         ...
@@ -199,12 +260,14 @@ class InMemoryOkfRepository:
         self._entities: dict[tuple[str, str, str, str], OkfEntityRecord] = {}  # (ws, entity_id, doc_id, ver)
         self._assertions: dict[tuple[str, str, str], OkfPropertyAssertion] = {}  # (ws, entity_id, assertion_id)
         self._manifests: dict[tuple[str, str, str], OkfManifest] = {}  # (ws, doc_id, ver)
+        self._ledgers: dict[tuple[str, str, str], OkfBudgetLedger] = {}  # (ws, doc_id, ver)
 
     def reset_fixtures(self) -> None:
         with self._lock:
             self._entities.clear()
             self._assertions.clear()
             self._manifests.clear()
+            self._ledgers.clear()
 
     def save_manifest(self, workspace_id: str, manifest: OkfManifest) -> None:
         with self._lock:
@@ -332,6 +395,276 @@ class InMemoryOkfRepository:
                 k: v for k, v in self._assertions.items()
                 if not (k[0] == workspace_id and v.document_id == document_id and (document_version is None or v.document_version == document_version))
             }
+            self._ledgers = {
+                k: v for k, v in self._ledgers.items()
+                if not (k[0] == workspace_id and k[1] == document_id and (document_version is None or k[2] == document_version))
+            }
+
+    def reserve_extraction_budget(
+        self,
+        workspace_id: str,
+        document_id: str,
+        document_version: str,
+        worker_id: str,
+        estimated_prompt_tokens: int,
+        max_output_tokens: int = 600,
+        max_calls: int = 2,
+        max_total_tokens: int = 5200,
+        lease_duration_s: float = 15.0,
+    ) -> ExtractionReservationResult:
+        with self._lock:
+            key = (workspace_id, document_id, document_version)
+            ledger = self._ledgers.get(key)
+            now = time.time()
+            est_tokens = estimated_prompt_tokens + max_output_tokens
+
+            if ledger is not None:
+                if ledger.status == "completed":
+                    return ExtractionReservationResult(
+                        granted=False,
+                        fence_token=ledger.fence_token,
+                        call_number=ledger.reserved_calls,
+                        remaining_calls=0,
+                        reason="already_completed",
+                        ledger=ledger,
+                    )
+                if ledger.status == "exhausted":
+                    return ExtractionReservationResult(
+                        granted=False,
+                        fence_token=ledger.fence_token,
+                        call_number=ledger.reserved_calls,
+                        remaining_calls=0,
+                        reason="already_exhausted",
+                        ledger=ledger,
+                    )
+                if ledger.lease_expires_at > now and ledger.lease_owner_id != worker_id:
+                    return ExtractionReservationResult(
+                        granted=False,
+                        fence_token=ledger.fence_token,
+                        call_number=ledger.reserved_calls,
+                        remaining_calls=max(0, max_calls - ledger.reserved_calls),
+                        reason="active_lease_held",
+                        ledger=ledger,
+                    )
+                if ledger.reserved_calls >= max_calls:
+                    updated = OkfBudgetLedger(
+                        workspace_id=workspace_id,
+                        document_id=document_id,
+                        document_version=document_version,
+                        reserved_calls=ledger.reserved_calls,
+                        completed_calls=ledger.completed_calls,
+                        reserved_tokens=ledger.reserved_tokens,
+                        spent_tokens=ledger.spent_tokens,
+                        lease_owner_id=ledger.lease_owner_id,
+                        lease_expires_at=ledger.lease_expires_at,
+                        fence_token=ledger.fence_token,
+                        status="exhausted",
+                        updated_at=_now_utc(),
+                    )
+                    self._ledgers[key] = updated
+                    return ExtractionReservationResult(
+                        granted=False,
+                        fence_token=updated.fence_token,
+                        call_number=updated.reserved_calls,
+                        remaining_calls=0,
+                        reason="calls_exhausted",
+                        ledger=updated,
+                    )
+                if ledger.spent_tokens + est_tokens > max_total_tokens:
+                    updated = OkfBudgetLedger(
+                        workspace_id=workspace_id,
+                        document_id=document_id,
+                        document_version=document_version,
+                        reserved_calls=ledger.reserved_calls,
+                        completed_calls=ledger.completed_calls,
+                        reserved_tokens=ledger.reserved_tokens,
+                        spent_tokens=ledger.spent_tokens,
+                        lease_owner_id=ledger.lease_owner_id,
+                        lease_expires_at=ledger.lease_expires_at,
+                        fence_token=ledger.fence_token,
+                        status="exhausted",
+                        updated_at=_now_utc(),
+                    )
+                    self._ledgers[key] = updated
+                    return ExtractionReservationResult(
+                        granted=False,
+                        fence_token=updated.fence_token,
+                        call_number=updated.reserved_calls,
+                        remaining_calls=0,
+                        reason="tokens_exhausted",
+                        ledger=updated,
+                    )
+
+                new_calls = ledger.reserved_calls + 1
+                new_fence = ledger.fence_token + 1
+                new_reserved = ledger.reserved_tokens + est_tokens
+                updated = OkfBudgetLedger(
+                    workspace_id=workspace_id,
+                    document_id=document_id,
+                    document_version=document_version,
+                    reserved_calls=new_calls,
+                    completed_calls=ledger.completed_calls,
+                    reserved_tokens=new_reserved,
+                    spent_tokens=ledger.spent_tokens,
+                    lease_owner_id=worker_id,
+                    lease_expires_at=now + lease_duration_s,
+                    fence_token=new_fence,
+                    status="active",
+                    updated_at=_now_utc(),
+                )
+                self._ledgers[key] = updated
+                return ExtractionReservationResult(
+                    granted=True,
+                    fence_token=new_fence,
+                    call_number=new_calls,
+                    remaining_calls=max_calls - new_calls,
+                    reason="granted",
+                    ledger=updated,
+                )
+            else:
+                new_ledger = OkfBudgetLedger(
+                    workspace_id=workspace_id,
+                    document_id=document_id,
+                    document_version=document_version,
+                    reserved_calls=1,
+                    completed_calls=0,
+                    reserved_tokens=est_tokens,
+                    spent_tokens=0,
+                    lease_owner_id=worker_id,
+                    lease_expires_at=now + lease_duration_s,
+                    fence_token=1,
+                    status="active",
+                    updated_at=_now_utc(),
+                )
+                self._ledgers[key] = new_ledger
+                return ExtractionReservationResult(
+                    granted=True,
+                    fence_token=1,
+                    call_number=1,
+                    remaining_calls=max_calls - 1,
+                    reason="granted",
+                    ledger=new_ledger,
+                )
+
+    def reconcile_extraction_budget(
+        self,
+        workspace_id: str,
+        document_id: str,
+        document_version: str,
+        worker_id: str,
+        fence_token: int,
+        actual_prompt_tokens: int,
+        actual_output_tokens: int,
+        status: str = "active",
+    ) -> ExtractionReconciliationResult:
+        with self._lock:
+            key = (workspace_id, document_id, document_version)
+            ledger = self._ledgers.get(key)
+            if ledger is None:
+                return ExtractionReconciliationResult(
+                    reconciled=False,
+                    fenced_out=True,
+                    reason="not_found",
+                    ledger=None,
+                )
+            now = time.time()
+            actual_total = actual_prompt_tokens + actual_output_tokens
+
+            if ledger.fence_token != fence_token or ledger.lease_owner_id != worker_id or ledger.lease_expires_at < now:
+                updated_spent = ledger.spent_tokens + actual_total
+                stale_status = "exhausted" if ledger.reserved_calls >= 2 else ledger.status
+                fenced_ledger = OkfBudgetLedger(
+                    workspace_id=workspace_id,
+                    document_id=document_id,
+                    document_version=document_version,
+                    reserved_calls=ledger.reserved_calls,
+                    completed_calls=ledger.completed_calls,
+                    reserved_tokens=ledger.reserved_tokens,
+                    spent_tokens=updated_spent,
+                    lease_owner_id=ledger.lease_owner_id if ledger.fence_token != fence_token else None,
+                    lease_expires_at=ledger.lease_expires_at if ledger.fence_token != fence_token else 0.0,
+                    fence_token=ledger.fence_token,
+                    status=stale_status,
+                    updated_at=_now_utc(),
+                )
+                self._ledgers[key] = fenced_ledger
+                return ExtractionReconciliationResult(
+                    reconciled=False,
+                    fenced_out=True,
+                    reason="fenced_out",
+                    ledger=fenced_ledger,
+                )
+
+            new_completed = ledger.completed_calls + 1
+            new_spent = ledger.spent_tokens + actual_total
+            reconciled_ledger = OkfBudgetLedger(
+                workspace_id=workspace_id,
+                document_id=document_id,
+                document_version=document_version,
+                reserved_calls=ledger.reserved_calls,
+                completed_calls=new_completed,
+                reserved_tokens=ledger.reserved_tokens,
+                spent_tokens=new_spent,
+                lease_owner_id=None,
+                lease_expires_at=0.0,
+                fence_token=ledger.fence_token,
+                status=status,
+                updated_at=_now_utc(),
+            )
+            self._ledgers[key] = reconciled_ledger
+            return ExtractionReconciliationResult(
+                reconciled=True,
+                fenced_out=False,
+                reason="reconciled",
+                ledger=reconciled_ledger,
+            )
+
+    def fail_extraction_budget(
+        self,
+        workspace_id: str,
+        document_id: str,
+        document_version: str,
+        worker_id: str,
+        fence_token: int,
+        error_reason: str,
+        prompt_tokens_spent: int = 0,
+        output_tokens_spent: int = 0,
+    ) -> None:
+        with self._lock:
+            key = (workspace_id, document_id, document_version)
+            ledger = self._ledgers.get(key)
+            if ledger is None:
+                return
+            actual_spent = prompt_tokens_spent + output_tokens_spent
+            new_spent = ledger.spent_tokens + actual_spent
+            new_status = "exhausted" if ledger.reserved_calls >= 2 else ledger.status
+            lease_owner = None if ledger.lease_owner_id == worker_id else ledger.lease_owner_id
+            lease_exp = 0.0 if ledger.lease_owner_id == worker_id else ledger.lease_expires_at
+            updated = OkfBudgetLedger(
+                workspace_id=workspace_id,
+                document_id=document_id,
+                document_version=document_version,
+                reserved_calls=ledger.reserved_calls,
+                completed_calls=ledger.completed_calls,
+                reserved_tokens=ledger.reserved_tokens,
+                spent_tokens=new_spent,
+                lease_owner_id=lease_owner,
+                lease_expires_at=lease_exp,
+                fence_token=ledger.fence_token,
+                status=new_status,
+                updated_at=_now_utc(),
+            )
+            self._ledgers[key] = updated
+
+    def get_budget_ledger(
+        self,
+        workspace_id: str,
+        document_id: str,
+        document_version: str,
+        consistent_read: bool = True,
+    ) -> OkfBudgetLedger | None:
+        with self._lock:
+            return self._ledgers.get((workspace_id, document_id, document_version))
 
 
 class SQLiteOkfRepository:
@@ -642,6 +975,407 @@ class SQLiteOkfRepository:
                         (workspace_id, document_id),
                     )
 
+    def reserve_extraction_budget(
+        self,
+        workspace_id: str,
+        document_id: str,
+        document_version: str,
+        worker_id: str,
+        estimated_prompt_tokens: int,
+        max_output_tokens: int = 600,
+        max_calls: int = 2,
+        max_total_tokens: int = 5200,
+        lease_duration_s: float = 15.0,
+    ) -> ExtractionReservationResult:
+        with self._lock:
+            with self._conn:
+                pk = f"WORKSPACE#{workspace_id}"
+                sk = f"BUDGET#DOC#{document_id}#VER#{document_version}"
+                now = time.time()
+                est_tokens = estimated_prompt_tokens + max_output_tokens
+
+                cursor = self._conn.execute(
+                    "SELECT data_json FROM kre_okf_facts WHERE pk = ? AND sk = ?",
+                    (pk, sk),
+                )
+                row = cursor.fetchone()
+                ledger: OkfBudgetLedger | None = None
+                if row:
+                    ledger = OkfBudgetLedger(**json.loads(row["data_json"]))
+
+                if ledger is not None:
+                    if ledger.status == "completed":
+                        return ExtractionReservationResult(
+                            granted=False,
+                            fence_token=ledger.fence_token,
+                            call_number=ledger.reserved_calls,
+                            remaining_calls=0,
+                            reason="already_completed",
+                            ledger=ledger,
+                        )
+                    if ledger.status == "exhausted":
+                        return ExtractionReservationResult(
+                            granted=False,
+                            fence_token=ledger.fence_token,
+                            call_number=ledger.reserved_calls,
+                            remaining_calls=0,
+                            reason="already_exhausted",
+                            ledger=ledger,
+                        )
+                    if ledger.lease_expires_at > now and ledger.lease_owner_id != worker_id:
+                        return ExtractionReservationResult(
+                            granted=False,
+                            fence_token=ledger.fence_token,
+                            call_number=ledger.reserved_calls,
+                            remaining_calls=max(0, max_calls - ledger.reserved_calls),
+                            reason="active_lease_held",
+                            ledger=ledger,
+                        )
+                    if ledger.reserved_calls >= max_calls:
+                        updated = OkfBudgetLedger(
+                            workspace_id=workspace_id,
+                            document_id=document_id,
+                            document_version=document_version,
+                            reserved_calls=ledger.reserved_calls,
+                            completed_calls=ledger.completed_calls,
+                            reserved_tokens=ledger.reserved_tokens,
+                            spent_tokens=ledger.spent_tokens,
+                            lease_owner_id=ledger.lease_owner_id,
+                            lease_expires_at=ledger.lease_expires_at,
+                            fence_token=ledger.fence_token,
+                            status="exhausted",
+                            updated_at=_now_utc(),
+                        )
+                        self._conn.execute(
+                            """
+                            INSERT OR REPLACE INTO kre_okf_facts (
+                                workspace_id, pk, sk, gsi1_pk, gsi1_sk, gsi2_pk, gsi2_sk,
+                                record_type, entity_id, document_id, document_version,
+                                normalized_name, property_key, data_json, created_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                workspace_id, pk, sk, pk, f"BUDGET#{document_id}",
+                                f"WORKSPACE#{workspace_id}#DOC#{document_id}", f"VER#{document_version}#BUDGET",
+                                "BUDGET", None, document_id, document_version, None, None,
+                                updated.model_dump_json(), updated.updated_at,
+                            ),
+                        )
+                        return ExtractionReservationResult(
+                            granted=False,
+                            fence_token=updated.fence_token,
+                            call_number=updated.reserved_calls,
+                            remaining_calls=0,
+                            reason="calls_exhausted",
+                            ledger=updated,
+                        )
+                    if ledger.spent_tokens + est_tokens > max_total_tokens:
+                        updated = OkfBudgetLedger(
+                            workspace_id=workspace_id,
+                            document_id=document_id,
+                            document_version=document_version,
+                            reserved_calls=ledger.reserved_calls,
+                            completed_calls=ledger.completed_calls,
+                            reserved_tokens=ledger.reserved_tokens,
+                            spent_tokens=ledger.spent_tokens,
+                            lease_owner_id=ledger.lease_owner_id,
+                            lease_expires_at=ledger.lease_expires_at,
+                            fence_token=ledger.fence_token,
+                            status="exhausted",
+                            updated_at=_now_utc(),
+                        )
+                        self._conn.execute(
+                            """
+                            INSERT OR REPLACE INTO kre_okf_facts (
+                                workspace_id, pk, sk, gsi1_pk, gsi1_sk, gsi2_pk, gsi2_sk,
+                                record_type, entity_id, document_id, document_version,
+                                normalized_name, property_key, data_json, created_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                workspace_id, pk, sk, pk, f"BUDGET#{document_id}",
+                                f"WORKSPACE#{workspace_id}#DOC#{document_id}", f"VER#{document_version}#BUDGET",
+                                "BUDGET", None, document_id, document_version, None, None,
+                                updated.model_dump_json(), updated.updated_at,
+                            ),
+                        )
+                        return ExtractionReservationResult(
+                            granted=False,
+                            fence_token=updated.fence_token,
+                            call_number=updated.reserved_calls,
+                            remaining_calls=0,
+                            reason="tokens_exhausted",
+                            ledger=updated,
+                        )
+
+                    new_calls = ledger.reserved_calls + 1
+                    new_fence = ledger.fence_token + 1
+                    new_reserved = ledger.reserved_tokens + est_tokens
+                    updated = OkfBudgetLedger(
+                        workspace_id=workspace_id,
+                        document_id=document_id,
+                        document_version=document_version,
+                        reserved_calls=new_calls,
+                        completed_calls=ledger.completed_calls,
+                        reserved_tokens=new_reserved,
+                        spent_tokens=ledger.spent_tokens,
+                        lease_owner_id=worker_id,
+                        lease_expires_at=now + lease_duration_s,
+                        fence_token=new_fence,
+                        status="active",
+                        updated_at=_now_utc(),
+                    )
+                    self._conn.execute(
+                        """
+                        INSERT OR REPLACE INTO kre_okf_facts (
+                            workspace_id, pk, sk, gsi1_pk, gsi1_sk, gsi2_pk, gsi2_sk,
+                            record_type, entity_id, document_id, document_version,
+                            normalized_name, property_key, data_json, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            workspace_id, pk, sk, pk, f"BUDGET#{document_id}",
+                            f"WORKSPACE#{workspace_id}#DOC#{document_id}", f"VER#{document_version}#BUDGET",
+                            "BUDGET", None, document_id, document_version, None, None,
+                            updated.model_dump_json(), updated.updated_at,
+                        ),
+                    )
+                    return ExtractionReservationResult(
+                        granted=True,
+                        fence_token=new_fence,
+                        call_number=new_calls,
+                        remaining_calls=max_calls - new_calls,
+                        reason="granted",
+                        ledger=updated,
+                    )
+                else:
+                    new_ledger = OkfBudgetLedger(
+                        workspace_id=workspace_id,
+                        document_id=document_id,
+                        document_version=document_version,
+                        reserved_calls=1,
+                        completed_calls=0,
+                        reserved_tokens=est_tokens,
+                        spent_tokens=0,
+                        lease_owner_id=worker_id,
+                        lease_expires_at=now + lease_duration_s,
+                        fence_token=1,
+                        status="active",
+                        updated_at=_now_utc(),
+                    )
+                    self._conn.execute(
+                        """
+                        INSERT OR REPLACE INTO kre_okf_facts (
+                            workspace_id, pk, sk, gsi1_pk, gsi1_sk, gsi2_pk, gsi2_sk,
+                            record_type, entity_id, document_id, document_version,
+                            normalized_name, property_key, data_json, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            workspace_id, pk, sk, pk, f"BUDGET#{document_id}",
+                            f"WORKSPACE#{workspace_id}#DOC#{document_id}", f"VER#{document_version}#BUDGET",
+                            "BUDGET", None, document_id, document_version, None, None,
+                            new_ledger.model_dump_json(), new_ledger.updated_at,
+                        ),
+                    )
+                    return ExtractionReservationResult(
+                        granted=True,
+                        fence_token=1,
+                        call_number=1,
+                        remaining_calls=max_calls - 1,
+                        reason="granted",
+                        ledger=new_ledger,
+                    )
+
+    def reconcile_extraction_budget(
+        self,
+        workspace_id: str,
+        document_id: str,
+        document_version: str,
+        worker_id: str,
+        fence_token: int,
+        actual_prompt_tokens: int,
+        actual_output_tokens: int,
+        status: str = "active",
+    ) -> ExtractionReconciliationResult:
+        with self._lock:
+            with self._conn:
+                pk = f"WORKSPACE#{workspace_id}"
+                sk = f"BUDGET#DOC#{document_id}#VER#{document_version}"
+                cursor = self._conn.execute(
+                    "SELECT data_json FROM kre_okf_facts WHERE pk = ? AND sk = ?",
+                    (pk, sk),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    return ExtractionReconciliationResult(
+                        reconciled=False,
+                        fenced_out=True,
+                        reason="not_found",
+                        ledger=None,
+                    )
+                ledger = OkfBudgetLedger(**json.loads(row["data_json"]))
+                now = time.time()
+                actual_total = actual_prompt_tokens + actual_output_tokens
+
+                if ledger.fence_token != fence_token or ledger.lease_owner_id != worker_id or ledger.lease_expires_at < now:
+                    updated_spent = ledger.spent_tokens + actual_total
+                    stale_status = "exhausted" if ledger.reserved_calls >= 2 else ledger.status
+                    fenced_ledger = OkfBudgetLedger(
+                        workspace_id=workspace_id,
+                        document_id=document_id,
+                        document_version=document_version,
+                        reserved_calls=ledger.reserved_calls,
+                        completed_calls=ledger.completed_calls,
+                        reserved_tokens=ledger.reserved_tokens,
+                        spent_tokens=updated_spent,
+                        lease_owner_id=ledger.lease_owner_id if ledger.fence_token != fence_token else None,
+                        lease_expires_at=ledger.lease_expires_at if ledger.fence_token != fence_token else 0.0,
+                        fence_token=ledger.fence_token,
+                        status=stale_status,
+                        updated_at=_now_utc(),
+                    )
+                    self._conn.execute(
+                        """
+                        INSERT OR REPLACE INTO kre_okf_facts (
+                            workspace_id, pk, sk, gsi1_pk, gsi1_sk, gsi2_pk, gsi2_sk,
+                            record_type, entity_id, document_id, document_version,
+                            normalized_name, property_key, data_json, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            workspace_id, pk, sk, pk, f"BUDGET#{document_id}",
+                            f"WORKSPACE#{workspace_id}#DOC#{document_id}", f"VER#{document_version}#BUDGET",
+                            "BUDGET", None, document_id, document_version, None, None,
+                            fenced_ledger.model_dump_json(), fenced_ledger.updated_at,
+                        ),
+                    )
+                    return ExtractionReconciliationResult(
+                        reconciled=False,
+                        fenced_out=True,
+                        reason="fenced_out",
+                        ledger=fenced_ledger,
+                    )
+
+                new_completed = ledger.completed_calls + 1
+                new_spent = ledger.spent_tokens + actual_total
+                reconciled_ledger = OkfBudgetLedger(
+                    workspace_id=workspace_id,
+                    document_id=document_id,
+                    document_version=document_version,
+                    reserved_calls=ledger.reserved_calls,
+                    completed_calls=new_completed,
+                    reserved_tokens=ledger.reserved_tokens,
+                    spent_tokens=new_spent,
+                    lease_owner_id=None,
+                    lease_expires_at=0.0,
+                    fence_token=ledger.fence_token,
+                    status=status,
+                    updated_at=_now_utc(),
+                )
+                self._conn.execute(
+                    """
+                    INSERT OR REPLACE INTO kre_okf_facts (
+                        workspace_id, pk, sk, gsi1_pk, gsi1_sk, gsi2_pk, gsi2_sk,
+                        record_type, entity_id, document_id, document_version,
+                        normalized_name, property_key, data_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        workspace_id, pk, sk, pk, f"BUDGET#{document_id}",
+                        f"WORKSPACE#{workspace_id}#DOC#{document_id}", f"VER#{document_version}#BUDGET",
+                        "BUDGET", None, document_id, document_version, None, None,
+                        reconciled_ledger.model_dump_json(), reconciled_ledger.updated_at,
+                    ),
+                )
+                return ExtractionReconciliationResult(
+                    reconciled=True,
+                    fenced_out=False,
+                    reason="reconciled",
+                    ledger=reconciled_ledger,
+                )
+
+    def fail_extraction_budget(
+        self,
+        workspace_id: str,
+        document_id: str,
+        document_version: str,
+        worker_id: str,
+        fence_token: int,
+        error_reason: str,
+        prompt_tokens_spent: int = 0,
+        output_tokens_spent: int = 0,
+    ) -> None:
+        with self._lock:
+            with self._conn:
+                pk = f"WORKSPACE#{workspace_id}"
+                sk = f"BUDGET#DOC#{document_id}#VER#{document_version}"
+                cursor = self._conn.execute(
+                    "SELECT data_json FROM kre_okf_facts WHERE pk = ? AND sk = ?",
+                    (pk, sk),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    return
+                ledger = OkfBudgetLedger(**json.loads(row["data_json"]))
+                actual_spent = prompt_tokens_spent + output_tokens_spent
+                new_spent = ledger.spent_tokens + actual_spent
+                new_status = "exhausted" if ledger.reserved_calls >= 2 else ledger.status
+                lease_owner = None if ledger.lease_owner_id == worker_id else ledger.lease_owner_id
+                lease_exp = 0.0 if ledger.lease_owner_id == worker_id else ledger.lease_expires_at
+                updated = OkfBudgetLedger(
+                    workspace_id=workspace_id,
+                    document_id=document_id,
+                    document_version=document_version,
+                    reserved_calls=ledger.reserved_calls,
+                    completed_calls=ledger.completed_calls,
+                    reserved_tokens=ledger.reserved_tokens,
+                    spent_tokens=new_spent,
+                    lease_owner_id=lease_owner,
+                    lease_expires_at=lease_exp,
+                    fence_token=ledger.fence_token,
+                    status=new_status,
+                    updated_at=_now_utc(),
+                )
+                self._conn.execute(
+                    """
+                    INSERT OR REPLACE INTO kre_okf_facts (
+                        workspace_id, pk, sk, gsi1_pk, gsi1_sk, gsi2_pk, gsi2_sk,
+                        record_type, entity_id, document_id, document_version,
+                        normalized_name, property_key, data_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        workspace_id, pk, sk, pk, f"BUDGET#{document_id}",
+                        f"WORKSPACE#{workspace_id}#DOC#{document_id}", f"VER#{document_version}#BUDGET",
+                        "BUDGET", None, document_id, document_version, None, None,
+                        updated.model_dump_json(), updated.updated_at,
+                    ),
+                )
+
+    def get_budget_ledger(
+        self,
+        workspace_id: str,
+        document_id: str,
+        document_version: str,
+        consistent_read: bool = True,
+    ) -> OkfBudgetLedger | None:
+        with self._lock:
+            pk = f"WORKSPACE#{workspace_id}"
+            sk = f"BUDGET#DOC#{document_id}#VER#{document_version}"
+            try:
+                cursor = self._conn.execute(
+                    "SELECT data_json FROM kre_okf_facts WHERE pk = ? AND sk = ?",
+                    (pk, sk),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                return OkfBudgetLedger(**json.loads(row["data_json"]))
+            except Exception as exc:
+                logger.error("SQLite get_budget_ledger failed: %s", exc)
+                return None
+
 
 class DynamoDBOkfRepository:
     """Authoritative production OKF repository backed by Amazon DynamoDB."""
@@ -947,6 +1681,318 @@ class DynamoDBOkfRepository:
     ) -> None:
         # Note: Scoped deletion in DynamoDB is done per version or deferred
         pass
+
+    def reserve_extraction_budget(
+        self,
+        workspace_id: str,
+        document_id: str,
+        document_version: str,
+        worker_id: str,
+        estimated_prompt_tokens: int,
+        max_output_tokens: int = 600,
+        max_calls: int = 2,
+        max_total_tokens: int = 5200,
+        lease_duration_s: float = 15.0,
+    ) -> ExtractionReservationResult:
+        _, table = self._get_resources()
+        pk = f"WORKSPACE#{workspace_id}"
+        sk = f"BUDGET#DOC#{document_id}#VER#{document_version}"
+        now = time.time()
+        est_tokens = estimated_prompt_tokens + max_output_tokens
+
+        try:
+            resp = table.update_item(
+                Key={"PK": pk, "SK": sk},
+                UpdateExpression=(
+                    "SET #rc = if_not_exists(#rc, :zero) + :one, "
+                    "#ft = if_not_exists(#ft, :zero) + :one, "
+                    "#lown = :wid, "
+                    "#lexp = :expires_at, "
+                    "#st = :st_act, "
+                    "#spent = if_not_exists(#spent, :zero), "
+                    "#comp = if_not_exists(#comp, :zero), "
+                    "#rt = if_not_exists(#rt, :zero) + :est_tokens, "
+                    "workspace_id = :ws, "
+                    "document_id = :did, "
+                    "document_version = :ver, "
+                    "record_type = :rtype, "
+                    "updated_at = :now_iso"
+                ),
+                ConditionExpression=(
+                    "(attribute_not_exists(PK)) OR ("
+                    "#rc < :max_calls AND "
+                    "#st = :st_act AND "
+                    "(#spent + :est_tokens <= :max_tokens) AND "
+                    "(#lexp < :now OR #lown = :wid)"
+                    ")"
+                ),
+                ExpressionAttributeNames={
+                    "#rc": "reserved_calls",
+                    "#ft": "fence_token",
+                    "#lown": "lease_owner_id",
+                    "#lexp": "lease_expires_at",
+                    "#st": "status",
+                    "#spent": "spent_tokens",
+                    "#comp": "completed_calls",
+                    "#rt": "reserved_tokens",
+                },
+                ExpressionAttributeValues={
+                    ":zero": 0,
+                    ":one": 1,
+                    ":max_calls": max_calls,
+                    ":max_tokens": max_total_tokens,
+                    ":est_tokens": est_tokens,
+                    ":wid": worker_id,
+                    ":expires_at": int(now + lease_duration_s),
+                    ":now": int(now),
+                    ":st_act": "active",
+                    ":ws": workspace_id,
+                    ":did": document_id,
+                    ":ver": document_version,
+                    ":rtype": "BUDGET",
+                    ":now_iso": _now_utc(),
+                },
+                ReturnValues="ALL_NEW",
+            )
+            attrs = resp.get("Attributes", {})
+            ledger = OkfBudgetLedger(
+                workspace_id=workspace_id,
+                document_id=document_id,
+                document_version=document_version,
+                reserved_calls=int(attrs.get("reserved_calls", 1)),
+                completed_calls=int(attrs.get("completed_calls", 0)),
+                reserved_tokens=int(attrs.get("reserved_tokens", est_tokens)),
+                spent_tokens=int(attrs.get("spent_tokens", 0)),
+                lease_owner_id=attrs.get("lease_owner_id"),
+                lease_expires_at=float(attrs.get("lease_expires_at", 0.0)),
+                fence_token=int(attrs.get("fence_token", 1)),
+                status=attrs.get("status", "active"),
+                updated_at=attrs.get("updated_at", _now_utc()),
+            )
+            return ExtractionReservationResult(
+                granted=True,
+                fence_token=ledger.fence_token,
+                call_number=ledger.reserved_calls,
+                remaining_calls=max_calls - ledger.reserved_calls,
+                reason="granted",
+                ledger=ledger,
+            )
+        except Exception as exc:
+            is_cond_err = False
+            if hasattr(exc, "response") and isinstance(exc.response, dict):
+                if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                    is_cond_err = True
+            elif "ConditionalCheckFailedException" in str(exc):
+                is_cond_err = True
+
+            if is_cond_err:
+                curr = self.get_budget_ledger(workspace_id, document_id, document_version, consistent_read=True)
+                if curr is not None:
+                    if curr.status == "completed":
+                        reason = "already_completed"
+                    elif curr.status == "exhausted":
+                        reason = "already_exhausted"
+                    elif curr.lease_expires_at > now and curr.lease_owner_id != worker_id:
+                        reason = "active_lease_held"
+                    elif curr.reserved_calls >= max_calls:
+                        reason = "calls_exhausted"
+                    elif curr.spent_tokens + est_tokens > max_total_tokens:
+                        reason = "tokens_exhausted"
+                    else:
+                        reason = "calls_exhausted"
+                    return ExtractionReservationResult(
+                        granted=False,
+                        fence_token=curr.fence_token,
+                        call_number=curr.reserved_calls,
+                        remaining_calls=max(0, max_calls - curr.reserved_calls),
+                        reason=reason,
+                        ledger=curr,
+                    )
+            logger.error("DynamoDB reserve_extraction_budget error: %s", exc)
+            return ExtractionReservationResult(
+                granted=False,
+                reason="storage_error",
+                ledger=None,
+            )
+
+    def reconcile_extraction_budget(
+        self,
+        workspace_id: str,
+        document_id: str,
+        document_version: str,
+        worker_id: str,
+        fence_token: int,
+        actual_prompt_tokens: int,
+        actual_output_tokens: int,
+        status: str = "active",
+    ) -> ExtractionReconciliationResult:
+        _, table = self._get_resources()
+        pk = f"WORKSPACE#{workspace_id}"
+        sk = f"BUDGET#DOC#{document_id}#VER#{document_version}"
+        actual_total = actual_prompt_tokens + actual_output_tokens
+        now = time.time()
+
+        try:
+            resp = table.update_item(
+                Key={"PK": pk, "SK": sk},
+                UpdateExpression=(
+                    "SET #comp = #comp + :one, "
+                    "#spent = #spent + :actual_tokens, "
+                    "#lexp = :zero, "
+                    "#st = :new_status, "
+                    "updated_at = :now_iso"
+                ),
+                ConditionExpression="#ft = :expected_ft AND #lown = :wid AND #lexp >= :now",
+                ExpressionAttributeNames={
+                    "#comp": "completed_calls",
+                    "#spent": "spent_tokens",
+                    "#lexp": "lease_expires_at",
+                    "#st": "status",
+                    "#ft": "fence_token",
+                    "#lown": "lease_owner_id",
+                },
+                ExpressionAttributeValues={
+                    ":one": 1,
+                    ":actual_tokens": actual_total,
+                    ":zero": 0,
+                    ":new_status": status,
+                    ":expected_ft": fence_token,
+                    ":wid": worker_id,
+                    ":now": int(now),
+                    ":now_iso": _now_utc(),
+                },
+                ReturnValues="ALL_NEW",
+            )
+            attrs = resp.get("Attributes", {})
+            ledger = OkfBudgetLedger(
+                workspace_id=workspace_id,
+                document_id=document_id,
+                document_version=document_version,
+                reserved_calls=int(attrs.get("reserved_calls", 0)),
+                completed_calls=int(attrs.get("completed_calls", 0)),
+                reserved_tokens=int(attrs.get("reserved_tokens", 0)),
+                spent_tokens=int(attrs.get("spent_tokens", 0)),
+                lease_owner_id=attrs.get("lease_owner_id"),
+                lease_expires_at=float(attrs.get("lease_expires_at", 0.0)),
+                fence_token=int(attrs.get("fence_token", 0)),
+                status=attrs.get("status", status),
+                updated_at=attrs.get("updated_at", _now_utc()),
+            )
+            return ExtractionReconciliationResult(
+                reconciled=True,
+                fenced_out=False,
+                reason="reconciled",
+                ledger=ledger,
+            )
+        except Exception as exc:
+            is_cond = False
+            if hasattr(exc, "response") and isinstance(exc.response, dict):
+                if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                    is_cond = True
+            elif "ConditionalCheckFailedException" in str(exc):
+                is_cond = True
+
+            if is_cond:
+                try:
+                    table.update_item(
+                        Key={"PK": pk, "SK": sk},
+                        UpdateExpression="SET #spent = #spent + :actual_tokens, updated_at = :now_iso",
+                        ExpressionAttributeNames={"#spent": "spent_tokens"},
+                        ExpressionAttributeValues={
+                            ":actual_tokens": actual_total,
+                            ":now_iso": _now_utc(),
+                        },
+                    )
+                except Exception as update_err:
+                    logger.warning("Failed to record fenced token spend in DynamoDB: %s", update_err)
+                curr = self.get_budget_ledger(workspace_id, document_id, document_version, consistent_read=True)
+                return ExtractionReconciliationResult(
+                    reconciled=False,
+                    fenced_out=True,
+                    reason="fenced_out",
+                    ledger=curr,
+                )
+            logger.error("DynamoDB reconcile_extraction_budget error: %s", exc)
+            return ExtractionReconciliationResult(
+                reconciled=False,
+                fenced_out=False,
+                reason="storage_error",
+                ledger=None,
+            )
+
+    def fail_extraction_budget(
+        self,
+        workspace_id: str,
+        document_id: str,
+        document_version: str,
+        worker_id: str,
+        fence_token: int,
+        error_reason: str,
+        prompt_tokens_spent: int = 0,
+        output_tokens_spent: int = 0,
+    ) -> None:
+        _, table = self._get_resources()
+        pk = f"WORKSPACE#{workspace_id}"
+        sk = f"BUDGET#DOC#{document_id}#VER#{document_version}"
+        actual_spent = prompt_tokens_spent + output_tokens_spent
+
+        try:
+            table.update_item(
+                Key={"PK": pk, "SK": sk},
+                UpdateExpression=(
+                    "SET #spent = #spent + :spent, "
+                    "#lexp = :zero, "
+                    "updated_at = :now_iso"
+                ),
+                ExpressionAttributeNames={
+                    "#spent": "spent_tokens",
+                    "#lexp": "lease_expires_at",
+                },
+                ExpressionAttributeValues={
+                    ":spent": actual_spent,
+                    ":zero": 0,
+                    ":now_iso": _now_utc(),
+                },
+            )
+        except Exception as exc:
+            logger.warning("DynamoDB fail_extraction_budget error: %s", exc)
+
+    def get_budget_ledger(
+        self,
+        workspace_id: str,
+        document_id: str,
+        document_version: str,
+        consistent_read: bool = True,
+    ) -> OkfBudgetLedger | None:
+        _, table = self._get_resources()
+        pk = f"WORKSPACE#{workspace_id}"
+        sk = f"BUDGET#DOC#{document_id}#VER#{document_version}"
+
+        try:
+            resp = table.get_item(
+                Key={"PK": pk, "SK": sk},
+                ConsistentRead=consistent_read,
+            )
+            item = resp.get("Item")
+            if not item:
+                return None
+            return OkfBudgetLedger(
+                workspace_id=workspace_id,
+                document_id=document_id,
+                document_version=document_version,
+                reserved_calls=int(item.get("reserved_calls", 0)),
+                completed_calls=int(item.get("completed_calls", 0)),
+                reserved_tokens=int(item.get("reserved_tokens", 0)),
+                spent_tokens=int(item.get("spent_tokens", 0)),
+                lease_owner_id=item.get("lease_owner_id"),
+                lease_expires_at=float(item.get("lease_expires_at", 0.0)),
+                fence_token=int(item.get("fence_token", 0)),
+                status=item.get("status", "active"),
+                updated_at=item.get("updated_at", _now_utc()),
+            )
+        except Exception as exc:
+            logger.error("DynamoDB get_budget_ledger error: %s", exc)
+            return None
 
 
 _SHARED_OKF_REPO: OkfRepositoryBase | None = None

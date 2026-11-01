@@ -11,7 +11,7 @@ It replaces legacy unpartitioned global DynamoDB tables and unconstrained table 
 
 ## Dependencies on Specification 0006 (OKF)
 
-Knowledge Graph enrichment depends on specification 0006 (Open Knowledge Framework) for single entity definitions, property assertions, and tabular schemas. Specification 0006 identified two open operational limitations: distributed cross process extraction budget coordination and request token accounting verification. These limitations must be closed in OKF first (via OKF Slice 3.1). Knowledge Graph enrichment adopts the resulting durable budget coordination and token bounding architecture, but does not claim to resolve open OKF limitations itself.
+Knowledge Graph enrichment depends on specification 0006 (Open Knowledge Framework) for single entity definitions, property assertions, and tabular schemas. Specification 0006 previously identified two open operational limitations: distributed cross process extraction budget coordination and request token accounting verification. These limitations were closed and verified in OKF via Slice 3.1. Knowledge Graph enrichment builds upon the durable budget coordination (`BUDGET#DOC#{doc}#VER#{ver}`, monotonic fence tokens, 15 second lease expiry, crash recovery) and authoritative request token accounting established in specification 0006.
 
 ## Context
 

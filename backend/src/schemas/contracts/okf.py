@@ -131,6 +131,54 @@ class OkfLookupResult(BaseModel):
     latency_ms: float = 0.0
 
 
+class OkfBudgetLedger(BaseModel):
+    """Durable ledger record tracking extraction call reservations, token spend, and active lease."""
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    workspace_id: str = Field(..., max_length=64)
+    document_id: str = Field(..., max_length=128)
+    document_version: str = Field(..., max_length=64)
+    reserved_calls: int = Field(default=0, ge=0)
+    completed_calls: int = Field(default=0, ge=0)
+    reserved_tokens: int = Field(default=0, ge=0)
+    spent_tokens: int = Field(default=0, ge=0)
+    lease_owner_id: str | None = Field(default=None, max_length=128)
+    lease_expires_at: float = Field(default=0.0, ge=0.0)
+    fence_token: int = Field(default=0, ge=0)
+    status: Literal["active", "completed", "exhausted", "failed"] = "active"
+    updated_at: str
+
+
+class ExtractionReservationResult(BaseModel):
+    """Outcome of attempting to reserve an extraction call permit from durable ledger."""
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    granted: bool
+    fence_token: int = 0
+    call_number: int = 0
+    remaining_calls: int = 0
+    reason: Literal[
+        "granted",
+        "calls_exhausted",
+        "tokens_exhausted",
+        "active_lease_held",
+        "already_completed",
+        "already_exhausted",
+        "storage_error",
+    ]
+    ledger: OkfBudgetLedger | None = None
+
+
+class ExtractionReconciliationResult(BaseModel):
+    """Outcome of reconciling a completed or failed extraction call."""
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    reconciled: bool
+    fenced_out: bool = False
+    reason: Literal["reconciled", "fenced_out", "not_found", "storage_error"]
+    ledger: OkfBudgetLedger | None = None
+
+
 import sys
 if __name__ in ("schemas.contracts.okf", "src.schemas.contracts.okf"):
     sys.modules["schemas.contracts.okf"] = sys.modules[__name__]

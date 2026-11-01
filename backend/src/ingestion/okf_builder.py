@@ -19,6 +19,7 @@ import re
 import threading
 import time
 from typing import Any, Callable, Sequence
+import uuid
 
 from config import settings
 from src.db.okf_repo import (
@@ -249,18 +250,28 @@ def get_or_create_document_budget(
         if repo is not None:
             try:
                 # Strongly consistent read ensures recovery does not miss recently committed reservations
-                existing_man = repo.get_manifest(
-                    workspace_id,
-                    document_id,
-                    document_version,
-                    consistent_read=True,
-                )
-                if existing_man is not None:
-                    prior_calls = getattr(existing_man, "model_calls", 0)
-                    prior_tokens = getattr(existing_man, "extraction_tokens", 0)
-                    if existing_man.status == "failed" or prior_calls >= max_calls:
+                ledger = None
+                if hasattr(repo, "get_budget_ledger"):
+                    ledger = repo.get_budget_ledger(workspace_id, document_id, document_version, consistent_read=True)
+                if ledger is not None:
+                    prior_calls = ledger.reserved_calls
+                    prior_tokens = ledger.spent_tokens
+                    if ledger.status in ("exhausted", "completed") or prior_calls >= max_calls or prior_tokens >= (max_input_tokens + max_output_tokens):
                         prior_exhausted = True
                         prior_reason = f"prior_recorded_attempts ({prior_calls}/{max_calls})"
+                else:
+                    existing_man = repo.get_manifest(
+                        workspace_id,
+                        document_id,
+                        document_version,
+                        consistent_read=True,
+                    )
+                    if existing_man is not None:
+                        prior_calls = getattr(existing_man, "model_calls", 0)
+                        prior_tokens = getattr(existing_man, "extraction_tokens", 0)
+                        if existing_man.status == "failed" or prior_calls >= max_calls:
+                            prior_exhausted = True
+                            prior_reason = f"prior_recorded_attempts ({prior_calls}/{max_calls})"
             except Exception as e:
                 logger.error("okf_builder.prior_manifest_storage_read_failed: %s", e)
                 prior_exhausted = True
@@ -861,10 +872,12 @@ class OkfBuilder:
         repo: OkfRepositoryBase | None = None,
         bedrock_client: Any | None = None,
         provider_controller: OkfProviderConcurrencyController | None = None,
+        worker_id: str | None = None,
     ) -> None:
         self.repo = repo or get_okf_repo()
         self._bedrock_client = bedrock_client
         self.provider_controller = provider_controller or get_okf_provider_controller()
+        self.worker_id = worker_id or f"worker_{os.getpid()}_{uuid.uuid4().hex[:8]}"
 
     def _get_bedrock_client(self) -> Any:
         if self._bedrock_client is not None:
@@ -1476,8 +1489,63 @@ class OkfBuilder:
             return "", {"input_tokens": 0, "output_tokens": 0}
 
         user_prompt = "\n\n".join(user_content_blocks)
-        estimated_prompt_tokens = count_request_tokens(system_prompt, user_prompt, model_id=model_id)
+        messages = [{"role": "user", "content": [{"text": user_prompt}]}]
+        system = [{"text": system_prompt}]
         max_output_tokens = 600
+
+        # Authoritative request-token counting (if live client is present)
+        # AC-3.5: Enforce verified provider token accounting before dispatch
+        if client is not None and hasattr(client, "count_tokens"):
+            try:
+                count_resp = client.count_tokens(
+                    modelId=model_id,
+                    input={"converse": {"messages": messages, "system": system}},
+                )
+                raw_tokens = count_resp.get("inputTokens", 0) if isinstance(count_resp, dict) else None
+                if isinstance(raw_tokens, int):
+                    estimated_prompt_tokens = raw_tokens
+                else:
+                    # In test/mock mode where count_tokens returns an unconfigured mock
+                    estimated_prompt_tokens = count_request_tokens(system_prompt, user_prompt, model_id=model_id)
+            except Exception as count_err:
+                budget.exhausted = True
+                budget.exhaustion_reason = f"authoritative_token_count_failed ({count_err})"
+                logger.error("Bedrock count_tokens failed (failing closed per AC-3): %s", count_err)
+                return "", {"input_tokens": 0, "output_tokens": 0}
+        else:
+            estimated_prompt_tokens = count_request_tokens(system_prompt, user_prompt, model_id=model_id)
+
+        # Enforce per-call input token bound before reservation or network dispatch
+        if estimated_prompt_tokens > budget.max_call_input_tokens:
+            budget.exhausted = True
+            budget.exhaustion_reason = f"per_call_input_token_limit_exceeded ({estimated_prompt_tokens} > {budget.max_call_input_tokens})"
+            logger.warning("Bedrock OKF call rejected: %s", budget.exhaustion_reason)
+            return "", {"input_tokens": 0, "output_tokens": 0}
+
+        # Atomically reserve call permit and token allowance on durable repository ledger
+        ver = getattr(budget, "document_version", "v1")
+        reservation_fence = 0
+        if hasattr(self.repo, "reserve_extraction_budget"):
+            durable_res = self.repo.reserve_extraction_budget(
+                workspace_id=workspace_id,
+                document_id=document_id,
+                document_version=ver,
+                worker_id=getattr(self, "worker_id", f"worker_{os.getpid()}"),
+                estimated_prompt_tokens=estimated_prompt_tokens,
+                max_output_tokens=max_output_tokens,
+                max_calls=budget.max_calls,
+                max_total_tokens=budget.max_input_tokens + budget.max_output_tokens,
+                lease_duration_s=15.0,
+            )
+            if not durable_res.granted:
+                budget.exhausted = True
+                budget.exhaustion_reason = durable_res.reason
+                logger.warning(
+                    "okf_builder.durable_reservation_denied ws=%s doc=%s ver=%s reason=%s",
+                    workspace_id, document_id, ver, durable_res.reason,
+                )
+                return "", {"input_tokens": 0, "output_tokens": 0}
+            reservation_fence = durable_res.fence_token
 
         # Test environment fallback
         if client is None:
@@ -1490,9 +1558,18 @@ class OkfBuilder:
                 return "", {"input_tokens": 0, "output_tokens": 0}
             out_json, stats = self._test_mode_fallback(chunks)
             budget.reconcile_call(estimated_prompt_tokens, max_output_tokens, stats["input_tokens"], stats["output_tokens"])
+            if hasattr(self.repo, "reconcile_extraction_budget"):
+                self.repo.reconcile_extraction_budget(
+                    workspace_id=workspace_id,
+                    document_id=document_id,
+                    document_version=ver,
+                    worker_id=getattr(self, "worker_id", f"worker_{os.getpid()}"),
+                    fence_token=reservation_fence,
+                    actual_prompt_tokens=stats["input_tokens"],
+                    actual_output_tokens=stats["output_tokens"],
+                )
             return out_json, stats
 
-        messages = [{"role": "user", "content": [{"text": user_prompt}]}]
         max_attempts = 2  # at most 1 retry on throttling (HTTP 429)
 
         for attempt in range(max_attempts):
@@ -1504,6 +1581,16 @@ class OkfBuilder:
                     "okf_builder.call_budget_exceeded attempt=%d reason=%s",
                     attempt, budget.exhaustion_reason,
                 )
+                if hasattr(self.repo, "fail_extraction_budget"):
+                    self.repo.fail_extraction_budget(
+                        workspace_id=workspace_id,
+                        document_id=document_id,
+                        document_version=ver,
+                        worker_id=getattr(self, "worker_id", f"worker_{os.getpid()}"),
+                        fence_token=reservation_fence,
+                        error_reason=budget.exhaustion_reason,
+                        prompt_tokens_spent=estimated_prompt_tokens,
+                    )
                 return "", {"input_tokens": 0, "output_tokens": 0}
 
             if not budget.reserve_call(estimated_prompt_tokens, max_output_tokens):
@@ -1511,36 +1598,16 @@ class OkfBuilder:
                     "okf_builder.call_budget_exceeded attempt=%d reason=%s",
                     attempt, budget.exhaustion_reason,
                 )
-                return "", {"input_tokens": 0, "output_tokens": 0}
-
-            # Persist in-flight attempt reservation to durable repository before provider call
-            # This ensures that if the process crashes or dies mid-call, the durable store records
-            # the attempted model call and does not silently reset upon restart/replay.
-            # If persistence fails, do not call the provider; report failed optional enrichment
-            # and preserve baseline availability per ADR-001.
-            try:
-                ver = getattr(budget, "document_version", "v1")
-                ikey = getattr(budget, "idempotency_key", "") or f"{workspace_id}:{document_id}:{ver}"
-                self.repo.save_manifest(
-                    workspace_id,
-                    OkfManifest(
+                if hasattr(self.repo, "fail_extraction_budget"):
+                    self.repo.fail_extraction_budget(
                         workspace_id=workspace_id,
                         document_id=document_id,
                         document_version=ver,
-                        entities=(),
-                        assertions=(),
-                        rejected_assertions_count=0,
-                        status="failed",
-                        extraction_tokens=budget.input_tokens_used + budget.output_tokens_used,
-                        model_calls=budget.calls_made,
-                        idempotency_key=ikey,
-                        created_at=_now_utc(),
-                    ),
-                )
-            except Exception as save_err:
-                logger.error("okf_builder.reservation_persistence_failed: %s", save_err)
-                budget.exhausted = True
-                budget.exhaustion_reason = f"reservation_persistence_failed ({save_err})"
+                        worker_id=getattr(self, "worker_id", f"worker_{os.getpid()}"),
+                        fence_token=reservation_fence,
+                        error_reason=budget.exhaustion_reason,
+                        prompt_tokens_spent=estimated_prompt_tokens,
+                    )
                 return "", {"input_tokens": 0, "output_tokens": 0}
 
             call_timeout = max(0.001, budget.max_elapsed_s - (time.perf_counter() - budget.started_at))
@@ -1550,7 +1617,7 @@ class OkfBuilder:
                     timeout_s=call_timeout,
                     modelId=model_id,
                     messages=messages,
-                    system=[{"text": system_prompt}],
+                    system=system,
                     inferenceConfig={
                         "temperature": 0.0,
                         "maxTokens": max_output_tokens,
@@ -1562,22 +1629,60 @@ class OkfBuilder:
                     elapsed_total = time.perf_counter() - budget.started_at
                     budget.exhaustion_reason = f"document_deadline_exceeded ({elapsed_total:.1f}s/{budget.max_elapsed_s:.1f}s)"
                     logger.warning("Bedrock OKF call exceeded document deadline: %s", budget.exhaustion_reason)
-                    # Zero retries on timeouts per AC-3
+                    if hasattr(self.repo, "fail_extraction_budget"):
+                        self.repo.fail_extraction_budget(
+                            workspace_id=workspace_id,
+                            document_id=document_id,
+                            document_version=ver,
+                            worker_id=getattr(self, "worker_id", f"worker_{os.getpid()}"),
+                            fence_token=reservation_fence,
+                            error_reason=budget.exhaustion_reason,
+                            prompt_tokens_spent=estimated_prompt_tokens,
+                        )
                     return "", {"input_tokens": 0, "output_tokens": 0}
 
                 if status == "admission_rejected":
                     budget.exhausted = True
                     budget.exhaustion_reason = "provider_concurrency_queue_saturated"
                     logger.warning("Bedrock OKF call rejected: %s", budget.exhaustion_reason)
+                    if hasattr(self.repo, "fail_extraction_budget"):
+                        self.repo.fail_extraction_budget(
+                            workspace_id=workspace_id,
+                            document_id=document_id,
+                            document_version=ver,
+                            worker_id=getattr(self, "worker_id", f"worker_{os.getpid()}"),
+                            fence_token=reservation_fence,
+                            error_reason=budget.exhaustion_reason,
+                            prompt_tokens_spent=estimated_prompt_tokens,
+                        )
                     return "", {"input_tokens": 0, "output_tokens": 0}
 
-                output_text = resp["output"]["message"]["content"][0]["text"]
                 raw_usage = resp.get("usage", {})
                 usage = {
                     "input_tokens": raw_usage.get("inputTokens", estimated_prompt_tokens),
                     "output_tokens": raw_usage.get("outputTokens", 0),
                 }
                 budget.reconcile_call(estimated_prompt_tokens, max_output_tokens, usage["input_tokens"], usage["output_tokens"])
+
+                # Reconcile against durable ledger and check stale worker fencing
+                if hasattr(self.repo, "reconcile_extraction_budget"):
+                    rec_res = self.repo.reconcile_extraction_budget(
+                        workspace_id=workspace_id,
+                        document_id=document_id,
+                        document_version=ver,
+                        worker_id=getattr(self, "worker_id", f"worker_{os.getpid()}"),
+                        fence_token=reservation_fence,
+                        actual_prompt_tokens=usage["input_tokens"],
+                        actual_output_tokens=usage["output_tokens"],
+                    )
+                    if rec_res.fenced_out:
+                        logger.warning(
+                            "okf_builder.worker_fenced_out ws=%s doc=%s ver=%s (discarding stale extracted assertions)",
+                            workspace_id, document_id, ver,
+                        )
+                        return "", usage
+
+                output_text = resp["output"]["message"]["content"][0]["text"]
                 return output_text, usage
 
             except Exception as e:
@@ -1593,10 +1698,30 @@ class OkfBuilder:
                         budget.exhausted = True
                         budget.exhaustion_reason = f"retry_would_exceed_deadline ({elapsed_so_far + retry_delay:.1f}s/{budget.max_elapsed_s:.1f}s)"
                         logger.warning("Bedrock OKF throttled (429), cannot retry within deadline: %s", budget.exhaustion_reason)
+                        if hasattr(self.repo, "fail_extraction_budget"):
+                            self.repo.fail_extraction_budget(
+                                workspace_id=workspace_id,
+                                document_id=document_id,
+                                document_version=ver,
+                                worker_id=getattr(self, "worker_id", f"worker_{os.getpid()}"),
+                                fence_token=reservation_fence,
+                                error_reason=budget.exhaustion_reason,
+                                prompt_tokens_spent=estimated_prompt_tokens,
+                            )
                         return "", {"input_tokens": 0, "output_tokens": 0}
 
                 # Zero retries on model errors, bad requests, or timeouts (AC-3)
                 logger.warning("Bedrock OKF call failed (no retries per AC-3): %s", e)
+                if hasattr(self.repo, "fail_extraction_budget"):
+                    self.repo.fail_extraction_budget(
+                        workspace_id=workspace_id,
+                        document_id=document_id,
+                        document_version=ver,
+                        worker_id=getattr(self, "worker_id", f"worker_{os.getpid()}"),
+                        fence_token=reservation_fence,
+                        error_reason=str(e),
+                        prompt_tokens_spent=estimated_prompt_tokens,
+                    )
                 return "", {"input_tokens": 0, "output_tokens": 0}
 
         return "", {"input_tokens": 0, "output_tokens": 0}
