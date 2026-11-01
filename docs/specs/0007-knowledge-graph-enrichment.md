@@ -9,9 +9,9 @@ This specification defines the bounded integration of Knowledge Graph enrichment
 
 It replaces legacy unpartitioned global DynamoDB tables and unconstrained table scans with a typed, workspace scoped relationship schema. Grounding validation rejects unsupported model claims by verifying that relationships and connected entities appear verbatim in authorized source chunks. Baseline BM25, vector discovery, PageIndex structural navigation, and TableStore deterministic aggregate execution remain fully independent of graph enrichment. Baseline retrieval serves as the guaranteed operational fallback per ADR-001 so that any extraction timeout, storage failure, or missing relationship falls back immediately without degrading core query execution.
 
-This specification directly addresses the two documented open limitations from specification 0006:
-1. Distributed cross process budget coordination is resolved via atomic conditional lease reservations in DynamoDB.
-2. The 32 token heuristic framing allowance is resolved via empirical tokenizer calibration and strict byte upper bounds.
+## Dependencies on Specification 0006 (OKF)
+
+Knowledge Graph enrichment depends on specification 0006 (Open Knowledge Framework) for single entity definitions, property assertions, and tabular schemas. Specification 0006 identified two open operational limitations: distributed cross process extraction budget coordination and request token accounting verification. These limitations must be closed in OKF first (via OKF Slice 3.1). Knowledge Graph enrichment adopts the resulting durable budget coordination and token bounding architecture, but does not claim to resolve open OKF limitations itself.
 
 ## Context
 
@@ -56,13 +56,13 @@ To prevent architectural bloat and duplicate work, the division of responsibilit
 - **AC-1**: Ingestion extracts and persists typed `KnowledgeGraphEntity` and `KnowledgeGraphRelationship` records per document version for text PDF and structured documents. Relationships represent directed triples `(source_entity, predicate, target_entity)` with verified source chunk locators.
 - **AC-2**: Extracted relationships are validated against authorized active chunks before persistence. Candidate relationships must cite an active chunk belonging to the current document version, possess a valid locator, and contain the asserted relationship predicate and both connected entities verbatim in the source chunk text. Unsupported claims are rejected as hallucinations and omitted from storage.
 - **AC-3**: Graph ingestion extraction enforces strict resource bounds per document version: maximum 2 Bedrock completion calls, maximum 4000 total prompt input tokens (capped at 2000 per call), maximum 1600 total output tokens (capped at 800 per call), and a 10.0s total provider deadline per call (3.0s connect, 7.0s read). Retries are capped at at most 1 retry on throttling (HTTP 429), with zero retries on model errors, bad requests, or timeouts. Extraction is idempotent, keyed by `idempotency_key = sha256(f"{workspace_id}:{document_id}:{document_version}:kg")`. Replaying an existing version reuses persisted relationships with zero additional model calls. Baseline publication completes independently per ADR-001.
-- **AC-4**: Cross process budget coordination across multiple worker processes and hosts is enforced via atomic conditional lease reservations in DynamoDB (`attribute_not_exists(PK) OR budget_reserved_until < :now`). In process locks coordinate threads within a single Python worker, while DynamoDB conditional writes prevent double spending across distributed workers without external lock managers.
-- **AC-5**: Token counting safety is enforced by combining character and byte upper bounds (maximum 8000 UTF-8 bytes per input chunk prompt) with tokenizer calibration against standard Bedrock and Anthropic tokenizer profiles. The framing buffer is calibrated with automated test fixtures that reject heuristic underestimations and fail closed.
-- **AC-6**: Storage and lookups are strictly partitioned by `workspace_id`. Graph edges are stored in `kre_knowledge_graph` using indexed partition keys (`KG#{workspace_id}#ENTITY#{source_id}`) and sorted ranges (`EDGE#{predicate}#{target_id}`). Reverse relationships are indexed via GSI1 (`KG#{workspace_id}#TARGET#{target_id}`). Multi hop traversal executes strictly via indexed queries with bounded limits (maximum 10 edges per node, maximum 25 total nodes visited), with zero unconstrained scans.
+- **AC-4**: Durable budget accounting, lease expiry, stale worker fencing, retries, and crash recovery: A conditional lease alone is not proof that spending stays within budget. Graph extraction enforces a durable ledger in `kre_knowledge_graph` (`PK = KG#{workspace_id}#DOC#{document_id}#V#{document_version}`, `SK = BUDGET#LEDGER`) that atomically records call reservations, cumulative token expenditures, active lease ownership, lease expiry timestamp, and a monotonically increasing fence token. Before making a provider call, a worker must atomically acquire a lease permit (`reserved_calls < max_calls`). The lease expires after 15 seconds. If a worker call takes longer than the lease window (or if the worker crashes) and another worker takes over by advancing the fence token, the late returning worker is fenced: its write is rejected and no relationships are persisted. However, the tokens consumed by the stale worker call are reconciled into the ledger cumulative token count. On worker crash or restart, budget recovery performs a strongly consistent read; if `reserved_calls >= max_calls` and extraction is uncompleted, the document version budget fails closed as exhausted with zero additional provider calls. Throttling retries (HTTP 429) must reuse the acquired lease slot within its window or count as a reserved call. Retries are strictly prohibited on timeouts, bad requests, or client errors.
+- **AC-5**: Complete provider request token bounding and verification: Ingestion extraction strictly bounds complete Bedrock request payloads, including system prompt blocks, chunk text, formatting instructions, XML tags, and Converse API envelope wrapper overhead. The text payload is bounded by maximum 2000 characters per chunk and 8000 UTF-8 bytes total per call prompt. Converse API framing overhead is bounded by an empirically verified upper bound rather than an arbitrary heuristic. Automated offline test fixtures verify that estimated request tokens equal or exceed token counts generated by official model tokenizer profiles across edge case payloads (dense punctuation, repeating whitespace, unicode sequences). Any prompt exceeding the 2000 input token ceiling fails closed before network dispatch with zero provider calls.
+- **AC-6**: Storage and lookups are strictly partitioned by `workspace_id`. Graph edges are stored in `kre_knowledge_graph` using indexed partition keys (`KG#{workspace_id}#ENTITY#{source_id}`) and sorted ranges (`EDGE#{predicate}#{target_id}`). Reverse relationships are indexed via GSI1 (`KG#{workspace_id}#TARGET#{target_id}`). A dedicated, workspace scoped entity name lookup index is maintained at `PK = KG#{workspace_id}#LOOKUP` with sort key `NAME#{normalized_canonical_name}`, mapping entity names to `entity_id` and document references. Multi hop traversal executes strictly via indexed queries against primary keys, GSI1, and the lookup index with bounded limits (maximum 10 edges per node, maximum 25 total nodes visited), with zero unconstrained table scans.
 - **AC-7**: Active deletion tombstones in `WorkspaceBoundaryRepository` filter out relationships belonging to deleted source documents. Tombstone checks execute inside worker tasks and fail closed: any check error or workspace tombstone returns zero graph candidates immediately without throwing unhandled exceptions.
-- **AC-8**: Graph lookups enforce hard client deadlines (50ms total wall clock deadline across entity matching, graph traversal, and chunk hydration) and bounded concurrency worker admission (maximum 4 concurrent workers, maximum 8 queued submissions) managed by `GraphConcurrencyController`. Concurrency capacity is retained until underlying storage worker threads finish executing. Expired lookups drop graph candidates cleanly, guarantee baseline fallback, and ensure zero late candidate publication.
+- **AC-8**: Retrieval latency targets and admission control: Graph lookups enforce a proposed target deadline of 50ms total wall clock time across entity lookup, graph traversal, and chunk hydration, explicitly marked as a proposed target pending empirical measurement and calibration during Slice 2 ablation. Lookups are governed by `GraphConcurrencyController` (maximum 4 concurrent workers, maximum 8 queued submissions). Concurrency capacity is retained until underlying storage worker threads finish executing. Expired lookups drop graph candidates cleanly, guarantee baseline fallback, and ensure zero late candidate publication.
 - **AC-9**: Graph traversal bounds maximum expansion depth to 2 hops (or 3 hops when explicitly requested by causal query plans), applying cycle detection to prevent infinite loops. Chunks backing traversed edges are hydrated via targeted batch reads by chunk identifier, never loading entire workspace chunk sets.
-- **AC-10**: Validated source chunks backing traversed edges are pooled into reciprocal rank fusion with a calibrated weight of 1.10 (divided to 0.55 on entity ambiguity or conflicting edges) without hard candidate page exclusions or chunk pruning. Queries executing on the fast path (`plan.fast_path == True`) bypass graph traversal entirely. Zero model calls and zero embedding invocations are performed during graph retrieval.
+- **AC-10**: Candidate fusion and fast path bypass: Validated source chunks backing traversed edges are pooled into reciprocal rank fusion with a proposed initial weight of 1.10 (divided to 0.55 on entity ambiguity or conflicting edges), explicitly marked as proposed until measured and calibrated against the 60 question benchmark in Slice 2. Graph candidates never exclude or prune chunks from other retrieval strategies. Queries executing on the fast path (`plan.fast_path == True`) bypass graph traversal entirely. Zero model calls and zero embedding invocations are performed during graph retrieval.
 - **AC-11**: Non destructive legacy cutover: Scoped retrieval in `KnowledgeGraphStrategy` queries exclusively through the new workspace partitioned table (`kre_knowledge_graph`), excluding old global unpartitioned records by construction. Legacy tables (`okf_entities`, `okf_properties`, `okf_relations`) and old data are preserved without modification, and deletion is explicitly deferred.
 - **AC-12**: DocumentSnapshot exposes `graph_status`, `graph_entities_count`, and `graph_relations_count` without requiring dedicated administrative HTTP endpoints. Candidate chunk identifiers, latency, traversed node count, and edge match counts are exposed in `QueryResponse.retrieval_candidates` debug trace.
 - **AC-13**: An offline ablation comparison suite evaluates candidate recall, precision, and latency with Knowledge Graph enabled versus disabled against the BM25 and vector baseline across canonical evaluation documents, including a counterexample test proving that an incorrect graph expansion does not prevent retrieval of the true answer page.
@@ -130,10 +130,21 @@ class KnowledgeGraphManifest(BaseModel):
 
 Storage is implemented in `kre_knowledge_graph` (DynamoDB in cloud production, SQLite in local development):
 
-* **Base Table Primary Key**:
+* **Directed Relationship Edge Records**:
   * Partition Key (`PK`): `KG#{workspace_id}#ENTITY#{source_entity_id}`
   * Sort Key (`SK`): `EDGE#{predicate}#{target_entity_id}#{relationship_id}`
   * Attributes: `workspace_id`, `relationship_id`, `source_entity_name`, `target_entity_name`, `source_document_id`, `source_document_version`, `source_chunk_id`, `location_json`, `verbatim_evidence`, `confidence`, `created_at_utc`.
+
+* **Workspace Scoped Entity Name Lookup Records**:
+  * Partition Key (`PK`): `KG#{workspace_id}#LOOKUP`
+  * Sort Key (`SK`): `NAME#{normalized_canonical_name}`
+  * Attributes: `workspace_id`, `entity_id`, `canonical_name`, `entity_type`, `document_ids`, `created_at_utc`.
+  * Enables deterministic, bounded seed entity resolution for queries without table scans.
+
+* **Durable Extraction Budget Ledger Records**:
+  * Partition Key (`PK`): `KG#{workspace_id}#DOC#{document_id}#V#{document_version}`
+  * Sort Key (`SK`): `BUDGET#LEDGER`
+  * Attributes: `workspace_id`, `document_id`, `document_version`, `reserved_calls`, `completed_calls`, `input_tokens_spent`, `output_tokens_spent`, `lease_owner_id`, `lease_expires_at`, `fence_token`, `status`, `updated_at_utc`.
 
 * **Global Secondary Index 1 (GSI1 - Incoming and Reverse Edges)**:
   * Partition Key (`GSI1_PK`): `KG#{workspace_id}#TARGET#{target_entity_id}`
@@ -145,46 +156,103 @@ Storage is implemented in `kre_knowledge_graph` (DynamoDB in cloud production, S
   * Sort Key (`GSI2_SK`): `EDGE#{relationship_id}`
   * Used for atomic version invalidation and document deletion.
 
-### 3. Distributed Lease Reservations and Token Counting Calibration
+### 3. Durable Budget Accounting, Stale Worker Fencing, and Token Verification
 
-To solve the open cross process budget limitation from specification 0006, graph enrichment uses atomic DynamoDB conditional writes for budget leases:
+A conditional lease alone is not proof that spending stays within budget. If a worker acquires a lease but experiences a latency spike exceeding the lease duration, a second worker could acquire the expired lease. If both workers then dispatch Bedrock calls, the document version exceeds its 2 call budget ceiling. Similarly, if a worker crashes after dispatching a provider call, releasing the lease blindly would permit unbudgeted retries.
+
+To ensure extraction spending stays strictly within budget across distributed workers and crashes, graph extraction enforces a durable ledger protocol:
 
 ```python
-# Atomic distributed budget reservation in DynamoDB
-key = {"PK": f"BUDGET#{workspace_id}#{document_id}#V#{document_version}", "SK": "LEASE"}
+# 1. Atomic pre call reservation with monotonic fencing
 now_ts = int(time.time())
-lease_expiry = now_ts + 30  # 30 second lease window
+worker_id = str(uuid.uuid4())
+lease_window_s = 15
 
+# Conditional reservation: acquire only if reserved_calls < max_calls
+# and (no active lease exists OR active lease has expired OR lease is owned by this worker)
 try:
-    table.put_item(
-        Item={
-            "PK": key["PK"],
-            "SK": key["SK"],
-            "workspace_id": workspace_id,
-            "document_id": document_id,
-            "document_version": document_version,
-            "reserved_at": now_ts,
-            "budget_reserved_until": lease_expiry,
-            "attempt_count": current_attempts + 1,
-            "total_tokens_used": current_tokens,
+    response = table.update_item(
+        Key={"PK": ledger_pk, "SK": "BUDGET#LEDGER"},
+        UpdateExpression=(
+            "SET reserved_calls = if_not_exists(reserved_calls, :zero) + :one, "
+            "fence_token = if_not_exists(fence_token, :zero) + :one, "
+            "lease_owner_id = :worker_id, "
+            "lease_expires_at = :expires_at, "
+            "status = :in_progress"
+        ),
+        ConditionExpression=(
+            "(attribute_not_exists(reserved_calls) OR reserved_calls < :max_calls) AND "
+            "(attribute_not_exists(lease_expires_at) OR lease_expires_at < :now OR lease_owner_id = :worker_id)"
+        ),
+        ExpressionAttributeValues={
+            ":zero": 0,
+            ":one": 1,
+            ":max_calls": 2,
+            ":worker_id": worker_id,
+            ":expires_at": now_ts + lease_window_s,
+            ":now": now_ts,
+            ":in_progress": "in_progress",
         },
-        ConditionExpression="attribute_not_exists(PK) OR budget_reserved_until < :now",
-        ExpressionAttributeValues={":now": now_ts},
+        ReturnValues="ALL_NEW",
     )
+    my_fence_token = response["Attributes"]["fence_token"]
 except ClientError as e:
     if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
-        # Another worker is actively processing or budget lease is currently held
-        logger.warning("Graph extraction budget lease held by peer process")
+        # Budget exhausted or active lease held by peer worker
+        logger.warning("Graph extraction budget exhausted or lease locked by peer")
         return False
 ```
 
-Token counting is calibrated by enforcing hard character lengths (max 2000 characters per chunk prompt) and validating token sequences using test fixtures that compare against the target foundation model tokenizer. Input text is validated before dispatch; any payload exceeding 2000 prompt tokens or 8000 bytes fails closed before making a provider call.
+```python
+# 2. Stale worker fencing on result writeback
+# When the call completes, the worker checks its fence_token.
+# If lease expired and another worker advanced fence_token, this write fails.
+try:
+    table.update_item(
+        Key={"PK": ledger_pk, "SK": "BUDGET#LEDGER"},
+        UpdateExpression=(
+            "SET completed_calls = if_not_exists(completed_calls, :zero) + :one, "
+            "input_tokens_spent = if_not_exists(input_tokens_spent, :zero) + :in_toks, "
+            "output_tokens_spent = if_not_exists(output_tokens_spent, :zero) + :out_toks, "
+            "lease_expires_at = :zero"
+        ),
+        ConditionExpression="fence_token = :my_fence",
+        ExpressionAttributeValues={
+            ":zero": 0,
+            ":one": 1,
+            ":in_toks": actual_input_tokens,
+            ":out_toks": actual_output_tokens,
+            ":my_fence": my_fence_token,
+        },
+    )
+except ClientError as e:
+    if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+        # Worker was fenced; discard extracted relationships to prevent corrupting state.
+        # Still record consumed tokens to keep cumulative accounting honest.
+        logger.warning("Worker fenced out; discarding stale extracted relationships")
+        _record_fenced_token_spend(ledger_pk, actual_input_tokens, actual_output_tokens)
+        return False
+```
+
+**Crash Recovery and Fail Closed Semantics**:
+When a worker starts or restarts, it performs a strongly consistent read on the budget ledger. If `reserved_calls >= max_calls` and status is not `completed`, the document version budget is marked `exhausted`. No further provider calls are permitted, failing closed per ADR-001 so that baseline search remains functional.
+
+**Retries and Throttling Policy**:
+Retries are capped at at most 1 retry on throttling (HTTP 429), and only when the retry delay fits within the active lease window. Zero retries are permitted on model errors, bad requests, or client timeouts. A retry reuses the active reservation slot; it never creates an unreserved provider call.
+
+**Complete Provider Request Token Bounding and Verification**:
+Before any network call is dispatched, the complete request payload is bounded:
+1. Hard text character limit: maximum 2000 characters per chunk prompt.
+2. Hard byte limit: maximum 8000 UTF-8 bytes per call prompt.
+3. Verified envelope framing: includes Converse API message blocks, XML system instructions, role wrappers, and format delimiters, calibrated with direct empirical measurements.
+4. Tokenizer test fixtures: automated offline test fixtures run against official model tokenizers to assert that `count_request_tokens` never underestimates actual tokens across adversarial text structures.
+5. If calculated tokens exceed 2000 input tokens, extraction fails closed immediately with zero provider calls.
 
 ### 4. Bounded Multi Hop Traversal Algorithm
 
 The traversal algorithm executes without full table scans or unbounded recursion:
 
-1. **Seed Entity Resolution**: Match query tokens deterministically against known entity canonical names in the active workspace using exact matching and prefix lookup via GSI1. Zero model calls are made.
+1. **Seed Entity Resolution**: Match query tokens deterministically against known entity canonical names in the active workspace using exact matching and prefix lookup against `PK = KG#{workspace_id}#LOOKUP` with `SK begins_with NAME#{query_token}` (Limit 5). Zero model calls and zero table scans are performed.
 2. **Hop 1 Expansion**:
    * For each seed entity, query outgoing edges: `PK = KG#{workspace_id}#ENTITY#{seed_id}` (Limit 10).
    * Query incoming edges via GSI1: `GSI1_PK = KG#{workspace_id}#TARGET#{seed_id}` (Limit 10).
@@ -203,14 +271,14 @@ The traversal algorithm executes without full table scans or unbounded recursion
 Graph lookups run through `GraphConcurrencyController`:
 * 4 concurrent storage worker threads.
 * 8 maximum queued requests.
-* 50ms hard caller deadline.
+* 50ms proposed target deadline across entity matching, graph traversal, and chunk hydration (explicitly marked as proposed until measured under benchmark load).
 * Dedicated socket timeouts: 30ms connect, 40ms read. Explicit `botocore` retry disabling (`max_attempts=1`).
 * Worker capacity retention: If the 50ms caller deadline expires before storage completes, worker capacity remains reserved until the underlying thread finishes, preventing saturation under latency spikes.
 
 ### 6. Candidate Fusion and Reciprocal Rank Fusion
 
-* **Fusion Weight**: 1.10 base weight.
-* **Ambiguity and Conflict Adjustment**: If an entity matches multiple candidates or relationship edges contain conflicting statements across documents, the weight is halved to 0.55.
+* **Proposed Fusion Weight**: 1.10 base weight (explicitly marked as proposed until calibrated in Slice 2 ablation).
+* **Ambiguity and Conflict Adjustment**: If an entity matches multiple candidates or relationship edges contain conflicting statements across documents, the weight is halved to 0.55 (proposed target).
 * **Fast Path Bypass**: If `plan.fast_path == True`, graph lookup is skipped entirely (zero tokens, zero latency).
 * **Soft Candidate Pooling**: Graph candidates are combined with BM25, vector, PageIndex, and OKF candidates using Reciprocal Rank Fusion ($k=60$). Graph candidates never exclude or prune chunks from other retrieval strategies.
 
@@ -228,7 +296,7 @@ Store graph relationships in dedicated workspace scoped DynamoDB records (`kre_k
 **Pros**:
 * Reuses existing DynamoDB and SQLite storage infrastructure without adding new database clusters.
 * Guarantees strict multi tenant isolation via workspace prefixed partition keys.
-* Resolves the open OKF cross process budget limitation via atomic conditional writes.
+* Adopts the durable budget accounting and fencing pattern proven in OKF Slice 3.1.
 * Bounded traversal and targeted chunk hydration prevent memory exhaustion and latency stalls.
 * Conforms strictly to ADR-001: graph extraction failures leave baseline search fully functional.
 
