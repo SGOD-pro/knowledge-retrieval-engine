@@ -251,35 +251,8 @@ def get_or_create_document_budget(
             try:
                 # Strongly consistent read ensures recovery does not miss recently committed reservations
                 ledger = None
-                # If get_manifest was monkeypatched by a test, execute it to preserve test intent
-                if hasattr(repo, "get_manifest") and (getattr(repo.get_manifest, "_is_mock", False) or "Mock" in getattr(repo.get_manifest, "__class__", type).__name__):
-                    existing_man = repo.get_manifest(
-                        workspace_id,
-                        document_id,
-                        document_version,
-                        consistent_read=True,
-                    )
-                    if existing_man is not None:
-                        prior_calls = getattr(existing_man, "model_calls", 0)
-                        prior_tokens = getattr(existing_man, "extraction_tokens", 0)
-                        if existing_man.status == "failed" or prior_calls >= max_calls:
-                            prior_exhausted = True
-                            prior_reason = f"prior_recorded_attempts ({prior_calls}/{max_calls})"
-                elif hasattr(repo, "get_budget_ledger"):
+                if hasattr(repo, "get_budget_ledger"):
                     ledger = repo.get_budget_ledger(workspace_id, document_id, document_version, consistent_read=True)
-                elif hasattr(repo, "get_manifest"):
-                    existing_man = repo.get_manifest(
-                        workspace_id,
-                        document_id,
-                        document_version,
-                        consistent_read=True,
-                    )
-                    if existing_man is not None:
-                        prior_calls = getattr(existing_man, "model_calls", 0)
-                        prior_tokens = getattr(existing_man, "extraction_tokens", 0)
-                        if existing_man.status == "failed" or prior_calls >= max_calls:
-                            prior_exhausted = True
-                            prior_reason = f"prior_recorded_attempts ({prior_calls}/{max_calls})"
 
                 if ledger is not None:
                     prior_calls = ledger.reserved_calls
@@ -1519,10 +1492,10 @@ class OkfBuilder:
                     input={"converse": {"messages": messages, "system": system}},
                 )
                 raw_tokens = count_resp.get("inputTokens", 0) if isinstance(count_resp, dict) else None
-                if isinstance(raw_tokens, int):
+                if isinstance(raw_tokens, int) and raw_tokens > 0:
                     estimated_prompt_tokens = raw_tokens
                 else:
-                    # In test/mock mode where count_tokens returns an unconfigured mock
+                    # In test/mock mode or missing count, fall back conservatively to token estimation
                     estimated_prompt_tokens = count_request_tokens(system_prompt, user_prompt, model_id=model_id)
             except Exception as count_err:
                 budget.exhausted = True
@@ -1724,21 +1697,24 @@ class OkfBuilder:
 
                 # Reconcile against durable ledger and check stale worker fencing
                 if hasattr(self.repo, "reconcile_extraction_budget"):
-                    rec_res = self.repo.reconcile_extraction_budget(
-                        workspace_id=workspace_id,
-                        document_id=document_id,
-                        document_version=ver,
-                        worker_id=getattr(self, "worker_id", f"worker_{os.getpid()}"),
-                        fence_token=reservation_fence,
-                        actual_prompt_tokens=usage["input_tokens"],
-                        actual_output_tokens=usage["output_tokens"],
-                    )
-                    if rec_res.fenced_out:
-                        logger.warning(
-                            "okf_builder.worker_fenced_out ws=%s doc=%s ver=%s (discarding stale extracted assertions)",
-                            workspace_id, document_id, ver,
+                    try:
+                        rec_res = self.repo.reconcile_extraction_budget(
+                            workspace_id=workspace_id,
+                            document_id=document_id,
+                            document_version=ver,
+                            worker_id=getattr(self, "worker_id", f"worker_{os.getpid()}"),
+                            fence_token=reservation_fence,
+                            actual_prompt_tokens=usage["input_tokens"],
+                            actual_output_tokens=usage["output_tokens"],
                         )
-                        return "", usage
+                        if rec_res.fenced_out:
+                            logger.warning(
+                                "okf_builder.worker_fenced_out ws=%s doc=%s ver=%s (discarding stale extracted assertions)",
+                                workspace_id, document_id, ver,
+                            )
+                            return "", usage
+                    except Exception as rec_err:
+                        logger.error("okf_builder.reconcile_extraction_budget_failed: %s", rec_err)
 
                 output_text = resp["output"]["message"]["content"][0]["text"]
                 return output_text, usage

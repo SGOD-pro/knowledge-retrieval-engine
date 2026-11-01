@@ -1936,9 +1936,9 @@ def test_dynamodb_adapter_budget_recovery_strongly_consistent_read():
         repo=repo,
     )
 
-    mock_table.get_item.assert_called_once()
-    call_kwargs2 = mock_table.get_item.call_args[1]
-    assert call_kwargs2.get("ConsistentRead") is True
+    assert mock_table.get_item.call_count == 2
+    for call in mock_table.get_item.call_args_list:
+        assert call[1].get("ConsistentRead") is True
     assert budget2.calls_made == 0
     assert budget2.exhausted is False
     assert budget2.can_call() is True

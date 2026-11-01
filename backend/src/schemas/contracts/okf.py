@@ -165,6 +165,7 @@ class ExtractionReservationResult(BaseModel):
         "active_lease_held",
         "already_completed",
         "already_exhausted",
+        "already_failed",
         "storage_error",
     ]
     ledger: OkfBudgetLedger | None = None

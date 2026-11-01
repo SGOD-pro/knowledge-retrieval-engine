@@ -238,7 +238,7 @@ except ClientError as e:
 When a worker starts or restarts, it performs a strongly consistent read on the budget ledger. If `reserved_calls >= max_calls` and status is not `completed`, the document version budget is marked `exhausted`. No further provider calls are permitted, failing closed per ADR-001 so that baseline search remains functional.
 
 **Retries and Throttling Policy**:
-Retries are capped at at most 1 retry on throttling (HTTP 429), and only when the retry delay fits within the active lease window. Zero retries are permitted on model errors, bad requests, or client timeouts. A retry reuses the active reservation slot; it never creates an unreserved provider call.
+Retries are capped at at most 1 retry on throttling (HTTP 429), and only when the retry delay fits within the active lease window. Zero retries are permitted on model errors, bad requests, or client timeouts. A retry acquires a separate atomic durable reservation while reusing the active lease owner identity; it never creates an unreserved provider call.
 
 **Complete Provider Request Token Bounding and Verification**:
 Before any network call is dispatched, the complete request payload is bounded:

@@ -437,6 +437,15 @@ class InMemoryOkfRepository:
                         reason="already_exhausted",
                         ledger=ledger,
                     )
+                if ledger.status == "failed":
+                    return ExtractionReservationResult(
+                        granted=False,
+                        fence_token=ledger.fence_token,
+                        call_number=ledger.reserved_calls,
+                        remaining_calls=0,
+                        reason="already_failed",
+                        ledger=ledger,
+                    )
                 if ledger.reserved_calls >= max_calls:
                     updated = OkfBudgetLedger(
                         workspace_id=workspace_id,
@@ -687,7 +696,7 @@ class InMemoryOkfRepository:
             ledger = self._ledgers.get(key)
             if ledger is not None:
                 return ledger
-            man = self._manifests.get(key)
+            man = self.get_manifest(workspace_id, document_id, document_version)
             if man is not None:
                 return OkfBudgetLedger(
                     workspace_id=workspace_id,
@@ -697,7 +706,7 @@ class InMemoryOkfRepository:
                     completed_calls=getattr(man, "model_calls", 0),
                     reserved_tokens=getattr(man, "extraction_tokens", 0),
                     spent_tokens=getattr(man, "extraction_tokens", 0),
-                    status=getattr(man, "status", "active"),
+                    status="failed" if getattr(man, "status", "") == "failed" else "completed",
                     updated_at=getattr(man, "created_at", _now_utc()),
                 )
             return None
@@ -1056,6 +1065,15 @@ class SQLiteOkfRepository:
                             call_number=ledger.reserved_calls,
                             remaining_calls=0,
                             reason="already_exhausted",
+                            ledger=ledger,
+                        )
+                    if ledger.status == "failed":
+                        return ExtractionReservationResult(
+                            granted=False,
+                            fence_token=ledger.fence_token,
+                            call_number=ledger.reserved_calls,
+                            remaining_calls=0,
+                            reason="already_failed",
                             ledger=ledger,
                         )
                     if ledger.reserved_calls >= max_calls:
@@ -1424,9 +1442,22 @@ class SQLiteOkfRepository:
                     (pk, sk),
                 )
                 row = cursor.fetchone()
-                if not row:
-                    return None
-                return OkfBudgetLedger(**json.loads(row["data_json"]))
+                if row:
+                    return OkfBudgetLedger(**json.loads(row["data_json"]))
+                man = self.get_manifest(workspace_id, document_id, document_version, consistent_read=consistent_read)
+                if man is not None:
+                    return OkfBudgetLedger(
+                        workspace_id=workspace_id,
+                        document_id=document_id,
+                        document_version=document_version,
+                        reserved_calls=getattr(man, "model_calls", 0),
+                        completed_calls=getattr(man, "model_calls", 0),
+                        reserved_tokens=getattr(man, "extraction_tokens", 0),
+                        spent_tokens=getattr(man, "extraction_tokens", 0),
+                        status="failed" if getattr(man, "status", "") == "failed" else "completed",
+                        updated_at=getattr(man, "created_at", _now_utc()),
+                    )
+                return None
             except Exception as exc:
                 logger.error("SQLite get_budget_ledger failed: %s", exc)
                 raise StorageUnavailableError(f"SQLite error reading OKF budget ledger: {exc}") from exc
@@ -1850,6 +1881,8 @@ class DynamoDBOkfRepository:
                         reason = "already_completed"
                     elif curr.status == "exhausted":
                         reason = "already_exhausted"
+                    elif curr.status == "failed":
+                        reason = "already_failed"
                     elif curr.reserved_calls >= max_calls:
                         reason = "calls_exhausted"
                     elif curr.spent_tokens + est_tokens > max_total_tokens:
@@ -1978,9 +2011,10 @@ class DynamoDBOkfRepository:
                 try:
                     table.update_item(
                         Key={"PK": pk, "SK": sk},
-                        UpdateExpression="SET #spent = #spent + :actual_tokens, #rf = list_append(if_not_exists(#rf, :empty_list), :ft_list), updated_at = :now_iso",
+                        UpdateExpression="SET #spent = if_not_exists(#spent, :zero) + :actual_tokens, #rf = list_append(if_not_exists(#rf, :empty_list), :ft_list), updated_at = :now_iso",
                         ExpressionAttributeNames={"#spent": "spent_tokens", "#rf": "reconciled_fences"},
                         ExpressionAttributeValues={
+                            ":zero": 0,
                             ":actual_tokens": actual_total,
                             ":empty_list": [],
                             ":ft_list": [fence_token],
@@ -2028,7 +2062,7 @@ class DynamoDBOkfRepository:
             table.update_item(
                 Key={"PK": pk, "SK": sk},
                 UpdateExpression=(
-                    "SET #spent = #spent + :spent, "
+                    "SET #spent = if_not_exists(#spent, :zero) + :spent, "
                     "#lexp = :zero, "
                     "#st = :st_fail, "
                     "#rf = list_append(if_not_exists(#rf, :empty_list), :ft_list), "
@@ -2070,6 +2104,19 @@ class DynamoDBOkfRepository:
             )
             item = resp.get("Item")
             if not item:
+                man = self.get_manifest(workspace_id, document_id, document_version, consistent_read=consistent_read)
+                if man is not None:
+                    return OkfBudgetLedger(
+                        workspace_id=workspace_id,
+                        document_id=document_id,
+                        document_version=document_version,
+                        reserved_calls=getattr(man, "model_calls", 0),
+                        completed_calls=getattr(man, "model_calls", 0),
+                        reserved_tokens=getattr(man, "extraction_tokens", 0),
+                        spent_tokens=getattr(man, "extraction_tokens", 0),
+                        status="failed" if getattr(man, "status", "") == "failed" else "completed",
+                        updated_at=getattr(man, "created_at", _now_utc()),
+                    )
                 return None
             raw_rf = item.get("reconciled_fences", [])
             reconciled_fences = tuple(int(x) for x in raw_rf) if raw_rf else ()

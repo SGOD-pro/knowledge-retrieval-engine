@@ -736,3 +736,370 @@ def test_dynamodb_repository_budget_ledger_stubbed():
     assert res.call_number == 1
     assert res.fence_token == 1
     mock_table.update_item.assert_called_once()
+
+
+def test_failed_status_denies_reservation_across_repositories(tmp_path):
+    """Verify that a ledger with status='failed' strictly denies further reservations
+    with reason='already_failed' across InMemory, SQLite, and DynamoDB repository adapters.
+    """
+    ws_id = "ws_fail_status"
+    doc_id = "doc_fail_status"
+    ver = "v1"
+
+    # 1. InMemoryOkfRepository
+    mem_repo = InMemoryOkfRepository()
+    # Seed a failed ledger
+    mem_repo._ledgers[(ws_id, doc_id, ver)] = OkfBudgetLedger(
+        workspace_id=ws_id,
+        document_id=doc_id,
+        document_version=ver,
+        reserved_calls=1,
+        completed_calls=0,
+        reserved_tokens=500,
+        spent_tokens=200,
+        status="failed",
+        updated_at="2026-11-01T00:00:00Z",
+    )
+    res_mem = mem_repo.reserve_extraction_budget(
+        workspace_id=ws_id,
+        document_id=doc_id,
+        document_version=ver,
+        worker_id="worker_test",
+        estimated_prompt_tokens=400,
+        max_output_tokens=300,
+    )
+    assert res_mem.granted is False
+    assert res_mem.reason == "already_failed"
+
+    # 2. SQLiteOkfRepository
+    db_file = tmp_path / "test_failed_status.db"
+    sqlite_repo = SQLiteOkfRepository(db_path=str(db_file))
+    # First make a reservation, then mark failed
+    res_sq1 = sqlite_repo.reserve_extraction_budget(
+        workspace_id=ws_id,
+        document_id=doc_id,
+        document_version=ver,
+        worker_id="worker_sq",
+        estimated_prompt_tokens=400,
+        max_output_tokens=300,
+    )
+    assert res_sq1.granted is True
+    sqlite_repo.fail_extraction_budget(
+        workspace_id=ws_id,
+        document_id=doc_id,
+        document_version=ver,
+        worker_id="worker_sq",
+        fence_token=res_sq1.fence_token,
+        error_reason="Simulated provider crash",
+        prompt_tokens_spent=400,
+    )
+    res_sq2 = sqlite_repo.reserve_extraction_budget(
+        workspace_id=ws_id,
+        document_id=doc_id,
+        document_version=ver,
+        worker_id="worker_sq_2",
+        estimated_prompt_tokens=400,
+        max_output_tokens=300,
+    )
+    assert res_sq2.granted is False
+    assert res_sq2.reason == "already_failed"
+
+    # 3. DynamoDBOkfRepository
+    ddb_repo = DynamoDBOkfRepository(table_name="test_facts")
+    mock_table = MagicMock()
+    mock_client = MagicMock()
+    ddb_repo._table = mock_table
+    ddb_repo._client = mock_client
+    from botocore.exceptions import ClientError
+    # Simulate conditional check failure because status is 'failed' (not 'active')
+    mock_table.update_item.side_effect = ClientError(
+        {"Error": {"Code": "ConditionalCheckFailedException", "Message": "Conditional check failed"}},
+        "UpdateItem",
+    )
+    # mock get_item to return failed ledger
+    mock_table.get_item.return_value = {
+        "Item": {
+            "PK": f"WORKSPACE#{ws_id}",
+            "SK": f"BUDGET#DOC#{doc_id}#VER#{ver}",
+            "reserved_calls": 1,
+            "completed_calls": 0,
+            "reserved_tokens": 500,
+            "spent_tokens": 200,
+            "status": "failed",
+            "fence_token": 1,
+            "reconciled_fences": [],
+            "lease_expires_at": 0,
+        }
+    }
+    res_ddb = ddb_repo.reserve_extraction_budget(
+        workspace_id=ws_id,
+        document_id=doc_id,
+        document_version=ver,
+        worker_id="worker_ddb",
+        estimated_prompt_tokens=400,
+        max_output_tokens=300,
+    )
+    assert res_ddb.granted is False
+    assert res_ddb.reason == "already_failed"
+
+
+def test_dynamodb_repository_reconciliation_and_fencing_stubbed():
+    """Verify DynamoDBOkfRepository reconciliation, duplicate idempotency, and stale worker fencing."""
+    ddb_repo = DynamoDBOkfRepository(table_name="test_facts")
+    mock_table = MagicMock()
+    mock_client = MagicMock()
+    ddb_repo._table = mock_table
+    ddb_repo._client = mock_client
+
+    ws_id = "ws_rec_stub"
+    doc_id = "doc_rec_stub"
+    ver = "v1"
+
+    # 1. Normal reconciliation
+    mock_table.get_item.return_value = {
+        "Item": {
+            "PK": f"WORKSPACE#{ws_id}",
+            "SK": f"BUDGET#DOC#{doc_id}#VER#{ver}",
+            "reserved_calls": 1,
+            "completed_calls": 0,
+            "reserved_tokens": 800,
+            "spent_tokens": 0,
+            "fence_token": 1,
+            "reconciled_fences": [],
+            "status": "active",
+            "lease_owner_id": "worker_1",
+            "lease_expires_at": 100.0,
+            "updated_at": "2026-11-01T12:00:00Z",
+        }
+    }
+    mock_table.update_item.return_value = {
+        "Attributes": {
+            "reserved_calls": 1,
+            "completed_calls": 1,
+            "reserved_tokens": 800,
+            "spent_tokens": 450,
+            "lease_owner_id": None,
+            "lease_expires_at": 0,
+            "fence_token": 1,
+            "reconciled_fences": [1],
+            "status": "completed",
+            "updated_at": "2026-11-01T12:05:00Z",
+        }
+    }
+    rec1 = ddb_repo.reconcile_extraction_budget(
+        workspace_id=ws_id,
+        document_id=doc_id,
+        document_version=ver,
+        worker_id="worker_1",
+        fence_token=1,
+        actual_prompt_tokens=300,
+        actual_output_tokens=150,
+    )
+    assert rec1.reconciled is True
+    assert rec1.fenced_out is False
+    assert rec1.reason == "reconciled"
+
+    # 2. Duplicate reconciliation: condition fails, ledger shows fence already in reconciled_fences
+    from botocore.exceptions import ClientError
+    mock_table.update_item.side_effect = ClientError(
+        {"Error": {"Code": "ConditionalCheckFailedException", "Message": "Conditional check failed"}},
+        "UpdateItem",
+    )
+    mock_table.get_item.return_value = {
+        "Item": {
+            "PK": f"WORKSPACE#{ws_id}",
+            "SK": f"BUDGET#DOC#{doc_id}#VER#{ver}",
+            "reserved_calls": 1,
+            "completed_calls": 1,
+            "reserved_tokens": 800,
+            "spent_tokens": 450,
+            "fence_token": 1,
+            "reconciled_fences": [1],
+            "status": "completed",
+            "lease_owner_id": None,
+            "lease_expires_at": 0.0,
+            "updated_at": "2026-11-01T12:00:00Z",
+        }
+    }
+    rec_dup = ddb_repo.reconcile_extraction_budget(
+        workspace_id=ws_id,
+        document_id=doc_id,
+        document_version=ver,
+        worker_id="worker_1",
+        fence_token=1,
+        actual_prompt_tokens=300,
+        actual_output_tokens=150,
+    )
+    assert rec_dup.reconciled is True
+    assert rec_dup.fenced_out is False
+    assert rec_dup.reason == "already_reconciled"
+
+    # 3. Stale worker fenced out: fence_token=1 reconciling when ledger has fence_token=2
+    mock_table.get_item.return_value = {
+        "Item": {
+            "PK": f"WORKSPACE#{ws_id}",
+            "SK": f"BUDGET#DOC#{doc_id}#VER#{ver}",
+            "reserved_calls": 2,
+            "completed_calls": 0,
+            "reserved_tokens": 1600,
+            "spent_tokens": 0,
+            "fence_token": 2,
+            "reconciled_fences": [],
+            "status": "active",
+            "lease_owner_id": "worker_active",
+            "lease_expires_at": 200.0,
+            "updated_at": "2026-11-01T12:00:00Z",
+        }
+    }
+    # Reset side_effect for the fallback update_item that records fenced token spend
+    mock_table.update_item.side_effect = [
+        ClientError(
+            {"Error": {"Code": "ConditionalCheckFailedException", "Message": "Conditional check failed"}},
+            "UpdateItem",
+        ),
+        {"Attributes": {}},
+    ]
+    rec_stale = ddb_repo.reconcile_extraction_budget(
+        workspace_id=ws_id,
+        document_id=doc_id,
+        document_version=ver,
+        worker_id="worker_stale",
+        fence_token=1,
+        actual_prompt_tokens=300,
+        actual_output_tokens=150,
+    )
+    assert rec_stale.reconciled is False
+    assert rec_stale.fenced_out is True
+    assert rec_stale.reason == "fenced_out"
+
+
+def test_dynamodb_repository_fail_extraction_budget_stubbed():
+    """Verify DynamoDBOkfRepository fail_extraction_budget updates status to failed and records failure reason."""
+    ddb_repo = DynamoDBOkfRepository(table_name="test_facts")
+    mock_table = MagicMock()
+    mock_client = MagicMock()
+    ddb_repo._table = mock_table
+    ddb_repo._client = mock_client
+
+    ws_id = "ws_fail_stub"
+    doc_id = "doc_fail_stub"
+    ver = "v1"
+
+    mock_table.get_item.return_value = {
+        "Item": {
+            "PK": f"WORKSPACE#{ws_id}",
+            "SK": f"BUDGET#DOC#{doc_id}#VER#{ver}",
+            "reserved_calls": 1,
+            "completed_calls": 0,
+            "reserved_tokens": 800,
+            "spent_tokens": 0,
+            "fence_token": 1,
+            "reconciled_fences": [],
+            "status": "active",
+            "lease_owner_id": "worker_err",
+            "lease_expires_at": 100.0,
+            "updated_at": "2026-11-01T12:00:00Z",
+        }
+    }
+
+    ddb_repo.fail_extraction_budget(
+        workspace_id=ws_id,
+        document_id=doc_id,
+        document_version=ver,
+        worker_id="worker_err",
+        fence_token=1,
+        error_reason="Provider timeout",
+        prompt_tokens_spent=350,
+    )
+
+    mock_table.update_item.assert_called_once()
+    kwargs = mock_table.update_item.call_args[1]
+    assert kwargs["Key"]["PK"] == f"WORKSPACE#{ws_id}"
+    assert kwargs["Key"]["SK"] == f"BUDGET#DOC#{doc_id}#VER#{ver}"
+    expr_vals = kwargs["ExpressionAttributeValues"]
+    assert expr_vals[":st_fail"] == "failed"
+    assert expr_vals[":spent"] == 350
+
+
+def test_legacy_manifest_fallback_when_no_budget_item_exists(tmp_path):
+    """Verify that when no budget ledger record exists in DynamoDB or SQLite,
+    get_budget_ledger cleanly falls back to checking the legacy manifest and synthesizing a ledger.
+    """
+    ws_id = "ws_legacy_fallback"
+    doc_id = "doc_legacy_fallback"
+    ver = "v1"
+
+    # 1. DynamoDB fallback test
+    ddb_repo = DynamoDBOkfRepository(table_name="test_facts")
+    mock_table = MagicMock()
+    mock_client = MagicMock()
+    ddb_repo._table = mock_table
+    ddb_repo._client = mock_client
+
+    legacy_manifest_data = {
+        "workspace_id": ws_id,
+        "document_id": doc_id,
+        "document_version": ver,
+        "entities": [],
+        "assertions": [],
+        "rejected_assertions_count": 0,
+        "status": "failed",
+        "extraction_tokens": 400,
+        "model_calls": 2,
+        "idempotency_key": f"{ws_id}:{doc_id}:{ver}",
+        "created_at": "2026-10-25T00:00:00Z",
+    }
+
+    def mock_get_item(Key, ConsistentRead=True):
+        sk = Key.get("SK", "")
+        if sk.startswith("BUDGET#"):
+            return {"ResponseMetadata": {"HTTPStatusCode": 200}}
+        elif sk.startswith("MANIFEST#"):
+            return {
+                "Item": {
+                    "PK": f"WORKSPACE#{ws_id}",
+                    "SK": f"MANIFEST#DOC#{doc_id}#VER#{ver}",
+                    "data_json": json.dumps(legacy_manifest_data),
+                }
+            }
+        return {}
+
+    mock_table.get_item.side_effect = mock_get_item
+    ledger_ddb = ddb_repo.get_budget_ledger(ws_id, doc_id, ver, consistent_read=True)
+    assert ledger_ddb is not None
+    assert ledger_ddb.reserved_calls == 2
+    assert ledger_ddb.completed_calls == 2
+    assert ledger_ddb.spent_tokens == 400
+    assert ledger_ddb.status == "failed"
+
+    # 2. SQLite fallback test
+    db_file = tmp_path / "test_legacy_sqlite.db"
+    sqlite_repo = SQLiteOkfRepository(db_path=str(db_file))
+    manifest = OkfManifest(
+        workspace_id=ws_id,
+        document_id=doc_id,
+        document_version=ver,
+        entities=[],
+        assertions=[],
+        rejected_assertions_count=0,
+        status="ready",
+        extraction_tokens=320,
+        model_calls=1,
+        idempotency_key=f"{ws_id}:{doc_id}:{ver}",
+        created_at="2026-10-25T00:00:00Z",
+    )
+    sqlite_repo.save_manifest(ws_id, manifest)
+    # Ensure no BUDGET row exists in SQLite table
+    cursor = sqlite_repo._conn.execute(
+        "SELECT COUNT(*) as c FROM kre_okf_facts WHERE sk LIKE 'BUDGET#%'"
+    )
+    assert cursor.fetchone()["c"] == 0
+
+    ledger_sq = sqlite_repo.get_budget_ledger(ws_id, doc_id, ver, consistent_read=True)
+    assert ledger_sq is not None
+    assert ledger_sq.reserved_calls == 1
+    assert ledger_sq.completed_calls == 1
+    assert ledger_sq.spent_tokens == 320
+    assert ledger_sq.status == "completed"
+
+
