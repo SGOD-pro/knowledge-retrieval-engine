@@ -22,7 +22,7 @@ _These are recommendations to keep your build orderly, not requirements. Skip an
 | 4 | Core walking skeleton | Slice 1 | done |
 | 5 | PageIndex structural retrieval | Slice 2 | done |
 | 6 | OKF integration | Slice 3 | done |
-| 7 | Baseline discovery retrieval and fusion | Slice 4 | planned |
+| 7 | Knowledge graph enrichment | Slice 4 | planned |
 | 8 | Knowledge Map and requirement router | Slice 5 | planned |
 | 9 | Evidence verification and answer assembly | Slice 6 | planned |
 | 10 | End to end interface integration | Slice 7 | planned |
