@@ -1,16 +1,18 @@
 """Offline regression tests for verified routing, outcome classification, and telemetry defects."""
 
+import concurrent.futures
 from decimal import Decimal
 from unittest.mock import MagicMock, patch
 import pytest
 
 from db.table_store.memory_store import MemoryTableStore
+from db.table_store.sqlite_store import SQLiteTableStore
 from providers.reranker_provider import (
     get_last_reranker_mode,
     rerank_documents,
     set_last_reranker_mode,
 )
-from schemas.models import QueryResponse
+from schemas.models import QueryResponse, RerankerMode
 from schemas.structured_table import (
     ColumnDefinition,
     HeaderTopology,
@@ -375,3 +377,322 @@ def test_reranker_telemetry_remote_success_and_fallback():
         scores = rerank_documents("test query", docs)
         assert len(scores) == 2
         assert get_last_reranker_mode() == "circuit_open_lexical_fallback"
+
+
+def _create_large_test_table(
+    store,
+    workspace_id: str,
+    table_id: str,
+    doc_id: str,
+    num_rows: int,
+    target_row_index: int | None = None,
+    target_name: str = "SpecialEntity",
+    coverage_complete: bool = True,
+) -> None:
+    cols = (
+        ColumnDefinition(col_index=0, name="ID", inferred_dtype=InferredDtype.INTEGER),
+        ColumnDefinition(col_index=1, name="Category", inferred_dtype=InferredDtype.STRING),
+        ColumnDefinition(col_index=2, name="Amount", inferred_dtype=InferredDtype.DECIMAL),
+    )
+    schema = TableSchema(
+        columns=cols,
+        header_rows=(0,),
+        header_topology=HeaderTopology.SINGLE_ROW,
+        confidence=1.0,
+    )
+    rows = []
+    for r_idx in range(num_rows):
+        cat_val = target_name if target_row_index is not None and r_idx == target_row_index else "Standard"
+        rows.append(
+            TableRow(
+                row_index=r_idx,
+                row_id=f"{table_id}_r_{r_idx}",
+                cells=(
+                    TableCell(
+                        cell_id=f"{table_id}_c_{r_idx}_0",
+                        row_index=r_idx,
+                        col_index=0,
+                        coordinate=f"A{r_idx + 1}",
+                        raw_value=str(r_idx),
+                        normalized_value=r_idx,
+                    ),
+                    TableCell(
+                        cell_id=f"{table_id}_c_{r_idx}_1",
+                        row_index=r_idx,
+                        col_index=1,
+                        coordinate=f"B{r_idx + 1}",
+                        raw_value=cat_val,
+                        normalized_value=cat_val,
+                    ),
+                    TableCell(
+                        cell_id=f"{table_id}_c_{r_idx}_2",
+                        row_index=r_idx,
+                        col_index=2,
+                        coordinate=f"C{r_idx + 1}",
+                        raw_value="100.0",
+                        normalized_value=Decimal("100.0"),
+                    ),
+                ),
+            )
+        )
+    table = StructuredTable(
+        table_id=table_id,
+        document_id=doc_id,
+        sheet_name=None,
+        page_number=None,
+        schema=schema,
+        rows=tuple(rows),
+        row_count=len(rows),
+        col_count=3,
+    )
+    store.store_table(table, workspace_id)
+    if hasattr(store, "store_schema"):
+        store.store_schema(table_id, workspace_id, schema, doc_id, "v1")
+    if hasattr(store, "write_row_batch_with_checkpoint"):
+        store.write_row_batch_with_checkpoint(
+            table_id=table_id,
+            workspace_id=workspace_id,
+            document_id=doc_id,
+            version="v1",
+            rows=list(rows),
+            checkpoint_batch=0,
+            source_rows=len(rows),
+            attempted_rows=len(rows),
+            persisted_rows=len(rows),
+            rejected_rows=0,
+            parser_version="1.0.0",
+            schema_version="",
+            content_hash="test_content_hash",
+        )
+    manifest = {
+        "coverage_complete": coverage_complete,
+        "source_rows": len(rows),
+        "persisted_rows": len(rows),
+        "rejected_rows": 0,
+        "document_version": "v1",
+    }
+    store.publish_active_version(table_id, workspace_id, doc_id, "v1", manifest)
+
+
+def test_scan_pagination_boundaries_memory_and_sqlite(tmp_path):
+    """Verify scan pagination boundaries at exactly 500 rows and 501 rows for Memory and SQLite stores."""
+    sqlite_path = str(tmp_path / "pagination_test.db")
+    stores = [
+        MemoryTableStore(),
+        SQLiteTableStore(sqlite_path),
+    ]
+
+    for store in stores:
+        ws = f"ws_boundary_{type(store).__name__}"
+
+        # 1. Exactly 500 rows: scan limit 500 should complete without truncation
+        _create_large_test_table(store, ws, "tab_500", "doc_500", num_rows=500)
+        res_500 = store.query_rows("tab_500", ws, max_scan_items=500)
+        assert len(res_500) == 500
+        assert res_500.is_truncated is False
+        assert res_500.scanned_count == 500
+
+        # 2. 501 rows: scan limit 500 should report truncation
+        _create_large_test_table(store, ws, "tab_501", "doc_501", num_rows=501)
+        res_501 = store.query_rows("tab_501", ws, max_scan_items=500)
+        assert len(res_501) == 500
+        assert res_501.is_truncated is True
+        assert res_501.scanned_count == 500
+
+
+def test_match_after_row_500_truncated_scan_falls_back_safely():
+    """Verify entity past row 500 triggers truncated scan reporting and safe fallback without false refusal."""
+    store = MemoryTableStore()
+    ws = "ws_scan_truncation"
+
+    # Table with 600 rows where RareEntity only exists at row 550
+    _create_large_test_table(
+        store,
+        ws,
+        "deep_table",
+        "doc_deep",
+        num_rows=600,
+        target_row_index=550,
+        target_name="RareEntity",
+    )
+
+    svc = StructuredQueryService(store)
+    query_past_limit = "What is the total Amount for RareEntity in deep_table?"
+
+    # Direct service call must raise UnresolvedFilterError with was_truncated=True
+    with pytest.raises(UnresolvedFilterError) as exc_info:
+        svc.execute(query_past_limit, workspace_id=ws)
+    assert exc_info.value.was_truncated is True
+
+    # Pipeline node must catch truncated unresolved filter and safely route to fallback
+    state = {
+        "query": query_past_limit,
+        "workspace_id": ws,
+        "document_ids": None,
+        "stage_timings": {},
+    }
+    with patch("services.retrieval.run_structured_aggregate.get_shared_table_store", return_value=store):
+        pipeline_res = execute_structured_aggregate(state)
+
+    assert pipeline_res["executed_path"] == "structured_aggregate_fallback"
+    assert pipeline_res["reranker_mode"] == RerankerMode.BYPASSED.value
+    assert "structured_aggregate_ms" in pipeline_res["stage_timings"]
+
+    # Contrast: when matching entity is within the first 500 rows, probe finds it and query succeeds
+    _create_large_test_table(
+        store,
+        ws,
+        "matched_table",
+        "doc_matched",
+        num_rows=600,
+        target_row_index=250,
+        target_name="EarlyEntity",
+    )
+    query_within_limit = "What is the total Amount for EarlyEntity in matched_table?"
+    match_result = svc.execute(query_within_limit, workspace_id=ws)
+    assert match_result.selection_count == 1
+    assert match_result.result_value == Decimal("100.0")
+
+
+def test_concurrent_reranker_telemetry_isolation():
+    """Verify concurrent requests retain isolated reranker telemetry per thread without cross-talk."""
+    import threading
+    import time
+
+    def mock_is_circuit_open(*args, **kwargs) -> bool:
+        tname = threading.current_thread().name
+        return "fallback" in tname
+
+    def mock_openrouter(query: str, documents: list[str]) -> list[float]:
+        return [0.95] * len(documents)
+
+    def worker(worker_type: str) -> tuple[str, str]:
+        threading.current_thread().name = f"thread_{worker_type}_{threading.get_ident()}"
+        if worker_type == "remote":
+            docs = ["chunk 1", "chunk 2"]
+            rerank_documents("sample query", docs)
+            time.sleep(0.01)
+            return worker_type, get_last_reranker_mode()
+        elif worker_type == "fallback":
+            docs = ["chunk 1", "chunk 2"]
+            rerank_documents("sample query", docs)
+            time.sleep(0.01)
+            return worker_type, get_last_reranker_mode()
+        else:
+            rerank_documents("sample query", [])
+            time.sleep(0.01)
+            return worker_type, get_last_reranker_mode()
+
+    task_types = ["remote", "fallback", "bypassed"] * 10
+    with patch("providers.reranker_provider._is_circuit_open", side_effect=mock_is_circuit_open), \
+         patch("providers.reranker_provider._openrouter_reranker", side_effect=mock_openrouter), \
+         patch("providers.reranker_provider._term_coverage_fallback", return_value=[0.35, 0.25]):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            outcomes = list(executor.map(worker, task_types))
+
+    for expected_type, recorded_mode in outcomes:
+        if expected_type == "remote":
+            assert recorded_mode == RerankerMode.REMOTE_SUCCESS.value
+        elif expected_type == "fallback":
+            assert recorded_mode == RerankerMode.CIRCUIT_OPEN_LEXICAL_FALLBACK.value
+        else:
+            assert recorded_mode == RerankerMode.BYPASSED.value
+
+
+def test_empty_aggregate_semantics_min_max_avg_count_sum():
+    """Verify empty aggregate results: count/sum are 0, avg/min/max are None (undefined), with empty citations."""
+    store = MemoryTableStore()
+    ws = "ws_empty_aggregates"
+    _create_test_table(store, ws, "survay", "doc_survay", years=[2024], coverage_complete=True)
+
+    svc = StructuredQueryService(store)
+
+    # 1. COUNT for nonexistent year returns Decimal(0)
+    res_count = svc.execute("What is the count of records for 2026 in survay.csv?", workspace_id=ws)
+    assert res_count.selection_count == 0
+    assert res_count.result_value == Decimal(0)
+
+    # 2. SUM for nonexistent year returns Decimal(0)
+    res_sum = svc.execute("What is the total income for 2026 in survay.csv?", workspace_id=ws)
+    assert res_sum.selection_count == 0
+    assert res_sum.result_value == Decimal(0)
+
+    # 3. AVG for nonexistent year returns None
+    res_avg = svc.execute("What is the average income for 2026 in survay.csv?", workspace_id=ws)
+    assert res_avg.selection_count == 0
+    assert res_avg.result_value is None
+    assert "undefined" in res_avg.answer_text.lower()
+
+    # 4. MIN for nonexistent year returns None
+    res_min = svc.execute("What is the minimum income for 2026 in survay.csv?", workspace_id=ws)
+    assert res_min.selection_count == 0
+    assert res_min.result_value is None
+    assert "undefined" in res_min.answer_text.lower()
+
+    # 5. MAX for nonexistent year returns None
+    res_max = svc.execute("What is the maximum income for 2026 in survay.csv?", workspace_id=ws)
+    assert res_max.selection_count == 0
+    assert res_max.result_value is None
+    assert "undefined" in res_max.answer_text.lower()
+
+    # 6. Pipeline execution returns refusal with empty citations and retained evidence
+    state = {
+        "query": "What is the average income for 2026 in survay.csv?",
+        "workspace_id": ws,
+        "document_ids": None,
+        "stage_timings": {},
+    }
+    with patch("services.retrieval.run_structured_aggregate.get_shared_table_store", return_value=store):
+        pipeline_res = execute_structured_aggregate(state)
+
+    assert pipeline_res["status"] == "success"
+    assert pipeline_res["is_refusal"] is True
+    assert pipeline_res["execution_result"].result_value is None
+    assert pipeline_res["citations"] == []
+    assert pipeline_res["retained_evidence_items"] == []
+    assert pipeline_res["reranker_mode"] == RerankerMode.BYPASSED.value
+
+
+def test_mixed_source_and_document_content_routing():
+    """Verify document table references bypass structured table scans while legitimate report aggregates route properly."""
+    planner = Planner()
+
+    # Academic/paper table and figure references should bypass structured table aggregate
+    q1 = "In Table 1 of the interpretability paper, what are the average attention values?"
+    assert planner.route(q1).use_structured_aggregate is False
+
+    q2 = "According to Table 2 of the vision transformer paper, what is the accuracy?"
+    assert planner.route(q2).use_structured_aggregate is False
+
+    q3 = "In Figure 3 of the paper, what is the loss trend?"
+    assert planner.route(q3).use_structured_aggregate is False
+
+    # Legitimate aggregate queries mentioning reports or workbooks route to structured table
+    q4 = "What is the total expenditure in the annual financial report table?"
+    assert planner.route(q4).use_structured_aggregate is True
+
+    q5 = "What is the average salary in the salary survey workbook?"
+    assert planner.route(q5).use_structured_aggregate is True
+
+    q6 = "What is the maximum revenue in survay.csv?"
+    assert planner.route(q6).use_structured_aggregate is True
+
+
+def test_workspace_isolation_table_store():
+    """Verify tables in workspace A are completely inaccessible from workspace B."""
+    store = MemoryTableStore()
+    _create_test_table(store, "ws_alpha", "financial_records", "doc_fin_alpha")
+
+    # In ws_alpha, table exists
+    assert store.get_table("financial_records", "ws_alpha") is not None
+    assert "financial_records" in store.list_tables("ws_alpha")
+
+    # In ws_beta, table does not exist
+    assert store.get_table("financial_records", "ws_beta") is None
+    assert store.list_tables("ws_beta") == []
+    assert len(store.query_rows("financial_records", "ws_beta")) == 0
+
+    # Querying from ws_beta cannot access ws_alpha data
+    svc = StructuredQueryService(store)
+    assert svc.execute("What is the total income in financial_records?", workspace_id="ws_beta") is None
+

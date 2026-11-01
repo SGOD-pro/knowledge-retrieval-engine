@@ -26,7 +26,7 @@ class StructuredQueryResult:
     predicate_values: list[Any]
     selection_count: int
     total_rows_in_table: int
-    result_value: Decimal | int | str
+    result_value: Decimal | int | str | None
     secondary_value: Decimal | int | str | None
     row_ids: list[str]
     row_indices: list[int]
@@ -55,10 +55,14 @@ class AmbiguousBindingError(StructuredExecutionError):
 class UnresolvedFilterError(StructuredExecutionError):
     """A required filter entity was not found in the table."""
 
-    def __init__(self, table_id: str, filter_values: list[Any]) -> None:
-        super().__init__(f"Required filter(s) {filter_values} not found in table '{table_id}'")
+    def __init__(self, table_id: str, filter_values: list[Any], was_truncated: bool = False) -> None:
+        msg = f"Required filter(s) {filter_values} not found in table '{table_id}'"
+        if was_truncated:
+            msg += " (scan was truncated at limit)"
+        super().__init__(msg)
         self.table_id = table_id
         self.filter_values = filter_values
+        self.was_truncated = was_truncated
 
 
 class IncompleteDataError(StructuredExecutionError):
@@ -178,11 +182,11 @@ class StructuredQueryService:
         # Document table indicators: references to numbered tables/figures/charts in narrative papers/reports
         is_tabular_explicit = bool(
             re.search(r'\.(?:csv|xlsx?|tsv)\b', q_lower)
-            or re.search(r'\b(?:spreadsheet|survay|dataset)\b', q_lower)
+            or re.search(r'\b(?:spreadsheet|survay|survey|dataset|workbook)\b', q_lower)
         )
         is_doc_ref = bool(
             re.search(r'\b(?:table|figure|fig\.|chart)\s+\d+\b', q_lower)
-            or re.search(r'\b(?:paper|article|report|study|section|pdf|document)\b', q_lower)
+            or re.search(r'\b(?:in the paper|in this paper|in the article|in this article|in the study|in the pdf)\b', q_lower)
         )
         is_internal_doc_table = is_doc_ref and not is_tabular_explicit
 
@@ -680,6 +684,8 @@ class StructuredQueryService:
         except Exception:
             probe_rows = []
 
+        truncated_cands: set[str] = set()
+
         for cand in unique_candidates:
             cand_lower = cand.lower().strip()
             bound = False
@@ -714,10 +720,17 @@ class StructuredQueryService:
                             continue
                         dtype_str = self._normalize_dtype(col.inferred_dtype)
                         is_numeric = dtype_str in {"integer", "decimal"}
-                        if is_numeric and not cand.isdigit():
-                            continue
+                        val_pred: Any = cand
+                        if is_numeric:
+                            clean_cand = cand.replace(",", "").strip()
+                            if clean_cand.lstrip("+-").isdigit():
+                                val_pred = int(clean_cand)
+                            else:
+                                try:
+                                    val_pred = Decimal(clean_cand)
+                                except Exception:
+                                    continue
                         try:
-                            val_pred: Any = int(cand) if (is_numeric and cand.isdigit()) else cand
                             matching = self.store.query_rows(
                                 table_id,
                                 workspace_id,
@@ -734,12 +747,15 @@ class StructuredQueryService:
                                 already_bound.add(col.col_index)
                                 bound = True
                                 break
+                            elif getattr(matching, "is_truncated", False):
+                                truncated_cands.add(cand)
                         except Exception:
                             pass
 
         # 6. Verify that all explicit filter requirements were resolved
         if explicit_requirements:
             unbound_requirements: list[str] = []
+            has_truncated = False
             for req in explicit_requirements:
                 req_lower = req.lower()
                 matched = any(
@@ -750,10 +766,13 @@ class StructuredQueryService:
                 )
                 if not matched:
                     unbound_requirements.append(req)
+                    if req in truncated_cands or any(req.lower() == tc.lower() for tc in truncated_cands):
+                        has_truncated = True
             if unbound_requirements:
                 raise UnresolvedFilterError(
                     table_id=table_id,
                     filter_values=unbound_requirements,
+                    was_truncated=has_truncated,
                 )
 
         return predicates, pred_cols, pred_vals
@@ -772,16 +791,28 @@ class StructuredQueryService:
         q_lower = query.lower()
         mentioned_col = None
         for col in schema.columns:
-            if bool(re.search(rf"\b{re.escape(col.name.lower())}\b", q_lower)):
+            c_name = col.name.lower()
+            c_name_spaces = c_name.replace("_", " ")
+            if (
+                bool(re.search(rf"\b{re.escape(c_name)}\b", q_lower))
+                or bool(re.search(rf"\b{re.escape(c_name_spaces)}\b", q_lower))
+                or any(
+                    bool(re.search(rf"\b{re.escape(part)}\b", q_lower))
+                    for part in c_name.split("_")
+                    if len(part) > 2 and part not in ("total", "sum", "avg", "min", "max", "all")
+                )
+            ):
                 mentioned_col = (col.col_index, col.name)
                 break
 
         if mentioned_col:
             target_col_idx, target_col_name = mentioned_col
-        else:
+        elif any(w in q_lower for w in ("earliest", "latest", "year", "date", "period")):
             target_col_idx, target_col_name = self._find_column_by_semantic_match(
-                ["year", "date", "period", "time", "value", "amount", "score", "count"], schema
+                ["year", "date", "period", "time"], schema
             )
+        else:
+            target_col_idx, target_col_name = self._find_target_metric_column(query, schema)
 
         predicates, pred_cols, pred_vals = self._extract_and_bind_predicates(
             query=query,
@@ -814,12 +845,12 @@ class StructuredQueryService:
 
         if min_val is None or max_val is None:
             if count == 0:
-                answer_text = f"No rows matched the requested filters in table '{table_id}'."
+                answer_text = f"No rows matched the requested filters in table '{table_id}' (0 matching rows). Minimum and maximum are undefined."
                 combined_ids = []
                 combined_idx = []
                 selection_hash = digest_min
-                int_min = 0
-                int_max = 0
+                int_min = None
+                int_max = None
             else:
                 raise StorageFailureError(f"No valid numeric data found in column '{target_col_name}'")
         else:
@@ -903,6 +934,8 @@ class StructuredQueryService:
             probe_rows = []
 
         already_bound: set[int] = {year_idx, val_idx}
+        truncated_cands_delta: set[str] = set()
+
         for cand in unique_candidates:
             cand_lower = cand.lower().strip()
             bound = False
@@ -944,10 +977,17 @@ class StructuredQueryService:
                             continue
                         dtype_str = self._normalize_dtype(col.inferred_dtype)
                         is_numeric = dtype_str in {"integer", "decimal"}
-                        if is_numeric and not cand.isdigit():
-                            continue
+                        val_pred: Any = cand
+                        if is_numeric:
+                            clean_cand = cand.replace(",", "").strip()
+                            if clean_cand.lstrip("+-").isdigit():
+                                val_pred = int(clean_cand)
+                            else:
+                                try:
+                                    val_pred = Decimal(clean_cand)
+                                except Exception:
+                                    continue
                         try:
-                            val_pred: Any = int(cand) if (is_numeric and cand.isdigit()) else cand
                             matching = self.store.query_rows(
                                 table_id,
                                 workspace_id,
@@ -966,6 +1006,8 @@ class StructuredQueryService:
                                 already_bound.add(col.col_index)
                                 bound = True
                                 break
+                            elif getattr(matching, "is_truncated", False):
+                                truncated_cands_delta.add(cand)
                         except Exception:
                             pass
 
@@ -981,9 +1023,14 @@ class StructuredQueryService:
                 if any_bound:
                     break
             if not any_bound:
+                has_truncated = any(
+                    req in truncated_cands_delta or any(req.lower() == tc.lower() for tc in truncated_cands_delta)
+                    for req in explicit_requirements
+                )
                 raise UnresolvedFilterError(
                     table_id=table_id,
                     filter_values=explicit_requirements,
+                    was_truncated=has_truncated,
                 )
 
         # Execute queries for period 1 and period 2 (limit=2 to detect duplicate matches)
@@ -1003,7 +1050,7 @@ class StructuredQueryService:
                 predicate_values=pred_vals,
                 selection_count=0,
                 total_rows_in_table=total_rows,
-                result_value=Decimal(0),
+                result_value=None,
                 secondary_value=None,
                 row_ids=[],
                 row_indices=[],
@@ -1168,10 +1215,12 @@ class StructuredQueryService:
             version=version,
         )
 
-        res_val = val if val is not None else Decimal(0)
         if count == 0:
-            answer_text = f"No rows matched the requested filters in table '{table_id}' (0 matching rows)."
+            res_val = Decimal(0) if op in (AggregateOp.COUNT, AggregateOp.SUM) else None
+            stat_msg = f"{op.value.title()} is {res_val}." if res_val is not None else f"{op.value.title()} is undefined."
+            answer_text = f"No rows matched the requested filters in table '{table_id}' (0 matching rows). {stat_msg}"
         else:
+            res_val = val
             answer_text = f"The {op.value} for {col_name} is {res_val}."
 
         return StructuredQueryResult(

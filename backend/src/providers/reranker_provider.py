@@ -12,6 +12,7 @@ Rule 27: No GPU packages (torch, transformers, faiss) — onnxruntime allowed on
 Rule 28: All reranker calls route through this module.
 """
 
+import contextvars
 import json
 import logging
 import math
@@ -22,6 +23,7 @@ import time
 import requests
 
 from config import settings
+from schemas.models import RerankerMode
 
 logger = logging.getLogger(__name__)
 
@@ -34,8 +36,9 @@ _last_request_time = 0.0
 REQUEST_INTERVAL_SECONDS = 0.2  # Max 5 requests per second
 
 _reranker_counter = {"reranker_calls": 0}
-_last_reranker_mode: str = "bypassed"
-_mode_lock = threading.Lock()
+_current_reranker_mode: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "current_reranker_mode", default=RerankerMode.BYPASSED.value
+)
 
 
 def reset_reranker_counter() -> None:
@@ -47,14 +50,11 @@ def get_reranker_counter() -> dict:
 
 
 def get_last_reranker_mode() -> str:
-    with _mode_lock:
-        return _last_reranker_mode
+    return _current_reranker_mode.get()
 
 
 def set_last_reranker_mode(mode: str) -> None:
-    global _last_reranker_mode
-    with _mode_lock:
-        _last_reranker_mode = mode
+    _current_reranker_mode.set(mode)
 
 _session: requests.Session | None = None
 _session_lock = threading.Lock()
@@ -333,7 +333,7 @@ def rerank_documents(
     documents list. Higher = more relevant.
     """
     if not documents:
-        set_last_reranker_mode("bypassed")
+        set_last_reranker_mode(RerankerMode.BYPASSED.value)
         return []
 
     t0 = time.perf_counter()
@@ -346,7 +346,7 @@ def rerank_documents(
                 if _circuit_breaker_tripped:
                     _circuit_breaker_tripped = False
                     logger.info("reranker.circuit_breaker_closed — probe succeeded, service recovered")
-            set_last_reranker_mode("remote_success")
+            set_last_reranker_mode(RerankerMode.REMOTE_SUCCESS.value)
             logger.info(
                 "reranker.openrouter.latency_ms=%.2f doc_count=%d avg_score=%.4f",
                 latency_ms,
@@ -363,7 +363,7 @@ def rerank_documents(
             )
 
     # Deterministic fallback (zero API call, immediate p50 < 2ms)
-    fallback_mode = "circuit_open_lexical_fallback"
+    fallback_mode = RerankerMode.CIRCUIT_OPEN_LEXICAL_FALLBACK.value
     set_last_reranker_mode(fallback_mode)
     logger.info("reranker.mode=%s", fallback_mode)
     return _term_coverage_fallback(query, documents)

@@ -1,5 +1,12 @@
 from dataclasses import asdict, dataclass
+from enum import StrEnum
 from typing import Any
+
+
+class RerankerMode(StrEnum):
+    REMOTE_SUCCESS = "remote_success"
+    CIRCUIT_OPEN_LEXICAL_FALLBACK = "circuit_open_lexical_fallback"
+    BYPASSED = "bypassed"
 
 
 @dataclass(frozen=True)

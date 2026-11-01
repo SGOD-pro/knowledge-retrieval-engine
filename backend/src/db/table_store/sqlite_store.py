@@ -9,7 +9,7 @@ from pathlib import Path
 import sqlite3
 from typing import Any
 
-from db.table_store.base import AggregateOp, Predicate, PredicateOp, TableStore
+from db.table_store.base import AggregateOp, Predicate, PredicateOp, TableRowList, TableStore
 from schemas.structured_table import (
     ColumnDefinition,
     HeaderTopology,
@@ -894,11 +894,11 @@ class SQLiteTableStore:
         max_scan_items: int | None = None,
     ) -> list[TableRow]:
         if not workspace_id:
-            return []
+            return TableRowList([], is_truncated=False, scanned_count=0)
 
         ver = version or self.get_active_version(table_id, workspace_id)
         if not ver:
-            return []
+            return TableRowList([], is_truncated=False, scanned_count=0)
 
         if ver == "legacy":
             cur = self._conn.execute(
@@ -913,12 +913,17 @@ class SQLiteTableStore:
 
         matched_rows: list[TableRow] = []
         scanned_count = 0
+        is_truncated = False
         for db_row in cur:
             scanned_count += 1
             if db_row["is_header"]:
                 continue
             cells = _json_to_cells(db_row["cells_json"])
             if predicates and not all(self._matches_predicate(cells, p) for p in predicates):
+                if max_scan_items is not None and scanned_count >= max_scan_items:
+                    if cur.fetchone() is not None:
+                        is_truncated = True
+                    break
                 continue
 
             matched_rows.append(
@@ -934,9 +939,11 @@ class SQLiteTableStore:
             if limit is not None and len(matched_rows) >= limit:
                 break
             if max_scan_items is not None and scanned_count >= max_scan_items:
+                if cur.fetchone() is not None:
+                    is_truncated = True
                 break
 
-        return matched_rows
+        return TableRowList(matched_rows, is_truncated=is_truncated, scanned_count=scanned_count)
 
     def aggregate(
         self,

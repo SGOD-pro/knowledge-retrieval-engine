@@ -1,22 +1,26 @@
 import logging
 import time
 
-from providers.reranker_provider import rerank_documents
-from schemas.models import Chunk
+from providers.reranker_provider import get_last_reranker_mode, rerank_documents
+from schemas.models import Chunk, RerankerMode
 
 logger = logging.getLogger(__name__)
 
 
 def rerank(
-    query: str, candidates: list[Chunk], top_k: int = 6, provider: str | None = None
-) -> list[Chunk]:
+    query: str,
+    candidates: list[Chunk],
+    top_k: int = 6,
+    provider: str | None = None,
+    return_mode: bool = False,
+) -> list[Chunk] | tuple[list[Chunk], str]:
     """
     Reranks candidate chunks using the provider layer API.
-    Returns the top_k chunks.
+    Returns the top_k chunks, optionally paired with the request-scoped reranker mode.
     """
     start_time = time.perf_counter()
     if not candidates:
-        return []
+        return ([], RerankerMode.BYPASSED.value) if return_mode else []
 
     # Extract text for the API call
     documents = [c.text for c in candidates]
@@ -120,4 +124,5 @@ def rerank(
         "reranker.latency_ms=%.2f reranker.confidence_score=%.2f", latency_ms, avg_score
     )
 
-    return top_chunks
+    mode = get_last_reranker_mode()
+    return (top_chunks, mode) if return_mode else top_chunks

@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import Enum
-from typing import Any, Protocol
+from typing import Any, Protocol, Sequence
 
 from schemas.structured_table import StructuredTable, TableRow, TableSchema
 
@@ -32,6 +32,24 @@ class Predicate:
     column_index: int
     op: PredicateOp
     value: Any
+
+
+class TableRowList(list):
+    """List of TableRow objects annotated with scan completion metadata."""
+
+    is_truncated: bool
+    scanned_count: int
+
+    def __init__(
+        self,
+        rows: Sequence[TableRow] = (),
+        *,
+        is_truncated: bool = False,
+        scanned_count: int = 0,
+    ) -> None:
+        super().__init__(rows)
+        self.is_truncated = is_truncated
+        self.scanned_count = scanned_count
 
 
 class TableStore(Protocol):

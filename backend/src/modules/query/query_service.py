@@ -3,7 +3,7 @@ import logging
 import time
 from config import CACHE_MIN_CONFIDENCE, CACHE_TTL_SECONDS
 from modules.query.query_repository import QueryRepository
-from schemas.models import QueryRequest
+from schemas.models import QueryRequest, RerankerMode
 
 logger = logging.getLogger(__name__)
 
@@ -216,7 +216,7 @@ class QueryService:
                 "cached": False,
                 "document_ids": target_doc_ids or [],
                 "retrieval_candidates": {},
-                "reranker_mode": "bypassed",
+                "reranker_mode": RerankerMode.BYPASSED.value,
             }
 
         t1 = time.perf_counter()
@@ -291,9 +291,9 @@ class QueryService:
             retrieval_candidates["okf_entity_state"] = getattr(response, "okf_entity_state", "none")
         if "okf_property_state" not in retrieval_candidates:
             retrieval_candidates["okf_property_state"] = getattr(response, "okf_property_state", "none")
-        reranker_mode = getattr(response, "reranker_mode", "bypassed")
+        reranker_mode = getattr(response, "reranker_mode", RerankerMode.BYPASSED.value)
         if executed_path in ("fast", "structured_aggregate"):
-            reranker_mode = "bypassed"
+            reranker_mode = RerankerMode.BYPASSED.value
 
         logger.info(
             "query.cost_tracking path=%s input_tokens=%d output_tokens=%d total_tokens=%d latency_ms=%.2f",

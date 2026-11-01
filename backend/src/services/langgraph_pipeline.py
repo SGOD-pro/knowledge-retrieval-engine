@@ -8,7 +8,7 @@ from typing import Any, TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from config import settings
-from schemas.models import Chunk
+from schemas.models import Chunk, RerankerMode
 from services.llm.llm_service import call as call_llm
 from services.retrieval.bm25_retriever import BM25Retriever
 from services.retrieval.compressor import compress_chunks
@@ -731,11 +731,9 @@ def run_reranker(state: PipelineState):
             "okf_entity_state": "none",
             "okf_property_state": "none",
         })
-        return {"top_chunks": [], "retrieval_candidates": cands, "reranker_mode": "bypassed"}
+        return {"top_chunks": [], "retrieval_candidates": cands, "reranker_mode": RerankerMode.BYPASSED.value}
 
-    from providers.reranker_provider import get_last_reranker_mode
-    top_chunks = rerank(state["query"], merged, top_k=6)
-    reranker_mode = get_last_reranker_mode()
+    top_chunks, reranker_mode = rerank(state["query"], merged, top_k=6, return_mode=True)
     latency_ms = (time.perf_counter() - t0) * 1000.0
     logger.info(
         "reranker.latency_ms=%.2f reranker.input_count=%d reranker.output_count=%d mode=%s",
@@ -1538,7 +1536,7 @@ class Pipeline:
             "graph_chunks": [],
             "top_chunks": [],
             "retrieval_candidates": {},
-            "reranker_mode": "bypassed",
+            "reranker_mode": RerankerMode.BYPASSED.value,
             "compressed_text": "",
             "context_snippet": "",
             "final_answer": "",
@@ -1611,7 +1609,7 @@ class Pipeline:
                 self.stages = plan.stages if plan else []
                 self.planned_path = state.get("planned_path", "fast" if (plan and plan.fast_path) else "full")
                 self.structured_aggregate = (self.executed_path == "structured_aggregate")
-                self.reranker_mode = state.get("reranker_mode", "bypassed")
+                self.reranker_mode = state.get("reranker_mode", RerankerMode.BYPASSED.value)
                 self.retrieval_candidates = state.get("retrieval_candidates", {})
                 self.structural_candidates = state.get("structural_candidates", [])
                 self.structural_candidate_ids = state.get("structural_candidate_ids", [])

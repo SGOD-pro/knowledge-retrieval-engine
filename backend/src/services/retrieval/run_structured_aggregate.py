@@ -6,6 +6,7 @@ import time
 from typing import Any
 
 from db.table_store import get_shared_table_store
+from schemas.models import RerankerMode
 from services.retrieval.structured_query_service import (
     AmbiguousBindingError,
     IncompleteDataError,
@@ -34,7 +35,7 @@ def build_structured_evidence_ref(result: StructuredQueryResult, workspace_id: s
         "selection_count": result.selection_count,
         "total_rows_in_table": result.total_rows_in_table,
         "selection_hash": result.selection_hash,
-        "result_value": str(result.result_value),
+        "result_value": str(result.result_value) if result.result_value is not None else None,
         "secondary_value": str(result.secondary_value) if result.secondary_value is not None else None,
         "schema_binding_confidence": result.schema_binding_confidence,
         "location_reference": f"{result.selection_count} row(s) from {result.table_id}",
@@ -65,7 +66,7 @@ def execute(state: dict[str, Any]) -> dict[str, Any]:
             "status": "error",
             "error_code": "incomplete_data",
             "error": f"Table data is incomplete: {e}",
-            "reranker_mode": "bypassed",
+            "reranker_mode": RerankerMode.BYPASSED.value,
             "stage_timings": {**existing_timings, "structured_aggregate_ms": latency_ms},
         }
     except AmbiguousBindingError as e:
@@ -77,7 +78,7 @@ def execute(state: dict[str, Any]) -> dict[str, Any]:
             "status": "clarification_needed",
             "error_code": "ambiguous_binding",
             "error": str(e),
-            "reranker_mode": "bypassed",
+            "reranker_mode": RerankerMode.BYPASSED.value,
             "stage_timings": {**existing_timings, "structured_aggregate_ms": latency_ms},
         }
     except StorageFailureError as e:
@@ -89,11 +90,21 @@ def execute(state: dict[str, Any]) -> dict[str, Any]:
             "status": "error",
             "error_code": "storage_failure",
             "error": str(e),
-            "reranker_mode": "bypassed",
+            "reranker_mode": RerankerMode.BYPASSED.value,
             "stage_timings": {**existing_timings, "structured_aggregate_ms": latency_ms},
         }
     except UnresolvedFilterError as e:
         latency_ms = (time.perf_counter() - t0) * 1000.0
+        if getattr(e, "was_truncated", False):
+            logger.info(
+                "structured_aggregate.truncated_filter table=%s filters=%s — falling back to general retrieval",
+                e.table_id, e.filter_values
+            )
+            return {
+                "executed_path": "structured_aggregate_fallback",
+                "reranker_mode": RerankerMode.BYPASSED.value,
+                "stage_timings": {**existing_timings, "structured_aggregate_ms": latency_ms},
+            }
         logger.warning("structured_aggregate.unresolved_filter query='%s' error=%s", query[:60], e)
         return {
             "final_answer": "NOT_FOUND",
@@ -101,7 +112,7 @@ def execute(state: dict[str, Any]) -> dict[str, Any]:
             "status": "error",
             "error_code": "unresolved_filter",
             "error": f"Required filter could not be resolved: {e}",
-            "reranker_mode": "bypassed",
+            "reranker_mode": RerankerMode.BYPASSED.value,
             "stage_timings": {**existing_timings, "structured_aggregate_ms": latency_ms},
         }
     except UnsupportedQueryError as e:
@@ -109,7 +120,7 @@ def execute(state: dict[str, Any]) -> dict[str, Any]:
         logger.info("structured_aggregate.unsupported query='%s' reason=%s", query[:60], e)
         return {
             "executed_path": "structured_aggregate_fallback",
-            "reranker_mode": "bypassed",
+            "reranker_mode": RerankerMode.BYPASSED.value,
             "stage_timings": {**existing_timings, "structured_aggregate_ms": latency_ms},
         }
 
@@ -117,50 +128,55 @@ def execute(state: dict[str, Any]) -> dict[str, Any]:
         latency_ms = (time.perf_counter() - t0) * 1000.0
         return {
             "executed_path": "structured_aggregate_fallback",
-            "reranker_mode": "bypassed",
+            "reranker_mode": RerankerMode.BYPASSED.value,
             "stage_timings": {**existing_timings, "structured_aggregate_ms": latency_ms},
         }
 
     latency_ms = (time.perf_counter() - t0) * 1000.0
     record_structured_aggregate()
 
-    citation = build_structured_evidence_ref(result, workspace_id)
-    from services.retrieval.evidence_contract import EvidenceItem
-    ev_item = EvidenceItem(
-        evidence_id=f"table_{result.table_id}_{result.selection_hash}",
-        workspace_id=workspace_id,
-        document_id=result.document_id,
-        document_version=result.document_version,
-        source_type="table_row_set",
-        locator={
-            "table_id": result.table_id,
-            "selection_hash": result.selection_hash,
-            "row_ids": result.row_ids,
-            "selection_count": result.selection_count,
-            "total_rows_in_table": result.total_rows_in_table,
-            "location_reference": citation["location_reference"],
-        },
-        text=result.answer_text,
-        structured_payload={
-            "table_id": result.table_id,
-            "document_version": result.document_version,
-            "operator": result.operator,
-            "target_column": result.target_column,
-            "selection_hash": result.selection_hash,
-            "selection_count": result.selection_count,
-        },
-        score=result.overall_confidence,
-        strategy="structured_table",
-        provenance={"table_id": result.table_id, "row_indices": result.row_indices},
-        citation_payload=citation,
-    )
-
     is_refusal = (result.selection_count == 0)
+    if is_refusal:
+        citations = []
+        retained_evidence_items = []
+    else:
+        citation = build_structured_evidence_ref(result, workspace_id)
+        from services.retrieval.evidence_contract import EvidenceItem
+        ev_item = EvidenceItem(
+            evidence_id=f"table_{result.table_id}_{result.selection_hash}",
+            workspace_id=workspace_id,
+            document_id=result.document_id,
+            document_version=result.document_version,
+            source_type="table_row_set",
+            locator={
+                "table_id": result.table_id,
+                "selection_hash": result.selection_hash,
+                "row_ids": result.row_ids,
+                "selection_count": result.selection_count,
+                "total_rows_in_table": result.total_rows_in_table,
+                "location_reference": citation["location_reference"],
+            },
+            text=result.answer_text,
+            structured_payload={
+                "table_id": result.table_id,
+                "document_version": result.document_version,
+                "operator": result.operator,
+                "target_column": result.target_column,
+                "selection_hash": result.selection_hash,
+                "selection_count": result.selection_count,
+            },
+            score=result.overall_confidence,
+            strategy="structured_table",
+            provenance={"table_id": result.table_id, "row_indices": result.row_indices},
+            citation_payload=citation,
+        )
+        citations = [citation]
+        retained_evidence_items = [ev_item]
 
     return {
         "final_answer": result.answer_text,
-        "citations": [citation],
-        "retained_evidence_items": [ev_item],
+        "citations": citations,
+        "retained_evidence_items": retained_evidence_items,
         "confidence_score": result.overall_confidence,
         "faithfulness": None,
         "citation_utilization_rate": None,
@@ -170,6 +186,6 @@ def execute(state: dict[str, Any]) -> dict[str, Any]:
         "status": "success",
         "is_refusal": is_refusal,
         "retrieval_candidates": {"structured_rows": result.row_ids},
-        "reranker_mode": "bypassed",
+        "reranker_mode": RerankerMode.BYPASSED.value,
         "stage_timings": {**existing_timings, "structured_aggregate_ms": latency_ms},
     }

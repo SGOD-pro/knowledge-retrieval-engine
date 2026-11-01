@@ -72,11 +72,11 @@ class StrategyRouter:
         is_qualitative = bool(re.search(r"\b(describe|explain|discuss|opinion|morale|sentiment|narrative|qualitative)\b", q_lower))
         is_tabular_file_explicit = bool(
             re.search(r'\.(?:csv|xlsx?|tsv)\b', q_lower)
-            or re.search(r'\b(?:spreadsheet|survay|dataset)\b', q_lower)
+            or re.search(r'\b(?:spreadsheet|survay|survey|dataset|workbook)\b', q_lower)
         )
         is_document_content_ref = bool(
             re.search(r'\b(?:table|figure|fig\.|chart)\s+\d+\b', q_lower)
-            or re.search(r'\b(?:paper|article|report|study|section|pdf|document)\b', q_lower)
+            or re.search(r'\b(?:in the paper|in this paper|in the article|in this article|in the study|in the pdf)\b', q_lower)
         )
         is_internal_doc_table = is_document_content_ref and not is_tabular_file_explicit
 

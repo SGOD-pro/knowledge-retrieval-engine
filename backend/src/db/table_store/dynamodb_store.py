@@ -19,7 +19,7 @@ from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
 
 from config import settings
-from db.table_store.base import AggregateOp, Predicate, PredicateOp
+from db.table_store.base import AggregateOp, Predicate, PredicateOp, TableRowList
 from schemas.structured_table import (
     ColumnDefinition,
     HeaderTopology,
@@ -634,11 +634,12 @@ class DynamoDBTableStore:
     ) -> list[TableRow]:
         ver = version or self.get_active_version(table_id, workspace_id)
         if not ver:
-            return []
+            return TableRowList([], is_truncated=False, scanned_count=0)
 
         table_pk = f"TABLE#{workspace_id}#{table_id}#V#{ver}"
         results: list[TableRow] = []
         scanned_count = 0
+        is_truncated = False
 
         query_kwargs: dict[str, Any] = {
             "KeyConditionExpression": Key("PK").eq(table_pk) & Key("SK").begins_with("ROW#"),
@@ -647,12 +648,17 @@ class DynamoDBTableStore:
         while True:
             resp = self.table.query(**query_kwargs)
             items = resp.get("Items", [])
-            scanned_count += len(items)
-            for item in items:
+            for idx, item in enumerate(items):
+                scanned_count += 1
                 if item.get("is_header"):
                     continue
                 cells = _json_to_cells(item.get("cells_json", "[]"))
                 if predicates and not all(self._matches_predicate(cells, p) for p in predicates):
+                    if max_scan_items is not None and scanned_count >= max_scan_items:
+                        has_more = (idx + 1 < len(items)) or bool(resp.get("LastEvaluatedKey"))
+                        if has_more:
+                            is_truncated = True
+                        break
                     continue
 
                 results.append(TableRow(
@@ -665,6 +671,11 @@ class DynamoDBTableStore:
                 ))
                 if limit is not None and len(results) >= limit:
                     break
+                if max_scan_items is not None and scanned_count >= max_scan_items:
+                    has_more = (idx + 1 < len(items)) or bool(resp.get("LastEvaluatedKey"))
+                    if has_more:
+                        is_truncated = True
+                    break
 
             if limit is not None and len(results) >= limit:
                 break
@@ -676,7 +687,7 @@ class DynamoDBTableStore:
                 break
             query_kwargs["ExclusiveStartKey"] = last_key
 
-        return results
+        return TableRowList(results, is_truncated=is_truncated, scanned_count=scanned_count)
 
     def aggregate(
         self,

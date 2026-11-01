@@ -4,7 +4,7 @@ from decimal import Decimal
 import logging
 from typing import Any
 
-from db.table_store.base import AggregateOp, Predicate, PredicateOp, TableStore
+from db.table_store.base import AggregateOp, Predicate, PredicateOp, TableRowList, TableStore
 from schemas.structured_table import StructuredTable, TableRow
 
 logger = logging.getLogger(__name__)
@@ -248,6 +248,7 @@ class MemoryTableStore:
             predicates=predicates,
             limit=limit,
             version=version,
+            max_scan_items=max_scan_items,
         )
         return rows_matched
 
@@ -302,6 +303,7 @@ class MemoryTableStore:
         predicates: list[Predicate] | None = None,
         limit: int | None = None,
         version: str | None = None,
+        max_scan_items: int | None = None,
     ) -> tuple[Decimal | None, int, list[str], list[TableRow], str]:
         import hashlib
 
@@ -315,12 +317,19 @@ class MemoryTableStore:
         matched_rows: list[TableRow] = []
         matched_ids: list[str] = []
         numeric_values: list[Decimal] = []
+        scanned_count = 0
+        is_truncated = False
 
-        for row in candidate_rows:
+        for idx, row in enumerate(candidate_rows):
+            scanned_count += 1
             if row.is_header:
                 continue
             if predicates:
                 if not all(self._matches_predicate(row, p) for p in predicates):
+                    if max_scan_items is not None and scanned_count >= max_scan_items:
+                        if idx + 1 < len(candidate_rows):
+                            is_truncated = True
+                        break
                     continue
 
             matched_rows.append(row)
@@ -341,6 +350,12 @@ class MemoryTableStore:
 
             if limit is not None and len(matched_rows) >= limit:
                 break
+            if max_scan_items is not None and scanned_count >= max_scan_items:
+                if idx + 1 < len(candidate_rows):
+                    is_truncated = True
+                break
+
+        rows_matched_list = TableRowList(matched_rows, is_truncated=is_truncated, scanned_count=scanned_count)
 
         count = len(matched_rows)
         digest = hashlib.sha256(",".join(sorted(matched_ids)).encode()).hexdigest()[:16]
@@ -358,7 +373,7 @@ class MemoryTableStore:
             elif op == AggregateOp.MAX:
                 agg_val = max(numeric_values)
 
-        return agg_val, count, matched_ids, matched_rows, digest
+        return agg_val, count, matched_ids, rows_matched_list, digest
 
     def invalidate_document_version(
         self,
