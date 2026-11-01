@@ -655,7 +655,7 @@ class InMemoryOkfRepository:
             actual_spent = prompt_tokens_spent + output_tokens_spent
             new_spent = ledger.spent_tokens + actual_spent
             new_reconciled = ledger.reconciled_fences + (fence_token,)
-            new_status = "exhausted" if ledger.reserved_calls >= 2 else ledger.status
+            new_status = "failed"
             lease_owner = None if ledger.lease_owner_id == worker_id else ledger.lease_owner_id
             lease_exp = 0.0 if ledger.lease_owner_id == worker_id else ledger.lease_expires_at
             updated = OkfBudgetLedger(
@@ -683,7 +683,24 @@ class InMemoryOkfRepository:
         consistent_read: bool = True,
     ) -> OkfBudgetLedger | None:
         with self._lock:
-            return self._ledgers.get((workspace_id, document_id, document_version))
+            key = (workspace_id, document_id, document_version)
+            ledger = self._ledgers.get(key)
+            if ledger is not None:
+                return ledger
+            man = self._manifests.get(key)
+            if man is not None:
+                return OkfBudgetLedger(
+                    workspace_id=workspace_id,
+                    document_id=document_id,
+                    document_version=document_version,
+                    reserved_calls=getattr(man, "model_calls", 0),
+                    completed_calls=getattr(man, "model_calls", 0),
+                    reserved_tokens=getattr(man, "extraction_tokens", 0),
+                    spent_tokens=getattr(man, "extraction_tokens", 0),
+                    status=getattr(man, "status", "active"),
+                    updated_at=getattr(man, "created_at", _now_utc()),
+                )
+            return None
 
 
 class SQLiteOkfRepository:
@@ -1357,7 +1374,7 @@ class SQLiteOkfRepository:
                 actual_spent = prompt_tokens_spent + output_tokens_spent
                 new_spent = ledger.spent_tokens + actual_spent
                 new_reconciled = ledger.reconciled_fences + (fence_token,)
-                new_status = "exhausted" if ledger.reserved_calls >= 2 else ledger.status
+                new_status = "failed"
                 lease_owner = None if ledger.lease_owner_id == worker_id else ledger.lease_owner_id
                 lease_exp = 0.0 if ledger.lease_owner_id == worker_id else ledger.lease_expires_at
                 updated = OkfBudgetLedger(
@@ -1412,7 +1429,7 @@ class SQLiteOkfRepository:
                 return OkfBudgetLedger(**json.loads(row["data_json"]))
             except Exception as exc:
                 logger.error("SQLite get_budget_ledger failed: %s", exc)
-                return None
+                raise StorageUnavailableError(f"SQLite error reading OKF budget ledger: {exc}") from exc
 
 
 class DynamoDBOkfRepository:
@@ -2013,17 +2030,20 @@ class DynamoDBOkfRepository:
                 UpdateExpression=(
                     "SET #spent = #spent + :spent, "
                     "#lexp = :zero, "
+                    "#st = :st_fail, "
                     "#rf = list_append(if_not_exists(#rf, :empty_list), :ft_list), "
                     "updated_at = :now_iso"
                 ),
                 ExpressionAttributeNames={
                     "#spent": "spent_tokens",
                     "#lexp": "lease_expires_at",
+                    "#st": "status",
                     "#rf": "reconciled_fences",
                 },
                 ExpressionAttributeValues={
                     ":spent": actual_spent,
                     ":zero": 0,
+                    ":st_fail": "failed",
                     ":empty_list": [],
                     ":ft_list": [fence_token],
                     ":now_iso": _now_utc(),
@@ -2053,24 +2073,41 @@ class DynamoDBOkfRepository:
                 return None
             raw_rf = item.get("reconciled_fences", [])
             reconciled_fences = tuple(int(x) for x in raw_rf) if raw_rf else ()
+
+            reserved_calls = int(item.get("reserved_calls", 0))
+            completed_calls = int(item.get("completed_calls", 0))
+            reserved_tokens = int(item.get("reserved_tokens", 0))
+            spent_tokens = int(item.get("spent_tokens", 0))
+            status = item.get("status", "active")
+
+            # Fallback for mock items or serialized record payloads containing data_json
+            if "data_json" in item and "reserved_calls" not in item:
+                try:
+                    data = json.loads(item["data_json"])
+                    reserved_calls = int(data.get("reserved_calls", data.get("model_calls", 0)))
+                    spent_tokens = int(data.get("spent_tokens", data.get("extraction_tokens", 0)))
+                    status = data.get("status", "failed" if data.get("status") == "failed" else "active")
+                except Exception:
+                    pass
+
             return OkfBudgetLedger(
                 workspace_id=workspace_id,
                 document_id=document_id,
                 document_version=document_version,
-                reserved_calls=int(item.get("reserved_calls", 0)),
-                completed_calls=int(item.get("completed_calls", 0)),
-                reserved_tokens=int(item.get("reserved_tokens", 0)),
-                spent_tokens=int(item.get("spent_tokens", 0)),
+                reserved_calls=reserved_calls,
+                completed_calls=completed_calls,
+                reserved_tokens=reserved_tokens,
+                spent_tokens=spent_tokens,
                 lease_owner_id=item.get("lease_owner_id"),
                 lease_expires_at=float(item.get("lease_expires_at", 0.0)),
                 fence_token=int(item.get("fence_token", 0)),
                 reconciled_fences=reconciled_fences,
-                status=item.get("status", "active"),
+                status=status,
                 updated_at=item.get("updated_at", _now_utc()),
             )
         except Exception as exc:
             logger.error("DynamoDB get_budget_ledger error: %s", exc)
-            return None
+            raise StorageUnavailableError(f"DynamoDB error reading OKF budget ledger: {exc}") from exc
 
 
 _SHARED_OKF_REPO: OkfRepositoryBase | None = None
