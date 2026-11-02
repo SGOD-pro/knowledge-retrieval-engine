@@ -74,6 +74,7 @@ class OkfEntityRecord(BaseModel):
     document_id: str = Field(..., max_length=128)
     document_version: str = Field(..., max_length=64)
     created_at: str
+    publication_id: str | None = Field(default=None, max_length=128)
 
 
 class OkfPropertyAssertion(BaseModel):
@@ -96,6 +97,7 @@ class OkfPropertyAssertion(BaseModel):
     confidence_score: float = Field(default=1.0, ge=0.0, le=1.0)
     validation_status: Literal["verified", "rejected"] = "verified"
     created_at: str
+    publication_id: str | None = Field(default=None, max_length=128)
 
 
 class OkfManifest(BaseModel):
@@ -113,6 +115,7 @@ class OkfManifest(BaseModel):
     model_calls: int = Field(default=0, ge=0)
     idempotency_key: str = Field(..., max_length=128)
     created_at: str
+    publication_id: str | None = Field(default=None, max_length=128)
 
 
 class OkfLookupResult(BaseModel):

@@ -2296,3 +2296,683 @@ def test_dynamodb_local_publication_99_item_boundary_and_readiness():
     assert repo.get_manifest(ws, doc_100, ver_100) is None
 
 
+# -----------------------------------------------------------------------------
+# 19. Large Publications & Same-Version Republication Isolation (Prompt 10)
+# -----------------------------------------------------------------------------
+
+
+def test_wide_csv_with_more_than_100_stored_items_staged_and_committed():
+    """Verifies that wide CSV documents yielding >= 100 items (1 manifest + 1 entity + 105 assertions = 107 items)
+    successfully stage payload items first into distinct publication keys and commit visibility atomically
+    without being blocked by the 100-action single transaction ceiling.
+    Verified across InMemory, SQLite, and DynamoDB Local.
+    """
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+        db_path = tmp.name
+
+    try:
+        mem_repo = InMemoryOkfRepository()
+        sqlite_repo = SQLiteOkfRepository(db_path=db_path)
+        ddb_repo = _get_ddb_local_repo("kre_okf_facts_wide_csv")
+
+        repos = [mem_repo, sqlite_repo, ddb_repo]
+        now = "2026-11-02T12:00:00Z"
+
+        for repo in repos:
+            ws = "ws_wide_csv"
+            doc = "doc_wide_table"
+            ver = "v1"
+            pub_id = f"pub_wide_{repo.__class__.__name__}"
+
+            ent = OkfEntityRecord(
+                workspace_id=ws,
+                entity_id="ent_wide",
+                entity_name="Wide Table Corp",
+                normalized_name="wide table corp",
+                entity_type="organization",
+                document_id=doc,
+                document_version=ver,
+                publication_id=pub_id,
+                created_at=now,
+            )
+            # 105 assertions + 1 entity + 1 manifest = 107 items (>= 100 items)
+            assertions = [
+                OkfPropertyAssertion(
+                    assertion_id=f"ass_col_{i}",
+                    workspace_id=ws,
+                    entity_id="ent_wide",
+                    entity_name="Wide Table Corp",
+                    property_key=f"column_{i}_metric",
+                    property_value=f"value_{i}",
+                    value_type="string",
+                    source_chunk_id="c_csv",
+                    document_id=doc,
+                    document_version=ver,
+                    page_number=1,
+                    confidence_score=1.0,
+                    validation_status="verified",
+                    publication_id=pub_id,
+                    created_at=now,
+                )
+                for i in range(105)
+            ]
+            manifest = OkfManifest(
+                workspace_id=ws,
+                document_id=doc,
+                document_version=ver,
+                publication_id=pub_id,
+                entities=(ent,),
+                assertions=tuple(assertions),
+                rejected_assertions_count=0,
+                status="ready",
+                extraction_tokens=0,
+                model_calls=0,
+                idempotency_key=f"{ws}:{doc}:{ver}:{pub_id}",
+                created_at=now,
+            )
+
+            # CSV is unfenced (fence_token=None)
+            repo.save_manifest(ws, manifest, fence_token=None)
+
+            # Verify manifest is durable and ready
+            assert repo.has_ready_okf(ws, doc, ver) is True
+            saved_man = repo.get_manifest(ws, doc, ver)
+            assert saved_man is not None
+            assert saved_man.status == "ready"
+            assert saved_man.publication_id == pub_id
+            assert len(saved_man.assertions) == 105
+
+            # Verify assertions retrieved for entity
+            retrieved = repo.get_assertions_for_entity(
+                workspace_id=ws,
+                entity_id="ent_wide",
+                publication_id=pub_id,
+                limit=200,
+            )
+            assert len(retrieved) == 105
+            assert {a.assertion_id for a in retrieved} == {f"ass_col_{i}" for i in range(105)}
+
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+def test_crash_or_batch_failure_before_publication_commit():
+    """Verifies that if a batch failure or crash occurs during payload staging before the
+    manifest commit transaction, the manifest is NEVER committed or exposed as ready.
+    Tested on DynamoDB Local and SQLite.
+    """
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+        db_path = tmp.name
+
+    try:
+        # 1. DynamoDB Local: simulate batch write failure during staging
+        ddb_repo = _get_ddb_local_repo("kre_okf_facts_staging_fail")
+        ws = "ws_fail"
+        doc = "doc_fail"
+        ver = "v1"
+        pub_id = "pub_fail_staged"
+        now = "2026-11-02T12:00:00Z"
+
+        ent = OkfEntityRecord(
+            workspace_id=ws,
+            entity_id="ent_fail",
+            entity_name="Fail Corp",
+            normalized_name="fail corp",
+            entity_type="organization",
+            document_id=doc,
+            document_version=ver,
+            publication_id=pub_id,
+            created_at=now,
+        )
+        assertions = [
+            OkfPropertyAssertion(
+                assertion_id=f"ass_fail_{i}",
+                workspace_id=ws,
+                entity_id="ent_fail",
+                entity_name="Fail Corp",
+                property_key=f"key_{i}",
+                property_value=f"val_{i}",
+                value_type="string",
+                source_chunk_id="c1",
+                document_id=doc,
+                document_version=ver,
+                page_number=1,
+                confidence_score=1.0,
+                validation_status="verified",
+                publication_id=pub_id,
+                created_at=now,
+            )
+            for i in range(105)
+        ]
+        manifest = OkfManifest(
+            workspace_id=ws,
+            document_id=doc,
+            document_version=ver,
+            publication_id=pub_id,
+            entities=(ent,),
+            assertions=tuple(assertions),
+            rejected_assertions_count=0,
+            status="ready",
+            extraction_tokens=0,
+            model_calls=0,
+            idempotency_key=f"{ws}:{doc}:{ver}",
+            created_at=now,
+        )
+
+        original_batch_writer = ddb_repo._table.batch_writer
+
+        class FailingBatchContext:
+            def __enter__(self):
+                raise RuntimeError("Simulated network crash during batch staging")
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                pass
+
+        ddb_repo._table.batch_writer = lambda: FailingBatchContext()
+
+        try:
+            with pytest.raises(RuntimeError, match="Simulated network crash during batch staging"):
+                ddb_repo.save_manifest(ws, manifest, fence_token=None)
+        finally:
+            ddb_repo._table.batch_writer = original_batch_writer
+
+        # Manifest must NOT exist and must NOT be ready
+        assert ddb_repo.has_ready_okf(ws, doc, ver) is False
+        assert ddb_repo.get_manifest(ws, doc, ver) is None
+
+        # 2. SQLite: simulate failure before manifest write completes
+        sqlite_repo = SQLiteOkfRepository(db_path=db_path)
+
+        class BrokenConnWrapper:
+            def __init__(self, real_conn):
+                self._real = real_conn
+            def __enter__(self):
+                return self
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                return False
+            def execute(self, *args, **kwargs):
+                raise RuntimeError("SQLite disk error")
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        orig_conn = sqlite_repo._conn
+        sqlite_repo._conn = BrokenConnWrapper(orig_conn)
+        try:
+            with pytest.raises(RuntimeError, match="SQLite disk error"):
+                sqlite_repo.save_manifest(ws, manifest, fence_token=None)
+        finally:
+            sqlite_repo._conn = orig_conn
+
+        assert sqlite_repo.has_ready_okf(ws, doc, ver) is False
+        assert sqlite_repo.get_manifest(ws, doc, ver) is None
+
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+def test_two_concurrent_publishers_and_lease_change_during_staging():
+    """Verifies that if Worker A stages items for a large publication, but Worker B
+    acquires an active Bedrock extraction lease before Worker A commits, Worker A's
+    transaction condition fails, preventing Worker A from committing or exposing its manifest.
+    DynamoDB Local verification.
+    """
+    repo = _get_ddb_local_repo("kre_okf_facts_lease_race")
+    ws = "ws_lease_race"
+    doc = "doc_race"
+    ver = "v1"
+    now = "2026-11-02T12:00:00Z"
+
+    pub_a_id = "pub_worker_a"
+    ent_a = OkfEntityRecord(
+        workspace_id=ws,
+        entity_id="ent_race",
+        entity_name="Race Corp",
+        normalized_name="race corp",
+        entity_type="organization",
+        document_id=doc,
+        document_version=ver,
+        publication_id=pub_a_id,
+        created_at=now,
+    )
+    assertions_a = [
+        OkfPropertyAssertion(
+            assertion_id=f"ass_a_{i}",
+            workspace_id=ws,
+            entity_id="ent_race",
+            entity_name="Race Corp",
+            property_key=f"k_{i}",
+            property_value=f"v_{i}",
+            value_type="string",
+            source_chunk_id="c1",
+            document_id=doc,
+            document_version=ver,
+            page_number=1,
+            confidence_score=1.0,
+            validation_status="verified",
+            publication_id=pub_a_id,
+            created_at=now,
+        )
+        for i in range(105)
+    ]
+    manifest_a = OkfManifest(
+        workspace_id=ws,
+        document_id=doc,
+        document_version=ver,
+        publication_id=pub_a_id,
+        entities=(ent_a,),
+        assertions=tuple(assertions_a),
+        rejected_assertions_count=0,
+        status="ready",
+        extraction_tokens=0,
+        model_calls=0,
+        idempotency_key=f"{ws}:{doc}:{ver}:a",
+        created_at=now,
+    )
+
+    original_transact = repo._client.transact_write_items
+
+    def transact_with_intervening_lease(**kwargs):
+        # Worker B acquires active lease right before Worker A commits
+        res_b = repo.reserve_extraction_budget(
+            workspace_id=ws,
+            document_id=doc,
+            document_version=ver,
+            worker_id="worker_b",
+            estimated_prompt_tokens=500,
+            max_output_tokens=300,
+            max_calls=2,
+            lease_duration_s=60.0,
+        )
+        assert res_b.granted is True
+        return original_transact(**kwargs)
+
+    repo._client.transact_write_items = transact_with_intervening_lease
+
+    try:
+        # Worker A attempts to save unfenced wide manifest
+        with pytest.raises(RuntimeError, match="Worker fenced out or unfenced write denied"):
+            repo.save_manifest(ws, manifest_a, fence_token=None)
+    finally:
+        repo._client.transact_write_items = original_transact
+
+    # Worker A's manifest was NOT committed
+    assert repo.has_ready_okf(ws, doc, ver) is False
+    assert repo.get_manifest(ws, doc, ver) is None
+
+    # Worker B's lease is still active on the budget ledger
+    ledger = repo.get_budget_ledger(ws, doc, ver)
+    assert ledger is not None
+    assert ledger.lease_owner_id == "worker_b"
+
+
+def test_existing_ready_publication_remains_readable_during_failed_staging():
+    """Verifies that an existing ready publication remains fully readable and authoritative
+    when a subsequent same-version publication fails during staging.
+    Tested across InMemory, SQLite, and DynamoDB Local.
+    """
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+        db_path = tmp.name
+
+    try:
+        mem_repo = InMemoryOkfRepository()
+        sqlite_repo = SQLiteOkfRepository(db_path=db_path)
+        ddb_repo = _get_ddb_local_repo("kre_okf_facts_existing_safe")
+
+        repos = [mem_repo, sqlite_repo, ddb_repo]
+        now = "2026-11-02T12:00:00Z"
+
+        for repo in repos:
+            ws = "ws_safe_read"
+            doc = "doc_safe"
+            ver = "v1"
+            pub_a_id = f"pub_existing_{repo.__class__.__name__}"
+
+            # Step 1: Commit initial ready Publication A (5 assertions)
+            ent_a = OkfEntityRecord(
+                workspace_id=ws,
+                entity_id="ent_safe",
+                entity_name="Safe Corp",
+                normalized_name="safe corp",
+                entity_type="organization",
+                document_id=doc,
+                document_version=ver,
+                publication_id=pub_a_id,
+                created_at=now,
+            )
+            assertions_a = [
+                OkfPropertyAssertion(
+                    assertion_id=f"ass_a_{i}",
+                    workspace_id=ws,
+                    entity_id="ent_safe",
+                    entity_name="Safe Corp",
+                    property_key=f"metric_{i}",
+                    property_value=f"score_{i}",
+                    value_type="string",
+                    source_chunk_id="c1",
+                    document_id=doc,
+                    document_version=ver,
+                    page_number=1,
+                    confidence_score=0.95,
+                    validation_status="verified",
+                    publication_id=pub_a_id,
+                    created_at=now,
+                )
+                for i in range(5)
+            ]
+            man_a = OkfManifest(
+                workspace_id=ws,
+                document_id=doc,
+                document_version=ver,
+                publication_id=pub_a_id,
+                entities=(ent_a,),
+                assertions=tuple(assertions_a),
+                rejected_assertions_count=0,
+                status="ready",
+                extraction_tokens=100,
+                model_calls=1,
+                idempotency_key=f"{ws}:{doc}:{ver}:a",
+                created_at=now,
+            )
+            repo.save_manifest(ws, man_a, fence_token=None)
+
+            assert repo.has_ready_okf(ws, doc, ver) is True
+            initial_assertions = repo.get_assertions_for_entity(
+                workspace_id=ws,
+                entity_id="ent_safe",
+                publication_id=pub_a_id,
+                limit=20,
+            )
+            assert len(initial_assertions) == 5
+
+            # Step 2: Attempt Publication B (105 items) which fails during staging
+            pub_b_id = f"pub_broken_{repo.__class__.__name__}"
+            ent_b = OkfEntityRecord(
+                workspace_id=ws,
+                entity_id="ent_safe",
+                entity_name="Safe Corp",
+                normalized_name="safe corp",
+                entity_type="organization",
+                document_id=doc,
+                document_version=ver,
+                publication_id=pub_b_id,
+                created_at=now,
+            )
+            assertions_b = [
+                OkfPropertyAssertion(
+                    assertion_id=f"ass_b_{i}",
+                    workspace_id=ws,
+                    entity_id="ent_safe",
+                    entity_name="Safe Corp",
+                    property_key=f"new_metric_{i}",
+                    property_value=f"new_score_{i}",
+                    value_type="string",
+                    source_chunk_id="c2",
+                    document_id=doc,
+                    document_version=ver,
+                    page_number=1,
+                    confidence_score=0.99,
+                    validation_status="verified",
+                    publication_id=pub_b_id,
+                    created_at=now,
+                )
+                for i in range(105)
+            ]
+            man_b = OkfManifest(
+                workspace_id=ws,
+                document_id=doc,
+                document_version=ver,
+                publication_id=pub_b_id,
+                entities=(ent_b,),
+                assertions=tuple(assertions_b),
+                rejected_assertions_count=0,
+                status="ready",
+                extraction_tokens=200,
+                model_calls=1,
+                idempotency_key=f"{ws}:{doc}:{ver}:b",
+                created_at=now,
+            )
+
+            if isinstance(repo, DynamoDBOkfRepository):
+                original_batch_writer = repo._table.batch_writer
+                class FailingBatchContext:
+                    def __enter__(self):
+                        raise RuntimeError("Simulated crash during batch staging")
+                    def __exit__(self, exc_type, exc_val, exc_tb):
+                        pass
+                repo._table.batch_writer = lambda: FailingBatchContext()
+                try:
+                    with pytest.raises(RuntimeError, match="Simulated crash during batch staging"):
+                        repo.save_manifest(ws, man_b, fence_token=None)
+                finally:
+                    repo._table.batch_writer = original_batch_writer
+
+            elif isinstance(repo, SQLiteOkfRepository):
+                class BrokenConnWrapper:
+                    def __init__(self, real_conn):
+                        self._real = real_conn
+                    def __enter__(self):
+                        return self
+                    def __exit__(self, exc_type, exc_val, exc_tb):
+                        return False
+                    def execute(self, *args, **kwargs):
+                        raise RuntimeError("SQLite insert error")
+                    def __getattr__(self, name):
+                        return getattr(self._real, name)
+
+                orig_conn = repo._conn
+                repo._conn = BrokenConnWrapper(orig_conn)
+                try:
+                    with pytest.raises(RuntimeError, match="SQLite insert error"):
+                        repo.save_manifest(ws, man_b, fence_token=None)
+                finally:
+                    repo._conn = orig_conn
+
+            elif isinstance(repo, InMemoryOkfRepository):
+                with patch("db.okf_repo._anchor_assertion_to_manifest", side_effect=RuntimeError("Staging parse error")):
+                    with pytest.raises(RuntimeError, match="Staging parse error"):
+                        repo.save_manifest(ws, man_b, fence_token=None)
+
+            # Step 3: Verify Publication A remains ready and retrievable
+            assert repo.has_ready_okf(ws, doc, ver) is True
+            cur_man = repo.get_manifest(ws, doc, ver)
+            assert cur_man is not None
+            assert cur_man.publication_id == pub_a_id
+            assert len(cur_man.assertions) == 5
+
+            cur_assertions = repo.get_assertions_for_entity(
+                workspace_id=ws,
+                entity_id="ent_safe",
+                publication_id=pub_a_id,
+                limit=20,
+            )
+            assert len(cur_assertions) == 5
+            assert {a.assertion_id for a in cur_assertions} == {f"ass_a_{i}" for i in range(5)}
+
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+def test_same_version_republication_stale_records_exceeding_query_limit():
+    """Verifies that when a document version is republished (A -> B) and stale A records
+    remain in storage exceeding the query limit (25 stale A records vs query limit of 10 or 20),
+    the actual OKF retrieval pipeline returns ONLY B records and zero A records.
+    Tested across InMemory, SQLite, and DynamoDB Local.
+    """
+    from db.workspace_boundary_repo import InMemoryWorkspaceBoundaryRepository
+    from schemas.contracts.boundary import DocumentSnapshot
+    from services.retrieval.okf_retriever import OkfRetriever
+
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+        db_path = tmp.name
+
+    try:
+        mem_repo = InMemoryOkfRepository()
+        sqlite_repo = SQLiteOkfRepository(db_path=db_path)
+        ddb_repo = _get_ddb_local_repo("kre_okf_facts_republish")
+
+        repos = [mem_repo, sqlite_repo, ddb_repo]
+        now = "2026-11-02T12:00:00Z"
+
+        for repo in repos:
+            ws = "ws_repub"
+            doc = "doc_repub_1"
+            ver = "v1"
+
+            pub_a_id = f"pub_a_{repo.__class__.__name__}"
+            pub_b_id = f"pub_b_{repo.__class__.__name__}"
+
+            # Publication A: 25 assertions for Acme Global
+            ent_a = OkfEntityRecord(
+                workspace_id=ws,
+                entity_id="ent_acme",
+                entity_name="Acme Global",
+                normalized_name="acme global",
+                entity_type="organization",
+                document_id=doc,
+                document_version=ver,
+                publication_id=pub_a_id,
+                created_at=now,
+            )
+            assertions_a = [
+                OkfPropertyAssertion(
+                    assertion_id=f"ass_a_{i}",
+                    workspace_id=ws,
+                    entity_id="ent_acme",
+                    entity_name="Acme Global",
+                    property_key=f"stale metric {i}",
+                    property_value=f"stale_val_{i}",
+                    value_type="string",
+                    source_chunk_id="chunk_a",
+                    document_id=doc,
+                    document_version=ver,
+                    page_number=1,
+                    confidence_score=0.90,
+                    validation_status="verified",
+                    publication_id=pub_a_id,
+                    created_at=now,
+                )
+                for i in range(25)
+            ]
+            man_a = OkfManifest(
+                workspace_id=ws,
+                document_id=doc,
+                document_version=ver,
+                publication_id=pub_a_id,
+                entities=(ent_a,),
+                assertions=tuple(assertions_a),
+                rejected_assertions_count=0,
+                status="ready",
+                extraction_tokens=100,
+                model_calls=1,
+                idempotency_key=f"{ws}:{doc}:{ver}:a",
+                created_at=now,
+            )
+            repo.save_manifest(ws, man_a, fence_token=None)
+            assert repo.has_ready_okf(ws, doc, ver) is True
+
+            # Step 2: Republish same workspace, document, version as Publication B with 5 assertions
+            ent_b = OkfEntityRecord(
+                workspace_id=ws,
+                entity_id="ent_acme",
+                entity_name="Acme Global",
+                normalized_name="acme global",
+                entity_type="organization",
+                document_id=doc,
+                document_version=ver,
+                publication_id=pub_b_id,
+                created_at=now,
+            )
+            assertions_b = [
+                OkfPropertyAssertion(
+                    assertion_id=f"ass_b_{i}",
+                    workspace_id=ws,
+                    entity_id="ent_acme",
+                    entity_name="Acme Global",
+                    property_key=f"current metric {i}",
+                    property_value=f"current_val_{i}",
+                    value_type="string",
+                    source_chunk_id="chunk_b",
+                    document_id=doc,
+                    document_version=ver,
+                    page_number=1,
+                    confidence_score=0.99,
+                    validation_status="verified",
+                    publication_id=pub_b_id,
+                    created_at=now,
+                )
+                for i in range(5)
+            ]
+            man_b = OkfManifest(
+                workspace_id=ws,
+                document_id=doc,
+                document_version=ver,
+                publication_id=pub_b_id,
+                entities=(ent_b,),
+                assertions=tuple(assertions_b),
+                rejected_assertions_count=0,
+                status="ready",
+                extraction_tokens=150,
+                model_calls=1,
+                idempotency_key=f"{ws}:{doc}:{ver}:b",
+                created_at=now,
+            )
+            repo.save_manifest(ws, man_b, fence_token=None)
+
+            # Authoritative manifest is now Publication B
+            assert repo.has_ready_okf(ws, doc, ver) is True
+            cur_man = repo.get_manifest(ws, doc, ver)
+            assert cur_man is not None
+            assert cur_man.publication_id == pub_b_id
+            assert len(cur_man.assertions) == 5
+
+            # Setup boundary repository snapshot
+            boundary_repo = InMemoryWorkspaceBoundaryRepository()
+            boundary_repo.save_document_snapshot(DocumentSnapshot(
+                workspace_id=ws,
+                document_id=doc,
+                source=f"{doc}.pdf",
+                version=ver,
+                format="pdf",
+                created_at=now,
+                okf_status="ready",
+            ))
+
+            retriever = OkfRetriever(repository=repo, boundary_repo=boundary_repo)
+
+            # Query through actual OKF retrieval pipeline
+            res = retriever.lookup_sync(
+                workspace_id=ws,
+                query="What are the current metric values of Acme Global?",
+                target_entities=["Acme Global"],
+                document_ids=[doc],
+            )
+
+            assert res.execution_status == "completed"
+            assert res.entity_state == "unique"
+            # Must return assertions from Publication B only
+            assert len(res.matched_assertions) == 5
+            returned_assertion_ids = {f.assertion_id for f in res.matched_assertions}
+            assert returned_assertion_ids == {f"ass_b_{i}" for i in range(5)}
+            # Zero stale assertions from Publication A must be returned
+            stale_assertion_ids = {f"ass_a_{i}" for i in range(25)}
+            assert returned_assertion_ids.isdisjoint(stale_assertion_ids)
+
+            # Also verify direct get_assertions_for_entity with limit=20
+            # 25 stale records must NOT hide any of the 5 current records
+            direct_assertions = repo.get_assertions_for_entity(
+                workspace_id=ws,
+                entity_id="ent_acme",
+                publication_id=pub_b_id,
+                limit=20,
+            )
+            assert len(direct_assertions) == 5
+            assert {a.assertion_id for a in direct_assertions} == {f"ass_b_{i}" for i in range(5)}
+
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+

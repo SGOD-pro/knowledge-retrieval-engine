@@ -214,6 +214,7 @@ class OkfRetriever:
             # Step 1.5: Discover authorized document scope, active versions, and ready manifests (AC-6, AC-7)
             target_docs_set = set(document_ids) if document_ids is not None else None
             active_ready_versions: dict[str, str] = {}
+            active_ready_manifests: dict[str, OkfManifest] = {}
 
             try:
                 if hasattr(self.boundary_repo, "list_document_snapshots"):
@@ -230,6 +231,7 @@ class OkfRetriever:
                             if man is None or man.status != "ready":
                                 continue
                             active_ready_versions[s.document_id] = s.version
+                            active_ready_manifests[s.document_id] = man
             except Exception as snap_err:
                 logger.warning("okf.snapshot_scope_check_error ws=%s error=%s", workspace_id, snap_err)
                 return WorkerResultWrapper(
@@ -287,6 +289,12 @@ class OkfRetriever:
                     continue
                 if ent.document_version != active_ready_versions[ent.document_id]:
                     continue
+                man = active_ready_manifests.get(ent.document_id)
+                if man is not None:
+                    active_pub = man.publication_id or man.idempotency_key
+                    ent_pub = getattr(ent, "publication_id", None)
+                    if ent_pub and ent_pub != active_pub:
+                        continue
                 valid_entities.append(ent)
 
             if not valid_entities:
@@ -315,14 +323,21 @@ class OkfRetriever:
             seen_assertion_ids: set[str] = set()
             for ent in valid_entities:
                 active_docs_param = list(active_ready_versions.keys())
+                man = active_ready_manifests.get(ent.document_id)
+                pub_id = (man.publication_id or man.idempotency_key) if man else None
+                valid_assertion_ids = {a.assertion_id for a in man.assertions} if man else None
+
                 ent_assertions = self.okf_repo.get_assertions_for_entity(
                     workspace_id=workspace_id,
                     entity_id=ent.entity_id,
                     active_document_ids=active_docs_param,
                     limit=20,
+                    publication_id=pub_id,
                 )
                 for ass in ent_assertions:
                     if ass.assertion_id in seen_assertion_ids:
+                        continue
+                    if valid_assertion_ids is not None and ass.assertion_id not in valid_assertion_ids:
                         continue
                     if target_docs_set is not None and ass.document_id not in target_docs_set:
                         continue

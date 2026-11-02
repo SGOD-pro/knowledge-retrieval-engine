@@ -107,6 +107,7 @@ class OkfRepositoryBase(Protocol):
         property_key: str | None = None,
         active_document_ids: Sequence[str] | None = None,
         limit: int = 20,
+        publication_id: str | None = None,
     ) -> list[OkfPropertyAssertion]:
         """Query Main table by PK=WORKSPACE#{ws_id} and SK begins_with ENTITY#{entity_id}."""
         ...
@@ -215,8 +216,15 @@ def _anchor_entity_to_manifest(
     workspace_id: str,
     document_id: str,
     document_version: str,
+    publication_id: str | None = None,
 ) -> OkfEntityRecord:
-    if ent.document_id != document_id or ent.workspace_id != workspace_id or ent.document_version != document_version:
+    target_pub = publication_id or getattr(ent, "publication_id", None)
+    if (
+        ent.document_id != document_id
+        or ent.workspace_id != workspace_id
+        or ent.document_version != document_version
+        or getattr(ent, "publication_id", None) != target_pub
+    ):
         return OkfEntityRecord(
             workspace_id=workspace_id,
             entity_id=ent.entity_id,
@@ -226,6 +234,7 @@ def _anchor_entity_to_manifest(
             document_id=document_id,
             document_version=document_version,
             created_at=ent.created_at,
+            publication_id=target_pub,
         )
     return ent
 
@@ -235,8 +244,15 @@ def _anchor_assertion_to_manifest(
     workspace_id: str,
     document_id: str,
     document_version: str,
+    publication_id: str | None = None,
 ) -> OkfPropertyAssertion:
-    if ass.document_id != document_id or ass.workspace_id != workspace_id or ass.document_version != document_version:
+    target_pub = publication_id or getattr(ass, "publication_id", None)
+    if (
+        ass.document_id != document_id
+        or ass.workspace_id != workspace_id
+        or ass.document_version != document_version
+        or getattr(ass, "publication_id", None) != target_pub
+    ):
         return OkfPropertyAssertion(
             assertion_id=ass.assertion_id,
             workspace_id=workspace_id,
@@ -254,6 +270,7 @@ def _anchor_assertion_to_manifest(
             confidence_score=ass.confidence_score,
             validation_status=ass.validation_status,
             created_at=ass.created_at,
+            publication_id=target_pub,
         )
     return ass
 
@@ -294,16 +311,20 @@ class InMemoryOkfRepository:
                 if existing_man is not None and existing_man.status == "ready" and manifest.status != "ready":
                     raise RuntimeError(f"Unfenced manifest write denied: cannot overwrite ready manifest with {manifest.status} status")
 
-            # Save manifest
-            self._manifests[key] = manifest
-            # Save entities anchored to manifest scope
+            pub_id = manifest.publication_id or manifest.idempotency_key
+            staged_entities = {}
             for ent in manifest.entities:
-                ent = _anchor_entity_to_manifest(ent, workspace_id, manifest.document_id, manifest.document_version)
-                self._entities[(workspace_id, ent.entity_id, ent.document_id, ent.document_version)] = ent
-            # Save assertions anchored to manifest scope
+                ent = _anchor_entity_to_manifest(ent, workspace_id, manifest.document_id, manifest.document_version, publication_id=pub_id)
+                staged_entities[(workspace_id, ent.entity_id, ent.document_id, ent.document_version)] = ent
+            staged_assertions = {}
             for ass in manifest.assertions:
-                ass = _anchor_assertion_to_manifest(ass, workspace_id, manifest.document_id, manifest.document_version)
-                self._assertions[(workspace_id, ass.entity_id, ass.assertion_id)] = ass
+                ass = _anchor_assertion_to_manifest(ass, workspace_id, manifest.document_id, manifest.document_version, publication_id=pub_id)
+                staged_assertions[(workspace_id, ass.entity_id, ass.assertion_id)] = ass
+
+            self._entities.update(staged_entities)
+            self._assertions.update(staged_assertions)
+            # Commit manifest visibility last
+            self._manifests[key] = manifest
 
     def resolve_entities(
         self,
@@ -337,6 +358,7 @@ class InMemoryOkfRepository:
         property_key: str | None = None,
         active_document_ids: Sequence[str] | None = None,
         limit: int = 20,
+        publication_id: str | None = None,
     ) -> list[OkfPropertyAssertion]:
         with self._lock:
             active_docs = set(active_document_ids) if active_document_ids is not None else None
@@ -345,6 +367,8 @@ class InMemoryOkfRepository:
             matched: list[OkfPropertyAssertion] = []
             for (ws, ent_id, _), ass in self._assertions.items():
                 if ws != workspace_id or ent_id != entity_id:
+                    continue
+                if publication_id is not None and getattr(ass, "publication_id", None) and ass.publication_id != publication_id:
                     continue
                 if active_docs is not None and ass.document_id not in active_docs:
                     continue
@@ -954,15 +978,17 @@ class SQLiteOkfRepository:
                         ),
                     )
 
+                pub_id = manifest.publication_id or manifest.idempotency_key
+
                 # 2. Save entity records
                 for ent in manifest.entities:
-                    ent = _anchor_entity_to_manifest(ent, workspace_id, manifest.document_id, manifest.document_version)
+                    ent = _anchor_entity_to_manifest(ent, workspace_id, manifest.document_id, manifest.document_version, publication_id=pub_id)
                     ent_pk = f"WORKSPACE#{workspace_id}"
-                    ent_sk = f"ENTITY#{ent.entity_id}#DOC#{ent.document_id}#VER#{ent.document_version}"
+                    ent_sk = f"ENTITY#{ent.entity_id}#DOC#{ent.document_id}#VER#{ent.document_version}#PUB#{pub_id}"
                     ent_gsi1_pk = ent_pk
                     ent_gsi1_sk = f"ENTITY_NAME#{ent.normalized_name}"
                     ent_gsi2_pk = f"WORKSPACE#{workspace_id}#DOC#{ent.document_id}"
-                    ent_gsi2_sk = f"VER#{ent.document_version}#ENTITY#{ent.entity_id}"
+                    ent_gsi2_sk = f"VER#{ent.document_version}#PUB#{pub_id}#ENTITY#{ent.entity_id}"
                     self._conn.execute(
                         """
                         INSERT OR REPLACE INTO kre_okf_facts (
@@ -980,13 +1006,13 @@ class SQLiteOkfRepository:
 
                 # 3. Save assertion records
                 for ass in manifest.assertions:
-                    ass = _anchor_assertion_to_manifest(ass, workspace_id, manifest.document_id, manifest.document_version)
+                    ass = _anchor_assertion_to_manifest(ass, workspace_id, manifest.document_id, manifest.document_version, publication_id=pub_id)
                     ass_pk = f"WORKSPACE#{workspace_id}"
-                    ass_sk = f"ENTITY#{ass.entity_id}#ASSERTION#{ass.assertion_id}"
+                    ass_sk = f"ENTITY#{ass.entity_id}#ASSERTION#PUB#{pub_id}#{ass.assertion_id}"
                     ass_gsi1_pk = ass_pk
-                    ass_gsi1_sk = f"ASSERTION#{ass.assertion_id}"
+                    ass_gsi1_sk = f"ASSERTION#{ass.assertion_id}#PUB#{pub_id}"
                     ass_gsi2_pk = f"WORKSPACE#{workspace_id}#DOC#{ass.document_id}"
-                    ass_gsi2_sk = f"VER#{ass.document_version}#ASSERTION#{ass.assertion_id}"
+                    ass_gsi2_sk = f"VER#{ass.document_version}#ASSERTION#PUB#{pub_id}#{ass.assertion_id}"
                     norm_k = normalize_property_key(ass.property_key)
                     self._conn.execute(
                         """
@@ -1016,7 +1042,7 @@ class SQLiteOkfRepository:
 
             gsi1_pk = f"WORKSPACE#{workspace_id}"
             results: list[OkfEntityRecord] = []
-            seen_entity_ids: set[str] = set()
+            seen_keys: set[tuple[str, str, str, str | None]] = set()
 
             for cand in norm_candidates:
                 # Query GSI1 by normalized name prefix or exact match
@@ -1026,14 +1052,15 @@ class SQLiteOkfRepository:
                     WHERE gsi1_pk = ? AND record_type = 'ENTITY' AND gsi1_sk LIKE ?
                     LIMIT ?
                     """,
-                    (gsi1_pk, f"ENTITY_NAME#{cand}%", limit),
+                    (gsi1_pk, f"ENTITY_NAME#{cand}%", limit * 5),
                 )
                 rows = cursor.fetchall()
                 for row in rows:
                     data = json.loads(row["data_json"])
                     rec = OkfEntityRecord(**data)
-                    if rec.entity_id not in seen_entity_ids:
-                        seen_entity_ids.add(rec.entity_id)
+                    k = (rec.entity_id, rec.document_id, rec.document_version, getattr(rec, "publication_id", None))
+                    if k not in seen_keys:
+                        seen_keys.add(k)
                         results.append(rec)
                         if len(results) >= limit:
                             return results
@@ -1047,16 +1074,20 @@ class SQLiteOkfRepository:
         property_key: str | None = None,
         active_document_ids: Sequence[str] | None = None,
         limit: int = 20,
+        publication_id: str | None = None,
     ) -> list[OkfPropertyAssertion]:
         with self._lock:
             pk = f"WORKSPACE#{workspace_id}"
-            sk_prefix = f"ENTITY#{entity_id}#ASSERTION#"
+            if publication_id:
+                sk_pattern = f"ENTITY#{entity_id}#ASSERTION#PUB#{publication_id}#%"
+            else:
+                sk_pattern = f"ENTITY#{entity_id}#ASSERTION#%"
 
             query = (
                 "SELECT data_json FROM kre_okf_facts "
                 "WHERE pk = ? AND sk LIKE ? AND record_type = 'ASSERTION'"
             )
-            params: list[Any] = [pk, f"{sk_prefix}%"]
+            params: list[Any] = [pk, sk_pattern]
 
             if property_key:
                 norm_key = normalize_property_key(property_key)
@@ -1737,6 +1768,7 @@ class DynamoDBOkfRepository:
         pass
 
     def save_manifest(self, workspace_id: str, manifest: OkfManifest, fence_token: int | None = None) -> None:
+        pub_id = manifest.publication_id or manifest.idempotency_key
         if fence_token is not None:
             curr = self.get_budget_ledger(workspace_id, manifest.document_id, manifest.document_version, consistent_read=True)
             if curr is not None and curr.fence_token > fence_token:
@@ -1757,52 +1789,56 @@ class DynamoDBOkfRepository:
                 "document_id": manifest.document_id,
                 "document_version": manifest.document_version,
                 "status": manifest.status,
+                "publication_id": pub_id,
                 "data_json": manifest.model_dump_json(),
                 "created_at": manifest.created_at,
             }
 
-            all_items: list[dict[str, Any]] = [manifest_item]
+            payload_items: list[dict[str, Any]] = []
 
             # Entities
             for ent in manifest.entities:
-                ent = _anchor_entity_to_manifest(ent, workspace_id, manifest.document_id, manifest.document_version)
-                all_items.append({
+                ent = _anchor_entity_to_manifest(ent, workspace_id, manifest.document_id, manifest.document_version, publication_id=pub_id)
+                payload_items.append({
                     "PK": f"WORKSPACE#{workspace_id}",
-                    "SK": f"ENTITY#{ent.entity_id}#DOC#{ent.document_id}#VER#{ent.document_version}",
+                    "SK": f"ENTITY#{ent.entity_id}#DOC#{ent.document_id}#VER#{ent.document_version}#PUB#{pub_id}",
                     "GSI1PK": f"WORKSPACE#{workspace_id}",
                     "GSI1SK": f"ENTITY_NAME#{ent.normalized_name}",
                     "GSI2PK": f"WORKSPACE#{workspace_id}#DOC#{ent.document_id}",
-                    "GSI2SK": f"VER#{ent.document_version}#ENTITY#{ent.entity_id}",
+                    "GSI2SK": f"VER#{ent.document_version}#PUB#{pub_id}#ENTITY#{ent.entity_id}",
                     "record_type": "ENTITY",
                     "workspace_id": workspace_id,
                     "entity_id": ent.entity_id,
                     "document_id": ent.document_id,
                     "document_version": ent.document_version,
                     "normalized_name": ent.normalized_name,
+                    "publication_id": pub_id,
                     "data_json": ent.model_dump_json(),
                     "created_at": ent.created_at,
                 })
 
             # Assertions
             for ass in manifest.assertions:
-                ass = _anchor_assertion_to_manifest(ass, workspace_id, manifest.document_id, manifest.document_version)
-                all_items.append({
+                ass = _anchor_assertion_to_manifest(ass, workspace_id, manifest.document_id, manifest.document_version, publication_id=pub_id)
+                payload_items.append({
                     "PK": f"WORKSPACE#{workspace_id}",
-                    "SK": f"ENTITY#{ass.entity_id}#ASSERTION#{ass.assertion_id}",
+                    "SK": f"ENTITY#{ass.entity_id}#ASSERTION#PUB#{pub_id}#{ass.assertion_id}",
                     "GSI1PK": f"WORKSPACE#{workspace_id}",
-                    "GSI1SK": f"ASSERTION#{ass.assertion_id}",
+                    "GSI1SK": f"ASSERTION#{ass.assertion_id}#PUB#{pub_id}",
                     "GSI2PK": f"WORKSPACE#{workspace_id}#DOC#{ass.document_id}",
-                    "GSI2SK": f"VER#{ass.document_version}#ASSERTION#{ass.assertion_id}",
+                    "GSI2SK": f"VER#{ass.document_version}#ASSERTION#PUB#{pub_id}#{ass.assertion_id}",
                     "record_type": "ASSERTION",
                     "workspace_id": workspace_id,
                     "entity_id": ass.entity_id,
                     "document_id": ass.document_id,
                     "document_version": ass.document_version,
                     "property_key": normalize_property_key(ass.property_key),
+                    "publication_id": pub_id,
                     "data_json": ass.model_dump_json(),
                     "created_at": ass.created_at,
                 })
 
+            all_items: list[dict[str, Any]] = [manifest_item] + payload_items
             serializer = TypeSerializer()
 
             if fence_token is not None:
@@ -1872,7 +1908,7 @@ class DynamoDBOkfRepository:
 
                 if len(all_items) < 100:
                     tx_items = [condition_check, manifest_put]
-                    for it in all_items[1:]:
+                    for it in payload_items:
                         tx_items.append({
                             "Put": {
                                 "TableName": self.table_name,
@@ -1890,9 +1926,14 @@ class DynamoDBOkfRepository:
                     existing_man = self.get_manifest(workspace_id, manifest.document_id, manifest.document_version, consistent_read=True)
                     if existing_man and existing_man.status == "ready" and manifest.status != "ready":
                         raise RuntimeError(f"Unfenced manifest write denied: cannot overwrite ready manifest with {manifest.status} status")
+
+                    # Stage all payload items (entities and assertions) first into distinct publication keys
                     with table.batch_writer() as batch:
-                        for it in all_items:
+                        for it in payload_items:
                             batch.put_item(Item=it)
+
+                    # Atomically validate publication authority and switch visibility to the new publication
+                    client.transact_write_items(TransactItems=[condition_check, manifest_put])
 
         except ClientError as ce:
             code = ce.response.get("Error", {}).get("Code", "")
@@ -1926,7 +1967,7 @@ class DynamoDBOkfRepository:
         from boto3.dynamodb.conditions import Key
 
         results: list[OkfEntityRecord] = []
-        seen_entity_ids: set[str] = set()
+        seen_keys: set[tuple[str, str, str, str | None]] = set()
 
         for cand in norm_candidates:
             try:
@@ -1934,14 +1975,15 @@ class DynamoDBOkfRepository:
                     IndexName="GSI1",
                     KeyConditionExpression=Key("GSI1PK").eq(f"WORKSPACE#{workspace_id}")
                     & Key("GSI1SK").begins_with(f"ENTITY_NAME#{cand}"),
-                    Limit=limit,
+                    Limit=limit * 5,
                 )
                 items = resp.get("Items", [])
                 for it in items:
                     if it.get("record_type") == "ENTITY":
                         rec = OkfEntityRecord(**json.loads(it["data_json"]))
-                        if rec.entity_id not in seen_entity_ids:
-                            seen_entity_ids.add(rec.entity_id)
+                        k = (rec.entity_id, rec.document_id, rec.document_version, getattr(rec, "publication_id", None))
+                        if k not in seen_keys:
+                            seen_keys.add(k)
                             results.append(rec)
                             if len(results) >= limit:
                                 return results
@@ -1957,12 +1999,16 @@ class DynamoDBOkfRepository:
         property_key: str | None = None,
         active_document_ids: Sequence[str] | None = None,
         limit: int = 20,
+        publication_id: str | None = None,
     ) -> list[OkfPropertyAssertion]:
         _, table = self._get_resources()
         from boto3.dynamodb.conditions import Key
 
         pk = f"WORKSPACE#{workspace_id}"
-        sk_prefix = f"ENTITY#{entity_id}#ASSERTION#"
+        if publication_id:
+            sk_prefix = f"ENTITY#{entity_id}#ASSERTION#PUB#{publication_id}#"
+        else:
+            sk_prefix = f"ENTITY#{entity_id}#ASSERTION#"
 
         key_cond = Key("PK").eq(pk) & Key("SK").begins_with(sk_prefix)
         norm_k = normalize_property_key(property_key) if property_key else None
@@ -1983,10 +2029,14 @@ class DynamoDBOkfRepository:
                 resp = table.query(**kwargs)
                 items = resp.get("Items", [])
                 for it in items:
+                    if it.get("record_type") != "ASSERTION":
+                        continue
                     data_json = it.get("data_json")
                     if not data_json:
                         continue
                     ass = OkfPropertyAssertion(**json.loads(data_json))
+                    if publication_id is not None and getattr(ass, "publication_id", None) and ass.publication_id != publication_id:
+                        continue
                     if norm_k and ass.property_key != norm_k:
                         continue
                     if active_docs is not None and ass.document_id not in active_docs:
