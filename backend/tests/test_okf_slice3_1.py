@@ -2800,6 +2800,7 @@ def test_same_version_republication_stale_records_exceeding_query_limit():
     the actual OKF retrieval pipeline returns ONLY B records and zero A records.
     Tested across InMemory, SQLite, and DynamoDB Local.
     """
+    import sqlite3
     from db.workspace_boundary_repo import InMemoryWorkspaceBoundaryRepository
     from schemas.contracts.boundary import DocumentSnapshot
     from services.retrieval.okf_retriever import OkfRetriever
@@ -2973,6 +2974,909 @@ def test_same_version_republication_stale_records_exceeding_query_limit():
     finally:
         if os.path.exists(db_path):
             os.remove(db_path)
+
+
+def test_builder_two_attempts_distinct_publication_ids_and_retrieval():
+    """Verify two extraction attempts on the same doc version and idempotency key
+    generate distinct publication IDs (no manual IDs) and retrieval isolates to attempt 2.
+    Tested across InMemory, SQLite, and DynamoDB Local.
+    """
+    import sqlite3
+    from db.workspace_boundary_repo import InMemoryWorkspaceBoundaryRepository
+    from schemas.contracts.boundary import DocumentSnapshot
+    from services.retrieval.okf_retriever import OkfRetriever
+
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+        db_path = tmp.name
+
+    try:
+        mem_repo = InMemoryOkfRepository()
+        sqlite_repo = SQLiteOkfRepository(db_path=db_path)
+        ddb_repo = _get_ddb_local_repo("kre_okf_facts_two_attempts")
+
+        repos = [mem_repo, sqlite_repo, ddb_repo]
+
+        for repo in repos:
+            ws = f"ws_att_{repo.__class__.__name__}"
+            doc = "doc_table_1"
+            ver = "v1"
+
+            builder = OkfBuilder(repo=repo)
+            boundary_repo = InMemoryWorkspaceBoundaryRepository()
+            retriever = OkfRetriever(repository=repo, boundary_repo=boundary_repo)
+
+            # Attempt 1: CSV with columns Product, Price
+            ch1 = Chunk(
+                id="ch1",
+                document_id=doc,
+                source_format="csv",
+                text="Product,Price\nWidget,100",
+                page_number=1,
+                element_type="table",
+                metadata={"headers": ["Product", "Price"]},
+            )
+            # Notice: NO publication_id argument passed; builder generates distinct identity
+            m1 = builder.extract_and_persist(ws, doc, ver, "csv", [ch1], table_name="Catalog")
+            assert m1.status == "ready"
+            assert m1.publication_id is not None
+            assert m1.publication_id.startswith("pub_")
+
+            # Setup active snapshot
+            boundary_repo.save_document_snapshot(DocumentSnapshot(
+                workspace_id=ws,
+                document_id=doc,
+                source=f"{doc}.csv",
+                version=ver,
+                format="csv",
+                created_at="2026-11-02T12:00:00Z",
+                okf_status="ready",
+            ))
+
+            # Query retrieval pipeline: returns Price column assertion
+            res1 = retriever.lookup_sync(
+                workspace_id=ws,
+                query="What are the columns of Catalog?",
+                target_entities=["Catalog"],
+                document_ids=[doc],
+            )
+            assert res1.execution_status == "completed"
+            assert res1.entity_state == "unique"
+            keys1 = {a.property_key for a in res1.matched_assertions}
+            assert "column:Price" in keys1
+            assert "column:Stock" not in keys1
+
+            # Attempt 2: Same doc, same ver, same computed idempotency key, updated columns Product, Stock
+            ch2 = Chunk(
+                id="ch2",
+                document_id=doc,
+                source_format="csv",
+                text="Product,Stock\nWidget,50",
+                page_number=1,
+                element_type="table",
+                metadata={"headers": ["Product", "Stock"]},
+            )
+            m2 = builder.extract_and_persist(ws, doc, ver, "csv", [ch2], table_name="Catalog", force_reextract=True)
+            assert m2.status == "ready"
+            assert m2.publication_id is not None
+            assert m2.publication_id.startswith("pub_")
+            # Publication IDs must be distinct despite identical idempotency keys
+            assert m1.idempotency_key == m2.idempotency_key
+            assert m1.publication_id != m2.publication_id
+
+            # Active manifest in repository is now m2
+            cur_man = repo.get_manifest(ws, doc, ver)
+            assert cur_man is not None
+            assert cur_man.publication_id == m2.publication_id
+
+            # Query retrieval pipeline: returns Stock column assertion and ZERO Price column assertions
+            res2 = retriever.lookup_sync(
+                workspace_id=ws,
+                query="What are the columns of Catalog?",
+                target_entities=["Catalog"],
+                document_ids=[doc],
+            )
+            assert res2.execution_status == "completed"
+            assert res2.entity_state == "unique"
+            keys2 = {a.property_key for a in res2.matched_assertions}
+            assert "column:Stock" in keys2
+            assert "column:Price" not in keys2
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+def test_large_csv_staging_failure_leaves_first_publication_intact():
+    """Verify that when a second large CSV staging attempt fails mid-staging,
+    the first ready publication remains completely readable and intact.
+    Tested on SQLite and DynamoDB Local.
+    """
+    import sqlite3
+    from db.workspace_boundary_repo import InMemoryWorkspaceBoundaryRepository
+    from schemas.contracts.boundary import DocumentSnapshot
+    from services.retrieval.okf_retriever import OkfRetriever
+
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+        db_path = tmp.name
+
+    try:
+        sqlite_repo = SQLiteOkfRepository(db_path=db_path)
+        ddb_repo = _get_ddb_local_repo("kre_okf_facts_staging_abort")
+
+        repos = [sqlite_repo, ddb_repo]
+
+        for repo in repos:
+            ws = f"ws_stage_{repo.__class__.__name__}"
+            doc = "doc_large_csv"
+            ver = "v1"
+
+            builder = OkfBuilder(repo=repo)
+            boundary_repo = InMemoryWorkspaceBoundaryRepository()
+            retriever = OkfRetriever(repository=repo, boundary_repo=boundary_repo)
+
+            # Attempt 1: Large CSV (>100 items: 105 columns)
+            headers_1 = [f"metric_a_{i}" for i in range(105)]
+            ch1 = Chunk(
+                id="ch1",
+                document_id=doc,
+                source_format="csv",
+                text=",".join(headers_1),
+                page_number=1,
+                element_type="table",
+                metadata={"headers": headers_1},
+            )
+            m1 = builder.extract_and_persist(ws, doc, ver, "csv", [ch1], table_name="BigTable")
+            assert m1.status == "ready"
+            pub_1 = m1.publication_id
+            assert pub_1 is not None
+
+            # Setup active snapshot
+            boundary_repo.save_document_snapshot(DocumentSnapshot(
+                workspace_id=ws,
+                document_id=doc,
+                source=f"{doc}.csv",
+                version=ver,
+                format="csv",
+                created_at="2026-11-02T12:00:00Z",
+                okf_status="ready",
+            ))
+
+            # Direct repository check: all 105 column assertions exist for BigTable under pub_1
+            from src.schemas.contracts.okf import compute_entity_id, normalize_entity_name
+            bigtable_ent_id = compute_entity_id(ws, doc, normalize_entity_name("BigTable"))
+            all_direct = repo.get_assertions_for_entity(
+                workspace_id=ws,
+                entity_id=bigtable_ent_id,
+                limit=200,
+                publication_id=pub_1,
+            )
+            assert len(all_direct) == 105
+            assert {a.property_key for a in all_direct} == {f"column:metric_a_{i}" for i in range(105)}
+
+            # Query retrieval: first publication is readable and returns publication 1 assertions
+            res1 = retriever.lookup_sync(
+                workspace_id=ws,
+                query="What are the columns of BigTable?",
+                target_entities=["BigTable"],
+                document_ids=[doc],
+            )
+            assert res1.execution_status == "completed"
+            assert len(res1.matched_assertions) > 0
+            assert all(a.publication_id == pub_1 for a in res1.matched_assertions)
+            assert all(a.property_key.startswith("column:metric_a_") for a in res1.matched_assertions)
+
+            # Attempt 2: Simulate failure during staging of second large CSV
+            headers_2 = [f"metric_b_{i}" for i in range(105)]
+            ch2 = Chunk(
+                id="ch2",
+                document_id=doc,
+                source_format="csv",
+                text=",".join(headers_2),
+                page_number=1,
+                element_type="table",
+                metadata={"headers": headers_2},
+            )
+
+            # Induce staging failure:
+            if isinstance(repo, SQLiteOkfRepository):
+                orig_conn = repo._conn
+                class FailingConn:
+                    def __init__(self, real):
+                        self._real = real
+                        self.count = 0
+                    def execute(self, sql, *args):
+                        if "INSERT OR REPLACE INTO kre_okf_facts" in sql:
+                            self.count += 1
+                            if self.count >= 3:
+                                raise sqlite3.OperationalError("Simulated disk error during staging")
+                        return self._real.execute(sql, *args)
+                    def __enter__(self):
+                        return self._real.__enter__()
+                    def __exit__(self, exc_type, exc_val, exc_tb):
+                        return self._real.__exit__(exc_type, exc_val, exc_tb)
+                    def __getattr__(self, name):
+                        return getattr(self._real, name)
+                repo._conn = FailingConn(orig_conn)
+                try:
+                    m2 = builder.extract_and_persist(ws, doc, ver, "csv", [ch2], table_name="BigTable", force_reextract=True)
+                finally:
+                    repo._conn = orig_conn
+            else:
+                client, table = repo._get_resources()
+                orig_table = repo._table
+                class FailingBatchWriter:
+                    def __init__(self, target):
+                        self.target = target
+                        self.count = 0
+                    def __enter__(self):
+                        return self
+                    def __exit__(self, exc_type, exc_val, exc_tb):
+                        pass
+                    def put_item(self, Item):
+                        self.count += 1
+                        if self.count > 5:
+                            raise RuntimeError("Simulated network timeout during batch staging")
+                class FailingTable:
+                    def __init__(self, real):
+                        self._real = real
+                    def batch_writer(self):
+                        return FailingBatchWriter(self._real)
+                    def __getattr__(self, name):
+                        return getattr(self._real, name)
+                repo._table = FailingTable(orig_table)
+                try:
+                    m2 = builder.extract_and_persist(ws, doc, ver, "csv", [ch2], table_name="BigTable", force_reextract=True)
+                finally:
+                    repo._table = orig_table
+
+            # Attempt 2 failed open (returned fallback failed manifest or exception handled)
+            assert m2.status == "failed"
+
+            # Assert first publication manifest is STILL ready and unchanged in the repository
+            cur_man = repo.get_manifest(ws, doc, ver)
+            assert cur_man is not None
+            assert cur_man.status == "ready"
+            assert cur_man.publication_id == pub_1
+
+            # Assert direct repository query still returns all 105 columns intact
+            all_direct_after = repo.get_assertions_for_entity(
+                workspace_id=ws,
+                entity_id=bigtable_ent_id,
+                limit=200,
+                publication_id=pub_1,
+            )
+            assert len(all_direct_after) == 105
+            assert {a.property_key for a in all_direct_after} == {f"column:metric_a_{i}" for i in range(105)}
+
+            # Assert retrieval pipeline still returns the first publication's columns intact
+            res_after = retriever.lookup_sync(
+                workspace_id=ws,
+                query="What are the columns of BigTable?",
+                target_entities=["BigTable"],
+                document_ids=[doc],
+            )
+            assert res_after.execution_status == "completed"
+            assert len(res_after.matched_assertions) > 0
+            assert all(a.publication_id == pub_1 for a in res_after.matched_assertions)
+            assert all(a.property_key.startswith("column:metric_a_") for a in res_after.matched_assertions)
+            # Zero attempt 2 metrics returned
+            assert not any(a.property_key.startswith("column:metric_b_") for a in res_after.matched_assertions)
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+def test_stale_entity_records_exceeding_limit_do_not_hide_current_entity():
+    """Verify that when more stale entity records exist than the entity resolution limit (10),
+    including legacy records without a publication ID and old version records,
+    the active entity is still resolved and its current assertions returned.
+    Tested on InMemory, SQLite, and DynamoDB Local.
+    """
+    import sqlite3
+    from db.workspace_boundary_repo import InMemoryWorkspaceBoundaryRepository
+    from schemas.contracts.boundary import DocumentSnapshot
+    from services.retrieval.okf_retriever import OkfRetriever
+
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+        db_path = tmp.name
+
+    try:
+        mem_repo = InMemoryOkfRepository()
+        sqlite_repo = SQLiteOkfRepository(db_path=db_path)
+        ddb_repo = _get_ddb_local_repo("kre_okf_facts_stale_limit")
+
+        repos = [mem_repo, sqlite_repo, ddb_repo]
+        now = "2026-11-02T12:00:00Z"
+
+        for repo in repos:
+            ws = f"ws_stale_{repo.__class__.__name__}"
+            doc = "doc_stale_1"
+            ver = "v1"
+            active_pub = f"pub_active_{repo.__class__.__name__}"
+
+            # Step 1: Create 15+ stale entity records under same entity name "ApexCorp"
+            # Category 1: 5 records from older versions v0_1 .. v0_5
+            for i in range(5):
+                man_old = OkfManifest(
+                    workspace_id=ws,
+                    document_id=doc,
+                    document_version=f"v0_{i}",
+                    publication_id=f"pub_v0_{i}",
+                    entities=(
+                        OkfEntityRecord(
+                            workspace_id=ws,
+                            entity_id="ent_apex",
+                            entity_name="ApexCorp",
+                            normalized_name="apexcorp",
+                            entity_type="organization",
+                            document_id=doc,
+                            document_version=f"v0_{i}",
+                            publication_id=f"pub_v0_{i}",
+                            created_at=now,
+                        ),
+                    ),
+                    assertions=(),
+                    rejected_assertions_count=0,
+                    status="ready",
+                    extraction_tokens=10,
+                    model_calls=0,
+                    idempotency_key=f"{ws}:{doc}:v0_{i}",
+                    created_at=now,
+                )
+                repo.save_manifest(ws, man_old, fence_token=None)
+
+            # Category 2: 5 records on same version v1 with old publication IDs
+            for i in range(5):
+                man_old_pub = OkfManifest(
+                    workspace_id=ws,
+                    document_id=doc,
+                    document_version=ver,
+                    publication_id=f"pub_superseded_{i}",
+                    entities=(
+                        OkfEntityRecord(
+                            workspace_id=ws,
+                            entity_id="ent_apex",
+                            entity_name="ApexCorp",
+                            normalized_name="apexcorp",
+                            entity_type="organization",
+                            document_id=doc,
+                            document_version=ver,
+                            publication_id=f"pub_superseded_{i}",
+                            created_at=now,
+                        ),
+                    ),
+                    assertions=(),
+                    rejected_assertions_count=0,
+                    status="failed",
+                    extraction_tokens=10,
+                    model_calls=1,
+                    idempotency_key=f"{ws}:{doc}:{ver}:old_{i}",
+                    created_at=now,
+                )
+                repo.save_manifest(ws, man_old_pub, fence_token=None)
+
+            # Category 3: 5 legacy entity records with publication_id = None
+            for i in range(5):
+                legacy_doc = f"doc_legacy_{i}"
+                man_legacy = OkfManifest(
+                    workspace_id=ws,
+                    document_id=legacy_doc,
+                    document_version="v1",
+                    publication_id=None,
+                    entities=(
+                        OkfEntityRecord(
+                            workspace_id=ws,
+                            entity_id=f"ent_apex_leg_{i}",
+                            entity_name="ApexCorp",
+                            normalized_name="apexcorp",
+                            entity_type="organization",
+                            document_id=legacy_doc,
+                            document_version="v1",
+                            publication_id=None,
+                            created_at=now,
+                        ),
+                    ),
+                    assertions=(),
+                    rejected_assertions_count=0,
+                    status="empty",
+                    extraction_tokens=0,
+                    model_calls=0,
+                    idempotency_key=f"{ws}:{legacy_doc}:v1",
+                    created_at=now,
+                )
+                repo.save_manifest(ws, man_legacy, fence_token=None)
+
+            # Step 2: Now create the active ready publication for ApexCorp on doc, version v1
+            ent_active = OkfEntityRecord(
+                workspace_id=ws,
+                entity_id="ent_apex",
+                entity_name="ApexCorp",
+                normalized_name="apexcorp",
+                entity_type="organization",
+                document_id=doc,
+                document_version=ver,
+                publication_id=active_pub,
+                created_at=now,
+            )
+            metrics_data = [("revenue", "50B"), ("profit", "10B"), ("headquarters", "San Jose")]
+            ass_active = [
+                OkfPropertyAssertion(
+                    assertion_id=f"ass_apex_{prop_k}",
+                    workspace_id=ws,
+                    entity_id="ent_apex",
+                    entity_name="ApexCorp",
+                    property_key=prop_k,
+                    property_value=prop_v,
+                    value_type="string",
+                    source_chunk_id="chunk_1",
+                    document_id=doc,
+                    document_version=ver,
+                    page_number=1,
+                    confidence_score=0.99,
+                    validation_status="verified",
+                    publication_id=active_pub,
+                    created_at=now,
+                )
+                for prop_k, prop_v in metrics_data
+            ]
+            man_active = OkfManifest(
+                workspace_id=ws,
+                document_id=doc,
+                document_version=ver,
+                publication_id=active_pub,
+                entities=(ent_active,),
+                assertions=tuple(ass_active),
+                rejected_assertions_count=0,
+                status="ready",
+                extraction_tokens=50,
+                model_calls=1,
+                idempotency_key=f"{ws}:{doc}:{ver}",
+                created_at=now,
+            )
+            repo.save_manifest(ws, man_active, fence_token=None)
+
+            # Setup active snapshot in boundary repo
+            boundary_repo = InMemoryWorkspaceBoundaryRepository()
+            boundary_repo.save_document_snapshot(DocumentSnapshot(
+                workspace_id=ws,
+                document_id=doc,
+                source=f"{doc}.pdf",
+                version=ver,
+                format="pdf",
+                created_at=now,
+                okf_status="ready",
+            ))
+
+            # Direct check: resolve_entities with limit=10
+            # 15+ stale records exist, but resolve_entities filters against active version and publication
+            resolved = repo.resolve_entities(
+                workspace_id=ws,
+                candidate_names=["ApexCorp"],
+                limit=10,
+                active_document_versions={doc: ver},
+                active_publications={doc: active_pub},
+            )
+            assert len(resolved) == 1
+            assert resolved[0].publication_id == active_pub
+            assert resolved[0].document_id == doc
+            assert resolved[0].document_version == ver
+
+            # Retrieval pipeline check: lookup finds ApexCorp and returns active assertions
+            retriever = OkfRetriever(repository=repo, boundary_repo=boundary_repo)
+            res = retriever.lookup_sync(
+                workspace_id=ws,
+                query="What is the revenue, profit, and headquarters for ApexCorp?",
+                target_entities=["ApexCorp"],
+                document_ids=[doc],
+            )
+            assert res.execution_status == "completed"
+            assert res.entity_state == "unique"
+            assert len(res.matched_assertions) == 3
+            assert {a.property_key for a in res.matched_assertions} == {"revenue", "profit", "headquarters"}
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+def test_concurrent_publishers_tombstones_and_isolation():
+    """Verify concurrent publisher fencing, boundary tombstones,
+    workspace isolation, and version isolation across OKF retrieval.
+    Tested on InMemory, SQLite, and DynamoDB Local.
+    """
+    import sqlite3
+    from db.workspace_boundary_repo import InMemoryWorkspaceBoundaryRepository
+    from schemas.contracts.boundary import DocumentSnapshot
+    from services.retrieval.okf_retriever import OkfRetriever
+
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+        db_path = tmp.name
+
+    try:
+        mem_repo = InMemoryOkfRepository()
+        sqlite_repo = SQLiteOkfRepository(db_path=db_path)
+        ddb_repo = _get_ddb_local_repo("kre_okf_facts_isolation_all")
+
+        repos = [mem_repo, sqlite_repo, ddb_repo]
+        now = "2026-11-02T12:00:00Z"
+
+        for repo in repos:
+            ws = f"ws_iso_{repo.__class__.__name__}"
+            doc = "doc_iso_1"
+            ver = "v1"
+
+            # 1. Concurrent Publishers & Fencing
+            res1 = repo.reserve_extraction_budget(ws, doc, ver, "worker_1", estimated_prompt_tokens=200)
+            assert res1.granted is True
+            fence1 = res1.fence_token
+
+            # Worker 2 supersedes worker 1's fence
+            time.sleep(0.01)  # ensure lease advancement
+            res2 = repo.reserve_extraction_budget(ws, doc, ver, "worker_2", estimated_prompt_tokens=200, lease_duration_s=10.0)
+            # Either granted with newer fence or worker 2 gets newer fence
+            if res2.granted:
+                fence2 = res2.fence_token
+                assert fence2 > fence1
+
+                # Worker 2 publishes successfully
+                pub_w2 = f"pub_w2_{repo.__class__.__name__}"
+                man2 = OkfManifest(
+                    workspace_id=ws,
+                    document_id=doc,
+                    document_version=ver,
+                    publication_id=pub_w2,
+                    entities=(),
+                    assertions=(),
+                    rejected_assertions_count=0,
+                    status="ready",
+                    extraction_tokens=200,
+                    model_calls=1,
+                    idempotency_key=f"{ws}:{doc}:{ver}:w2",
+                    created_at=now,
+                )
+                repo.save_manifest(ws, man2, fence_token=fence2)
+
+                # Stale worker 1 attempts to save manifest with fence1: must be rejected!
+                man1 = OkfManifest(
+                    workspace_id=ws,
+                    document_id=doc,
+                    document_version=ver,
+                    publication_id="pub_w1_stale",
+                    entities=(),
+                    assertions=(),
+                    rejected_assertions_count=0,
+                    status="failed",
+                    extraction_tokens=200,
+                    model_calls=1,
+                    idempotency_key=f"{ws}:{doc}:{ver}:w1",
+                    created_at=now,
+                )
+                with pytest.raises(RuntimeError):
+                    repo.save_manifest(ws, man1, fence_token=fence1)
+
+                # Authoritative manifest remains worker 2's publication
+                cur = repo.get_manifest(ws, doc, ver)
+                assert cur is not None
+                assert cur.publication_id == pub_w2
+
+            # 2. Tombstone Isolation
+            boundary_repo = InMemoryWorkspaceBoundaryRepository()
+            doc_tomb = "doc_tomb_1"
+            pub_tomb = f"pub_tomb_{repo.__class__.__name__}"
+            ent_tomb = OkfEntityRecord(
+                workspace_id=ws,
+                entity_id="ent_tomb",
+                entity_name="TombCorp",
+                normalized_name="tombcorp",
+                entity_type="organization",
+                document_id=doc_tomb,
+                document_version="v1",
+                publication_id=pub_tomb,
+                created_at=now,
+            )
+            ass_tomb = OkfPropertyAssertion(
+                assertion_id="ass_tomb_1",
+                workspace_id=ws,
+                entity_id="ent_tomb",
+                entity_name="TombCorp",
+                property_key="metric",
+                property_value="active",
+                value_type="string",
+                source_chunk_id="ch_tomb",
+                document_id=doc_tomb,
+                document_version="v1",
+                confidence_score=1.0,
+                validation_status="verified",
+                publication_id=pub_tomb,
+                created_at=now,
+            )
+            man_tomb = OkfManifest(
+                workspace_id=ws,
+                document_id=doc_tomb,
+                document_version="v1",
+                publication_id=pub_tomb,
+                entities=(ent_tomb,),
+                assertions=(ass_tomb,),
+                rejected_assertions_count=0,
+                status="ready",
+                extraction_tokens=10,
+                model_calls=0,
+                idempotency_key=f"{ws}:{doc_tomb}:v1",
+                created_at=now,
+            )
+            repo.save_manifest(ws, man_tomb, fence_token=None)
+            boundary_repo.save_document_snapshot(DocumentSnapshot(
+                workspace_id=ws,
+                document_id=doc_tomb,
+                source=f"{doc_tomb}.pdf",
+                version="v1",
+                format="pdf",
+                created_at=now,
+                okf_status="ready",
+            ))
+
+            # Before tombstone: retrieval works
+            retriever = OkfRetriever(repository=repo, boundary_repo=boundary_repo)
+            r_before = retriever.lookup_sync(ws, "What is TombCorp metric?", target_entities=["TombCorp"], document_ids=[doc_tomb])
+            assert r_before.entity_state == "unique"
+            assert len(r_before.matched_assertions) == 1
+
+            # After tombstone: retrieval returns none
+            from schemas.contracts.boundary import TombstoneRecord
+            boundary_repo._tombstones[(ws, "source", doc_tomb)] = TombstoneRecord(
+                workspace_id=ws,
+                resource_type="source",
+                resource_id=doc_tomb,
+                manifest_generation=1,
+                tombstoned_at=now,
+                deleted_by_principal_id="tester",
+                reason="testing",
+            )
+            assert boundary_repo.has_tombstone(ws, "source", doc_tomb) is True
+            r_after = retriever.lookup_sync(ws, "What is TombCorp metric?", target_entities=["TombCorp"], document_ids=[doc_tomb])
+            assert r_after.entity_state == "none"
+            assert len(r_after.matched_assertions) == 0
+
+            # 3. Cross Workspace Isolation
+            ws_a = f"{ws}_alpha"
+            ws_b = f"{ws}_beta"
+            doc_iso = "doc_iso_shared"
+            pub_a = f"pub_a_{repo.__class__.__name__}"
+            pub_b = f"pub_b_{repo.__class__.__name__}"
+
+            ent_a = OkfEntityRecord(
+                workspace_id=ws_a,
+                entity_id="ent_corp",
+                entity_name="SharedCorp",
+                normalized_name="sharedcorp",
+                entity_type="organization",
+                document_id=doc_iso,
+                document_version="v1",
+                publication_id=pub_a,
+                created_at=now,
+            )
+            ass_a = OkfPropertyAssertion(
+                assertion_id="ass_iso_a",
+                workspace_id=ws_a,
+                entity_id="ent_corp",
+                entity_name="SharedCorp",
+                property_key="hq",
+                property_value="Tokyo",
+                value_type="string",
+                source_chunk_id="ch_a",
+                document_id=doc_iso,
+                document_version="v1",
+                confidence_score=1.0,
+                validation_status="verified",
+                publication_id=pub_a,
+                created_at=now,
+            )
+            man_a = OkfManifest(
+                workspace_id=ws_a,
+                document_id=doc_iso,
+                document_version="v1",
+                publication_id=pub_a,
+                entities=(ent_a,),
+                assertions=(ass_a,),
+                rejected_assertions_count=0,
+                status="ready",
+                extraction_tokens=10,
+                model_calls=0,
+                idempotency_key=f"{ws_a}:{doc_iso}:v1",
+                created_at=now,
+            )
+            repo.save_manifest(ws_a, man_a, fence_token=None)
+
+            ent_b = OkfEntityRecord(
+                workspace_id=ws_b,
+                entity_id="ent_corp",
+                entity_name="SharedCorp",
+                normalized_name="sharedcorp",
+                entity_type="organization",
+                document_id=doc_iso,
+                document_version="v1",
+                publication_id=pub_b,
+                created_at=now,
+            )
+            ass_b = OkfPropertyAssertion(
+                assertion_id="ass_iso_b",
+                workspace_id=ws_b,
+                entity_id="ent_corp",
+                entity_name="SharedCorp",
+                property_key="hq",
+                property_value="Berlin",
+                value_type="string",
+                source_chunk_id="ch_b",
+                document_id=doc_iso,
+                document_version="v1",
+                confidence_score=1.0,
+                validation_status="verified",
+                publication_id=pub_b,
+                created_at=now,
+            )
+            man_b = OkfManifest(
+                workspace_id=ws_b,
+                document_id=doc_iso,
+                document_version="v1",
+                publication_id=pub_b,
+                entities=(ent_b,),
+                assertions=(ass_b,),
+                rejected_assertions_count=0,
+                status="ready",
+                extraction_tokens=10,
+                model_calls=0,
+                idempotency_key=f"{ws_b}:{doc_iso}:v1",
+                created_at=now,
+            )
+            repo.save_manifest(ws_b, man_b, fence_token=None)
+
+            boundary_repo.save_document_snapshot(DocumentSnapshot(
+                workspace_id=ws_a,
+                document_id=doc_iso,
+                source=f"{doc_iso}.pdf",
+                version="v1",
+                format="pdf",
+                created_at=now,
+                okf_status="ready",
+            ))
+            boundary_repo.save_document_snapshot(DocumentSnapshot(
+                workspace_id=ws_b,
+                document_id=doc_iso,
+                source=f"{doc_iso}.pdf",
+                version="v1",
+                format="pdf",
+                created_at=now,
+                okf_status="ready",
+            ))
+
+            r_a = retriever.lookup_sync(ws_a, "Where is SharedCorp hq?", target_entities=["SharedCorp"], document_ids=[doc_iso])
+            assert r_a.entity_state == "unique"
+            assert [a.property_value for a in r_a.matched_assertions] == ["Tokyo"]
+
+            r_b = retriever.lookup_sync(ws_b, "Where is SharedCorp hq?", target_entities=["SharedCorp"], document_ids=[doc_iso])
+            assert r_b.entity_state == "unique"
+            assert [a.property_value for a in r_b.matched_assertions] == ["Berlin"]
+
+            # 4. Cross Version Isolation
+            doc_v = "doc_version_isolated"
+            pub_v1 = f"pub_v1_{repo.__class__.__name__}"
+            pub_v2 = f"pub_v2_{repo.__class__.__name__}"
+
+            ent_v1 = OkfEntityRecord(
+                workspace_id=ws,
+                entity_id="ent_vcorp",
+                entity_name="VCorp",
+                normalized_name="vcorp",
+                entity_type="organization",
+                document_id=doc_v,
+                document_version="v1",
+                publication_id=pub_v1,
+                created_at=now,
+            )
+            ass_v1 = OkfPropertyAssertion(
+                assertion_id="ass_v1_city",
+                workspace_id=ws,
+                entity_id="ent_vcorp",
+                entity_name="VCorp",
+                property_key="city",
+                property_value="New York",
+                value_type="string",
+                source_chunk_id="ch_v1",
+                document_id=doc_v,
+                document_version="v1",
+                confidence_score=1.0,
+                validation_status="verified",
+                publication_id=pub_v1,
+                created_at=now,
+            )
+            man_v1 = OkfManifest(
+                workspace_id=ws,
+                document_id=doc_v,
+                document_version="v1",
+                publication_id=pub_v1,
+                entities=(ent_v1,),
+                assertions=(ass_v1,),
+                rejected_assertions_count=0,
+                status="ready",
+                extraction_tokens=10,
+                model_calls=0,
+                idempotency_key=f"{ws}:{doc_v}:v1",
+                created_at=now,
+            )
+            repo.save_manifest(ws, man_v1, fence_token=None)
+
+            ent_v2 = OkfEntityRecord(
+                workspace_id=ws,
+                entity_id="ent_vcorp",
+                entity_name="VCorp",
+                normalized_name="vcorp",
+                entity_type="organization",
+                document_id=doc_v,
+                document_version="v2",
+                publication_id=pub_v2,
+                created_at=now,
+            )
+            ass_v2 = OkfPropertyAssertion(
+                assertion_id="ass_v2_city",
+                workspace_id=ws,
+                entity_id="ent_vcorp",
+                entity_name="VCorp",
+                property_key="city",
+                property_value="London",
+                value_type="string",
+                source_chunk_id="ch_v2",
+                document_id=doc_v,
+                document_version="v2",
+                confidence_score=1.0,
+                validation_status="verified",
+                publication_id=pub_v2,
+                created_at=now,
+            )
+            man_v2 = OkfManifest(
+                workspace_id=ws,
+                document_id=doc_v,
+                document_version="v2",
+                publication_id=pub_v2,
+                entities=(ent_v2,),
+                assertions=(ass_v2,),
+                rejected_assertions_count=0,
+                status="ready",
+                extraction_tokens=10,
+                model_calls=0,
+                idempotency_key=f"{ws}:{doc_v}:v2",
+                created_at=now,
+            )
+            repo.save_manifest(ws, man_v2, fence_token=None)
+
+            # When snapshot points to v1:
+            boundary_repo.save_document_snapshot(DocumentSnapshot(
+                workspace_id=ws,
+                document_id=doc_v,
+                source=f"{doc_v}.pdf",
+                version="v1",
+                format="pdf",
+                created_at=now,
+                okf_status="ready",
+            ))
+            r_v1 = retriever.lookup_sync(ws, "What is VCorp city?", target_entities=["VCorp"], document_ids=[doc_v])
+            assert r_v1.entity_state == "unique"
+            assert [a.property_value for a in r_v1.matched_assertions] == ["New York"]
+
+            # When snapshot points to v2:
+            boundary_repo.save_document_snapshot(DocumentSnapshot(
+                workspace_id=ws,
+                document_id=doc_v,
+                source=f"{doc_v}.pdf",
+                version="v2",
+                format="pdf",
+                created_at=now,
+                okf_status="ready",
+            ))
+            r_v2 = retriever.lookup_sync(ws, "What is VCorp city?", target_entities=["VCorp"], document_ids=[doc_v])
+            assert r_v2.entity_state == "unique"
+            assert [a.property_value for a in r_v2.matched_assertions] == ["London"]
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
 
 
 

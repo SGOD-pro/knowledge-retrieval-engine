@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import uuid
 from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -60,6 +61,11 @@ def compute_idempotency_key(workspace_id: str, document_id: str, document_versio
     """
     token = f"{workspace_id}:{document_id}:{document_version}"
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def generate_publication_id() -> str:
+    """Generate a distinct publication identity for a publication attempt."""
+    return f"pub_{uuid.uuid4().hex[:16]}"
 
 
 class OkfEntityRecord(BaseModel):

@@ -35,6 +35,7 @@ from src.schemas.contracts.okf import (
     compute_assertion_id,
     compute_entity_id,
     compute_idempotency_key,
+    generate_publication_id,
     normalize_entity_name,
     normalize_property_key,
 )
@@ -101,6 +102,7 @@ class DocumentExtractionBudget:
     started_at: float = field(default_factory=time.perf_counter)
     exhausted: bool = False
     exhaustion_reason: str | None = None
+    publication_id: str | None = None
 
     def can_call(self) -> bool:
         if self.exhausted:
@@ -1010,10 +1012,12 @@ class OkfBuilder:
                     model_calls=budget.calls_made,
                     idempotency_key=idempotency_key,
                     created_at=timestamp,
+                    publication_id=generate_publication_id(),
                 )
                 return failed_manifest
 
             fmt = (format or "").lower().replace(".", "")
+            attempt_pub_id = generate_publication_id()
 
             try:
                 if fmt == "csv":
@@ -1026,6 +1030,7 @@ class OkfBuilder:
                         table_store=table_store,
                         idempotency_key=idempotency_key,
                         timestamp=timestamp,
+                        publication_id=attempt_pub_id,
                     )
                 elif fmt == "pdf":
                     return self._extract_pdf(
@@ -1036,6 +1041,7 @@ class OkfBuilder:
                         idempotency_key=idempotency_key,
                         timestamp=timestamp,
                         budget=budget,
+                        publication_id=attempt_pub_id,
                     )
                 else:
                     # Unsupported format for factual entity extraction (DOCX/PPTX) -> return empty manifest
@@ -1051,6 +1057,7 @@ class OkfBuilder:
                         model_calls=0,
                         idempotency_key=idempotency_key,
                         created_at=timestamp,
+                        publication_id=attempt_pub_id,
                     )
                     try:
                         self.repo.save_manifest(workspace_id, manifest)
@@ -1078,6 +1085,7 @@ class OkfBuilder:
                     model_calls=budget.calls_made if 'budget' in locals() else 1,
                     idempotency_key=idempotency_key,
                     created_at=timestamp,
+                    publication_id=attempt_pub_id,
                 )
                 try:
                     fence_token = getattr(budget, "last_reservation_fence", None) if 'budget' in locals() else None
@@ -1097,12 +1105,14 @@ class OkfBuilder:
         table_store: Any | None,
         idempotency_key: str,
         timestamp: str,
+        publication_id: str | None = None,
     ) -> OkfManifest:
         """Deterministic curated table schema and column header extraction with 0 model calls."""
         t_name = table_name or document_id
         ent_name = t_name
         norm_name = normalize_entity_name(ent_name)
         ent_id = compute_entity_id(workspace_id, document_id, norm_name)
+        pub_id = publication_id or generate_publication_id()
 
         entity = OkfEntityRecord(
             workspace_id=workspace_id,
@@ -1113,6 +1123,7 @@ class OkfBuilder:
             document_id=document_id,
             document_version=document_version,
             created_at=timestamp,
+            publication_id=pub_id,
         )
 
         assertions: list[OkfPropertyAssertion] = []
@@ -1178,6 +1189,7 @@ class OkfBuilder:
                     confidence_score=1.0,
                     validation_status="verified",
                     created_at=timestamp,
+                    publication_id=pub_id,
                 )
             )
 
@@ -1193,12 +1205,32 @@ class OkfBuilder:
             model_calls=0,
             idempotency_key=idempotency_key,
             created_at=timestamp,
+            publication_id=pub_id,
         )
 
         try:
             self.repo.save_manifest(workspace_id, manifest)
         except Exception as csv_err:
-            logger.warning("okf_builder.csv_save_manifest_skipped: %s", csv_err)
+            logger.warning(
+                "okf_builder.csv_save_manifest_failed ws=%s doc=%s: %s (failing open per ADR-001)",
+                workspace_id,
+                document_id,
+                csv_err,
+            )
+            manifest = OkfManifest(
+                workspace_id=workspace_id,
+                document_id=document_id,
+                document_version=document_version,
+                entities=(),
+                assertions=(),
+                rejected_assertions_count=0,
+                status="failed",
+                extraction_tokens=0,
+                model_calls=0,
+                idempotency_key=idempotency_key,
+                created_at=timestamp,
+                publication_id=pub_id,
+            )
         logger.info(
             "okf_builder.csv_ready ws=%s doc=%s ver=%s columns=%d (0 tokens, 0 model calls)",
             workspace_id,
@@ -1217,12 +1249,15 @@ class OkfBuilder:
         idempotency_key: str,
         timestamp: str,
         budget: DocumentExtractionBudget | None = None,
+        publication_id: str | None = None,
     ) -> OkfManifest:
         """Bounded Bedrock fact extraction for text PDFs with chunk grounding validation."""
+        pub_id = publication_id or generate_publication_id()
         if budget is None:
             budget = get_or_create_document_budget(
                 workspace_id, document_id, document_version, idempotency_key, repo=self.repo,
             )
+        budget.publication_id = pub_id
 
         if not chunks:
             manifest = OkfManifest(
@@ -1237,6 +1272,7 @@ class OkfBuilder:
                 model_calls=0,
                 idempotency_key=idempotency_key,
                 created_at=timestamp,
+                publication_id=pub_id,
             )
             try:
                 self.repo.save_manifest(workspace_id, manifest)
@@ -1361,6 +1397,7 @@ class OkfBuilder:
                     document_id=document_id,
                     document_version=document_version,
                     created_at=timestamp,
+                    publication_id=pub_id,
                 )
 
             ass_id = compute_assertion_id(
@@ -1391,6 +1428,7 @@ class OkfBuilder:
                     confidence_score=1.0,
                     validation_status="verified",
                     created_at=timestamp,
+                    publication_id=pub_id,
                 )
             )
 
@@ -1406,6 +1444,7 @@ class OkfBuilder:
             model_calls=budget.calls_made,
             idempotency_key=idempotency_key,
             created_at=timestamp,
+            publication_id=pub_id,
         )
 
         fence_token = getattr(budget, "last_reservation_fence", None)
@@ -1431,6 +1470,7 @@ class OkfBuilder:
                     model_calls=manifest.model_calls,
                     idempotency_key=idempotency_key,
                     created_at=timestamp,
+                    publication_id=pub_id,
                 )
         else:
             logger.warning(
@@ -1668,6 +1708,7 @@ class OkfBuilder:
             # and preserve baseline availability per ADR-001.
             try:
                 ikey = getattr(budget, "idempotency_key", "") or f"{workspace_id}:{document_id}:{ver}"
+                pub_id = getattr(budget, "publication_id", None) or generate_publication_id()
                 self.repo.save_manifest(
                     workspace_id,
                     OkfManifest(
@@ -1682,6 +1723,7 @@ class OkfBuilder:
                         model_calls=budget.calls_made,
                         idempotency_key=ikey,
                         created_at=_now_utc(),
+                        publication_id=pub_id,
                     ),
                     fence_token=reservation_fence,
                 )

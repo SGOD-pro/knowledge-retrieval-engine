@@ -128,9 +128,9 @@ class CloudRepository(
             logger.debug("DynamoDB table creation skipped: %s", e)
 
     # ── OKF Facade Delegations ───────────────────────────────────────
-    def resolve_entities(self, workspace_id: str, candidate_names: Any, limit: int = 20):
+    def resolve_entities(self, workspace_id: str, candidate_names: Any, limit: int = 20, **kwargs):
         from db.okf_repo import get_okf_repo
-        return get_okf_repo().resolve_entities(workspace_id, candidate_names, limit=limit)
+        return get_okf_repo().resolve_entities(workspace_id, candidate_names, limit=limit, **kwargs)
 
     def get_assertions_for_entity(
         self,
@@ -139,6 +139,7 @@ class CloudRepository(
         property_key: str | None = None,
         active_document_ids: Any = None,
         limit: int = 20,
+        **kwargs,
     ):
         from db.okf_repo import get_okf_repo
         return get_okf_repo().get_assertions_for_entity(
@@ -147,6 +148,7 @@ class CloudRepository(
             property_key=property_key,
             active_document_ids=active_document_ids,
             limit=limit,
+            **kwargs,
         )
 
     def save_manifest(self, workspace_id: str, manifest: Any = None) -> None:

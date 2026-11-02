@@ -268,11 +268,18 @@ class OkfRetriever:
                     status="completed",
                 )
 
+            active_pubs: dict[str, str | None] = {
+                doc_id: getattr(man, "publication_id", None)
+                for doc_id, man in active_ready_manifests.items()
+            }
+
             # Step 2: Resolve entities via GSI1 index (AC-6)
             entities = self.okf_repo.resolve_entities(
                 workspace_id=workspace_id,
                 candidate_names=candidate_names,
                 limit=10,
+                active_document_versions=active_ready_versions,
+                active_publications=active_pubs,
             )
 
             # Filter entities by authorized document scope, active versions, and ready manifests
@@ -291,10 +298,14 @@ class OkfRetriever:
                     continue
                 man = active_ready_manifests.get(ent.document_id)
                 if man is not None:
-                    active_pub = man.publication_id or man.idempotency_key
+                    active_pub = getattr(man, "publication_id", None)
                     ent_pub = getattr(ent, "publication_id", None)
-                    if ent_pub and ent_pub != active_pub:
-                        continue
+                    if active_pub is not None:
+                        if ent_pub != active_pub:
+                            continue
+                    else:
+                        if ent_pub is not None:
+                            continue
                 valid_entities.append(ent)
 
             if not valid_entities:
@@ -324,7 +335,7 @@ class OkfRetriever:
             for ent in valid_entities:
                 active_docs_param = list(active_ready_versions.keys())
                 man = active_ready_manifests.get(ent.document_id)
-                pub_id = (man.publication_id or man.idempotency_key) if man else None
+                pub_id = getattr(man, "publication_id", None) if man else None
                 valid_assertion_ids = {a.assertion_id for a in man.assertions} if man else None
 
                 ent_assertions = self.okf_repo.get_assertions_for_entity(

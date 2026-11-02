@@ -16,7 +16,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any, Protocol, Sequence, runtime_checkable
+from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
 from boto3.dynamodb.types import TypeSerializer
 from botocore.exceptions import ClientError
@@ -30,6 +30,7 @@ from src.schemas.contracts.okf import (
     OkfEntityRecord,
     OkfManifest,
     OkfPropertyAssertion,
+    generate_publication_id,
     normalize_entity_name,
     normalize_property_key,
 )
@@ -96,6 +97,8 @@ class OkfRepositoryBase(Protocol):
         workspace_id: str,
         candidate_names: Sequence[str],
         limit: int = 10,
+        active_document_versions: Mapping[str, str] | None = None,
+        active_publications: Mapping[str, str | None] | None = None,
     ) -> list[OkfEntityRecord]:
         """Query GSI1 by normalized name prefix or exact match with bounded limit. Avoids scans."""
         ...
@@ -280,8 +283,8 @@ class InMemoryOkfRepository:
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
-        self._entities: dict[tuple[str, str, str, str], OkfEntityRecord] = {}  # (ws, entity_id, doc_id, ver)
-        self._assertions: dict[tuple[str, str, str], OkfPropertyAssertion] = {}  # (ws, entity_id, assertion_id)
+        self._entities: dict[tuple[str, str, str, str, str], OkfEntityRecord] = {}  # (ws, entity_id, doc_id, ver, pub_id)
+        self._assertions: dict[tuple[str, str, str, str], OkfPropertyAssertion] = {}  # (ws, entity_id, assertion_id, pub_id)
         self._manifests: dict[tuple[str, str, str], OkfManifest] = {}  # (ws, doc_id, ver)
         self._ledgers: dict[tuple[str, str, str], OkfBudgetLedger] = {}  # (ws, doc_id, ver)
 
@@ -311,15 +314,18 @@ class InMemoryOkfRepository:
                 if existing_man is not None and existing_man.status == "ready" and manifest.status != "ready":
                     raise RuntimeError(f"Unfenced manifest write denied: cannot overwrite ready manifest with {manifest.status} status")
 
-            pub_id = manifest.publication_id or manifest.idempotency_key
+            pub_id = manifest.publication_id or generate_publication_id()
+            if manifest.publication_id is None:
+                manifest = manifest.model_copy(update={"publication_id": pub_id})
+
             staged_entities = {}
             for ent in manifest.entities:
                 ent = _anchor_entity_to_manifest(ent, workspace_id, manifest.document_id, manifest.document_version, publication_id=pub_id)
-                staged_entities[(workspace_id, ent.entity_id, ent.document_id, ent.document_version)] = ent
+                staged_entities[(workspace_id, ent.entity_id, ent.document_id, ent.document_version, pub_id)] = ent
             staged_assertions = {}
             for ass in manifest.assertions:
                 ass = _anchor_assertion_to_manifest(ass, workspace_id, manifest.document_id, manifest.document_version, publication_id=pub_id)
-                staged_assertions[(workspace_id, ass.entity_id, ass.assertion_id)] = ass
+                staged_assertions[(workspace_id, ass.entity_id, ass.assertion_id, pub_id)] = ass
 
             self._entities.update(staged_entities)
             self._assertions.update(staged_assertions)
@@ -331,6 +337,8 @@ class InMemoryOkfRepository:
         workspace_id: str,
         candidate_names: Sequence[str],
         limit: int = 10,
+        active_document_versions: Mapping[str, str] | None = None,
+        active_publications: Mapping[str, str | None] | None = None,
     ) -> list[OkfEntityRecord]:
         with self._lock:
             norm_candidates = {normalize_entity_name(name) for name in candidate_names if name}
@@ -338,14 +346,34 @@ class InMemoryOkfRepository:
                 return []
 
             matched: list[OkfEntityRecord] = []
-            for (ws, _, _, _), ent in self._entities.items():
-                if ws != workspace_id:
+            seen_keys: set[tuple[str, str, str, str | None]] = set()
+            for ent in self._entities.values():
+                if ent.workspace_id != workspace_id:
                     continue
+                if active_document_versions is not None:
+                    if ent.document_id not in active_document_versions:
+                        continue
+                    if active_document_versions[ent.document_id] != ent.document_version:
+                        continue
+                if active_publications is not None:
+                    if ent.document_id not in active_publications:
+                        continue
+                    expected_pub = active_publications[ent.document_id]
+                    ent_pub = getattr(ent, "publication_id", None)
+                    if expected_pub is not None:
+                        if ent_pub != expected_pub:
+                            continue
+                    else:
+                        if ent_pub is not None:
+                            continue
                 ent_norm = ent.normalized_name
                 # Check exact or prefix match against any candidate
                 for cand in norm_candidates:
                     if ent_norm == cand or ent_norm.startswith(cand):
-                        matched.append(ent)
+                        k = (ent.entity_id, ent.document_id, ent.document_version, getattr(ent, "publication_id", None))
+                        if k not in seen_keys:
+                            seen_keys.add(k)
+                            matched.append(ent)
                         break
                 if len(matched) >= limit:
                     break
@@ -365,8 +393,8 @@ class InMemoryOkfRepository:
             norm_key = normalize_property_key(property_key) if property_key else None
 
             matched: list[OkfPropertyAssertion] = []
-            for (ws, ent_id, _), ass in self._assertions.items():
-                if ws != workspace_id or ent_id != entity_id:
+            for ass in self._assertions.values():
+                if ass.workspace_id != workspace_id or ass.entity_id != entity_id:
                     continue
                 if publication_id is not None and getattr(ass, "publication_id", None) and ass.publication_id != publication_id:
                     continue
@@ -399,8 +427,8 @@ class InMemoryOkfRepository:
     ) -> tuple[list[OkfPropertyAssertion], str | None]:
         with self._lock:
             matched = [
-                ass for (ws, _, _), ass in self._assertions.items()
-                if ws == workspace_id and ass.document_id == document_id and ass.document_version == document_version
+                ass for ass in self._assertions.values()
+                if ass.workspace_id == workspace_id and ass.document_id == document_id and ass.document_version == document_version
             ]
             offset = int(next_token) if next_token and next_token.isdigit() else 0
             sliced = matched[offset : offset + limit]
@@ -877,6 +905,10 @@ class SQLiteOkfRepository:
     def save_manifest(self, workspace_id: str, manifest: OkfManifest, fence_token: int | None = None) -> None:
         with self._lock:
             with self._conn:
+                pub_id = manifest.publication_id or generate_publication_id()
+                if manifest.publication_id is None:
+                    manifest = manifest.model_copy(update={"publication_id": pub_id})
+
                 if fence_token is not None:
                     pk = f"WORKSPACE#{workspace_id}"
                     sk = f"BUDGET#DOC#{manifest.document_id}#VER#{manifest.document_version}"
@@ -1034,6 +1066,8 @@ class SQLiteOkfRepository:
         workspace_id: str,
         candidate_names: Sequence[str],
         limit: int = 10,
+        active_document_versions: Mapping[str, str] | None = None,
+        active_publications: Mapping[str, str | None] | None = None,
     ) -> list[OkfEntityRecord]:
         with self._lock:
             norm_candidates = [normalize_entity_name(name) for name in candidate_names if name]
@@ -1050,14 +1084,28 @@ class SQLiteOkfRepository:
                     """
                     SELECT data_json FROM kre_okf_facts
                     WHERE gsi1_pk = ? AND record_type = 'ENTITY' AND gsi1_sk LIKE ?
-                    LIMIT ?
                     """,
-                    (gsi1_pk, f"ENTITY_NAME#{cand}%", limit * 5),
+                    (gsi1_pk, f"ENTITY_NAME#{cand}%"),
                 )
-                rows = cursor.fetchall()
-                for row in rows:
+                for row in cursor:
                     data = json.loads(row["data_json"])
                     rec = OkfEntityRecord(**data)
+                    if active_document_versions is not None:
+                        if rec.document_id not in active_document_versions:
+                            continue
+                        if active_document_versions[rec.document_id] != rec.document_version:
+                            continue
+                    if active_publications is not None:
+                        if rec.document_id not in active_publications:
+                            continue
+                        expected_pub = active_publications[rec.document_id]
+                        ent_pub = getattr(rec, "publication_id", None)
+                        if expected_pub is not None:
+                            if ent_pub != expected_pub:
+                                continue
+                        else:
+                            if ent_pub is not None:
+                                continue
                     k = (rec.entity_id, rec.document_id, rec.document_version, getattr(rec, "publication_id", None))
                     if k not in seen_keys:
                         seen_keys.add(k)
@@ -1768,7 +1816,9 @@ class DynamoDBOkfRepository:
         pass
 
     def save_manifest(self, workspace_id: str, manifest: OkfManifest, fence_token: int | None = None) -> None:
-        pub_id = manifest.publication_id or manifest.idempotency_key
+        pub_id = manifest.publication_id or generate_publication_id()
+        if manifest.publication_id is None:
+            manifest = manifest.model_copy(update={"publication_id": pub_id})
         if fence_token is not None:
             curr = self.get_budget_ledger(workspace_id, manifest.document_id, manifest.document_version, consistent_read=True)
             if curr is not None and curr.fence_token > fence_token:
@@ -1958,6 +2008,8 @@ class DynamoDBOkfRepository:
         workspace_id: str,
         candidate_names: Sequence[str],
         limit: int = 10,
+        active_document_versions: Mapping[str, str] | None = None,
+        active_publications: Mapping[str, str | None] | None = None,
     ) -> list[OkfEntityRecord]:
         _, table = self._get_resources()
         norm_candidates = [normalize_entity_name(name) for name in candidate_names if name]
@@ -1971,22 +2023,43 @@ class DynamoDBOkfRepository:
 
         for cand in norm_candidates:
             try:
-                resp = table.query(
-                    IndexName="GSI1",
-                    KeyConditionExpression=Key("GSI1PK").eq(f"WORKSPACE#{workspace_id}")
+                query_kwargs: dict[str, Any] = {
+                    "IndexName": "GSI1",
+                    "KeyConditionExpression": Key("GSI1PK").eq(f"WORKSPACE#{workspace_id}")
                     & Key("GSI1SK").begins_with(f"ENTITY_NAME#{cand}"),
-                    Limit=limit * 5,
-                )
-                items = resp.get("Items", [])
-                for it in items:
-                    if it.get("record_type") == "ENTITY":
-                        rec = OkfEntityRecord(**json.loads(it["data_json"]))
-                        k = (rec.entity_id, rec.document_id, rec.document_version, getattr(rec, "publication_id", None))
-                        if k not in seen_keys:
-                            seen_keys.add(k)
-                            results.append(rec)
-                            if len(results) >= limit:
-                                return results
+                }
+                while True:
+                    resp = table.query(**query_kwargs)
+                    items = resp.get("Items", [])
+                    for it in items:
+                        if it.get("record_type") == "ENTITY":
+                            rec = OkfEntityRecord(**json.loads(it["data_json"]))
+                            if active_document_versions is not None:
+                                if rec.document_id not in active_document_versions:
+                                    continue
+                                if active_document_versions[rec.document_id] != rec.document_version:
+                                    continue
+                            if active_publications is not None:
+                                if rec.document_id not in active_publications:
+                                    continue
+                                expected_pub = active_publications[rec.document_id]
+                                ent_pub = getattr(rec, "publication_id", None)
+                                if expected_pub is not None:
+                                    if ent_pub != expected_pub:
+                                        continue
+                                else:
+                                    if ent_pub is not None:
+                                        continue
+                            k = (rec.entity_id, rec.document_id, rec.document_version, getattr(rec, "publication_id", None))
+                            if k not in seen_keys:
+                                seen_keys.add(k)
+                                results.append(rec)
+                                if len(results) >= limit:
+                                    return results
+                    last_key = resp.get("LastEvaluatedKey")
+                    if not last_key:
+                        break
+                    query_kwargs["ExclusiveStartKey"] = last_key
             except Exception as exc:
                 logger.warning("DynamoDB resolve_entities GSI1 query failed: %s", exc)
 
