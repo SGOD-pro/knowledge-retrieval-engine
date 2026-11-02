@@ -8,6 +8,7 @@ Supports in-memory test storage, durable SQLite persistence, and DynamoDB.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from decimal import Decimal
 import json
 import logging
 import os
@@ -83,7 +84,7 @@ def disable_client_retries(client: Any) -> None:
 class OkfRepositoryBase(Protocol):
     """Authoritative repository operations for OKF entities and assertions."""
 
-    def save_manifest(self, workspace_id: str, manifest: OkfManifest) -> None:
+    def save_manifest(self, workspace_id: str, manifest: OkfManifest, fence_token: int | None = None) -> None:
         """Atomically persist manifest entities and validated assertions under workspace PK."""
         ...
 
@@ -157,6 +158,8 @@ class OkfRepositoryBase(Protocol):
         max_calls: int = 2,
         max_total_tokens: int = 5200,
         lease_duration_s: float = 15.0,
+        max_input_tokens: int = 4000,
+        max_output_ceiling: int = 1200,
     ) -> ExtractionReservationResult:
         """Atomically reserve an extraction call permit and token allocation."""
         ...
@@ -269,8 +272,13 @@ class InMemoryOkfRepository:
             self._manifests.clear()
             self._ledgers.clear()
 
-    def save_manifest(self, workspace_id: str, manifest: OkfManifest) -> None:
+    def save_manifest(self, workspace_id: str, manifest: OkfManifest, fence_token: int | None = None) -> None:
         with self._lock:
+            if fence_token is not None:
+                ledger = self._ledgers.get((workspace_id, manifest.document_id, manifest.document_version))
+                if ledger is not None and ledger.fence_token > fence_token:
+                    raise RuntimeError(f"Worker fenced out: fence token {fence_token} superseded by {ledger.fence_token}")
+
             # Save manifest
             self._manifests[(workspace_id, manifest.document_id, manifest.document_version)] = manifest
             # Save entities anchored to manifest scope
@@ -411,12 +419,17 @@ class InMemoryOkfRepository:
         max_calls: int = 2,
         max_total_tokens: int = 5200,
         lease_duration_s: float = 15.0,
+        max_input_tokens: int = 4000,
+        max_output_ceiling: int = 1200,
     ) -> ExtractionReservationResult:
         with self._lock:
             key = (workspace_id, document_id, document_version)
             ledger = self._ledgers.get(key)
             now = time.time()
             est_tokens = estimated_prompt_tokens + max_output_tokens
+            p_thresh = max_input_tokens - estimated_prompt_tokens
+            o_thresh = max_output_ceiling - max_output_tokens
+            t_thresh = max_total_tokens - est_tokens
 
             if ledger is not None:
                 if ledger.status == "completed":
@@ -455,6 +468,10 @@ class InMemoryOkfRepository:
                         completed_calls=ledger.completed_calls,
                         reserved_tokens=ledger.reserved_tokens,
                         spent_tokens=ledger.spent_tokens,
+                        reserved_prompt_tokens=ledger.reserved_prompt_tokens,
+                        reserved_output_tokens=ledger.reserved_output_tokens,
+                        spent_prompt_tokens=ledger.spent_prompt_tokens,
+                        spent_output_tokens=ledger.spent_output_tokens,
                         lease_owner_id=ledger.lease_owner_id,
                         lease_expires_at=ledger.lease_expires_at,
                         fence_token=ledger.fence_token,
@@ -471,7 +488,11 @@ class InMemoryOkfRepository:
                         reason="calls_exhausted",
                         ledger=updated,
                     )
-                if ledger.spent_tokens + est_tokens > max_total_tokens:
+                if (
+                    ledger.reserved_prompt_tokens > p_thresh
+                    or ledger.reserved_output_tokens > o_thresh
+                    or ledger.reserved_tokens > t_thresh
+                ):
                     updated = OkfBudgetLedger(
                         workspace_id=workspace_id,
                         document_id=document_id,
@@ -480,6 +501,10 @@ class InMemoryOkfRepository:
                         completed_calls=ledger.completed_calls,
                         reserved_tokens=ledger.reserved_tokens,
                         spent_tokens=ledger.spent_tokens,
+                        reserved_prompt_tokens=ledger.reserved_prompt_tokens,
+                        reserved_output_tokens=ledger.reserved_output_tokens,
+                        spent_prompt_tokens=ledger.spent_prompt_tokens,
+                        spent_output_tokens=ledger.spent_output_tokens,
                         lease_owner_id=ledger.lease_owner_id,
                         lease_expires_at=ledger.lease_expires_at,
                         fence_token=ledger.fence_token,
@@ -509,6 +534,8 @@ class InMemoryOkfRepository:
                 new_calls = ledger.reserved_calls + 1
                 new_fence = ledger.fence_token + 1
                 new_reserved = ledger.reserved_tokens + est_tokens
+                new_reserved_prompt = ledger.reserved_prompt_tokens + estimated_prompt_tokens
+                new_reserved_output = ledger.reserved_output_tokens + max_output_tokens
                 updated = OkfBudgetLedger(
                     workspace_id=workspace_id,
                     document_id=document_id,
@@ -517,6 +544,10 @@ class InMemoryOkfRepository:
                     completed_calls=ledger.completed_calls,
                     reserved_tokens=new_reserved,
                     spent_tokens=ledger.spent_tokens,
+                    reserved_prompt_tokens=new_reserved_prompt,
+                    reserved_output_tokens=new_reserved_output,
+                    spent_prompt_tokens=ledger.spent_prompt_tokens,
+                    spent_output_tokens=ledger.spent_output_tokens,
                     lease_owner_id=worker_id,
                     lease_expires_at=now + lease_duration_s,
                     fence_token=new_fence,
@@ -542,6 +573,10 @@ class InMemoryOkfRepository:
                     completed_calls=0,
                     reserved_tokens=est_tokens,
                     spent_tokens=0,
+                    reserved_prompt_tokens=estimated_prompt_tokens,
+                    reserved_output_tokens=max_output_tokens,
+                    spent_prompt_tokens=0,
+                    spent_output_tokens=0,
                     lease_owner_id=worker_id,
                     lease_expires_at=now + lease_duration_s,
                     fence_token=1,
@@ -593,6 +628,8 @@ class InMemoryOkfRepository:
             if ledger.fence_token != fence_token or ledger.lease_owner_id != worker_id or ledger.lease_expires_at < now:
                 new_reconciled = ledger.reconciled_fences + (fence_token,)
                 updated_spent = ledger.spent_tokens + actual_total
+                updated_spt = ledger.spent_prompt_tokens + actual_prompt_tokens
+                updated_sot = ledger.spent_output_tokens + actual_output_tokens
                 stale_status = "exhausted" if ledger.reserved_calls >= 2 else ledger.status
                 fenced_ledger = OkfBudgetLedger(
                     workspace_id=workspace_id,
@@ -602,6 +639,10 @@ class InMemoryOkfRepository:
                     completed_calls=ledger.completed_calls,
                     reserved_tokens=ledger.reserved_tokens,
                     spent_tokens=updated_spent,
+                    reserved_prompt_tokens=ledger.reserved_prompt_tokens,
+                    reserved_output_tokens=ledger.reserved_output_tokens,
+                    spent_prompt_tokens=updated_spt,
+                    spent_output_tokens=updated_sot,
                     lease_owner_id=ledger.lease_owner_id if ledger.fence_token != fence_token else None,
                     lease_expires_at=ledger.lease_expires_at if ledger.fence_token != fence_token else 0.0,
                     fence_token=ledger.fence_token,
@@ -619,6 +660,8 @@ class InMemoryOkfRepository:
 
             new_completed = ledger.completed_calls + 1
             new_spent = ledger.spent_tokens + actual_total
+            new_spt = ledger.spent_prompt_tokens + actual_prompt_tokens
+            new_sot = ledger.spent_output_tokens + actual_output_tokens
             new_reconciled = ledger.reconciled_fences + (fence_token,)
             reconciled_ledger = OkfBudgetLedger(
                 workspace_id=workspace_id,
@@ -628,6 +671,10 @@ class InMemoryOkfRepository:
                 completed_calls=new_completed,
                 reserved_tokens=ledger.reserved_tokens,
                 spent_tokens=new_spent,
+                reserved_prompt_tokens=ledger.reserved_prompt_tokens,
+                reserved_output_tokens=ledger.reserved_output_tokens,
+                spent_prompt_tokens=new_spt,
+                spent_output_tokens=new_sot,
                 lease_owner_id=None,
                 lease_expires_at=0.0,
                 fence_token=ledger.fence_token,
@@ -663,6 +710,8 @@ class InMemoryOkfRepository:
                 return
             actual_spent = prompt_tokens_spent + output_tokens_spent
             new_spent = ledger.spent_tokens + actual_spent
+            new_spt = ledger.spent_prompt_tokens + prompt_tokens_spent
+            new_sot = ledger.spent_output_tokens + output_tokens_spent
             new_reconciled = ledger.reconciled_fences + (fence_token,)
             new_status = "failed"
             lease_owner = None if ledger.lease_owner_id == worker_id else ledger.lease_owner_id
@@ -675,6 +724,10 @@ class InMemoryOkfRepository:
                 completed_calls=ledger.completed_calls,
                 reserved_tokens=ledger.reserved_tokens,
                 spent_tokens=new_spent,
+                reserved_prompt_tokens=ledger.reserved_prompt_tokens,
+                reserved_output_tokens=ledger.reserved_output_tokens,
+                spent_prompt_tokens=new_spt,
+                spent_output_tokens=new_sot,
                 lease_owner_id=lease_owner,
                 lease_expires_at=lease_exp,
                 fence_token=ledger.fence_token,
@@ -773,9 +826,20 @@ class SQLiteOkfRepository:
             with self._conn:
                 self._conn.execute("DELETE FROM kre_okf_facts")
 
-    def save_manifest(self, workspace_id: str, manifest: OkfManifest) -> None:
+    def save_manifest(self, workspace_id: str, manifest: OkfManifest, fence_token: int | None = None) -> None:
         with self._lock:
             with self._conn:
+                if fence_token is not None:
+                    pk = f"WORKSPACE#{workspace_id}"
+                    sk = f"BUDGET#DOC#{manifest.document_id}#VER#{manifest.document_version}"
+                    cur = self._conn.execute("SELECT data_json FROM kre_okf_facts WHERE pk = ? AND sk = ?", (pk, sk))
+                    row = cur.fetchone()
+                    if row:
+                        ledger_data = json.loads(row["data_json"])
+                        curr_fence = int(ledger_data.get("fence_token", 0))
+                        if curr_fence > fence_token:
+                            raise RuntimeError(f"Worker fenced out: fence token {fence_token} superseded by {curr_fence}")
+
                 # 1. Save manifest record
                 man_pk = f"WORKSPACE#{workspace_id}"
                 man_sk = f"MANIFEST#DOC#{manifest.document_id}#VER#{manifest.document_version}"
@@ -1031,6 +1095,8 @@ class SQLiteOkfRepository:
         max_calls: int = 2,
         max_total_tokens: int = 5200,
         lease_duration_s: float = 15.0,
+        max_input_tokens: int = 4000,
+        max_output_ceiling: int = 1200,
     ) -> ExtractionReservationResult:
         with self._lock:
             with self._conn:
@@ -1038,6 +1104,9 @@ class SQLiteOkfRepository:
                 sk = f"BUDGET#DOC#{document_id}#VER#{document_version}"
                 now = time.time()
                 est_tokens = estimated_prompt_tokens + max_output_tokens
+                p_thresh = max_input_tokens - estimated_prompt_tokens
+                o_thresh = max_output_ceiling - max_output_tokens
+                t_thresh = max_total_tokens - est_tokens
 
                 cursor = self._conn.execute(
                     "SELECT data_json FROM kre_okf_facts WHERE pk = ? AND sk = ?",
@@ -1085,6 +1154,10 @@ class SQLiteOkfRepository:
                             completed_calls=ledger.completed_calls,
                             reserved_tokens=ledger.reserved_tokens,
                             spent_tokens=ledger.spent_tokens,
+                            reserved_prompt_tokens=ledger.reserved_prompt_tokens,
+                            reserved_output_tokens=ledger.reserved_output_tokens,
+                            spent_prompt_tokens=ledger.spent_prompt_tokens,
+                            spent_output_tokens=ledger.spent_output_tokens,
                             lease_owner_id=ledger.lease_owner_id,
                             lease_expires_at=ledger.lease_expires_at,
                             fence_token=ledger.fence_token,
@@ -1115,7 +1188,11 @@ class SQLiteOkfRepository:
                             reason="calls_exhausted",
                             ledger=updated,
                         )
-                    if ledger.spent_tokens + est_tokens > max_total_tokens:
+                    if (
+                        ledger.reserved_prompt_tokens > p_thresh
+                        or ledger.reserved_output_tokens > o_thresh
+                        or ledger.reserved_tokens > t_thresh
+                    ):
                         updated = OkfBudgetLedger(
                             workspace_id=workspace_id,
                             document_id=document_id,
@@ -1124,6 +1201,10 @@ class SQLiteOkfRepository:
                             completed_calls=ledger.completed_calls,
                             reserved_tokens=ledger.reserved_tokens,
                             spent_tokens=ledger.spent_tokens,
+                            reserved_prompt_tokens=ledger.reserved_prompt_tokens,
+                            reserved_output_tokens=ledger.reserved_output_tokens,
+                            spent_prompt_tokens=ledger.spent_prompt_tokens,
+                            spent_output_tokens=ledger.spent_output_tokens,
                             lease_owner_id=ledger.lease_owner_id,
                             lease_expires_at=ledger.lease_expires_at,
                             fence_token=ledger.fence_token,
@@ -1167,6 +1248,8 @@ class SQLiteOkfRepository:
                     new_calls = ledger.reserved_calls + 1
                     new_fence = ledger.fence_token + 1
                     new_reserved = ledger.reserved_tokens + est_tokens
+                    new_reserved_prompt = ledger.reserved_prompt_tokens + estimated_prompt_tokens
+                    new_reserved_output = ledger.reserved_output_tokens + max_output_tokens
                     updated = OkfBudgetLedger(
                         workspace_id=workspace_id,
                         document_id=document_id,
@@ -1175,6 +1258,10 @@ class SQLiteOkfRepository:
                         completed_calls=ledger.completed_calls,
                         reserved_tokens=new_reserved,
                         spent_tokens=ledger.spent_tokens,
+                        reserved_prompt_tokens=new_reserved_prompt,
+                        reserved_output_tokens=new_reserved_output,
+                        spent_prompt_tokens=ledger.spent_prompt_tokens,
+                        spent_output_tokens=ledger.spent_output_tokens,
                         lease_owner_id=worker_id,
                         lease_expires_at=now + lease_duration_s,
                         fence_token=new_fence,
@@ -1214,6 +1301,10 @@ class SQLiteOkfRepository:
                         completed_calls=0,
                         reserved_tokens=est_tokens,
                         spent_tokens=0,
+                        reserved_prompt_tokens=estimated_prompt_tokens,
+                        reserved_output_tokens=max_output_tokens,
+                        spent_prompt_tokens=0,
+                        spent_output_tokens=0,
                         lease_owner_id=worker_id,
                         lease_expires_at=now + lease_duration_s,
                         fence_token=1,
@@ -1286,6 +1377,8 @@ class SQLiteOkfRepository:
                 if ledger.fence_token != fence_token or ledger.lease_owner_id != worker_id or ledger.lease_expires_at < now:
                     new_reconciled = ledger.reconciled_fences + (fence_token,)
                     updated_spent = ledger.spent_tokens + actual_total
+                    updated_spt = ledger.spent_prompt_tokens + actual_prompt_tokens
+                    updated_sot = ledger.spent_output_tokens + actual_output_tokens
                     stale_status = "exhausted" if ledger.reserved_calls >= 2 else ledger.status
                     fenced_ledger = OkfBudgetLedger(
                         workspace_id=workspace_id,
@@ -1295,6 +1388,10 @@ class SQLiteOkfRepository:
                         completed_calls=ledger.completed_calls,
                         reserved_tokens=ledger.reserved_tokens,
                         spent_tokens=updated_spent,
+                        reserved_prompt_tokens=ledger.reserved_prompt_tokens,
+                        reserved_output_tokens=ledger.reserved_output_tokens,
+                        spent_prompt_tokens=updated_spt,
+                        spent_output_tokens=updated_sot,
                         lease_owner_id=ledger.lease_owner_id if ledger.fence_token != fence_token else None,
                         lease_expires_at=ledger.lease_expires_at if ledger.fence_token != fence_token else 0.0,
                         fence_token=ledger.fence_token,
@@ -1326,6 +1423,8 @@ class SQLiteOkfRepository:
 
                 new_completed = ledger.completed_calls + 1
                 new_spent = ledger.spent_tokens + actual_total
+                new_spt = ledger.spent_prompt_tokens + actual_prompt_tokens
+                new_sot = ledger.spent_output_tokens + actual_output_tokens
                 new_reconciled = ledger.reconciled_fences + (fence_token,)
                 reconciled_ledger = OkfBudgetLedger(
                     workspace_id=workspace_id,
@@ -1335,6 +1434,10 @@ class SQLiteOkfRepository:
                     completed_calls=new_completed,
                     reserved_tokens=ledger.reserved_tokens,
                     spent_tokens=new_spent,
+                    reserved_prompt_tokens=ledger.reserved_prompt_tokens,
+                    reserved_output_tokens=ledger.reserved_output_tokens,
+                    spent_prompt_tokens=new_spt,
+                    spent_output_tokens=new_sot,
                     lease_owner_id=None,
                     lease_expires_at=0.0,
                     fence_token=ledger.fence_token,
@@ -1391,6 +1494,8 @@ class SQLiteOkfRepository:
                     return
                 actual_spent = prompt_tokens_spent + output_tokens_spent
                 new_spent = ledger.spent_tokens + actual_spent
+                new_spt = ledger.spent_prompt_tokens + prompt_tokens_spent
+                new_sot = ledger.spent_output_tokens + output_tokens_spent
                 new_reconciled = ledger.reconciled_fences + (fence_token,)
                 new_status = "failed"
                 lease_owner = None if ledger.lease_owner_id == worker_id else ledger.lease_owner_id
@@ -1403,6 +1508,10 @@ class SQLiteOkfRepository:
                     completed_calls=ledger.completed_calls,
                     reserved_tokens=ledger.reserved_tokens,
                     spent_tokens=new_spent,
+                    reserved_prompt_tokens=ledger.reserved_prompt_tokens,
+                    reserved_output_tokens=ledger.reserved_output_tokens,
+                    spent_prompt_tokens=new_spt,
+                    spent_output_tokens=new_sot,
                     lease_owner_id=lease_owner,
                     lease_expires_at=lease_exp,
                     fence_token=ledger.fence_token,
@@ -1519,7 +1628,12 @@ class DynamoDBOkfRepository:
         # No-op in production DynamoDB table
         pass
 
-    def save_manifest(self, workspace_id: str, manifest: OkfManifest) -> None:
+    def save_manifest(self, workspace_id: str, manifest: OkfManifest, fence_token: int | None = None) -> None:
+        if fence_token is not None:
+            curr = self.get_budget_ledger(workspace_id, manifest.document_id, manifest.document_version, consistent_read=True)
+            if curr is not None and curr.fence_token > fence_token:
+                raise RuntimeError(f"Worker fenced out: fence token {fence_token} superseded by {curr.fence_token}")
+
         _, table = self._get_resources()
         try:
             with table.batch_writer() as batch:
@@ -1779,12 +1893,17 @@ class DynamoDBOkfRepository:
         max_calls: int = 2,
         max_total_tokens: int = 5200,
         lease_duration_s: float = 15.0,
+        max_input_tokens: int = 4000,
+        max_output_ceiling: int = 1200,
     ) -> ExtractionReservationResult:
         _, table = self._get_resources()
         pk = f"WORKSPACE#{workspace_id}"
         sk = f"BUDGET#DOC#{document_id}#VER#{document_version}"
         now = time.time()
         est_tokens = estimated_prompt_tokens + max_output_tokens
+        p_thresh = max_input_tokens - estimated_prompt_tokens
+        o_thresh = max_output_ceiling - max_output_tokens
+        t_thresh = max_total_tokens - est_tokens
 
         try:
             resp = table.update_item(
@@ -1796,8 +1915,12 @@ class DynamoDBOkfRepository:
                     "#lexp = :expires_at, "
                     "#st = :st_act, "
                     "#spent = if_not_exists(#spent, :zero), "
+                    "#spt = if_not_exists(#spt, :zero), "
+                    "#sot = if_not_exists(#sot, :zero), "
                     "#comp = if_not_exists(#comp, :zero), "
                     "#rt = if_not_exists(#rt, :zero) + :est_tokens, "
+                    "#rpt = if_not_exists(#rpt, :zero) + :est_prompt, "
+                    "#rot = if_not_exists(#rot, :zero) + :max_output, "
                     "workspace_id = :ws, "
                     "document_id = :did, "
                     "document_version = :ver, "
@@ -1808,7 +1931,9 @@ class DynamoDBOkfRepository:
                     "(attribute_not_exists(PK)) OR ("
                     "#rc < :max_calls AND "
                     "#st = :st_act AND "
-                    "(#spent + :est_tokens <= :max_tokens) AND "
+                    "(attribute_not_exists(#rpt) OR #rpt <= :p_thresh) AND "
+                    "(attribute_not_exists(#rot) OR #rot <= :o_thresh) AND "
+                    "(attribute_not_exists(#rt) OR #rt <= :t_thresh) AND "
                     "(#lexp < :now OR #lown = :wid)"
                     ")"
                 ),
@@ -1819,18 +1944,26 @@ class DynamoDBOkfRepository:
                     "#lexp": "lease_expires_at",
                     "#st": "status",
                     "#spent": "spent_tokens",
+                    "#spt": "spent_prompt_tokens",
+                    "#sot": "spent_output_tokens",
                     "#comp": "completed_calls",
                     "#rt": "reserved_tokens",
+                    "#rpt": "reserved_prompt_tokens",
+                    "#rot": "reserved_output_tokens",
                 },
                 ExpressionAttributeValues={
                     ":zero": 0,
                     ":one": 1,
                     ":max_calls": max_calls,
-                    ":max_tokens": max_total_tokens,
+                    ":p_thresh": p_thresh,
+                    ":o_thresh": o_thresh,
+                    ":t_thresh": t_thresh,
                     ":est_tokens": est_tokens,
+                    ":est_prompt": estimated_prompt_tokens,
+                    ":max_output": max_output_tokens,
                     ":wid": worker_id,
-                    ":expires_at": int(now + lease_duration_s),
-                    ":now": int(now),
+                    ":expires_at": Decimal(str(round(now + lease_duration_s, 4))),
+                    ":now": Decimal(str(round(now, 4))),
                     ":st_act": "active",
                     ":ws": workspace_id,
                     ":did": document_id,
@@ -1851,6 +1984,10 @@ class DynamoDBOkfRepository:
                 completed_calls=int(attrs.get("completed_calls", 0)),
                 reserved_tokens=int(attrs.get("reserved_tokens", est_tokens)),
                 spent_tokens=int(attrs.get("spent_tokens", 0)),
+                reserved_prompt_tokens=int(attrs.get("reserved_prompt_tokens", estimated_prompt_tokens)),
+                reserved_output_tokens=int(attrs.get("reserved_output_tokens", max_output_tokens)),
+                spent_prompt_tokens=int(attrs.get("spent_prompt_tokens", 0)),
+                spent_output_tokens=int(attrs.get("spent_output_tokens", 0)),
                 lease_owner_id=attrs.get("lease_owner_id"),
                 lease_expires_at=float(attrs.get("lease_expires_at", 0.0)),
                 fence_token=int(attrs.get("fence_token", 1)),
@@ -1885,7 +2022,11 @@ class DynamoDBOkfRepository:
                         reason = "already_failed"
                     elif curr.reserved_calls >= max_calls:
                         reason = "calls_exhausted"
-                    elif curr.spent_tokens + est_tokens > max_total_tokens:
+                    elif (
+                        curr.reserved_prompt_tokens > p_thresh
+                        or curr.reserved_output_tokens > o_thresh
+                        or curr.reserved_tokens > t_thresh
+                    ):
                         reason = "tokens_exhausted"
                     elif curr.lease_expires_at > now and curr.lease_owner_id != worker_id:
                         reason = "active_lease_held"
@@ -1938,15 +2079,19 @@ class DynamoDBOkfRepository:
                 UpdateExpression=(
                     "SET #comp = #comp + :one, "
                     "#spent = #spent + :actual_tokens, "
+                    "#spt = if_not_exists(#spt, :zero) + :actual_prompt, "
+                    "#sot = if_not_exists(#sot, :zero) + :actual_output, "
                     "#lexp = :zero, "
                     "#st = :new_status, "
                     "#rf = list_append(if_not_exists(#rf, :empty_list), :ft_list), "
                     "updated_at = :now_iso"
                 ),
-                ConditionExpression="#ft = :expected_ft AND #lown = :wid AND #lexp >= :now",
+                ConditionExpression="#ft = :expected_ft AND #lown = :wid AND #lexp >= :now AND (attribute_not_exists(#rf) OR NOT contains(#rf, :expected_ft))",
                 ExpressionAttributeNames={
                     "#comp": "completed_calls",
                     "#spent": "spent_tokens",
+                    "#spt": "spent_prompt_tokens",
+                    "#sot": "spent_output_tokens",
                     "#lexp": "lease_expires_at",
                     "#st": "status",
                     "#ft": "fence_token",
@@ -1956,11 +2101,13 @@ class DynamoDBOkfRepository:
                 ExpressionAttributeValues={
                     ":one": 1,
                     ":actual_tokens": actual_total,
+                    ":actual_prompt": actual_prompt_tokens,
+                    ":actual_output": actual_output_tokens,
                     ":zero": 0,
                     ":new_status": status,
                     ":expected_ft": fence_token,
                     ":wid": worker_id,
-                    ":now": int(now),
+                    ":now": Decimal(str(round(now, 4))),
                     ":empty_list": [],
                     ":ft_list": [fence_token],
                     ":now_iso": _now_utc(),
@@ -1978,6 +2125,10 @@ class DynamoDBOkfRepository:
                 completed_calls=int(attrs.get("completed_calls", 0)),
                 reserved_tokens=int(attrs.get("reserved_tokens", 0)),
                 spent_tokens=int(attrs.get("spent_tokens", 0)),
+                reserved_prompt_tokens=int(attrs.get("reserved_prompt_tokens", 0)),
+                reserved_output_tokens=int(attrs.get("reserved_output_tokens", 0)),
+                spent_prompt_tokens=int(attrs.get("spent_prompt_tokens", 0)),
+                spent_output_tokens=int(attrs.get("spent_output_tokens", 0)),
                 lease_owner_id=attrs.get("lease_owner_id"),
                 lease_expires_at=float(attrs.get("lease_expires_at", 0.0)),
                 fence_token=int(attrs.get("fence_token", 0)),
@@ -2011,17 +2162,40 @@ class DynamoDBOkfRepository:
                 try:
                     table.update_item(
                         Key={"PK": pk, "SK": sk},
-                        UpdateExpression="SET #spent = if_not_exists(#spent, :zero) + :actual_tokens, #rf = list_append(if_not_exists(#rf, :empty_list), :ft_list), updated_at = :now_iso",
-                        ExpressionAttributeNames={"#spent": "spent_tokens", "#rf": "reconciled_fences"},
+                        UpdateExpression=(
+                            "SET #spent = if_not_exists(#spent, :zero) + :actual_tokens, "
+                            "#spt = if_not_exists(#spt, :zero) + :actual_prompt, "
+                            "#sot = if_not_exists(#sot, :zero) + :actual_output, "
+                            "#rf = list_append(if_not_exists(#rf, :empty_list), :ft_list), "
+                            "updated_at = :now_iso"
+                        ),
+                        ConditionExpression="(attribute_not_exists(#rf) OR NOT contains(#rf, :expected_ft))",
+                        ExpressionAttributeNames={
+                            "#spent": "spent_tokens",
+                            "#spt": "spent_prompt_tokens",
+                            "#sot": "spent_output_tokens",
+                            "#rf": "reconciled_fences",
+                        },
                         ExpressionAttributeValues={
                             ":zero": 0,
                             ":actual_tokens": actual_total,
+                            ":actual_prompt": actual_prompt_tokens,
+                            ":actual_output": actual_output_tokens,
                             ":empty_list": [],
                             ":ft_list": [fence_token],
+                            ":expected_ft": fence_token,
                             ":now_iso": _now_utc(),
                         },
                     )
                 except Exception as update_err:
+                    if "ConditionalCheckFailedException" in str(update_err):
+                        curr = self.get_budget_ledger(workspace_id, document_id, document_version, consistent_read=True)
+                        return ExtractionReconciliationResult(
+                            reconciled=True,
+                            fenced_out=False,
+                            reason="already_reconciled",
+                            ledger=curr,
+                        )
                     logger.warning("Failed to record fenced token spend in DynamoDB: %s", update_err)
                 curr = self.get_budget_ledger(workspace_id, document_id, document_version, consistent_read=True)
                 return ExtractionReconciliationResult(
@@ -2063,27 +2237,37 @@ class DynamoDBOkfRepository:
                 Key={"PK": pk, "SK": sk},
                 UpdateExpression=(
                     "SET #spent = if_not_exists(#spent, :zero) + :spent, "
+                    "#spt = if_not_exists(#spt, :zero) + :spt, "
+                    "#sot = if_not_exists(#sot, :zero) + :sot, "
                     "#lexp = :zero, "
                     "#st = :st_fail, "
                     "#rf = list_append(if_not_exists(#rf, :empty_list), :ft_list), "
                     "updated_at = :now_iso"
                 ),
+                ConditionExpression="(attribute_not_exists(#rf) OR NOT contains(#rf, :expected_ft))",
                 ExpressionAttributeNames={
                     "#spent": "spent_tokens",
+                    "#spt": "spent_prompt_tokens",
+                    "#sot": "spent_output_tokens",
                     "#lexp": "lease_expires_at",
                     "#st": "status",
                     "#rf": "reconciled_fences",
                 },
                 ExpressionAttributeValues={
                     ":spent": actual_spent,
+                    ":spt": prompt_tokens_spent,
+                    ":sot": output_tokens_spent,
                     ":zero": 0,
                     ":st_fail": "failed",
                     ":empty_list": [],
                     ":ft_list": [fence_token],
+                    ":expected_ft": fence_token,
                     ":now_iso": _now_utc(),
                 },
             )
         except Exception as exc:
+            if "ConditionalCheckFailedException" in str(exc):
+                return
             logger.warning("DynamoDB fail_extraction_budget error: %s", exc)
 
     def get_budget_ledger(
@@ -2125,6 +2309,10 @@ class DynamoDBOkfRepository:
             completed_calls = int(item.get("completed_calls", 0))
             reserved_tokens = int(item.get("reserved_tokens", 0))
             spent_tokens = int(item.get("spent_tokens", 0))
+            reserved_prompt_tokens = int(item.get("reserved_prompt_tokens", 0))
+            reserved_output_tokens = int(item.get("reserved_output_tokens", 0))
+            spent_prompt_tokens = int(item.get("spent_prompt_tokens", 0))
+            spent_output_tokens = int(item.get("spent_output_tokens", 0))
             status = item.get("status", "active")
 
             # Fallback for mock items or serialized record payloads containing data_json
@@ -2133,6 +2321,10 @@ class DynamoDBOkfRepository:
                     data = json.loads(item["data_json"])
                     reserved_calls = int(data.get("reserved_calls", data.get("model_calls", 0)))
                     spent_tokens = int(data.get("spent_tokens", data.get("extraction_tokens", 0)))
+                    reserved_prompt_tokens = int(data.get("reserved_prompt_tokens", 0))
+                    reserved_output_tokens = int(data.get("reserved_output_tokens", 0))
+                    spent_prompt_tokens = int(data.get("spent_prompt_tokens", 0))
+                    spent_output_tokens = int(data.get("spent_output_tokens", 0))
                     status = data.get("status", "failed" if data.get("status") == "failed" else "active")
                 except Exception:
                     pass
@@ -2145,6 +2337,10 @@ class DynamoDBOkfRepository:
                 completed_calls=completed_calls,
                 reserved_tokens=reserved_tokens,
                 spent_tokens=spent_tokens,
+                reserved_prompt_tokens=reserved_prompt_tokens,
+                reserved_output_tokens=reserved_output_tokens,
+                spent_prompt_tokens=spent_prompt_tokens,
+                spent_output_tokens=spent_output_tokens,
                 lease_owner_id=item.get("lease_owner_id"),
                 lease_expires_at=float(item.get("lease_expires_at", 0.0)),
                 fence_token=int(item.get("fence_token", 0)),

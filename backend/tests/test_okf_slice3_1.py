@@ -19,6 +19,7 @@ import json
 import multiprocessing
 import os
 from pathlib import Path
+import threading
 import time
 from unittest.mock import MagicMock, patch
 
@@ -43,7 +44,9 @@ from schemas.contracts.okf import (
     ExtractionReconciliationResult,
     ExtractionReservationResult,
     OkfBudgetLedger,
+    OkfEntityRecord,
     OkfManifest,
+    OkfPropertyAssertion,
 )
 
 
@@ -502,6 +505,7 @@ def test_throttling_retry_within_lease():
     ver = "v1"
 
     mock_bedrock = MagicMock()
+    mock_bedrock.count_tokens.return_value = {"inputTokens": 200}
     # Attempt 0: throttled (429), Attempt 1: succeeds
     mock_bedrock.converse.side_effect = [
         botocore.exceptions.ClientError({"Error": {"Code": "ThrottlingException", "Message": "Rate exceeded"}}, "Converse"),
@@ -1102,4 +1106,370 @@ def test_legacy_manifest_fallback_when_no_budget_item_exists(tmp_path):
     assert ledger_sq.spent_tokens == 320
     assert ledger_sq.status == "completed"
 
+
+# -----------------------------------------------------------------------------
+# 16. DynamoDB Local Integration & Concurrent Idempotency Evidence
+# -----------------------------------------------------------------------------
+
+def _get_ddb_local_repo(table_name: str = "kre_okf_facts_test"):
+    import boto3
+    try:
+        client = boto3.client(
+            "dynamodb",
+            endpoint_url="http://localhost:8000",
+            region_name="us-east-1",
+            aws_access_key_id="test",
+            aws_secret_access_key="test",
+        )
+        client.list_tables()
+    except Exception:
+        pytest.skip("DynamoDB Local is not running on http://localhost:8000")
+
+    try:
+        client.delete_table(TableName=table_name)
+    except Exception:
+        pass
+
+    client.create_table(
+        TableName=table_name,
+        KeySchema=[
+            {"AttributeName": "PK", "KeyType": "HASH"},
+            {"AttributeName": "SK", "KeyType": "RANGE"},
+        ],
+        AttributeDefinitions=[
+            {"AttributeName": "PK", "AttributeType": "S"},
+            {"AttributeName": "SK", "AttributeType": "S"},
+        ],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    waiter = client.get_waiter("table_exists")
+    waiter.wait(TableName=table_name)
+
+    repo = DynamoDBOkfRepository(table_name=table_name)
+    repo._client = client
+    resource = boto3.resource(
+        "dynamodb",
+        endpoint_url="http://localhost:8000",
+        region_name="us-east-1",
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+    )
+    repo._table = resource.Table(table_name)
+    return repo
+
+
+def test_dynamodb_local_reservations_and_ceiling_enforcement():
+    """LIVE DYNAMODB LOCAL EVIDENCE:
+    Exercises real DynamoDB update and condition expressions against DynamoDB Local.
+    Verifies two-call limit, separate prompt/output limits, and lease expiry.
+    """
+    repo = _get_ddb_local_repo("kre_okf_test_reservations")
+    ws = "ws_ddb_local"
+    doc = "doc_ddb"
+    ver = "v1"
+
+    # Call 1: 1500 prompt tokens, 600 max output -> granted
+    r1 = repo.reserve_extraction_budget(
+        workspace_id=ws,
+        document_id=doc,
+        document_version=ver,
+        worker_id="worker_a",
+        estimated_prompt_tokens=1500,
+        max_output_tokens=600,
+        max_calls=2,
+        max_total_tokens=5200,
+        lease_duration_s=15.0,
+    )
+    assert r1.granted is True
+    assert r1.fence_token == 1
+    assert r1.call_number == 1
+    assert r1.remaining_calls == 1
+
+    # Call 2: same worker, another 1500 prompt tokens -> granted (total 3000 prompt <= 4000)
+    r2 = repo.reserve_extraction_budget(
+        workspace_id=ws,
+        document_id=doc,
+        document_version=ver,
+        worker_id="worker_a",
+        estimated_prompt_tokens=1500,
+        max_output_tokens=600,
+        max_calls=2,
+        max_total_tokens=5200,
+        lease_duration_s=15.0,
+    )
+    assert r2.granted is True
+    assert r2.fence_token == 2
+    assert r2.call_number == 2
+    assert r2.remaining_calls == 0
+
+    # Call 3: exceeds max_calls=2 -> calls_exhausted
+    r3 = repo.reserve_extraction_budget(
+        workspace_id=ws,
+        document_id=doc,
+        document_version=ver,
+        worker_id="worker_a",
+        estimated_prompt_tokens=500,
+        max_output_tokens=600,
+        max_calls=2,
+        max_total_tokens=5200,
+    )
+    assert r3.granted is False
+    assert r3.reason == "calls_exhausted"
+
+    # Separate document testing token ceiling enforcement
+    doc_tok = "doc_tok_overflow"
+    r_tok1 = repo.reserve_extraction_budget(
+        workspace_id=ws,
+        document_id=doc_tok,
+        document_version=ver,
+        worker_id="worker_b",
+        estimated_prompt_tokens=2500,
+        max_output_tokens=600,
+        max_calls=5,
+        max_input_tokens=4000,
+        max_total_tokens=5200,
+    )
+    assert r_tok1.granted is True
+
+    # 2nd call tries to reserve another 2500 prompt tokens (2500 + 2500 = 5000 > 4000)
+    r_tok2 = repo.reserve_extraction_budget(
+        workspace_id=ws,
+        document_id=doc_tok,
+        document_version=ver,
+        worker_id="worker_b",
+        estimated_prompt_tokens=2500,
+        max_output_tokens=600,
+        max_calls=5,
+        max_input_tokens=4000,
+        max_total_tokens=5200,
+    )
+    assert r_tok2.granted is False
+    assert r_tok2.reason == "tokens_exhausted"
+
+
+def test_dynamodb_local_reconciliation_concurrent_idempotency():
+    """LIVE DYNAMODB LOCAL EVIDENCE:
+    Tests concurrent duplicate reconciliation requests against DynamoDB Local.
+    Proves that atomic condition (attribute_not_exists(rf) OR NOT contains(rf, expected_ft))
+    guarantees exact idempotency and single accounting under high concurrency.
+    """
+    repo = _get_ddb_local_repo("kre_okf_test_reconcile_conc")
+    ws = "ws_conc"
+    doc = "doc_conc"
+    ver = "v1"
+
+    # Worker reserves call
+    r1 = repo.reserve_extraction_budget(
+        workspace_id=ws,
+        document_id=doc,
+        document_version=ver,
+        worker_id="worker_conc",
+        estimated_prompt_tokens=1500,
+        max_output_tokens=600,
+    )
+    assert r1.granted is True
+
+    results = []
+    lock = threading.Lock()
+
+    def do_reconcile():
+        res = repo.reconcile_extraction_budget(
+            workspace_id=ws,
+            document_id=doc,
+            document_version=ver,
+            worker_id="worker_conc",
+            fence_token=r1.fence_token,
+            actual_prompt_tokens=800,
+            actual_output_tokens=150,
+        )
+        with lock:
+            results.append(res)
+
+    threads = [threading.Thread(target=do_reconcile) for _ in range(5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # All threads must report successful reconciliation
+    assert len(results) == 5
+    assert all(r.reconciled for r in results)
+    reasons = [r.reason for r in results]
+    assert "reconciled" in reasons
+    assert reasons.count("reconciled") == 1
+    assert reasons.count("already_reconciled") == 4
+
+    # Final ledger item must show exact single accounting
+    ledger = repo.get_budget_ledger(ws, doc, ver, consistent_read=True)
+    assert ledger is not None
+    assert ledger.completed_calls == 1
+    assert ledger.spent_tokens == 950
+    assert ledger.spent_prompt_tokens == 800
+    assert ledger.spent_output_tokens == 150
+    assert ledger.reconciled_fences == (r1.fence_token,)
+
+
+def test_dynamodb_local_stale_reconciliation_concurrent_idempotency():
+    """LIVE DYNAMODB LOCAL EVIDENCE:
+    Tests concurrent duplicate stale reconciliation requests against DynamoDB Local.
+    Proves that stale workers cannot increment completed_calls and cannot double count spent tokens.
+    """
+    repo = _get_ddb_local_repo("kre_okf_test_stale_conc")
+    ws = "ws_stale"
+    doc = "doc_stale"
+    ver = "v1"
+
+    # Worker 1 reserves fence 1
+    r1 = repo.reserve_extraction_budget(
+        workspace_id=ws,
+        document_id=doc,
+        document_version=ver,
+        worker_id="worker_1",
+        estimated_prompt_tokens=1000,
+        max_output_tokens=500,
+        lease_duration_s=0.01,  # Short lease
+    )
+    time.sleep(0.05)  # Lease expires
+
+    # Worker 2 supersedes worker 1 (fence 2)
+    r2 = repo.reserve_extraction_budget(
+        workspace_id=ws,
+        document_id=doc,
+        document_version=ver,
+        worker_id="worker_2",
+        estimated_prompt_tokens=1000,
+        max_output_tokens=500,
+    )
+    assert r2.granted is True
+    assert r2.fence_token == 2
+
+    # Now concurrent requests for stale worker 1 (fence 1) arrive
+    results = []
+    lock = threading.Lock()
+
+    def do_stale():
+        res = repo.reconcile_extraction_budget(
+            workspace_id=ws,
+            document_id=doc,
+            document_version=ver,
+            worker_id="worker_1",
+            fence_token=1,
+            actual_prompt_tokens=700,
+            actual_output_tokens=100,
+        )
+        with lock:
+            results.append(res)
+
+    threads = [threading.Thread(target=do_stale) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # Stale workers must be fenced out or recognized as already reconciled
+    assert len(results) == 4
+    for r in results:
+        if r.fenced_out:
+            assert r.reason == "fenced_out"
+        else:
+            assert r.reason == "already_reconciled"
+
+    # Final ledger must show 0 completed calls for worker 1 and exactly 800 spent tokens recorded
+    ledger = repo.get_budget_ledger(ws, doc, ver, consistent_read=True)
+    assert ledger is not None
+    assert ledger.completed_calls == 0
+    assert ledger.spent_tokens == 800
+    assert ledger.spent_prompt_tokens == 700
+    assert ledger.spent_output_tokens == 100
+    assert ledger.reconciled_fences == (1,)
+
+
+# -----------------------------------------------------------------------------
+# 17. Fail-Closed Reconciliation & Authoritative Token Bounding Tests
+# -----------------------------------------------------------------------------
+
+def test_reconciliation_failure_fails_closed_zero_assertions():
+    """Verify that when reconciliation fails or returns storage_error, extracted text is discarded and zero assertions are published."""
+    repo = InMemoryOkfRepository()
+    ws, doc, ver = "ws_rec_fail", "doc_rf", "v1"
+
+    mock_bedrock = MagicMock()
+    mock_bedrock.count_tokens.return_value = {"inputTokens": 100}
+    mock_bedrock.converse.return_value = {
+        "output": {"message": {"content": [{"text": json.dumps([
+            {"entity_name": "TestCorp", "property_key": "revenue", "property_value": "$10M", "source_chunk_id": "c1"}
+        ])}]}},
+        "usage": {"inputTokens": 100, "outputTokens": 50},
+    }
+
+    ch = Chunk(id="c1", document_id=doc, source_format="pdf", text="TestCorp revenue is $10M.", page_number=1, element_type="paragraph")
+    builder = OkfBuilder(repo=repo, bedrock_client=mock_bedrock)
+
+    # Patch reconcile_extraction_budget to return storage_error
+    with patch.object(repo, "reconcile_extraction_budget", return_value=ExtractionReconciliationResult(reconciled=False, reason="storage_error")):
+        manifest = builder.extract_and_persist(ws, doc, ver, "pdf", [ch])
+
+    # Assertions must be discarded and manifest marked failed
+    assert len(manifest.assertions) == 0
+    assert manifest.status == "failed"
+
+
+def test_token_counting_missing_or_invalid_zero_converse_dispatches():
+    """Verify that if count_tokens is missing or returns invalid/zero count, zero Converse calls are dispatched."""
+    repo = InMemoryOkfRepository()
+    ws, doc, ver = "ws_tok_check", "doc_tc", "v1"
+    ch = Chunk(id="c1", document_id=doc, source_format="pdf", text="Acme text.", page_number=1, element_type="paragraph")
+
+    # Case 1: Client missing count_tokens capability
+    mock_no_count = MagicMock(spec=["converse"])
+    builder1 = OkfBuilder(repo=repo, bedrock_client=mock_no_count)
+    m1 = builder1.extract_and_persist(ws, doc, ver, "pdf", [ch])
+    assert m1.status == "failed"
+    assert len(m1.assertions) == 0
+    assert mock_no_count.converse.call_count == 0
+
+    # Case 2: count_tokens returns zero or malformed response
+    mock_bad_count = MagicMock()
+    mock_bad_count.count_tokens.return_value = {"inputTokens": 0}
+    builder2 = OkfBuilder(repo=repo, bedrock_client=mock_bad_count)
+    m2 = builder2.extract_and_persist(ws, doc, "v2", "pdf", [ch])
+    assert m2.status == "failed"
+    assert len(m2.assertions) == 0
+    mock_bad_count.converse.assert_not_called()
+
+
+def test_publication_path_fencing_race_prevention():
+    """Verify that a stale worker whose fence token was superseded cannot publish assertions in save_manifest."""
+    repo = InMemoryOkfRepository()
+    ws, doc, ver = "ws_race_pub", "doc_rp", "v1"
+
+    # Worker 1 reserves fence 1 with short lease
+    r1 = repo.reserve_extraction_budget(ws, doc, ver, "worker_1", 1000, lease_duration_s=0.01)
+    assert r1.fence_token == 1
+    time.sleep(0.03)
+
+    # Worker 2 takes over and reserves fence 2
+    r2 = repo.reserve_extraction_budget(ws, doc, ver, "worker_2", 1000)
+    assert r2.fence_token == 2
+
+    # Worker 1 tries to save manifest using stale fence 1
+    stale_manifest = OkfManifest(
+        workspace_id=ws,
+        document_id=doc,
+        document_version=ver,
+        entities=[OkfEntityRecord(workspace_id=ws, entity_id="e1", entity_name="StaleCorp", normalized_name="stalecorp", entity_type="organization", document_id=doc, document_version=ver, created_at="2026-11-02T00:00:00Z")],
+        assertions=[OkfPropertyAssertion(workspace_id=ws, document_id=doc, document_version=ver, assertion_id="a1", entity_id="e1", entity_name="StaleCorp", property_key="k", property_value="v", source_chunk_id="c1", created_at="2026-11-02T00:00:00Z")],
+        rejected_assertions_count=0,
+        status="ready",
+        extraction_tokens=500,
+        model_calls=1,
+        idempotency_key=f"{ws}:{doc}:{ver}",
+        created_at="2026-11-02T00:00:00Z",
+    )
+
+    with pytest.raises(RuntimeError, match="Worker fenced out"):
+        repo.save_manifest(ws, stale_manifest, fence_token=1)
+
+    # Repository must contain zero assertions for StaleCorp
+    assert len(repo.get_assertions_for_entity(ws, "e1")) == 0
 

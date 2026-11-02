@@ -245,6 +245,7 @@ def test_chunk_grounding_rejection_unsupported_claims():
     ])
 
     mock_bedrock = MagicMock()
+    mock_bedrock.count_tokens.return_value = {"inputTokens": 200}
     mock_bedrock.converse.return_value = {
         "output": {"message": {"content": [{"text": model_output}]}},
         "usage": {"inputTokens": 200, "outputTokens": 80},
@@ -294,6 +295,7 @@ def test_ingestion_budget_enforcement():
     """Verify Bedrock calls enforce max calls, token caps, and provider deadlines."""
     repo = InMemoryOkfRepository()
     mock_bedrock = MagicMock()
+    mock_bedrock.count_tokens.return_value = {"inputTokens": 500}
     mock_bedrock.converse.return_value = {
         "output": {"message": {"content": [{"text": "[]"}]}},
         "usage": {"inputTokens": 500, "outputTokens": 50},
@@ -331,6 +333,7 @@ def test_idempotent_replay_zero_additional_model_calls():
     """Replaying an already extracted document version reuses assertions with 0 model calls."""
     repo = InMemoryOkfRepository()
     mock_bedrock = MagicMock()
+    mock_bedrock.count_tokens.return_value = {"inputTokens": 100}
     mock_bedrock.converse.return_value = {
         "output": {"message": {"content": [{"text": json.dumps([
             {"entity_name": "Acme", "property_key": "ceo", "property_value": "Jane", "source_chunk_id": "c1"}
@@ -356,6 +359,7 @@ def test_adr001_fail_open_ingestion_resilience():
     """Injecting a model provider exception records status='failed' without raising errors."""
     repo = InMemoryOkfRepository()
     mock_bedrock = MagicMock()
+    mock_bedrock.count_tokens.return_value = {"inputTokens": 100}
     mock_bedrock.converse.side_effect = RuntimeError("Bedrock timeout or rate limit")
 
     ch1 = Chunk(id="c1", document_id="doc_err", source_format="pdf", text="Sample text", element_type="p", page_number=1)

@@ -337,6 +337,7 @@ def test_extraction_budget_enforces_call_limit_and_retry_exhaustion():
 
     # Bedrock client that throttles on every attempt (HTTP 429)
     mock_client = MagicMock()
+    mock_client.count_tokens.return_value = {"inputTokens": 100}
     mock_client.converse.side_effect = Exception("ThrottlingException: Rate exceeded (HTTP 429)")
 
     builder = OkfBuilder(repo=repo, bedrock_client=mock_client)
@@ -392,6 +393,7 @@ def test_concurrent_ingestion_shares_single_document_budget():
         }
 
     mock_client = MagicMock()
+    mock_client.count_tokens.return_value = {"inputTokens": 100}
     mock_client.converse.side_effect = _fake_converse
 
     builder = OkfBuilder(repo=repo, bedrock_client=mock_client)
@@ -502,6 +504,7 @@ def test_builder_rejects_wrong_entity_in_extraction_pass():
     ])
 
     mock_bedrock = MagicMock()
+    mock_bedrock.count_tokens.return_value = {"inputTokens": 100}
     mock_bedrock.converse.return_value = {
         "output": {"message": {"content": [{"text": model_output}]}},
         "usage": {"inputTokens": 100, "outputTokens": 50},
@@ -855,6 +858,7 @@ def test_upfront_budget_reservation_and_persistence_across_replays():
     # 2. Shared document deadline across retry delays
     repo = InMemoryOkfRepository()
     mock_bedrock = MagicMock()
+    mock_bedrock.count_tokens.return_value = {"inputTokens": 100}
     # Simulate throttling error
     mock_bedrock.converse.side_effect = Exception("ThrottlingException: HTTP 429 Too Many Requests")
 
@@ -1262,6 +1266,7 @@ def test_blocking_provider_call_enforces_remaining_document_deadline():
     """Enforce the remaining document deadline across actual blocking provider calls with zero retries."""
     builder = OkfBuilder()
     mock_client = MagicMock()
+    mock_client.count_tokens.return_value = {"inputTokens": 100}
 
     # Simulate a slow client call that takes 0.5s
     def slow_converse(**kwargs):
@@ -1392,6 +1397,7 @@ def test_concurrent_provider_calls_bounded_across_documents():
         return {"output": {"message": {"content": [{"text": "[]"}]}}, "usage": {"inputTokens": 50, "outputTokens": 10}}
 
     mock_client = MagicMock()
+    mock_client.count_tokens.return_value = {"inputTokens": 50}
     mock_client.converse.side_effect = slow_provider_work
 
     builder = OkfBuilder(bedrock_client=mock_client, provider_controller=controller)
@@ -1515,6 +1521,7 @@ def test_attempt_reservation_survives_crash_and_restart():
 
     # Mock client that raises an unexpected crash exception during call 1
     mock_crash_client = MagicMock()
+    mock_crash_client.count_tokens.return_value = {"inputTokens": 100}
     mock_crash_client.converse.side_effect = RuntimeError("Fatal worker process crash simulation")
 
     test_chunk = Chunk(
@@ -1568,6 +1575,7 @@ def test_reservation_write_failure_aborts_provider_call_and_preserves_baseline()
     doc_ver = "v1"
 
     mock_client = MagicMock()
+    mock_client.count_tokens.return_value = {"inputTokens": 100}
     mock_client.converse = MagicMock()
 
     builder = OkfBuilder(repo=repo, bedrock_client=mock_client)
@@ -1645,6 +1653,7 @@ def test_storage_read_failure_fails_closed_without_fresh_budget():
 
     # 2. extract_and_persist with this broken storage makes zero provider calls
     mock_client = MagicMock()
+    mock_client.count_tokens.return_value = {"inputTokens": 100}
     mock_client.converse = MagicMock()
     builder = OkfBuilder(repo=repo, bedrock_client=mock_client)
 
@@ -1707,6 +1716,7 @@ def test_dynamodb_repository_adapter_read_failure_fails_closed_without_fresh_bud
 
     # 3. Verify extract_and_persist makes zero provider calls and fails open for baseline availability
     mock_bedrock = MagicMock()
+    mock_bedrock.count_tokens.return_value = {"inputTokens": 100}
     builder = OkfBuilder(repo=repo, bedrock_client=mock_bedrock)
     test_chunk = Chunk(
         id="chk_ddb1",
@@ -1828,6 +1838,7 @@ def test_per_call_input_token_limit_enforced_independently():
     # 3. Provider invocation with prompt tokens exceeding per-call limit makes zero provider calls
     repo = InMemoryOkfRepository()
     mock_bedrock = MagicMock()
+    mock_bedrock.count_tokens.return_value = {"inputTokens": 2050}
     builder = OkfBuilder(repo=repo, bedrock_client=mock_bedrock)
 
     budget_prov = DocumentExtractionBudget(

@@ -244,7 +244,8 @@ def get_or_create_document_budget(
         # from a storage read failure (get_manifest raises an exception); a failed read
         # must fail closed and mark the budget exhausted, rather than silently authorizing a fresh budget.
         prior_calls = 0
-        prior_tokens = 0
+        prior_input_tokens = 0
+        prior_output_tokens = 0
         prior_exhausted = False
         prior_reason = None
         if repo is not None:
@@ -256,8 +257,16 @@ def get_or_create_document_budget(
 
                 if ledger is not None:
                     prior_calls = ledger.reserved_calls
-                    prior_tokens = ledger.spent_tokens
-                    if ledger.status in ("exhausted", "completed", "failed") or prior_calls >= max_calls or prior_tokens >= (max_input_tokens + max_output_tokens):
+                    prior_input_tokens = max(ledger.reserved_prompt_tokens, ledger.spent_prompt_tokens)
+                    prior_output_tokens = max(ledger.reserved_output_tokens, ledger.spent_output_tokens)
+                    prior_tokens = prior_input_tokens + prior_output_tokens
+                    if (
+                        ledger.status in ("exhausted", "completed", "failed")
+                        or prior_calls >= max_calls
+                        or prior_input_tokens >= max_input_tokens
+                        or prior_output_tokens >= max_output_tokens
+                        or prior_tokens >= (max_input_tokens + max_output_tokens)
+                    ):
                         prior_exhausted = True
                         prior_reason = f"prior_recorded_attempts ({prior_calls}/{max_calls})"
             except Exception as e:
@@ -277,8 +286,8 @@ def get_or_create_document_budget(
             max_call_output_tokens=max_call_output_tokens,
             max_elapsed_s=max_elapsed_s,
             calls_made=prior_calls,
-            input_tokens_used=prior_tokens // 2,
-            output_tokens_used=prior_tokens - (prior_tokens // 2),
+            input_tokens_used=prior_input_tokens,
+            output_tokens_used=prior_output_tokens,
             exhausted=prior_exhausted,
             exhaustion_reason=prior_reason,
         )
@@ -1389,7 +1398,7 @@ class OkfBuilder:
         )
 
         try:
-            self.repo.save_manifest(workspace_id, manifest)
+            self.repo.save_manifest(workspace_id, manifest, fence_token=getattr(budget, "last_reservation_fence", None))
         except Exception as save_err:
             logger.warning(
                 "okf_builder.final_manifest_save_failed ws=%s doc=%s: %s (failing open per ADR-001)",
@@ -1485,18 +1494,25 @@ class OkfBuilder:
 
         # Authoritative request-token counting (if live client is present)
         # AC-3.5: Enforce verified provider token accounting before dispatch
-        if client is not None and hasattr(client, "count_tokens"):
+        if client is not None:
+            if not hasattr(client, "count_tokens"):
+                budget.exhausted = True
+                budget.exhaustion_reason = "missing_count_tokens_capability"
+                logger.error("Bedrock client missing count_tokens capability (failing closed per AC-3)")
+                return "", {"input_tokens": 0, "output_tokens": 0}
+
             try:
                 count_resp = client.count_tokens(
                     modelId=model_id,
                     input={"converse": {"messages": messages, "system": system}},
                 )
                 raw_tokens = count_resp.get("inputTokens", 0) if isinstance(count_resp, dict) else None
-                if isinstance(raw_tokens, int) and raw_tokens > 0:
-                    estimated_prompt_tokens = raw_tokens
-                else:
-                    # In test/mock mode or missing count, fall back conservatively to token estimation
-                    estimated_prompt_tokens = count_request_tokens(system_prompt, user_prompt, model_id=model_id)
+                if not isinstance(raw_tokens, int) or raw_tokens <= 0:
+                    budget.exhausted = True
+                    budget.exhaustion_reason = f"invalid_count_tokens_response ({count_resp})"
+                    logger.error("Bedrock count_tokens returned invalid count (failing closed per AC-3): %s", count_resp)
+                    return "", {"input_tokens": 0, "output_tokens": 0}
+                estimated_prompt_tokens = raw_tokens
             except Exception as count_err:
                 budget.exhausted = True
                 budget.exhaustion_reason = f"authoritative_token_count_failed ({count_err})"
@@ -1527,6 +1543,8 @@ class OkfBuilder:
                     max_calls=budget.max_calls,
                     max_total_tokens=budget.max_input_tokens + budget.max_output_tokens,
                     lease_duration_s=15.0,
+                    max_input_tokens=budget.max_input_tokens,
+                    max_output_ceiling=budget.max_output_tokens,
                 )
                 if not durable_res.granted:
                     budget.exhausted = True
@@ -1537,6 +1555,7 @@ class OkfBuilder:
                     )
                     return "", {"input_tokens": 0, "output_tokens": 0}
                 reservation_fence = durable_res.fence_token
+                budget.last_reservation_fence = reservation_fence
 
             if not budget.reserve_call(estimated_prompt_tokens, max_output_tokens):
                 logger.warning(
@@ -1548,15 +1567,20 @@ class OkfBuilder:
             out_json, stats = self._test_mode_fallback(chunks)
             budget.reconcile_call(estimated_prompt_tokens, max_output_tokens, stats["input_tokens"], stats["output_tokens"])
             if hasattr(self.repo, "reconcile_extraction_budget"):
-                self.repo.reconcile_extraction_budget(
-                    workspace_id=workspace_id,
-                    document_id=document_id,
-                    document_version=ver,
-                    worker_id=getattr(self, "worker_id", f"worker_{os.getpid()}"),
-                    fence_token=reservation_fence,
-                    actual_prompt_tokens=stats["input_tokens"],
-                    actual_output_tokens=stats["output_tokens"],
-                )
+                try:
+                    rec_res = self.repo.reconcile_extraction_budget(
+                        workspace_id=workspace_id,
+                        document_id=document_id,
+                        document_version=ver,
+                        worker_id=getattr(self, "worker_id", f"worker_{os.getpid()}"),
+                        fence_token=reservation_fence,
+                        actual_prompt_tokens=stats["input_tokens"],
+                        actual_output_tokens=stats["output_tokens"],
+                    )
+                    if not rec_res.reconciled or rec_res.fenced_out:
+                        return "", stats
+                except Exception:
+                    return "", stats
             return out_json, stats
 
         max_attempts = 2  # at most 1 retry on throttling (HTTP 429)
@@ -1595,6 +1619,8 @@ class OkfBuilder:
                         max_calls=budget.max_calls,
                         max_total_tokens=budget.max_input_tokens + budget.max_output_tokens,
                         lease_duration_s=15.0,
+                        max_input_tokens=budget.max_input_tokens,
+                        max_output_ceiling=budget.max_output_tokens,
                     )
                 except Exception as res_err:
                     budget.exhausted = True
@@ -1611,6 +1637,7 @@ class OkfBuilder:
                     )
                     return "", {"input_tokens": 0, "output_tokens": 0}
                 reservation_fence = durable_res.fence_token
+                budget.last_reservation_fence = reservation_fence
 
             # Persist in-flight attempt reservation to durable repository manifest before provider call
             # This ensures that if the process crashes or dies mid-call, the durable store records
@@ -1634,6 +1661,7 @@ class OkfBuilder:
                         idempotency_key=ikey,
                         created_at=_now_utc(),
                     ),
+                    fence_token=reservation_fence,
                 )
             except Exception as save_err:
                 logger.error("okf_builder.reservation_persistence_failed: %s", save_err)
@@ -1707,14 +1735,19 @@ class OkfBuilder:
                             actual_prompt_tokens=usage["input_tokens"],
                             actual_output_tokens=usage["output_tokens"],
                         )
-                        if rec_res.fenced_out:
+                        if not rec_res.reconciled or rec_res.fenced_out:
                             logger.warning(
-                                "okf_builder.worker_fenced_out ws=%s doc=%s ver=%s (discarding stale extracted assertions)",
-                                workspace_id, document_id, ver,
+                                "okf_builder.reconciliation_failed_or_fenced ws=%s doc=%s ver=%s reason=%s fenced=%s (failing closed, discarding assertions)",
+                                workspace_id,
+                                document_id,
+                                ver,
+                                rec_res.reason,
+                                rec_res.fenced_out,
                             )
                             return "", usage
                     except Exception as rec_err:
-                        logger.error("okf_builder.reconcile_extraction_budget_failed: %s", rec_err)
+                        logger.error("okf_builder.reconcile_extraction_budget_failed: %s (failing closed, discarding assertions)", rec_err)
+                        return "", usage
 
                 output_text = resp["output"]["message"]["content"][0]["text"]
                 return output_text, usage
