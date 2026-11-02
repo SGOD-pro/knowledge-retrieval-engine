@@ -115,9 +115,9 @@ class OkfRepositoryBase(Protocol):
         self,
         workspace_id: str,
         document_id: str,
-        document_version: str,
+        document_version: str = "v1",
     ) -> bool:
-        """Query GSI2 with Limit=1 to verify whether active OKF assertions exist."""
+        """Query authoritative manifest to verify whether document version has published ready state."""
         ...
 
     def list_assertions_by_document(
@@ -277,13 +277,25 @@ class InMemoryOkfRepository:
 
     def save_manifest(self, workspace_id: str, manifest: OkfManifest, fence_token: int | None = None) -> None:
         with self._lock:
+            key = (workspace_id, manifest.document_id, manifest.document_version)
+            ledger = self._ledgers.get(key)
             if fence_token is not None:
-                ledger = self._ledgers.get((workspace_id, manifest.document_id, manifest.document_version))
                 if ledger is not None and ledger.fence_token > fence_token:
                     raise RuntimeError(f"Worker fenced out: fence token {fence_token} superseded by {ledger.fence_token}")
+            else:
+                now = time.time()
+                if ledger is not None:
+                    lease_exp = float(ledger.lease_expires_at or 0)
+                    if ledger.lease_owner_id and lease_exp > now:
+                        raise RuntimeError(f"Unfenced manifest write denied: active lease held on document {manifest.document_id}")
+                    if manifest.status in ("failed", "empty"):
+                        raise RuntimeError(f"Unfenced manifest write denied: document {manifest.document_id} has budget ledger; requires fence token")
+                existing_man = self._manifests.get(key)
+                if existing_man is not None and existing_man.status == "ready" and manifest.status != "ready":
+                    raise RuntimeError(f"Unfenced manifest write denied: cannot overwrite ready manifest with {manifest.status} status")
 
             # Save manifest
-            self._manifests[(workspace_id, manifest.document_id, manifest.document_version)] = manifest
+            self._manifests[key] = manifest
             # Save entities anchored to manifest scope
             for ent in manifest.entities:
                 ent = _anchor_entity_to_manifest(ent, workspace_id, manifest.document_id, manifest.document_version)
@@ -347,16 +359,11 @@ class InMemoryOkfRepository:
         self,
         workspace_id: str,
         document_id: str,
-        document_version: str,
+        document_version: str = "v1",
     ) -> bool:
         with self._lock:
             man = self._manifests.get((workspace_id, document_id, document_version))
-            if man and man.status == "ready":
-                return True
-            for (ws, _, _), ass in self._assertions.items():
-                if ws == workspace_id and ass.document_id == document_id and ass.document_version == document_version:
-                    return True
-            return False
+            return bool(man and man.status == "ready")
 
     def list_assertions_by_document(
         self,
@@ -892,6 +899,46 @@ class SQLiteOkfRepository:
                     if cur.rowcount == 0:
                         raise RuntimeError(f"Worker fenced out: fence token {fence_token} superseded")
                 else:
+                    bpk = f"WORKSPACE#{workspace_id}"
+                    bsk = f"BUDGET#DOC#{manifest.document_id}#VER#{manifest.document_version}"
+                    now_ts = time.time()
+
+                    # 1. Active lease check & budget ledger protection
+                    budget_cur = self._conn.execute(
+                        "SELECT data_json FROM kre_okf_facts WHERE pk = ? AND sk = ?",
+                        (bpk, bsk),
+                    )
+                    budget_row = budget_cur.fetchone()
+                    if budget_row:
+                        try:
+                            bdata = json.loads(budget_row["data_json"])
+                            lease_exp = float(bdata.get("lease_expires_at") or 0)
+                            lease_owner = bdata.get("lease_owner_id")
+                            if lease_owner and lease_exp > now_ts:
+                                raise RuntimeError(f"Unfenced manifest write denied: active lease held on document {manifest.document_id}")
+                            if manifest.status in ("failed", "empty"):
+                                raise RuntimeError(f"Unfenced manifest write denied: document {manifest.document_id} has budget ledger; requires fence token")
+                        except RuntimeError:
+                            raise
+                        except Exception:
+                            pass
+
+                    # 2. Existing ready manifest protection
+                    man_cur = self._conn.execute(
+                        "SELECT data_json FROM kre_okf_facts WHERE pk = ? AND sk = ?",
+                        (man_pk, man_sk),
+                    )
+                    man_row = man_cur.fetchone()
+                    if man_row:
+                        try:
+                            mdata = json.loads(man_row["data_json"])
+                            if mdata.get("status") == "ready" and manifest.status != "ready":
+                                raise RuntimeError(f"Unfenced manifest write denied: cannot overwrite ready manifest with {manifest.status} status")
+                        except RuntimeError:
+                            raise
+                        except Exception:
+                            pass
+
                     self._conn.execute(
                         """
                         INSERT OR REPLACE INTO kre_okf_facts (
@@ -1034,21 +1081,23 @@ class SQLiteOkfRepository:
         self,
         workspace_id: str,
         document_id: str,
-        document_version: str,
+        document_version: str = "v1",
     ) -> bool:
         with self._lock:
-            gsi2_pk = f"WORKSPACE#{workspace_id}#DOC#{document_id}"
-            gsi2_prefix = f"VER#{document_version}#"
-
+            pk = f"WORKSPACE#{workspace_id}"
+            sk = f"MANIFEST#DOC#{document_id}#VER#{document_version}"
             cursor = self._conn.execute(
-                """
-                SELECT 1 FROM kre_okf_facts
-                WHERE gsi2_pk = ? AND gsi2_sk LIKE ?
-                LIMIT 1
-                """,
-                (gsi2_pk, f"{gsi2_prefix}%"),
+                "SELECT data_json FROM kre_okf_facts WHERE pk = ? AND sk = ?",
+                (pk, sk),
             )
-            return cursor.fetchone() is not None
+            row = cursor.fetchone()
+            if not row:
+                return False
+            try:
+                data = json.loads(row["data_json"])
+                return data.get("status") == "ready"
+            except Exception:
+                return False
 
     def list_assertions_by_document(
         self,
@@ -1707,6 +1756,7 @@ class DynamoDBOkfRepository:
                 "workspace_id": workspace_id,
                 "document_id": manifest.document_id,
                 "document_version": manifest.document_version,
+                "status": manifest.status,
                 "data_json": manifest.model_dump_json(),
                 "created_at": manifest.created_at,
             }
@@ -1753,11 +1803,12 @@ class DynamoDBOkfRepository:
                     "created_at": ass.created_at,
                 })
 
+            serializer = TypeSerializer()
+
             if fence_token is not None:
                 if len(all_items) >= 100:
                     raise ValueError(f"Fenced manifest exceeds atomic transaction limit of 99 items: {len(all_items)}")
 
-                serializer = TypeSerializer()
                 condition_check = {
                     "ConditionCheck": {
                         "TableName": self.table_name,
@@ -1780,19 +1831,65 @@ class DynamoDBOkfRepository:
                     })
                 client.transact_write_items(TransactItems=tx_items)
             else:
-                if len(all_items) <= 100:
-                    serializer = TypeSerializer()
-                    tx_items = [
-                        {
+                now_epoch = int(time.time())
+                budget_key = {
+                    "PK": {"S": f"WORKSPACE#{workspace_id}"},
+                    "SK": {"S": f"BUDGET#DOC#{manifest.document_id}#VER#{manifest.document_version}"},
+                }
+
+                if manifest.status in ("failed", "empty"):
+                    # Unfenced failed/empty manifest cannot be saved if a budget ledger exists
+                    condition_check = {
+                        "ConditionCheck": {
+                            "TableName": self.table_name,
+                            "Key": budget_key,
+                            "ConditionExpression": "attribute_not_exists(PK)",
+                        }
+                    }
+                else:
+                    # Unfenced ready manifest (e.g. CSV) cannot overwrite if active Bedrock lease is held
+                    condition_check = {
+                        "ConditionCheck": {
+                            "TableName": self.table_name,
+                            "Key": budget_key,
+                            "ConditionExpression": "attribute_not_exists(PK) OR attribute_not_exists(lease_expires_at) OR lease_expires_at < :now_epoch",
+                            "ExpressionAttributeValues": {":now_epoch": {"N": str(now_epoch)}},
+                        }
+                    }
+
+                manifest_put = {
+                    "Put": {
+                        "TableName": self.table_name,
+                        "Item": {k: serializer.serialize(v) for k, v in manifest_item.items()},
+                        "ConditionExpression": "attribute_not_exists(PK) OR :incoming_status = :ready_status OR #status <> :ready_status",
+                        "ExpressionAttributeNames": {"#status": "status"},
+                        "ExpressionAttributeValues": {
+                            ":ready_status": {"S": "ready"},
+                            ":incoming_status": {"S": manifest.status},
+                        },
+                    }
+                }
+
+                if len(all_items) < 100:
+                    tx_items = [condition_check, manifest_put]
+                    for it in all_items[1:]:
+                        tx_items.append({
                             "Put": {
                                 "TableName": self.table_name,
                                 "Item": {k: serializer.serialize(v) for k, v in it.items()}
                             }
-                        }
-                        for it in all_items
-                    ]
+                        })
                     client.transact_write_items(TransactItems=tx_items)
                 else:
+                    # For large items (e.g. CSV with > 98 rows)
+                    ledger = self.get_budget_ledger(workspace_id, manifest.document_id, manifest.document_version, consistent_read=True)
+                    if ledger and ledger.lease_owner_id and (ledger.lease_expires_at or 0) > now_epoch:
+                        raise RuntimeError(f"Unfenced manifest write denied: active lease held on document {manifest.document_id}")
+                    if manifest.status in ("failed", "empty") and ledger is not None:
+                        raise RuntimeError(f"Unfenced manifest write denied: document {manifest.document_id} has budget ledger; requires fence token")
+                    existing_man = self.get_manifest(workspace_id, manifest.document_id, manifest.document_version, consistent_read=True)
+                    if existing_man and existing_man.status == "ready" and manifest.status != "ready":
+                        raise RuntimeError(f"Unfenced manifest write denied: cannot overwrite ready manifest with {manifest.status} status")
                     with table.batch_writer() as batch:
                         for it in all_items:
                             batch.put_item(Item=it)
@@ -1800,14 +1897,18 @@ class DynamoDBOkfRepository:
         except ClientError as ce:
             code = ce.response.get("Error", {}).get("Code", "")
             if code == "TransactionCanceledException" or "TransactionCanceledException" in str(ce):
-                raise RuntimeError(f"Worker fenced out: fence token {fence_token} superseded") from ce
+                raise RuntimeError(f"Worker fenced out or unfenced write denied: fence={fence_token} status={manifest.status}") from ce
             logger.error("DynamoDB save_manifest failed for doc %s: %s", manifest.document_id, ce)
             raise StorageUnavailableError(f"DynamoDB error saving OKF manifest: {ce}") from ce
         except RuntimeError:
             raise
+        except ValueError as ve:
+            raise StorageUnavailableError(f"DynamoDB error saving OKF manifest: {ve}") from ve
+        except StorageUnavailableError:
+            raise
         except Exception as exc:
-            if "TransactionCanceledException" in str(exc) or "Worker fenced out" in str(exc):
-                raise RuntimeError(f"Worker fenced out: fence token {fence_token} superseded") from exc
+            if "TransactionCanceledException" in str(exc) or "Worker fenced out" in str(exc) or "Unfenced manifest write denied" in str(exc):
+                raise RuntimeError(f"Worker fenced out or unfenced write denied: {exc}") from exc
             logger.error("DynamoDB save_manifest failed for doc %s: %s", manifest.document_id, exc)
             raise StorageUnavailableError(f"DynamoDB error saving OKF manifest: {exc}") from exc
 
@@ -1907,21 +2008,27 @@ class DynamoDBOkfRepository:
         self,
         workspace_id: str,
         document_id: str,
-        document_version: str,
+        document_version: str = "v1",
     ) -> bool:
         _, table = self._get_resources()
-        from boto3.dynamodb.conditions import Key
-
+        pk = f"WORKSPACE#{workspace_id}"
+        sk = f"MANIFEST#DOC#{document_id}#VER#{document_version}"
         try:
-            resp = table.query(
-                IndexName="GSI2",
-                KeyConditionExpression=Key("GSI2PK").eq(f"WORKSPACE#{workspace_id}#DOC#{document_id}")
-                & Key("GSI2SK").begins_with(f"VER#{document_version}#"),
-                Limit=1,
+            resp = table.get_item(
+                Key={"PK": pk, "SK": sk},
+                ConsistentRead=True,
             )
-            return len(resp.get("Items", [])) > 0
+            item = resp.get("Item")
+            if not item:
+                return False
+            if "status" in item:
+                return item["status"] == "ready"
+            if "data_json" in item:
+                data = json.loads(item["data_json"])
+                return data.get("status") == "ready"
+            return False
         except Exception as exc:
-            logger.error("DynamoDB has_ready_okf GSI2 query failed: %s", exc)
+            logger.error("DynamoDB has_ready_okf get_item failed: %s", exc)
             raise StorageUnavailableError(f"DynamoDB error querying OKF readiness: {exc}") from exc
 
     def list_assertions_by_document(

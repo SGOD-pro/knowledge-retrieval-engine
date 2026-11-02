@@ -1878,3 +1878,421 @@ def test_sqlite_deterministic_publication_race_with_pause():
         if os.path.exists(db_path):
             os.remove(db_path)
 
+
+def test_ordering_denied_worker_b_cannot_overwrite_published_worker_a_sqlite():
+    """Ordering 1: Worker B is denied reservation, Worker A publishes ready results,
+    then Worker B attempts an unfenced write.
+    Asserts Worker B cannot overwrite Worker A's ready manifest or assertions in SQLite."""
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+        db_path = tmp.name
+
+    try:
+        repo_a = SQLiteOkfRepository(db_path=db_path)
+        repo_b = SQLiteOkfRepository(db_path=db_path)
+
+        ws = "ws_order1"
+        doc = "doc_order1"
+        ver = "v1"
+
+        # Worker A acquires reservation
+        res_a = repo_a.reserve_extraction_budget(ws, doc, ver, "worker_A", 100, 200, 2, 3000, 15.0)
+        assert res_a.granted is True
+        assert res_a.fence_token == 1
+
+        # Worker B attempts reservation -> denied (active lease held)
+        res_b = repo_b.reserve_extraction_budget(ws, doc, ver, "worker_B", 100, 200, 2, 3000, 15.0)
+        assert res_b.granted is False
+        assert res_b.reason == "active_lease_held"
+
+        # Worker A completes extraction and publishes ready manifest with fence_token=1
+        now = "2026-11-02T00:00:00Z"
+        ent_a = OkfEntityRecord(
+            workspace_id=ws, entity_id="e_a1", entity_name="Alpha Corp", normalized_name="alpha corp",
+            entity_type="organization", document_id=doc, document_version=ver, created_at=now,
+        )
+        ass_a = OkfPropertyAssertion(
+            assertion_id="a_a1", workspace_id=ws, entity_id="e_a1", entity_name="Alpha Corp",
+            property_key="revenue", property_value="50M", value_type="string",
+            source_chunk_id="c1", document_id=doc, document_version=ver,
+            page_number=1, confidence_score=1.0, validation_status="verified", created_at=now,
+        )
+        man_a = OkfManifest(
+            workspace_id=ws, document_id=doc, document_version=ver,
+            entities=(ent_a,), assertions=(ass_a,), rejected_assertions_count=0,
+            status="ready", extraction_tokens=300, model_calls=1,
+            idempotency_key=f"{ws}:{doc}:{ver}", created_at=now,
+        )
+        repo_a.save_manifest(ws, man_a, fence_token=res_a.fence_token)
+
+        assert repo_a.has_ready_okf(ws, doc, ver) is True
+
+        # Worker B (unauthorized, no fence token) attempts to save failed manifest with fence_token=None
+        man_b = OkfManifest(
+            workspace_id=ws, document_id=doc, document_version=ver,
+            entities=(), assertions=(), rejected_assertions_count=0,
+            status="failed", extraction_tokens=0, model_calls=0,
+            idempotency_key=f"{ws}:{doc}:{ver}", created_at="2026-11-02T00:00:05Z",
+        )
+
+        with pytest.raises(RuntimeError, match="Unfenced manifest write denied"):
+            repo_b.save_manifest(ws, man_b, fence_token=None)
+
+        # In OkfBuilder, unauthorized worker skips writing manifest altogether
+        builder_b = OkfBuilder(repo=repo_b)
+        budget_b = get_or_create_document_budget(ws, doc, ver, f"{ws}:{doc}:{ver}", repo=repo_b)
+        ret_b = builder_b._extract_pdf(
+            workspace_id=ws, document_id=doc, document_version=ver,
+            chunks=[Chunk(id="c1", document_id=doc, text="some text", page_number=1, source_format="pdf", element_type="text")],
+            idempotency_key=f"{ws}:{doc}:{ver}", timestamp="2026-11-02T00:00:06Z",
+            budget=budget_b,
+        )
+        assert ret_b.status == "failed"
+
+        # Verify Worker A's ready manifest is completely intact
+        m = repo_b.get_manifest(ws, doc, ver)
+        assert m is not None
+        assert m.status == "ready"
+        assert len(m.assertions) == 1
+        assert m.assertions[0].property_value == "50M"
+        assert repo_b.has_ready_okf(ws, doc, ver) is True
+
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+def test_ordering_denied_worker_b_cannot_overwrite_published_worker_a_dynamodb_local():
+    """Ordering 1 on DynamoDB Local: Worker B is denied reservation, Worker A publishes ready results,
+    then Worker B attempts an unfenced write.
+    Asserts Worker B cannot overwrite Worker A's ready manifest or assertions in DynamoDB."""
+    repo = _get_ddb_local_repo("kre_okf_facts_order1_ddb")
+    ws = "ws_ddb_o1"
+    doc = "doc_ddb_o1"
+    ver = "v1"
+
+    res_a = repo.reserve_extraction_budget(ws, doc, ver, "worker_A", 100, 200, 2, 3000, 15.0)
+    assert res_a.granted is True
+    assert res_a.fence_token == 1
+
+    res_b = repo.reserve_extraction_budget(ws, doc, ver, "worker_B", 100, 200, 2, 3000, 15.0)
+    assert res_b.granted is False
+    assert res_b.reason == "active_lease_held"
+
+    now = "2026-11-02T00:00:00Z"
+    ent_a = OkfEntityRecord(
+        workspace_id=ws, entity_id="e_a1", entity_name="Alpha Corp", normalized_name="alpha corp",
+        entity_type="organization", document_id=doc, document_version=ver, created_at=now,
+    )
+    ass_a = OkfPropertyAssertion(
+        assertion_id="a_a1", workspace_id=ws, entity_id="e_a1", entity_name="Alpha Corp",
+        property_key="revenue", property_value="50M", value_type="string",
+        source_chunk_id="c1", document_id=doc, document_version=ver,
+        page_number=1, confidence_score=1.0, validation_status="verified", created_at=now,
+    )
+    man_a = OkfManifest(
+        workspace_id=ws, document_id=doc, document_version=ver,
+        entities=(ent_a,), assertions=(ass_a,), rejected_assertions_count=0,
+        status="ready", extraction_tokens=300, model_calls=1,
+        idempotency_key=f"{ws}:{doc}:{ver}", created_at=now,
+    )
+    repo.save_manifest(ws, man_a, fence_token=res_a.fence_token)
+    assert repo.has_ready_okf(ws, doc, ver) is True
+
+    man_b = OkfManifest(
+        workspace_id=ws, document_id=doc, document_version=ver,
+        entities=(), assertions=(), rejected_assertions_count=0,
+        status="failed", extraction_tokens=0, model_calls=0,
+        idempotency_key=f"{ws}:{doc}:{ver}", created_at="2026-11-02T00:00:05Z",
+    )
+
+    with pytest.raises(RuntimeError, match="Worker fenced out or unfenced write denied"):
+        repo.save_manifest(ws, man_b, fence_token=None)
+
+    m = repo.get_manifest(ws, doc, ver)
+    assert m is not None
+    assert m.status == "ready"
+    assert len(m.assertions) == 1
+    assert m.assertions[0].property_value == "50M"
+    assert repo.has_ready_okf(ws, doc, ver) is True
+
+
+def test_worker_b_fails_before_reservation_cannot_overwrite_active_lease_sqlite():
+    """Ordering 2: Worker A holds an active lease, Worker B fails before reservation
+    (e.g. CountTokens failure or pre-reservation exception) and attempts an unfenced write.
+    Asserts Worker B cannot overwrite Worker A's active lease or in-flight manifest in SQLite."""
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+        db_path = tmp.name
+
+    try:
+        repo_a = SQLiteOkfRepository(db_path=db_path)
+        repo_b = SQLiteOkfRepository(db_path=db_path)
+
+        ws = "ws_order2"
+        doc = "doc_order2"
+        ver = "v1"
+
+        # Worker A acquires reservation and holds active lease
+        res_a = repo_a.reserve_extraction_budget(ws, doc, ver, "worker_A", 100, 200, 2, 3000, 15.0)
+        assert res_a.granted is True
+
+        # Worker A saves in-flight manifest
+        in_flight_man_a = OkfManifest(
+            workspace_id=ws, document_id=doc, document_version=ver,
+            entities=(), assertions=(), rejected_assertions_count=0,
+            status="failed", extraction_tokens=100, model_calls=1,
+            idempotency_key=f"{ws}:{doc}:{ver}", created_at="2026-11-02T00:00:00Z",
+        )
+        repo_a.save_manifest(ws, in_flight_man_a, fence_token=res_a.fence_token)
+
+        # Worker B fails before reservation (fence_token is None) and attempts to write
+        failed_man_b = OkfManifest(
+            workspace_id=ws, document_id=doc, document_version=ver,
+            entities=(), assertions=(), rejected_assertions_count=0,
+            status="failed", extraction_tokens=0, model_calls=0,
+            idempotency_key=f"{ws}:{doc}:{ver}", created_at="2026-11-02T00:00:01Z",
+        )
+
+        with pytest.raises(RuntimeError, match="Unfenced manifest write denied: active lease held"):
+            repo_b.save_manifest(ws, failed_man_b, fence_token=None)
+
+        # In-flight manifest still retains Worker A's reservation usage
+        m = repo_b.get_manifest(ws, doc, ver)
+        assert m is not None
+        assert m.extraction_tokens == 100
+        assert m.model_calls == 1
+
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+def test_worker_b_fails_before_reservation_cannot_overwrite_active_lease_dynamodb_local():
+    """Ordering 2 on DynamoDB Local: Worker A holds an active lease, Worker B fails before reservation
+    and attempts an unfenced write.
+    Asserts Worker B cannot overwrite Worker A's active lease or in-flight manifest in DynamoDB."""
+    repo = _get_ddb_local_repo("kre_okf_facts_order2_ddb")
+    ws = "ws_ddb_o2"
+    doc = "doc_ddb_o2"
+    ver = "v1"
+
+    res_a = repo.reserve_extraction_budget(ws, doc, ver, "worker_A", 100, 200, 2, 3000, 15.0)
+    assert res_a.granted is True
+
+    in_flight_man_a = OkfManifest(
+        workspace_id=ws, document_id=doc, document_version=ver,
+        entities=(), assertions=(), rejected_assertions_count=0,
+        status="failed", extraction_tokens=100, model_calls=1,
+        idempotency_key=f"{ws}:{doc}:{ver}", created_at="2026-11-02T00:00:00Z",
+    )
+    repo.save_manifest(ws, in_flight_man_a, fence_token=res_a.fence_token)
+
+    failed_man_b = OkfManifest(
+        workspace_id=ws, document_id=doc, document_version=ver,
+        entities=(), assertions=(), rejected_assertions_count=0,
+        status="failed", extraction_tokens=0, model_calls=0,
+        idempotency_key=f"{ws}:{doc}:{ver}", created_at="2026-11-02T00:00:01Z",
+    )
+
+    with pytest.raises(RuntimeError, match="Worker fenced out or unfenced write denied"):
+        repo.save_manifest(ws, failed_man_b, fence_token=None)
+
+    m = repo.get_manifest(ws, doc, ver)
+    assert m is not None
+    assert m.extraction_tokens == 100
+    assert m.model_calls == 1
+
+
+def test_stale_assertions_coexisting_with_failed_or_newer_manifest():
+    """Verifies that stale assertions coexisting with a failed manifest do not cause has_ready_okf
+    to return True, and that publishing a newer version v2 is isolated from v1."""
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+        db_path = tmp.name
+
+    try:
+        sqlite_repo = SQLiteOkfRepository(db_path=db_path)
+        ddb_repo = _get_ddb_local_repo("kre_okf_facts_stale_test")
+
+        for r in (sqlite_repo, ddb_repo):
+            ws = "ws_stale"
+            doc = "doc_stale"
+
+            # 1. Simulate leftover/stale assertion for v1
+            ass = OkfPropertyAssertion(
+                assertion_id="a_stale_1", workspace_id=ws, entity_id="e1", entity_name="Corp",
+                property_key="revenue", property_value="10M", value_type="string",
+                source_chunk_id="c1", document_id=doc, document_version="v1",
+                page_number=1, confidence_score=1.0, validation_status="verified", created_at="2026-11-02T00:00:00Z",
+            )
+            # Save manifest for v1 with status="failed"
+            man_failed = OkfManifest(
+                workspace_id=ws, document_id=doc, document_version="v1",
+                entities=(), assertions=(ass,), rejected_assertions_count=0,
+                status="failed", extraction_tokens=0, model_calls=1,
+                idempotency_key=f"{ws}:{doc}:v1", created_at="2026-11-02T00:00:00Z",
+            )
+            # Use fence_token=1 to save failed manifest with the assertion
+            res = r.reserve_extraction_budget(ws, doc, "v1", "worker_1", 100, 200, 2, 3000, 15.0)
+            r.save_manifest(ws, man_failed, fence_token=res.fence_token)
+
+            # Assert v1 is NOT ready even though an assertion record exists in storage
+            assert r.has_ready_okf(ws, doc, "v1") is False
+
+            # 2. Publish newer version v2 with status="ready"
+            res_v2 = r.reserve_extraction_budget(ws, doc, "v2", "worker_2", 100, 200, 2, 3000, 15.0)
+            man_ready_v2 = OkfManifest(
+                workspace_id=ws, document_id=doc, document_version="v2",
+                entities=(), assertions=(ass,), rejected_assertions_count=0,
+                status="ready", extraction_tokens=200, model_calls=1,
+                idempotency_key=f"{ws}:{doc}:v2", created_at="2026-11-02T00:00:10Z",
+            )
+            r.save_manifest(ws, man_ready_v2, fence_token=res_v2.fence_token)
+
+            # Assert v2 is ready, while v1 remains NOT ready
+            assert r.has_ready_okf(ws, doc, "v2") is True
+            assert r.has_ready_okf(ws, doc, "v1") is False
+
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+def test_cross_workspace_and_version_readiness_isolation():
+    """Verifies that has_ready_okf enforces strict workspace and version boundaries across
+    InMemory, SQLite, and DynamoDB Local."""
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+        db_path = tmp.name
+
+    try:
+        mem_repo = InMemoryOkfRepository()
+        sqlite_repo = SQLiteOkfRepository(db_path=db_path)
+        ddb_repo = _get_ddb_local_repo("kre_okf_facts_isolation_test")
+
+        for r in (mem_repo, sqlite_repo, ddb_repo):
+            doc = "doc_iso"
+            now = "2026-11-02T00:00:00Z"
+
+            # Workspace 1 Version 1: ready
+            res1 = r.reserve_extraction_budget("ws1", doc, "v1", "w1", 100, 200, 2, 3000, 15.0)
+            man_ws1_v1 = OkfManifest(
+                workspace_id="ws1", document_id=doc, document_version="v1",
+                entities=(), assertions=(), rejected_assertions_count=0,
+                status="ready", extraction_tokens=100, model_calls=1,
+                idempotency_key=f"ws1:{doc}:v1", created_at=now,
+            )
+            r.save_manifest("ws1", man_ws1_v1, fence_token=res1.fence_token)
+
+            # Workspace 2 Version 1: failed
+            res2 = r.reserve_extraction_budget("ws2", doc, "v1", "w2", 100, 200, 2, 3000, 15.0)
+            man_ws2_v1 = OkfManifest(
+                workspace_id="ws2", document_id=doc, document_version="v1",
+                entities=(), assertions=(), rejected_assertions_count=0,
+                status="failed", extraction_tokens=100, model_calls=1,
+                idempotency_key=f"ws2:{doc}:v1", created_at=now,
+            )
+            r.save_manifest("ws2", man_ws2_v1, fence_token=res2.fence_token)
+
+            # Workspace 1 Version 2: failed
+            res3 = r.reserve_extraction_budget("ws1", doc, "v2", "w3", 100, 200, 2, 3000, 15.0)
+            man_ws1_v2 = OkfManifest(
+                workspace_id="ws1", document_id=doc, document_version="v2",
+                entities=(), assertions=(), rejected_assertions_count=0,
+                status="failed", extraction_tokens=100, model_calls=1,
+                idempotency_key=f"ws1:{doc}:v2", created_at=now,
+            )
+            r.save_manifest("ws1", man_ws1_v2, fence_token=res3.fence_token)
+
+            # Verification of isolated readiness
+            assert r.has_ready_okf("ws1", doc, "v1") is True
+            assert r.has_ready_okf("ws2", doc, "v1") is False
+            assert r.has_ready_okf("ws1", doc, "v2") is False
+            assert r.has_ready_okf("ws2", doc, "v2") is False
+            assert r.has_ready_okf("ws_other", doc, "v1") is False
+
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+def test_dynamodb_local_publication_99_item_boundary_and_readiness():
+    """Boundary test on DynamoDB Local:
+    1. Exactly 99 items (1 manifest + 1 entity + 97 assertions) with fence token:
+       Succeeds within the 100-action TransactWriteItems limit (1 ConditionCheck + 99 Puts).
+       Manifest is saved, status is ready, has_ready_okf is True.
+    2. Exactly 100 items (1 manifest + 1 entity + 98 assertions) with fence token:
+       Raises StorageUnavailableError wrapping ValueError.
+       OkfBuilder catches the error, fails open per ADR-001 returning status='failed'.
+       Database retains zero items from the transaction, and has_ready_okf is False."""
+    from src.schemas.contracts.boundary import StorageUnavailableError
+
+    repo = _get_ddb_local_repo("kre_okf_facts_boundary_test")
+    ws = "ws_boundary"
+    now = "2026-11-02T00:00:00Z"
+
+    # Part 1: Exactly 99 items succeeds
+    doc_99 = "doc_boundary_99"
+    ver_99 = "v1"
+    res_99 = repo.reserve_extraction_budget(ws, doc_99, ver_99, "w_99", 100, 200, 2, 3000, 15.0)
+
+    ent_99 = OkfEntityRecord(
+        workspace_id=ws, entity_id="e_b99", entity_name="Boundary Corp", normalized_name="boundary corp",
+        entity_type="organization", document_id=doc_99, document_version=ver_99, created_at=now,
+    )
+    assertions_97 = [
+        OkfPropertyAssertion(
+            assertion_id=f"a_{i}", workspace_id=ws, entity_id="e_b99", entity_name="Boundary Corp",
+            property_key=f"prop_{i}", property_value=f"val_{i}", value_type="string",
+            source_chunk_id="c1", document_id=doc_99, document_version=ver_99,
+            page_number=1, confidence_score=1.0, validation_status="verified", created_at=now,
+        )
+        for i in range(97)
+    ]
+    man_99 = OkfManifest(
+        workspace_id=ws, document_id=doc_99, document_version=ver_99,
+        entities=(ent_99,), assertions=tuple(assertions_97), rejected_assertions_count=0,
+        status="ready", extraction_tokens=300, model_calls=1,
+        idempotency_key=f"{ws}:{doc_99}:{ver_99}", created_at=now,
+    )
+
+    # 1 manifest + 1 entity + 97 assertions = 99 items
+    repo.save_manifest(ws, man_99, fence_token=res_99.fence_token)
+
+    assert repo.has_ready_okf(ws, doc_99, ver_99) is True
+    saved_99 = repo.get_manifest(ws, doc_99, ver_99)
+    assert saved_99 is not None
+    assert saved_99.status == "ready"
+    assert len(saved_99.assertions) == 97
+
+    # Part 2: Exactly 100 items fails transaction and preserves ADR-001 fail-open
+    doc_100 = "doc_boundary_100"
+    ver_100 = "v1"
+    res_100 = repo.reserve_extraction_budget(ws, doc_100, ver_100, "w_100", 100, 200, 2, 3000, 15.0)
+
+    ent_100 = OkfEntityRecord(
+        workspace_id=ws, entity_id="e_b100", entity_name="Boundary Corp", normalized_name="boundary corp",
+        entity_type="organization", document_id=doc_100, document_version=ver_100, created_at=now,
+    )
+    assertions_98 = [
+        OkfPropertyAssertion(
+            assertion_id=f"a_{i}", workspace_id=ws, entity_id="e_b100", entity_name="Boundary Corp",
+            property_key=f"prop_{i}", property_value=f"val_{i}", value_type="string",
+            source_chunk_id="c1", document_id=doc_100, document_version=ver_100,
+            page_number=1, confidence_score=1.0, validation_status="verified", created_at=now,
+        )
+        for i in range(98)
+    ]
+    man_100 = OkfManifest(
+        workspace_id=ws, document_id=doc_100, document_version=ver_100,
+        entities=(ent_100,), assertions=tuple(assertions_98), rejected_assertions_count=0,
+        status="ready", extraction_tokens=300, model_calls=1,
+        idempotency_key=f"{ws}:{doc_100}:{ver_100}", created_at=now,
+    )
+
+    # 1 manifest + 1 entity + 98 assertions = 100 items -> raises StorageUnavailableError
+    with pytest.raises(StorageUnavailableError, match="Fenced manifest exceeds atomic transaction limit of 99 items: 100"):
+        repo.save_manifest(ws, man_100, fence_token=res_100.fence_token)
+
+    # In database: zero items committed for doc_100
+    assert repo.has_ready_okf(ws, doc_100, ver_100) is False
+    assert repo.get_manifest(ws, doc_100, ver_100) is None
+
+

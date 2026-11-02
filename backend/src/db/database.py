@@ -160,9 +160,9 @@ class CloudRepository(
         from db.okf_repo import get_okf_repo
         return get_okf_repo().get_manifest(workspace_id, document_id)
 
-    def has_ready_okf(self, workspace_id: str, document_id: str) -> bool:
+    def has_ready_okf(self, workspace_id: str, document_id: str, document_version: str = "v1") -> bool:
         from db.okf_repo import get_okf_repo
-        return get_okf_repo().has_ready_okf(workspace_id, document_id)
+        return get_okf_repo().has_ready_okf(workspace_id, document_id, document_version)
 
     def get_okf_properties(self, concept_id: str) -> list[dict[str, Any]]:
         from db.okf_repo import get_okf_repo

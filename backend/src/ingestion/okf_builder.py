@@ -940,7 +940,7 @@ class OkfBuilder:
                         document_version,
                         consistent_read=True,
                     )
-                    if existing_man:
+                    if existing_man and existing_man.status == "ready":
                         logger.info(
                             "okf_builder.idempotent_replay ws=%s doc=%s ver=%s assertions=%d",
                             workspace_id,
@@ -1052,7 +1052,10 @@ class OkfBuilder:
                         idempotency_key=idempotency_key,
                         created_at=timestamp,
                     )
-                    self.repo.save_manifest(workspace_id, manifest)
+                    try:
+                        self.repo.save_manifest(workspace_id, manifest)
+                    except Exception as unfenced_err:
+                        logger.warning("okf_builder.unsupported_format_save_manifest_skipped: %s", unfenced_err)
                     return manifest
 
             except Exception as exc:
@@ -1078,7 +1081,8 @@ class OkfBuilder:
                 )
                 try:
                     fence_token = getattr(budget, "last_reservation_fence", None) if 'budget' in locals() else None
-                    self.repo.save_manifest(workspace_id, failed_manifest, fence_token=fence_token)
+                    if fence_token is not None:
+                        self.repo.save_manifest(workspace_id, failed_manifest, fence_token=fence_token)
                 except Exception:
                     pass
                 return failed_manifest
@@ -1191,7 +1195,10 @@ class OkfBuilder:
             created_at=timestamp,
         )
 
-        self.repo.save_manifest(workspace_id, manifest)
+        try:
+            self.repo.save_manifest(workspace_id, manifest)
+        except Exception as csv_err:
+            logger.warning("okf_builder.csv_save_manifest_skipped: %s", csv_err)
         logger.info(
             "okf_builder.csv_ready ws=%s doc=%s ver=%s columns=%d (0 tokens, 0 model calls)",
             workspace_id,
@@ -1231,7 +1238,10 @@ class OkfBuilder:
                 idempotency_key=idempotency_key,
                 created_at=timestamp,
             )
-            self.repo.save_manifest(workspace_id, manifest)
+            try:
+                self.repo.save_manifest(workspace_id, manifest)
+            except Exception as empty_err:
+                logger.warning("okf_builder.empty_pdf_save_manifest_skipped: %s", empty_err)
             return manifest
 
         # Build authorized chunk lookup map: source_chunk_id -> chunk
@@ -1398,27 +1408,38 @@ class OkfBuilder:
             created_at=timestamp,
         )
 
-        try:
-            self.repo.save_manifest(workspace_id, manifest, fence_token=getattr(budget, "last_reservation_fence", None))
-        except Exception as save_err:
+        fence_token = getattr(budget, "last_reservation_fence", None)
+        if fence_token is not None or manifest.status == "ready":
+            try:
+                self.repo.save_manifest(workspace_id, manifest, fence_token=fence_token)
+            except Exception as save_err:
+                logger.warning(
+                    "okf_builder.final_manifest_save_failed ws=%s doc=%s: %s (failing open per ADR-001)",
+                    workspace_id,
+                    document_id,
+                    save_err,
+                )
+                manifest = OkfManifest(
+                    workspace_id=workspace_id,
+                    document_id=document_id,
+                    document_version=document_version,
+                    entities=(),
+                    assertions=(),
+                    rejected_assertions_count=rejected_count,
+                    status="failed",
+                    extraction_tokens=manifest.extraction_tokens,
+                    model_calls=manifest.model_calls,
+                    idempotency_key=idempotency_key,
+                    created_at=timestamp,
+                )
+        else:
             logger.warning(
-                "okf_builder.final_manifest_save_failed ws=%s doc=%s: %s (failing open per ADR-001)",
+                "okf_builder.unauthorized_worker_skip_manifest_save ws=%s doc=%s ver=%s reason=%s status=%s",
                 workspace_id,
                 document_id,
-                save_err,
-            )
-            manifest = OkfManifest(
-                workspace_id=workspace_id,
-                document_id=document_id,
-                document_version=document_version,
-                entities=(),
-                assertions=(),
-                rejected_assertions_count=rejected_count,
-                status="failed",
-                extraction_tokens=manifest.extraction_tokens,
-                model_calls=manifest.model_calls,
-                idempotency_key=idempotency_key,
-                created_at=timestamp,
+                document_version,
+                getattr(budget, "exhaustion_reason", "no_reservation_fence"),
+                manifest.status,
             )
 
         logger.info(
