@@ -18,6 +18,9 @@ import time
 from pathlib import Path
 from typing import Any, Protocol, Sequence, runtime_checkable
 
+from boto3.dynamodb.types import TypeSerializer
+from botocore.exceptions import ClientError
+
 from config import settings
 from src.schemas.contracts.boundary import StorageUnavailableError
 from src.schemas.contracts.okf import (
@@ -430,6 +433,20 @@ class InMemoryOkfRepository:
             p_thresh = max_input_tokens - estimated_prompt_tokens
             o_thresh = max_output_ceiling - max_output_tokens
             t_thresh = max_total_tokens - est_tokens
+
+            if max_calls < 1:
+                return ExtractionReservationResult(
+                    granted=False,
+                    reason="calls_exhausted",
+                    ledger=ledger,
+                )
+
+            if p_thresh < 0 or o_thresh < 0 or t_thresh < 0:
+                return ExtractionReservationResult(
+                    granted=False,
+                    reason="tokens_exhausted",
+                    ledger=ledger,
+                )
 
             if ledger is not None:
                 if ledger.status == "completed":
@@ -847,20 +864,48 @@ class SQLiteOkfRepository:
                 gsi1_sk = f"MANIFEST#{manifest.document_id}"
                 gsi2_pk = f"WORKSPACE#{workspace_id}#DOC#{manifest.document_id}"
                 gsi2_sk = f"VER#{manifest.document_version}#MANIFEST"
-                self._conn.execute(
-                    """
-                    INSERT OR REPLACE INTO kre_okf_facts (
-                        workspace_id, pk, sk, gsi1_pk, gsi1_sk, gsi2_pk, gsi2_sk,
-                        record_type, entity_id, document_id, document_version,
-                        normalized_name, property_key, data_json, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        workspace_id, man_pk, man_sk, gsi1_pk, gsi1_sk, gsi2_pk, gsi2_sk,
-                        "MANIFEST", None, manifest.document_id, manifest.document_version,
-                        None, None, manifest.model_dump_json(), manifest.created_at,
-                    ),
-                )
+
+                if fence_token is not None:
+                    bpk = f"WORKSPACE#{workspace_id}"
+                    bsk = f"BUDGET#DOC#{manifest.document_id}#VER#{manifest.document_version}"
+                    cur = self._conn.execute(
+                        """
+                        INSERT OR REPLACE INTO kre_okf_facts (
+                            workspace_id, pk, sk, gsi1_pk, gsi1_sk, gsi2_pk, gsi2_sk,
+                            record_type, entity_id, document_id, document_version,
+                            normalized_name, property_key, data_json, created_at
+                        )
+                        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM kre_okf_facts
+                            WHERE pk = ? AND sk = ?
+                            AND CAST(json_extract(data_json, '$.fence_token') AS INTEGER) > ?
+                        )
+                        """,
+                        (
+                            workspace_id, man_pk, man_sk, gsi1_pk, gsi1_sk, gsi2_pk, gsi2_sk,
+                            "MANIFEST", None, manifest.document_id, manifest.document_version,
+                            None, None, manifest.model_dump_json(), manifest.created_at,
+                            bpk, bsk, fence_token,
+                        ),
+                    )
+                    if cur.rowcount == 0:
+                        raise RuntimeError(f"Worker fenced out: fence token {fence_token} superseded")
+                else:
+                    self._conn.execute(
+                        """
+                        INSERT OR REPLACE INTO kre_okf_facts (
+                            workspace_id, pk, sk, gsi1_pk, gsi1_sk, gsi2_pk, gsi2_sk,
+                            record_type, entity_id, document_id, document_version,
+                            normalized_name, property_key, data_json, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            workspace_id, man_pk, man_sk, gsi1_pk, gsi1_sk, gsi2_pk, gsi2_sk,
+                            "MANIFEST", None, manifest.document_id, manifest.document_version,
+                            None, None, manifest.model_dump_json(), manifest.created_at,
+                        ),
+                    )
 
                 # 2. Save entity records
                 for ent in manifest.entities:
@@ -1116,6 +1161,20 @@ class SQLiteOkfRepository:
                 ledger: OkfBudgetLedger | None = None
                 if row:
                     ledger = OkfBudgetLedger(**json.loads(row["data_json"]))
+
+                if max_calls < 1:
+                    return ExtractionReservationResult(
+                        granted=False,
+                        reason="calls_exhausted",
+                        ledger=ledger,
+                    )
+
+                if p_thresh < 0 or o_thresh < 0 or t_thresh < 0:
+                    return ExtractionReservationResult(
+                        granted=False,
+                        reason="tokens_exhausted",
+                        ledger=ledger,
+                    )
 
                 if ledger is not None:
                     if ledger.status == "completed":
@@ -1634,71 +1693,121 @@ class DynamoDBOkfRepository:
             if curr is not None and curr.fence_token > fence_token:
                 raise RuntimeError(f"Worker fenced out: fence token {fence_token} superseded by {curr.fence_token}")
 
-        _, table = self._get_resources()
+        client, table = self._get_resources()
         try:
-            with table.batch_writer() as batch:
-                # Manifest item
-                batch.put_item(
-                    Item={
-                        "PK": f"WORKSPACE#{workspace_id}",
-                        "SK": f"MANIFEST#DOC#{manifest.document_id}#VER#{manifest.document_version}",
-                        "GSI1PK": f"WORKSPACE#{workspace_id}",
-                        "GSI1SK": f"MANIFEST#{manifest.document_id}",
-                        "GSI2PK": f"WORKSPACE#{workspace_id}#DOC#{manifest.document_id}",
-                        "GSI2SK": f"VER#{manifest.document_version}#MANIFEST",
-                        "record_type": "MANIFEST",
-                        "workspace_id": workspace_id,
-                        "document_id": manifest.document_id,
-                        "document_version": manifest.document_version,
-                        "data_json": manifest.model_dump_json(),
-                        "created_at": manifest.created_at,
+            # Manifest item
+            manifest_item = {
+                "PK": f"WORKSPACE#{workspace_id}",
+                "SK": f"MANIFEST#DOC#{manifest.document_id}#VER#{manifest.document_version}",
+                "GSI1PK": f"WORKSPACE#{workspace_id}",
+                "GSI1SK": f"MANIFEST#{manifest.document_id}",
+                "GSI2PK": f"WORKSPACE#{workspace_id}#DOC#{manifest.document_id}",
+                "GSI2SK": f"VER#{manifest.document_version}#MANIFEST",
+                "record_type": "MANIFEST",
+                "workspace_id": workspace_id,
+                "document_id": manifest.document_id,
+                "document_version": manifest.document_version,
+                "data_json": manifest.model_dump_json(),
+                "created_at": manifest.created_at,
+            }
+
+            all_items: list[dict[str, Any]] = [manifest_item]
+
+            # Entities
+            for ent in manifest.entities:
+                ent = _anchor_entity_to_manifest(ent, workspace_id, manifest.document_id, manifest.document_version)
+                all_items.append({
+                    "PK": f"WORKSPACE#{workspace_id}",
+                    "SK": f"ENTITY#{ent.entity_id}#DOC#{ent.document_id}#VER#{ent.document_version}",
+                    "GSI1PK": f"WORKSPACE#{workspace_id}",
+                    "GSI1SK": f"ENTITY_NAME#{ent.normalized_name}",
+                    "GSI2PK": f"WORKSPACE#{workspace_id}#DOC#{ent.document_id}",
+                    "GSI2SK": f"VER#{ent.document_version}#ENTITY#{ent.entity_id}",
+                    "record_type": "ENTITY",
+                    "workspace_id": workspace_id,
+                    "entity_id": ent.entity_id,
+                    "document_id": ent.document_id,
+                    "document_version": ent.document_version,
+                    "normalized_name": ent.normalized_name,
+                    "data_json": ent.model_dump_json(),
+                    "created_at": ent.created_at,
+                })
+
+            # Assertions
+            for ass in manifest.assertions:
+                ass = _anchor_assertion_to_manifest(ass, workspace_id, manifest.document_id, manifest.document_version)
+                all_items.append({
+                    "PK": f"WORKSPACE#{workspace_id}",
+                    "SK": f"ENTITY#{ass.entity_id}#ASSERTION#{ass.assertion_id}",
+                    "GSI1PK": f"WORKSPACE#{workspace_id}",
+                    "GSI1SK": f"ASSERTION#{ass.assertion_id}",
+                    "GSI2PK": f"WORKSPACE#{workspace_id}#DOC#{ass.document_id}",
+                    "GSI2SK": f"VER#{ass.document_version}#ASSERTION#{ass.assertion_id}",
+                    "record_type": "ASSERTION",
+                    "workspace_id": workspace_id,
+                    "entity_id": ass.entity_id,
+                    "document_id": ass.document_id,
+                    "document_version": ass.document_version,
+                    "property_key": normalize_property_key(ass.property_key),
+                    "data_json": ass.model_dump_json(),
+                    "created_at": ass.created_at,
+                })
+
+            if fence_token is not None:
+                if len(all_items) >= 100:
+                    raise ValueError(f"Fenced manifest exceeds atomic transaction limit of 99 items: {len(all_items)}")
+
+                serializer = TypeSerializer()
+                condition_check = {
+                    "ConditionCheck": {
+                        "TableName": self.table_name,
+                        "Key": {
+                            "PK": {"S": f"WORKSPACE#{workspace_id}"},
+                            "SK": {"S": f"BUDGET#DOC#{manifest.document_id}#VER#{manifest.document_version}"},
+                        },
+                        "ConditionExpression": "attribute_not_exists(PK) OR #ft <= :expected_fence",
+                        "ExpressionAttributeNames": {"#ft": "fence_token"},
+                        "ExpressionAttributeValues": {":expected_fence": {"N": str(fence_token)}},
                     }
-                )
-
-                # Entities
-                for ent in manifest.entities:
-                    ent = _anchor_entity_to_manifest(ent, workspace_id, manifest.document_id, manifest.document_version)
-                    batch.put_item(
-                        Item={
-                            "PK": f"WORKSPACE#{workspace_id}",
-                            "SK": f"ENTITY#{ent.entity_id}#DOC#{ent.document_id}#VER#{ent.document_version}",
-                            "GSI1PK": f"WORKSPACE#{workspace_id}",
-                            "GSI1SK": f"ENTITY_NAME#{ent.normalized_name}",
-                            "GSI2PK": f"WORKSPACE#{workspace_id}#DOC#{ent.document_id}",
-                            "GSI2SK": f"VER#{ent.document_version}#ENTITY#{ent.entity_id}",
-                            "record_type": "ENTITY",
-                            "workspace_id": workspace_id,
-                            "entity_id": ent.entity_id,
-                            "document_id": ent.document_id,
-                            "document_version": ent.document_version,
-                            "normalized_name": ent.normalized_name,
-                            "data_json": ent.model_dump_json(),
-                            "created_at": ent.created_at,
+                }
+                tx_items = [condition_check]
+                for it in all_items:
+                    tx_items.append({
+                        "Put": {
+                            "TableName": self.table_name,
+                            "Item": {k: serializer.serialize(v) for k, v in it.items()}
                         }
-                    )
-
-                # Assertions
-                for ass in manifest.assertions:
-                    ass = _anchor_assertion_to_manifest(ass, workspace_id, manifest.document_id, manifest.document_version)
-                    batch.put_item(
-                        Item={
-                            "PK": f"WORKSPACE#{workspace_id}",
-                            "SK": f"ENTITY#{ass.entity_id}#ASSERTION#{ass.assertion_id}",
-                            "GSI1PK": f"WORKSPACE#{workspace_id}",
-                            "GSI1SK": f"ASSERTION#{ass.assertion_id}",
-                            "GSI2PK": f"WORKSPACE#{workspace_id}#DOC#{ass.document_id}",
-                            "GSI2SK": f"VER#{ass.document_version}#ASSERTION#{ass.assertion_id}",
-                            "record_type": "ASSERTION",
-                            "workspace_id": workspace_id,
-                            "entity_id": ass.entity_id,
-                            "document_id": ass.document_id,
-                            "document_version": ass.document_version,
-                            "property_key": normalize_property_key(ass.property_key),
-                            "data_json": ass.model_dump_json(),
-                            "created_at": ass.created_at,
+                    })
+                client.transact_write_items(TransactItems=tx_items)
+            else:
+                if len(all_items) <= 100:
+                    serializer = TypeSerializer()
+                    tx_items = [
+                        {
+                            "Put": {
+                                "TableName": self.table_name,
+                                "Item": {k: serializer.serialize(v) for k, v in it.items()}
+                            }
                         }
-                    )
+                        for it in all_items
+                    ]
+                    client.transact_write_items(TransactItems=tx_items)
+                else:
+                    with table.batch_writer() as batch:
+                        for it in all_items:
+                            batch.put_item(Item=it)
+
+        except ClientError as ce:
+            code = ce.response.get("Error", {}).get("Code", "")
+            if code == "TransactionCanceledException" or "TransactionCanceledException" in str(ce):
+                raise RuntimeError(f"Worker fenced out: fence token {fence_token} superseded") from ce
+            logger.error("DynamoDB save_manifest failed for doc %s: %s", manifest.document_id, ce)
+            raise StorageUnavailableError(f"DynamoDB error saving OKF manifest: {ce}") from ce
+        except RuntimeError:
+            raise
         except Exception as exc:
+            if "TransactionCanceledException" in str(exc) or "Worker fenced out" in str(exc):
+                raise RuntimeError(f"Worker fenced out: fence token {fence_token} superseded") from exc
             logger.error("DynamoDB save_manifest failed for doc %s: %s", manifest.document_id, exc)
             raise StorageUnavailableError(f"DynamoDB error saving OKF manifest: {exc}") from exc
 
@@ -1905,6 +2014,22 @@ class DynamoDBOkfRepository:
         o_thresh = max_output_ceiling - max_output_tokens
         t_thresh = max_total_tokens - est_tokens
 
+        if max_calls < 1:
+            curr = self.get_budget_ledger(workspace_id, document_id, document_version, consistent_read=True)
+            return ExtractionReservationResult(
+                granted=False,
+                reason="calls_exhausted",
+                ledger=curr,
+            )
+
+        if p_thresh < 0 or o_thresh < 0 or t_thresh < 0:
+            curr = self.get_budget_ledger(workspace_id, document_id, document_version, consistent_read=True)
+            return ExtractionReservationResult(
+                granted=False,
+                reason="tokens_exhausted",
+                ledger=curr,
+            )
+
         try:
             resp = table.update_item(
                 Key={"PK": pk, "SK": sk},
@@ -1928,7 +2053,13 @@ class DynamoDBOkfRepository:
                     "updated_at = :now_iso"
                 ),
                 ConditionExpression=(
-                    "(attribute_not_exists(PK)) OR ("
+                    "("
+                    "attribute_not_exists(PK) AND "
+                    ":one <= :max_calls AND "
+                    ":est_prompt <= :max_input AND "
+                    ":max_output <= :max_out_ceiling AND "
+                    ":est_tokens <= :max_total"
+                    ") OR ("
                     "#rc < :max_calls AND "
                     "#st = :st_act AND "
                     "(attribute_not_exists(#rpt) OR #rpt <= :p_thresh) AND "
@@ -1955,6 +2086,9 @@ class DynamoDBOkfRepository:
                     ":zero": 0,
                     ":one": 1,
                     ":max_calls": max_calls,
+                    ":max_input": max_input_tokens,
+                    ":max_out_ceiling": max_output_ceiling,
+                    ":max_total": max_total_tokens,
                     ":p_thresh": p_thresh,
                     ":o_thresh": o_thresh,
                     ":t_thresh": t_thresh,
@@ -2039,6 +2173,21 @@ class DynamoDBOkfRepository:
                         remaining_calls=max(0, max_calls - curr.reserved_calls),
                         reason=reason,
                         ledger=curr,
+                    )
+                else:
+                    if max_calls < 1:
+                        reason = "calls_exhausted"
+                    elif p_thresh < 0 or o_thresh < 0 or t_thresh < 0:
+                        reason = "tokens_exhausted"
+                    else:
+                        reason = "calls_exhausted"
+                    return ExtractionReservationResult(
+                        granted=False,
+                        fence_token=0,
+                        call_number=0,
+                        remaining_calls=0,
+                        reason=reason,
+                        ledger=None,
                     )
             logger.error("DynamoDB reserve_extraction_budget error: %s", exc)
             return ExtractionReservationResult(

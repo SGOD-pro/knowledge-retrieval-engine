@@ -1077,7 +1077,8 @@ class OkfBuilder:
                     created_at=timestamp,
                 )
                 try:
-                    self.repo.save_manifest(workspace_id, failed_manifest)
+                    fence_token = getattr(budget, "last_reservation_fence", None) if 'budget' in locals() else None
+                    self.repo.save_manifest(workspace_id, failed_manifest, fence_token=fence_token)
                 except Exception:
                     pass
                 return failed_manifest

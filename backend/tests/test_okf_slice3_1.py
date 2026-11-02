@@ -19,6 +19,7 @@ import json
 import multiprocessing
 import os
 from pathlib import Path
+import tempfile
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -1139,6 +1140,28 @@ def _get_ddb_local_repo(table_name: str = "kre_okf_facts_test"):
         AttributeDefinitions=[
             {"AttributeName": "PK", "AttributeType": "S"},
             {"AttributeName": "SK", "AttributeType": "S"},
+            {"AttributeName": "GSI1PK", "AttributeType": "S"},
+            {"AttributeName": "GSI1SK", "AttributeType": "S"},
+            {"AttributeName": "GSI2PK", "AttributeType": "S"},
+            {"AttributeName": "GSI2SK", "AttributeType": "S"},
+        ],
+        GlobalSecondaryIndexes=[
+            {
+                "IndexName": "GSI1",
+                "KeySchema": [
+                    {"AttributeName": "GSI1PK", "KeyType": "HASH"},
+                    {"AttributeName": "GSI1SK", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "ALL"},
+            },
+            {
+                "IndexName": "GSI2",
+                "KeySchema": [
+                    {"AttributeName": "GSI2PK", "KeyType": "HASH"},
+                    {"AttributeName": "GSI2SK", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "ALL"},
+            },
         ],
         BillingMode="PAY_PER_REQUEST",
     )
@@ -1472,4 +1495,386 @@ def test_publication_path_fencing_race_prevention():
 
     # Repository must contain zero assertions for StaleCorp
     assert len(repo.get_assertions_for_entity(ws, "e1")) == 0
+
+
+def test_dynamodb_local_first_and_subsequent_reservation_boundary_ceilings():
+    """LIVE DYNAMODB LOCAL EVIDENCE:
+    Tests boundary ceilings for first (absent ledger) and subsequent reservations.
+    Proves that an absent ledger strictly rejects calls exceeding call, prompt, output,
+    or total token ceilings before any item is created, and that subsequent reservations
+    strictly enforce cumulative ceilings.
+    """
+    repo = _get_ddb_local_repo("kre_okf_test_boundary_ceilings")
+    ws = "ws_bound_ceil"
+
+    # 1. First reservation with max_calls = 0 -> DENIED (calls_exhausted)
+    r_call0 = repo.reserve_extraction_budget(ws, "d1", "v1", "w1", 100, max_calls=0)
+    assert r_call0.granted is False
+    assert r_call0.reason == "calls_exhausted"
+    assert repo.get_budget_ledger(ws, "d1", "v1") is None
+
+    # 2. First reservation with prompt tokens > 4000 -> DENIED (tokens_exhausted)
+    r_p4001 = repo.reserve_extraction_budget(ws, "d2", "v1", "w1", 4001, max_input_tokens=4000)
+    assert r_p4001.granted is False
+    assert r_p4001.reason == "tokens_exhausted"
+    assert repo.get_budget_ledger(ws, "d2", "v1") is None
+
+    # 3. First reservation with max output > 1200 -> DENIED (tokens_exhausted)
+    r_o1201 = repo.reserve_extraction_budget(ws, "d3", "v1", "w1", 100, max_output_tokens=1201, max_output_ceiling=1200)
+    assert r_o1201.granted is False
+    assert r_o1201.reason == "tokens_exhausted"
+    assert repo.get_budget_ledger(ws, "d3", "v1") is None
+
+    # 4. First reservation with total > 5200 -> DENIED (tokens_exhausted)
+    r_t5201 = repo.reserve_extraction_budget(ws, "d4", "v1", "w1", 3500, max_output_tokens=1800, max_total_tokens=5200, max_output_ceiling=2000)
+    assert r_t5201.granted is False
+    assert r_t5201.reason == "tokens_exhausted"
+    assert repo.get_budget_ledger(ws, "d4", "v1") is None
+
+    # 5. First reservation at exact boundary -> GRANTED
+    r_exact = repo.reserve_extraction_budget(
+        ws, "d5", "v1", "w1", 4000, max_output_tokens=1200, max_calls=1,
+        max_input_tokens=4000, max_output_ceiling=1200, max_total_tokens=5200
+    )
+    assert r_exact.granted is True
+    assert r_exact.fence_token == 1
+    assert r_exact.call_number == 1
+    ledger = repo.get_budget_ledger(ws, "d5", "v1")
+    assert ledger is not None
+    assert ledger.reserved_prompt_tokens == 4000
+    assert ledger.reserved_output_tokens == 1200
+    assert ledger.reserved_tokens == 5200
+
+    # 6. Subsequent reservation on d5 exceeds calls -> DENIED (calls_exhausted)
+    r_next = repo.reserve_extraction_budget(ws, "d5", "v1", "w1", 100, max_calls=1)
+    assert r_next.granted is False
+    assert r_next.reason == "calls_exhausted"
+
+    # 7. Document with 2 calls:
+    r_c1 = repo.reserve_extraction_budget(
+        ws, "d6", "v1", "w1", 2000, max_output_tokens=600, max_calls=2,
+        max_input_tokens=4000, max_output_ceiling=1200, max_total_tokens=5200
+    )
+    assert r_c1.granted is True
+
+    # Call 2 tries prompt 2001 -> DENIED (tokens_exhausted)
+    r_c2_fail = repo.reserve_extraction_budget(
+        ws, "d6", "v1", "w1", 2001, max_output_tokens=600, max_calls=2,
+        max_input_tokens=4000, max_output_ceiling=1200, max_total_tokens=5200
+    )
+    assert r_c2_fail.granted is False
+    assert r_c2_fail.reason == "tokens_exhausted"
+
+    # Call 2 at exact prompt 2000 -> GRANTED
+    r_c2_ok = repo.reserve_extraction_budget(
+        ws, "d6", "v1", "w1", 2000, max_output_tokens=600, max_calls=2,
+        max_input_tokens=4000, max_output_ceiling=1200, max_total_tokens=5200
+    )
+    assert r_c2_ok.granted is True
+    assert r_c2_ok.call_number == 2
+
+    # Call 3 exceeds max_calls 2 -> DENIED (calls_exhausted)
+    r_c3 = repo.reserve_extraction_budget(ws, "d6", "v1", "w1", 100, max_calls=2)
+    assert r_c3.granted is False
+    assert r_c3.reason == "calls_exhausted"
+
+
+def test_sqlite_and_memory_first_and_subsequent_reservation_boundary_ceilings():
+    """Verify first (absent ledger) and subsequent reservation boundary ceilings on SQLite and InMemory."""
+    for repo in [InMemoryOkfRepository(), SQLiteOkfRepository(db_path=":memory:")]:
+        ws = "ws_bound_local"
+
+        # First reservation max_calls = 0 -> DENIED
+        r0 = repo.reserve_extraction_budget(ws, "d1", "v1", "w1", 100, max_calls=0)
+        assert r0.granted is False
+        assert r0.reason == "calls_exhausted"
+        assert repo.get_budget_ledger(ws, "d1", "v1") is None
+
+        # First reservation prompt > 4000 -> DENIED
+        r1 = repo.reserve_extraction_budget(ws, "d2", "v1", "w1", 4001, max_input_tokens=4000)
+        assert r1.granted is False
+        assert r1.reason == "tokens_exhausted"
+        assert repo.get_budget_ledger(ws, "d2", "v1") is None
+
+        # First reservation output > 1200 -> DENIED
+        r2 = repo.reserve_extraction_budget(ws, "d3", "v1", "w1", 100, max_output_tokens=1201, max_output_ceiling=1200)
+        assert r2.granted is False
+        assert r2.reason == "tokens_exhausted"
+        assert repo.get_budget_ledger(ws, "d3", "v1") is None
+
+        # Exact boundary reservation -> GRANTED
+        r_exact = repo.reserve_extraction_budget(
+            ws, "d4", "v1", "w1", 4000, max_output_tokens=1200, max_calls=1,
+            max_input_tokens=4000, max_output_ceiling=1200, max_total_tokens=5200
+        )
+        assert r_exact.granted is True
+        ledger = repo.get_budget_ledger(ws, "d4", "v1")
+        assert ledger is not None
+        assert ledger.reserved_prompt_tokens == 4000
+        assert ledger.reserved_output_tokens == 1200
+
+
+def test_dynamodb_deterministic_publication_race_with_pause():
+    """LIVE DYNAMODB LOCAL EVIDENCE:
+    Deterministic race test that pauses Worker A after its fence read,
+    lets Worker B advance the fence and publish, then resumes Worker A.
+    Proves that DynamoDB transact_write_items atomically aborts Worker A's
+    stale write and prevents Worker A from overwriting the manifest or exposing
+    any entities or assertions.
+    """
+    repo = _get_ddb_local_repo("kre_okf_test_tx_race_pause")
+    ws = "ws_tx_race"
+    doc = "doc_race_ddb"
+    ver = "v1"
+
+    # Worker A reserves fence 1
+    r1 = repo.reserve_extraction_budget(ws, doc, ver, "worker_a", 1000)
+    assert r1.fence_token == 1
+
+    man_a = OkfManifest(
+        workspace_id=ws,
+        document_id=doc,
+        document_version=ver,
+        entities=[OkfEntityRecord(
+            workspace_id=ws, entity_id="e_a", entity_name="CorpA", normalized_name="corpa",
+            entity_type="organization", document_id=doc, document_version=ver, created_at="2026-11-02T00:00:00Z"
+        )],
+        assertions=[OkfPropertyAssertion(
+            workspace_id=ws, document_id=doc, document_version=ver, assertion_id="a_a",
+            entity_id="e_a", entity_name="CorpA", property_key="rev", property_value="$10M",
+            source_chunk_id="c1", created_at="2026-11-02T00:00:00Z"
+        )],
+        rejected_assertions_count=0,
+        status="ready",
+        extraction_tokens=111,
+        model_calls=1,
+        idempotency_key=f"{ws}:{doc}:{ver}",
+        created_at="2026-11-02T00:00:00Z",
+    )
+
+    man_b = OkfManifest(
+        workspace_id=ws,
+        document_id=doc,
+        document_version=ver,
+        entities=[OkfEntityRecord(
+            workspace_id=ws, entity_id="e_b", entity_name="CorpB", normalized_name="corpb",
+            entity_type="organization", document_id=doc, document_version=ver, created_at="2026-11-02T00:00:00Z"
+        )],
+        assertions=[OkfPropertyAssertion(
+            workspace_id=ws, document_id=doc, document_version=ver, assertion_id="a_b",
+            entity_id="e_b", entity_name="CorpB", property_key="rev", property_value="$20M",
+            source_chunk_id="c2", created_at="2026-11-02T00:00:00Z"
+        )],
+        rejected_assertions_count=0,
+        status="ready",
+        extraction_tokens=222,
+        model_calls=2,
+        idempotency_key=f"{ws}:{doc}:{ver}",
+        created_at="2026-11-02T00:00:00Z",
+    )
+
+    worker_a_read_event = threading.Event()
+    resume_worker_a_event = threading.Event()
+    worker_a_error = []
+
+    orig_get_ledger = repo.get_budget_ledger
+
+    def hooked_get_ledger(*args, **kwargs):
+        ledger = orig_get_ledger(*args, **kwargs)
+        worker_a_read_event.set()
+        resume_worker_a_event.wait(timeout=5.0)
+        return ledger
+
+    def run_worker_a():
+        try:
+            repo.save_manifest(ws, man_a, fence_token=1)
+        except Exception as e:
+            worker_a_error.append(e)
+
+    # Intercept fence read only for Worker A
+    repo.get_budget_ledger = hooked_get_ledger
+    t_a = threading.Thread(target=run_worker_a)
+    t_a.start()
+
+    # Wait for Worker A to complete fence read and pause
+    assert worker_a_read_event.wait(timeout=5.0)
+
+    # Restore original get_budget_ledger for Worker B
+    repo.get_budget_ledger = orig_get_ledger
+
+    # Expire worker A lease in DynamoDB and let Worker B advance fence to 2 and publish manifest
+    client, _ = repo._get_resources()
+    client.update_item(
+        TableName=repo.table_name,
+        Key={"PK": {"S": f"WORKSPACE#{ws}"}, "SK": {"S": f"BUDGET#DOC#{doc}#VER#{ver}"}},
+        UpdateExpression="SET lease_expires_at = :past",
+        ExpressionAttributeValues={":past": {"N": "0"}},
+    )
+    r2 = repo.reserve_extraction_budget(ws, doc, ver, "worker_b", 1000, lease_duration_s=15.0)
+    assert r2.fence_token == 2
+    repo.save_manifest(ws, man_b, fence_token=2)
+
+    # Resume Worker A
+    resume_worker_a_event.set()
+    t_a.join(timeout=5.0)
+
+    assert len(worker_a_error) == 1
+    assert isinstance(worker_a_error[0], RuntimeError)
+    assert "Worker fenced out" in str(worker_a_error[0])
+
+    # Assert Worker A cannot overwrite the manifest (tokens must be 222 from Worker B)
+    m = repo.get_manifest(ws, doc, ver)
+    assert m is not None
+    assert m.extraction_tokens == 222
+
+    # Assert Worker A cannot expose any assertions
+    ass_a = repo.get_assertions_for_entity(ws, "e_a")
+    assert len(ass_a) == 0
+
+    # Assert Worker A cannot expose any entities
+    ents_a = repo.resolve_entities(ws, ["CorpA"])
+    assert len(ents_a) == 0
+
+    # Assert Worker B's entities and assertions are visible
+    ass_b = repo.get_assertions_for_entity(ws, "e_b")
+    assert len(ass_b) == 1
+    ents_b = repo.resolve_entities(ws, ["CorpB"])
+    assert len(ents_b) == 1
+
+
+def test_sqlite_deterministic_publication_race_with_pause():
+    """Verify deterministic publication race with separate SQLite connections in WAL mode.
+    Pauses Worker A after its fence read on connection 1, lets Worker B on connection 2
+    advance the fence and publish, resumes Worker A, and asserts Worker A cannot overwrite
+    the manifest or expose any assertions.
+    """
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
+        db_path = tf.name
+
+    try:
+        repo_a = SQLiteOkfRepository(db_path=db_path)
+        repo_b = SQLiteOkfRepository(db_path=db_path)
+
+        ws = "ws_sq_race"
+        doc = "doc_sq_race"
+        ver = "v1"
+
+        # Worker A reserves fence 1
+        r1 = repo_a.reserve_extraction_budget(ws, doc, ver, "worker_a", 1000)
+        assert r1.fence_token == 1
+
+        man_a = OkfManifest(
+            workspace_id=ws,
+            document_id=doc,
+            document_version=ver,
+            entities=[OkfEntityRecord(
+                workspace_id=ws, entity_id="e_a", entity_name="CorpA", normalized_name="corpa",
+                entity_type="organization", document_id=doc, document_version=ver, created_at="2026-11-02T00:00:00Z"
+            )],
+            assertions=[OkfPropertyAssertion(
+                workspace_id=ws, document_id=doc, document_version=ver, assertion_id="a_a",
+                entity_id="e_a", entity_name="CorpA", property_key="rev", property_value="$10M",
+                source_chunk_id="c1", created_at="2026-11-02T00:00:00Z"
+            )],
+            rejected_assertions_count=0,
+            status="ready",
+            extraction_tokens=111,
+            model_calls=1,
+            idempotency_key=f"{ws}:{doc}:{ver}",
+            created_at="2026-11-02T00:00:00Z",
+        )
+
+        man_b = OkfManifest(
+            workspace_id=ws,
+            document_id=doc,
+            document_version=ver,
+            entities=[OkfEntityRecord(
+                workspace_id=ws, entity_id="e_b", entity_name="CorpB", normalized_name="corpb",
+                entity_type="organization", document_id=doc, document_version=ver, created_at="2026-11-02T00:00:00Z"
+            )],
+            assertions=[OkfPropertyAssertion(
+                workspace_id=ws, document_id=doc, document_version=ver, assertion_id="a_b",
+                entity_id="e_b", entity_name="CorpB", property_key="rev", property_value="$20M",
+                source_chunk_id="c2", created_at="2026-11-02T00:00:00Z"
+            )],
+            rejected_assertions_count=0,
+            status="ready",
+            extraction_tokens=222,
+            model_calls=2,
+            idempotency_key=f"{ws}:{doc}:{ver}",
+            created_at="2026-11-02T00:00:00Z",
+        )
+
+        worker_a_read_event = threading.Event()
+        resume_worker_a_event = threading.Event()
+        worker_a_error = []
+
+        class ConnProxy:
+            def __init__(self, conn):
+                self._real = conn
+            def execute(self, sql, *args, **kwargs):
+                res = self._real.execute(sql, *args, **kwargs)
+                if "SELECT data_json FROM kre_okf_facts WHERE pk = ? AND sk = ?" in sql:
+                    worker_a_read_event.set()
+                    resume_worker_a_event.wait(timeout=5.0)
+                return res
+            def __enter__(self):
+                return self._real.__enter__()
+            def __exit__(self, *args):
+                return self._real.__exit__(*args)
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        repo_a._conn = ConnProxy(repo_a._conn)
+
+        def run_worker_a():
+            try:
+                repo_a.save_manifest(ws, man_a, fence_token=1)
+            except Exception as e:
+                worker_a_error.append(e)
+
+        t_a = threading.Thread(target=run_worker_a)
+        t_a.start()
+
+        assert worker_a_read_event.wait(timeout=5.0)
+
+        # Worker B on repo_b advances fence to 2 and publishes manifest
+        with repo_b._lock:
+            with repo_b._conn:
+                repo_b._conn.execute('UPDATE kre_okf_facts SET data_json = json_set(data_json, "$.lease_expires_at", 0) WHERE sk LIKE "BUDGET%"')
+
+        r2 = repo_b.reserve_extraction_budget(ws, doc, ver, "worker_b", 1000)
+        assert r2.fence_token == 2
+        repo_b.save_manifest(ws, man_b, fence_token=2)
+
+        # Resume Worker A
+        resume_worker_a_event.set()
+        t_a.join(timeout=5.0)
+
+        assert len(worker_a_error) == 1
+        assert isinstance(worker_a_error[0], RuntimeError)
+        assert "Worker fenced out" in str(worker_a_error[0])
+
+        # Assert Worker A cannot overwrite manifest
+        m = repo_b.get_manifest(ws, doc, ver)
+        assert m is not None
+        assert m.extraction_tokens == 222
+
+        # Assert Worker A cannot expose assertions
+        ass_a = repo_b.get_assertions_for_entity(ws, "e_a")
+        assert len(ass_a) == 0
+
+        # Assert Worker A cannot expose entities
+        ents_a = repo_b.resolve_entities(ws, ["CorpA"])
+        assert len(ents_a) == 0
+
+        # Assert Worker B's entities and assertions are visible
+        ass_b = repo_b.get_assertions_for_entity(ws, "e_b")
+        assert len(ass_b) == 1
+        ents_b = repo_b.resolve_entities(ws, ["CorpB"])
+        assert len(ents_b) == 1
+
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
 
