@@ -1491,7 +1491,7 @@ def test_publication_path_fencing_race_prevention():
     )
 
     with pytest.raises(RuntimeError, match="Worker fenced out"):
-        repo.save_manifest(ws, stale_manifest, fence_token=1)
+        repo.save_manifest(ws, stale_manifest, fence_token=1, worker_id="worker_1")
 
     # Repository must contain zero assertions for StaleCorp
     assert len(repo.get_assertions_for_entity(ws, "e1")) == 0
@@ -1687,7 +1687,7 @@ def test_dynamodb_deterministic_publication_race_with_pause():
 
     def run_worker_a():
         try:
-            repo.save_manifest(ws, man_a, fence_token=1)
+            repo.save_manifest(ws, man_a, fence_token=1, worker_id="worker_a")
         except Exception as e:
             worker_a_error.append(e)
 
@@ -1712,7 +1712,7 @@ def test_dynamodb_deterministic_publication_race_with_pause():
     )
     r2 = repo.reserve_extraction_budget(ws, doc, ver, "worker_b", 1000, lease_duration_s=15.0)
     assert r2.fence_token == 2
-    repo.save_manifest(ws, man_b, fence_token=2)
+    repo.save_manifest(ws, man_b, fence_token=2, worker_id="worker_b")
 
     # Resume Worker A
     resume_worker_a_event.set()
@@ -1829,7 +1829,7 @@ def test_sqlite_deterministic_publication_race_with_pause():
 
         def run_worker_a():
             try:
-                repo_a.save_manifest(ws, man_a, fence_token=1)
+                repo_a.save_manifest(ws, man_a, fence_token=1, worker_id="worker_a")
             except Exception as e:
                 worker_a_error.append(e)
 
@@ -1845,7 +1845,7 @@ def test_sqlite_deterministic_publication_race_with_pause():
 
         r2 = repo_b.reserve_extraction_budget(ws, doc, ver, "worker_b", 1000)
         assert r2.fence_token == 2
-        repo_b.save_manifest(ws, man_b, fence_token=2)
+        repo_b.save_manifest(ws, man_b, fence_token=2, worker_id="worker_b")
 
         # Resume Worker A
         resume_worker_a_event.set()
@@ -1922,7 +1922,7 @@ def test_ordering_denied_worker_b_cannot_overwrite_published_worker_a_sqlite():
             status="ready", extraction_tokens=300, model_calls=1,
             idempotency_key=f"{ws}:{doc}:{ver}", created_at=now,
         )
-        repo_a.save_manifest(ws, man_a, fence_token=res_a.fence_token)
+        repo_a.save_manifest(ws, man_a, fence_token=res_a.fence_token, worker_id="worker_A")
 
         assert repo_a.has_ready_okf(ws, doc, ver) is True
 
@@ -1995,7 +1995,7 @@ def test_ordering_denied_worker_b_cannot_overwrite_published_worker_a_dynamodb_l
         status="ready", extraction_tokens=300, model_calls=1,
         idempotency_key=f"{ws}:{doc}:{ver}", created_at=now,
     )
-    repo.save_manifest(ws, man_a, fence_token=res_a.fence_token)
+    repo.save_manifest(ws, man_a, fence_token=res_a.fence_token, worker_id="worker_A")
     assert repo.has_ready_okf(ws, doc, ver) is True
 
     man_b = OkfManifest(
@@ -2042,7 +2042,7 @@ def test_worker_b_fails_before_reservation_cannot_overwrite_active_lease_sqlite(
             status="failed", extraction_tokens=100, model_calls=1,
             idempotency_key=f"{ws}:{doc}:{ver}", created_at="2026-11-02T00:00:00Z",
         )
-        repo_a.save_manifest(ws, in_flight_man_a, fence_token=res_a.fence_token)
+        repo_a.save_manifest(ws, in_flight_man_a, fence_token=res_a.fence_token, worker_id="worker_A")
 
         # Worker B fails before reservation (fence_token is None) and attempts to write
         failed_man_b = OkfManifest(
@@ -2084,7 +2084,7 @@ def test_worker_b_fails_before_reservation_cannot_overwrite_active_lease_dynamod
         status="failed", extraction_tokens=100, model_calls=1,
         idempotency_key=f"{ws}:{doc}:{ver}", created_at="2026-11-02T00:00:00Z",
     )
-    repo.save_manifest(ws, in_flight_man_a, fence_token=res_a.fence_token)
+    repo.save_manifest(ws, in_flight_man_a, fence_token=res_a.fence_token, worker_id="worker_A")
 
     failed_man_b = OkfManifest(
         workspace_id=ws, document_id=doc, document_version=ver,
@@ -2132,7 +2132,7 @@ def test_stale_assertions_coexisting_with_failed_or_newer_manifest():
             )
             # Use fence_token=1 to save failed manifest with the assertion
             res = r.reserve_extraction_budget(ws, doc, "v1", "worker_1", 100, 200, 2, 3000, 15.0)
-            r.save_manifest(ws, man_failed, fence_token=res.fence_token)
+            r.save_manifest(ws, man_failed, fence_token=res.fence_token, worker_id="worker_1")
 
             # Assert v1 is NOT ready even though an assertion record exists in storage
             assert r.has_ready_okf(ws, doc, "v1") is False
@@ -2145,7 +2145,7 @@ def test_stale_assertions_coexisting_with_failed_or_newer_manifest():
                 status="ready", extraction_tokens=200, model_calls=1,
                 idempotency_key=f"{ws}:{doc}:v2", created_at="2026-11-02T00:00:10Z",
             )
-            r.save_manifest(ws, man_ready_v2, fence_token=res_v2.fence_token)
+            r.save_manifest(ws, man_ready_v2, fence_token=res_v2.fence_token, worker_id="worker_2")
 
             # Assert v2 is ready, while v1 remains NOT ready
             assert r.has_ready_okf(ws, doc, "v2") is True
@@ -2179,7 +2179,7 @@ def test_cross_workspace_and_version_readiness_isolation():
                 status="ready", extraction_tokens=100, model_calls=1,
                 idempotency_key=f"ws1:{doc}:v1", created_at=now,
             )
-            r.save_manifest("ws1", man_ws1_v1, fence_token=res1.fence_token)
+            r.save_manifest("ws1", man_ws1_v1, fence_token=res1.fence_token, worker_id="w1")
 
             # Workspace 2 Version 1: failed
             res2 = r.reserve_extraction_budget("ws2", doc, "v1", "w2", 100, 200, 2, 3000, 15.0)
@@ -2189,7 +2189,7 @@ def test_cross_workspace_and_version_readiness_isolation():
                 status="failed", extraction_tokens=100, model_calls=1,
                 idempotency_key=f"ws2:{doc}:v1", created_at=now,
             )
-            r.save_manifest("ws2", man_ws2_v1, fence_token=res2.fence_token)
+            r.save_manifest("ws2", man_ws2_v1, fence_token=res2.fence_token, worker_id="w2")
 
             # Workspace 1 Version 2: failed
             res3 = r.reserve_extraction_budget("ws1", doc, "v2", "w3", 100, 200, 2, 3000, 15.0)
@@ -2199,7 +2199,7 @@ def test_cross_workspace_and_version_readiness_isolation():
                 status="failed", extraction_tokens=100, model_calls=1,
                 idempotency_key=f"ws1:{doc}:v2", created_at=now,
             )
-            r.save_manifest("ws1", man_ws1_v2, fence_token=res3.fence_token)
+            r.save_manifest("ws1", man_ws1_v2, fence_token=res3.fence_token, worker_id="w3")
 
             # Verification of isolated readiness
             assert r.has_ready_okf("ws1", doc, "v1") is True
@@ -2254,7 +2254,7 @@ def test_dynamodb_local_publication_99_item_boundary_and_readiness():
     )
 
     # 1 manifest + 1 entity + 97 assertions = 99 items
-    repo.save_manifest(ws, man_99, fence_token=res_99.fence_token)
+    repo.save_manifest(ws, man_99, fence_token=res_99.fence_token, worker_id="w_99")
 
     assert repo.has_ready_okf(ws, doc_99, ver_99) is True
     saved_99 = repo.get_manifest(ws, doc_99, ver_99)
@@ -2289,7 +2289,7 @@ def test_dynamodb_local_publication_99_item_boundary_and_readiness():
 
     # 1 manifest + 1 entity + 98 assertions = 100 items -> raises StorageUnavailableError
     with pytest.raises(StorageUnavailableError, match="Fenced manifest exceeds atomic transaction limit of 99 items: 100"):
-        repo.save_manifest(ws, man_100, fence_token=res_100.fence_token)
+        repo.save_manifest(ws, man_100, fence_token=res_100.fence_token, worker_id="w_100")
 
     # In database: zero items committed for doc_100
     assert repo.has_ready_okf(ws, doc_100, ver_100) is False
@@ -3532,7 +3532,7 @@ def test_concurrent_publishers_tombstones_and_isolation():
                     idempotency_key=f"{ws}:{doc}:{ver}:w2",
                     created_at=now,
                 )
-                repo.save_manifest(ws, man2, fence_token=fence2)
+                repo.save_manifest(ws, man2, fence_token=fence2, worker_id="worker_2")
 
                 # Stale worker 1 attempts to save manifest with fence1: must be rejected!
                 man1 = OkfManifest(
@@ -3550,7 +3550,7 @@ def test_concurrent_publishers_tombstones_and_isolation():
                     created_at=now,
                 )
                 with pytest.raises(RuntimeError):
-                    repo.save_manifest(ws, man1, fence_token=fence1)
+                    repo.save_manifest(ws, man1, fence_token=fence1, worker_id="worker_1")
 
                 # Authoritative manifest remains worker 2's publication
                 cur = repo.get_manifest(ws, doc, ver)
@@ -4433,6 +4433,107 @@ def test_dynamodb_stale_entity_pagination_safety_bound_fails_closed():
         assert len(result.matched_assertions) == 0
     finally:
         table.query = orig_query
+
+
+def test_fenced_manifest_requires_non_empty_worker_id_across_repositories():
+    """Verifies that fenced save_manifest strictly requires a valid, non-empty worker_id
+    across InMemory, SQLite, and DynamoDB Local. Missing (None), empty (""), or whitespace-only ("   ")
+    worker identity is rejected with ValueError before any publication write occurs.
+    A mismatched worker identity is rejected with RuntimeError, while the legitimate worker succeeds."""
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+        db_path = tmp.name
+
+    try:
+        mem_repo = InMemoryOkfRepository()
+        sqlite_repo = SQLiteOkfRepository(db_path=db_path)
+        ddb_repo = _get_ddb_local_repo("kre_okf_facts_worker_id_contract")
+
+        now_iso = "2026-11-02T00:00:00Z"
+
+        for repo in (mem_repo, sqlite_repo, ddb_repo):
+            engine_name = repo.__class__.__name__
+            ws = f"ws_worker_{engine_name}"
+            doc = f"doc_worker_{engine_name}"
+            ver = "v1"
+
+            res = repo.reserve_extraction_budget(
+                ws, doc, ver, "legit_worker",
+                estimated_prompt_tokens=100,
+                max_output_tokens=200,
+                max_calls=2,
+                max_total_tokens=3000,
+                lease_duration_s=30.0,
+            )
+            assert res.granted is True
+            fence = res.fence_token
+
+            ent = OkfEntityRecord(
+                workspace_id=ws,
+                entity_id=f"e_{engine_name}",
+                entity_name="Contract Corp",
+                normalized_name="contract corp",
+                entity_type="organization",
+                document_id=doc,
+                document_version=ver,
+                created_at=now_iso,
+            )
+            ass = OkfPropertyAssertion(
+                assertion_id=f"a_{engine_name}",
+                workspace_id=ws,
+                entity_id=f"e_{engine_name}",
+                entity_name="Contract Corp",
+                property_key="metric",
+                property_value="passed",
+                source_chunk_id="c1",
+                document_id=doc,
+                document_version=ver,
+                created_at=now_iso,
+            )
+            manifest = OkfManifest(
+                workspace_id=ws,
+                document_id=doc,
+                document_version=ver,
+                entities=(ent,),
+                assertions=(ass,),
+                rejected_assertions_count=0,
+                status="ready",
+                extraction_tokens=150,
+                model_calls=1,
+                idempotency_key=f"{ws}:{doc}:{ver}",
+                created_at=now_iso,
+            )
+
+            # 1. Missing worker_id (None) -> ValueError
+            with pytest.raises(ValueError, match="Fenced manifest write requires valid non-empty worker_id"):
+                repo.save_manifest(ws, manifest, fence_token=fence, worker_id=None)
+
+            # 2. Empty string worker_id ("") -> ValueError
+            with pytest.raises(ValueError, match="Fenced manifest write requires valid non-empty worker_id"):
+                repo.save_manifest(ws, manifest, fence_token=fence, worker_id="")
+
+            # 3. Whitespace-only worker_id ("   ") -> ValueError
+            with pytest.raises(ValueError, match="Fenced manifest write requires valid non-empty worker_id"):
+                repo.save_manifest(ws, manifest, fence_token=fence, worker_id="   ")
+
+            # 4. Wrong worker identity -> RuntimeError
+            with pytest.raises(RuntimeError, match="lease owned by legit_worker, not wrong_worker"):
+                repo.save_manifest(ws, manifest, fence_token=fence, worker_id="wrong_worker")
+
+            # Publication must NOT have committed from any of the rejected attempts
+            assert repo.has_ready_okf(ws, doc, ver) is False
+
+            # 5. Correct worker identity -> Successfully committed
+            repo.save_manifest(ws, manifest, fence_token=fence, worker_id="legit_worker")
+            assert repo.has_ready_okf(ws, doc, ver) is True
+            committed = repo.get_manifest(ws, doc, ver)
+            assert committed is not None
+            assert committed.status == "ready"
+            assert committed.extraction_tokens == 150
+
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
 
 
 

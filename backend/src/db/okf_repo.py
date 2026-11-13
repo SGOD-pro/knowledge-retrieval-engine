@@ -99,7 +99,9 @@ class OkfRepositoryBase(Protocol):
         base_publication_id: str | None | object = _UNSPECIFIED,
         worker_id: str | None = None,
     ) -> None:
-        """Atomically persist manifest entities and validated assertions under workspace PK."""
+        """Atomically persist manifest entities and validated assertions under workspace PK.
+        When fence_token is supplied, worker_id is strictly mandatory (non-empty string)
+        and must match the active lease owner."""
         ...
 
     def resolve_entities(
@@ -318,14 +320,18 @@ class InMemoryOkfRepository:
             ledger = self._ledgers.get(key)
             now = time.time()
             if fence_token is not None:
+                if not worker_id or not isinstance(worker_id, str) or not worker_id.strip():
+                    raise ValueError(
+                        f"Fenced manifest write requires valid non-empty worker_id for document {manifest.document_id}"
+                    )
                 if ledger is None:
                     raise RuntimeError(f"Fenced manifest write denied: missing budget ledger for document {manifest.document_id}")
                 if ledger.fence_token != fence_token:
                     raise RuntimeError(f"Worker fenced out: fence token {fence_token} does not match ledger fence {ledger.fence_token}")
                 if (ledger.lease_expires_at or 0.0) < now:
                     raise RuntimeError(f"Fenced manifest write denied: lease expired for fence {fence_token}")
-                if worker_id is not None and ledger.lease_owner_id != worker_id:
-                    raise RuntimeError(f"Fenced manifest write denied: lease owned by {ledger.lease_owner_id}, not {worker_id}")
+                if ledger.lease_owner_id != worker_id.strip():
+                    raise RuntimeError(f"Fenced manifest write denied: lease owned by {ledger.lease_owner_id}, not {worker_id.strip()}")
             else:
                 if ledger is not None:
                     lease_exp = float(ledger.lease_expires_at or 0)
@@ -974,6 +980,10 @@ class SQLiteOkfRepository:
                 now_ts = time.time()
 
                 if fence_token is not None:
+                    if not worker_id or not isinstance(worker_id, str) or not worker_id.strip():
+                        raise ValueError(
+                            f"Fenced manifest write requires valid non-empty worker_id for document {manifest.document_id}"
+                        )
                     cur = self._conn.execute("SELECT data_json FROM kre_okf_facts WHERE pk = ? AND sk = ?", (bpk, bsk))
                     row = cur.fetchone()
                     if not row:
@@ -986,8 +996,8 @@ class SQLiteOkfRepository:
                     if lease_exp < now_ts:
                         raise RuntimeError(f"Fenced manifest write denied: lease expired for fence {fence_token}")
                     lease_owner = ledger_data.get("lease_owner_id")
-                    if worker_id is not None and lease_owner != worker_id:
-                        raise RuntimeError(f"Fenced manifest write denied: lease owned by {lease_owner}, not {worker_id}")
+                    if lease_owner != worker_id.strip():
+                        raise RuntimeError(f"Fenced manifest write denied: lease owned by {lease_owner}, not {worker_id.strip()}")
                 else:
                     # 1. Active lease check & budget ledger protection
                     budget_cur = self._conn.execute(
@@ -1928,6 +1938,10 @@ class DynamoDBOkfRepository:
         now_ts = float(now_epoch)
 
         if fence_token is not None:
+            if not worker_id or not isinstance(worker_id, str) or not worker_id.strip():
+                raise ValueError(
+                    f"Fenced manifest write requires valid non-empty worker_id for document {manifest.document_id}"
+                )
             curr = self.get_budget_ledger(workspace_id, manifest.document_id, manifest.document_version, consistent_read=True)
             if curr is None:
                 raise RuntimeError(f"Fenced manifest write denied: missing budget ledger for document {manifest.document_id}")
@@ -1935,8 +1949,8 @@ class DynamoDBOkfRepository:
                 raise RuntimeError(f"Worker fenced out: fence token {fence_token} superseded by {curr.fence_token}")
             if (curr.lease_expires_at or 0.0) < now_ts:
                 raise RuntimeError(f"Fenced manifest write denied: lease expired for fence {fence_token}")
-            if worker_id is not None and curr.lease_owner_id != worker_id:
-                raise RuntimeError(f"Fenced manifest write denied: lease owned by {curr.lease_owner_id}, not {worker_id}")
+            if curr.lease_owner_id != worker_id.strip():
+                raise RuntimeError(f"Fenced manifest write denied: lease owned by {curr.lease_owner_id}, not {worker_id.strip()}")
 
         client, table = self._get_resources()
         try:
@@ -2013,19 +2027,18 @@ class DynamoDBOkfRepository:
                     "attribute_exists(PK)",
                     "#ft = :expected_fence",
                     "#lexp >= :now_epoch",
+                    "#lown = :wid",
                 ]
                 expr_attr_names = {
                     "#ft": "fence_token",
                     "#lexp": "lease_expires_at",
+                    "#lown": "lease_owner_id",
                 }
                 expr_attr_vals = {
                     ":expected_fence": {"N": str(fence_token)},
                     ":now_epoch": {"N": str(now_epoch)},
+                    ":wid": {"S": worker_id.strip()},
                 }
-                if worker_id is not None:
-                    cond_parts.append("#lown = :wid")
-                    expr_attr_names["#lown"] = "lease_owner_id"
-                    expr_attr_vals[":wid"] = {"S": worker_id}
 
                 condition_check = {
                     "ConditionCheck": {
