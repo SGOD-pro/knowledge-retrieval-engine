@@ -122,6 +122,7 @@ class OkfManifest(BaseModel):
     idempotency_key: str = Field(..., max_length=128)
     created_at: str
     publication_id: str | None = Field(default=None, max_length=128)
+    base_publication_id: str | None = Field(default=None, max_length=128)
 
 
 class OkfLookupResult(BaseModel):

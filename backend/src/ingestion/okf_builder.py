@@ -1090,7 +1090,8 @@ class OkfBuilder:
                 try:
                     fence_token = getattr(budget, "last_reservation_fence", None) if 'budget' in locals() else None
                     if fence_token is not None:
-                        self.repo.save_manifest(workspace_id, failed_manifest, fence_token=fence_token)
+                        wid = getattr(self, "worker_id", f"worker_{os.getpid()}")
+                        self.repo.save_manifest(workspace_id, failed_manifest, fence_token=fence_token, worker_id=wid)
                 except Exception:
                     pass
                 return failed_manifest
@@ -1113,6 +1114,14 @@ class OkfBuilder:
         norm_name = normalize_entity_name(ent_name)
         ent_id = compute_entity_id(workspace_id, document_id, norm_name)
         pub_id = publication_id or generate_publication_id()
+        existing_man = None
+        base_pub_id = None
+        if hasattr(self.repo, "get_manifest"):
+            try:
+                existing_man = self.repo.get_manifest(workspace_id, document_id, document_version, consistent_read=True)
+                base_pub_id = existing_man.publication_id if existing_man else None
+            except Exception:
+                pass
 
         entity = OkfEntityRecord(
             workspace_id=workspace_id,
@@ -1206,10 +1215,11 @@ class OkfBuilder:
             idempotency_key=idempotency_key,
             created_at=timestamp,
             publication_id=pub_id,
+            base_publication_id=base_pub_id,
         )
 
         try:
-            self.repo.save_manifest(workspace_id, manifest)
+            self.repo.save_manifest(workspace_id, manifest, base_publication_id=base_pub_id)
         except Exception as csv_err:
             logger.warning(
                 "okf_builder.csv_save_manifest_failed ws=%s doc=%s: %s (failing open per ADR-001)",
@@ -1230,6 +1240,7 @@ class OkfBuilder:
                 idempotency_key=idempotency_key,
                 created_at=timestamp,
                 publication_id=pub_id,
+                base_publication_id=base_pub_id,
             )
         logger.info(
             "okf_builder.csv_ready ws=%s doc=%s ver=%s columns=%d (0 tokens, 0 model calls)",
@@ -1450,7 +1461,8 @@ class OkfBuilder:
         fence_token = getattr(budget, "last_reservation_fence", None)
         if fence_token is not None or manifest.status == "ready":
             try:
-                self.repo.save_manifest(workspace_id, manifest, fence_token=fence_token)
+                wid = getattr(self, "worker_id", f"worker_{os.getpid()}")
+                self.repo.save_manifest(workspace_id, manifest, fence_token=fence_token, worker_id=wid)
             except Exception as save_err:
                 logger.warning(
                     "okf_builder.final_manifest_save_failed ws=%s doc=%s: %s (failing open per ADR-001)",
@@ -1726,6 +1738,7 @@ class OkfBuilder:
                         publication_id=pub_id,
                     ),
                     fence_token=reservation_fence,
+                    worker_id=getattr(self, "worker_id", f"worker_{os.getpid()}"),
                 )
             except Exception as save_err:
                 logger.error("okf_builder.reservation_persistence_failed: %s", save_err)

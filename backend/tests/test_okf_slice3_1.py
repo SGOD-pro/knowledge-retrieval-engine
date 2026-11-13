@@ -3878,5 +3878,562 @@ def test_concurrent_publishers_tombstones_and_isolation():
             os.remove(db_path)
 
 
+# -----------------------------------------------------------------------------
+# 20. Concurrent Publication Ordering & Fenced Authority Verification Tests
+# -----------------------------------------------------------------------------
+
+from datetime import datetime, timezone
+import uuid
+from db.workspace_boundary_repo import InMemoryWorkspaceBoundaryRepository
+from schemas.contracts.boundary import DocumentSnapshot
+from services.retrieval.okf_retriever import OkfRetriever
+from db.okf_repo import StorageUnavailableError
+
+def _test_now_utc() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def test_concurrent_csv_publishers_paused_after_staging_cannot_replace_committed_dynamodb_local():
+    """LIVE DYNAMODB LOCAL EVIDENCE:
+    Two concurrent unfenced CSV publishers ingest the same document version.
+    Publisher A stages payload items, pauses before committing manifest visibility.
+    Publisher B stages payload items and commits ready manifest B.
+    Publisher A resumes and attempts to commit manifest A.
+    Atomically aborts A's commit and preserves B's ready publication.
+    """
+    repo = _get_ddb_local_repo("kre_okf_test_csv_race")
+    ws = "ws_csv_race"
+    doc = "table_race"
+    ver = "v1"
+
+    builder_a = OkfBuilder(repo=repo, bedrock_client=None)
+    builder_b = OkfBuilder(repo=repo, bedrock_client=None)
+
+    ch_a = Chunk(
+        id=f"{doc}:csv:ch_a",
+        document_id=doc,
+        source_format="csv",
+        text="A,B,C",
+        page_number=1,
+        element_type="table",
+        metadata={"headers": ["col_alpha", "col_beta"]},
+    )
+    ch_b = Chunk(
+        id=f"{doc}:csv:ch_b",
+        document_id=doc,
+        source_format="csv",
+        text="X,Y,Z",
+        page_number=1,
+        element_type="table",
+        metadata={"headers": ["col_xray", "col_yankee"]},
+    )
+
+    stage_event = threading.Event()
+    resume_a_event = threading.Event()
+
+    client, table = repo._get_resources()
+    orig_transact = client.transact_write_items
+
+    def hooked_transact(*args, **kwargs):
+        if threading.current_thread().name == "WorkerA":
+            stage_event.set()
+            resume_a_event.wait(timeout=20.0)
+        return orig_transact(*args, **kwargs)
+
+    client.transact_write_items = hooked_transact
+
+    m_a_res = []
+    def run_publisher_a():
+        res = builder_a.extract_and_persist(ws, doc, ver, "csv", [ch_a])
+        m_a_res.append(res)
+
+    with patch("ingestion.okf_builder.get_document_extraction_lock", side_effect=lambda key: threading.Lock()):
+        t_a = threading.Thread(target=run_publisher_a, name="WorkerA")
+        t_a.start()
+
+        # Wait for publisher A to stage and reach manifest commit
+        assert stage_event.wait(timeout=10.0)
+
+        # Publisher B runs and commits
+        m_b = builder_b.extract_and_persist(ws, doc, ver, "csv", [ch_b])
+        assert m_b.status == "ready"
+        assert repo.has_ready_okf(ws, doc, ver) is True
+
+        # Resume publisher A
+        resume_a_event.set()
+        t_a.join(timeout=10.0)
+
+    # Publisher A must fail open per ADR-001 with failed status in memory,
+    # and repo must retain publisher B's manifest and assertions
+    assert len(m_a_res) == 1
+    assert m_a_res[0].status == "failed"
+
+    durable_man = repo.get_manifest(ws, doc, ver, consistent_read=True)
+    assert durable_man is not None
+    assert durable_man.status == "ready"
+    assert durable_man.publication_id == m_b.publication_id
+
+    # Retrieval proves only Publisher B's assertions are visible
+    boundary_repo = InMemoryWorkspaceBoundaryRepository()
+    boundary_repo.save_document_snapshot(DocumentSnapshot(
+        workspace_id=ws,
+        document_id=doc,
+        source=f"{doc}.csv",
+        version=ver,
+        format="csv",
+        created_at=_test_now_utc(),
+        okf_status="ready",
+    ))
+    retriever = OkfRetriever(repository=repo, boundary_repo=boundary_repo)
+    result = retriever.lookup_sync(ws, "What columns does table_race have?", target_entities=[doc], document_ids=[doc])
+    assert result.entity_state == "unique"
+    prop_keys = [a.property_key for a in result.matched_assertions]
+    assert "column:col_xray" in prop_keys or "column:col_yankee" in prop_keys
+    assert "column:col_alpha" not in prop_keys
+
+
+def test_concurrent_csv_publishers_paused_after_staging_cannot_replace_committed_sqlite_separate_connections():
+    """Verify safe concurrent publication ordering in SQLite with separate connections.
+    Publisher A stages against initial manifest, pauses before commit.
+    Publisher B commits a ready publication.
+    Publisher A resumes and is atomically rejected; Publisher B remains authoritative.
+    """
+    db_path = f"/tmp/kre_okf_test_csv_race_{uuid.uuid4().hex[:8]}.db"
+    try:
+        repo_a = SQLiteOkfRepository(db_path=db_path)
+        repo_b = SQLiteOkfRepository(db_path=db_path)
+        ws = "ws_csv_sq"
+        doc = "tbl_sq"
+        ver = "v1"
+
+        builder_a = OkfBuilder(repo=repo_a, bedrock_client=None)
+        builder_b = OkfBuilder(repo=repo_b, bedrock_client=None)
+
+        ch_a = Chunk(
+            id=f"{doc}:csv:ch_a",
+            document_id=doc,
+            source_format="csv",
+            text="A,B",
+            page_number=1,
+            element_type="table",
+            metadata={"headers": ["col_alpha"]},
+        )
+        ch_b = Chunk(
+            id=f"{doc}:csv:ch_b",
+            document_id=doc,
+            source_format="csv",
+            text="X,Y",
+            page_number=1,
+            element_type="table",
+            metadata={"headers": ["col_beta"]},
+        )
+
+        stage_event = threading.Event()
+        resume_a_event = threading.Event()
+
+        orig_save = repo_a.save_manifest
+        def hooked_save_a(*args, **kwargs):
+            stage_event.set()
+            resume_a_event.wait(timeout=20.0)
+            return orig_save(*args, **kwargs)
+
+        repo_a.save_manifest = hooked_save_a
+
+        res_a = []
+        def run_a():
+            r = builder_a.extract_and_persist(ws, doc, ver, "csv", [ch_a])
+            res_a.append(r)
+
+        with patch("ingestion.okf_builder.get_document_extraction_lock", side_effect=lambda key: threading.Lock()):
+            t_a = threading.Thread(target=run_a, name="WorkerA")
+            t_a.start()
+
+            assert stage_event.wait(timeout=10.0)
+
+            # Publisher B commits successfully
+            m_b = builder_b.extract_and_persist(ws, doc, ver, "csv", [ch_b])
+            assert m_b.status == "ready"
+
+            # Resume A
+            resume_a_event.set()
+            t_a.join(timeout=10.0)
+
+        # Worker A was rejected
+        assert len(res_a) == 1
+        assert res_a[0].status == "failed"
+
+        # Durable manifest in SQLite remains B
+        durable_man = repo_b.get_manifest(ws, doc, ver, consistent_read=True)
+        assert durable_man is not None
+        assert durable_man.publication_id == m_b.publication_id
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+def test_fenced_publication_authority_at_write_missing_expired_wrong_owner_stale_fence_dynamodb_local():
+    """LIVE DYNAMODB LOCAL EVIDENCE:
+    Verifies that fenced manifest publication requires:
+    1. An existing ledger (missing ledger rejected)
+    2. An unexpired lease (expired lease rejected)
+    3. The correct lease owner (wrong worker rejected)
+    4. Exact current fence token (stale or future fence rejected)
+    5. Atomic condition failure if fence advances immediately before write.
+    """
+    repo = _get_ddb_local_repo("kre_okf_test_fenced_auth")
+    ws = "ws_fenced_auth"
+    now_iso = _test_now_utc()
+
+    def make_manifest(doc, ver, pub_id):
+        return OkfManifest(
+            workspace_id=ws,
+            document_id=doc,
+            document_version=ver,
+            entities=(),
+            assertions=(),
+            rejected_assertions_count=0,
+            status="ready",
+            extraction_tokens=10,
+            model_calls=1,
+            idempotency_key=f"{ws}:{doc}:{ver}",
+            created_at=now_iso,
+            publication_id=pub_id,
+        )
+
+    # 1. Missing ledger: doc has never reserved budget
+    m_missing = make_manifest("doc_missing", "v1", "pub_m")
+    with pytest.raises(RuntimeError) as exc_missing:
+        repo.save_manifest(ws, m_missing, fence_token=1, worker_id="worker_x")
+    assert "missing budget ledger" in str(exc_missing.value) or "Worker fenced out" in str(exc_missing.value)
+
+    # 2. Expired lease: worker reserved with short lease that expired
+    doc_exp = "doc_exp"
+    r_exp = repo.reserve_extraction_budget(ws, doc_exp, "v1", "worker_exp", 500, lease_duration_s=0.01)
+    assert r_exp.granted is True
+    time.sleep(0.05)  # Lease expires
+    m_exp = make_manifest(doc_exp, "v1", "pub_exp")
+    with pytest.raises(RuntimeError) as exc_exp:
+        repo.save_manifest(ws, m_exp, fence_token=r_exp.fence_token, worker_id="worker_exp")
+    assert "lease expired" in str(exc_exp.value) or "Worker fenced out" in str(exc_exp.value)
+
+    # 3. Wrong owner: worker_a owns lease, worker_b attempts to commit
+    doc_owner = "doc_owner"
+    r_owner = repo.reserve_extraction_budget(ws, doc_owner, "v1", "worker_owner_a", 500, lease_duration_s=15.0)
+    assert r_owner.granted is True
+    m_owner = make_manifest(doc_owner, "v1", "pub_owner")
+    with pytest.raises(RuntimeError) as exc_owner:
+        repo.save_manifest(ws, m_owner, fence_token=r_owner.fence_token, worker_id="worker_wrong_b")
+    assert "lease owned by" in str(exc_owner.value) or "Worker fenced out" in str(exc_owner.value)
+
+    # 4. Stale fence: fence token 1 superseded by fence token 2
+    doc_stale = "doc_stale"
+    r_stale1 = repo.reserve_extraction_budget(ws, doc_stale, "v1", "worker_s1", 500, lease_duration_s=0.01)
+    time.sleep(0.05)
+    r_stale2 = repo.reserve_extraction_budget(ws, doc_stale, "v1", "worker_s2", 500, lease_duration_s=15.0)
+    assert r_stale2.fence_token == 2
+    m_stale = make_manifest(doc_stale, "v1", "pub_s1")
+    with pytest.raises(RuntimeError) as exc_stale:
+        repo.save_manifest(ws, m_stale, fence_token=1, worker_id="worker_s1")
+    assert "superseded" in str(exc_stale.value) or "Worker fenced out" in str(exc_stale.value)
+
+    # 5. Fence advancement immediately before publication transaction:
+    doc_tx = "doc_tx_adv"
+    r_tx1 = repo.reserve_extraction_budget(ws, doc_tx, "v1", "worker_tx1", 500, lease_duration_s=15.0)
+    m_tx = make_manifest(doc_tx, "v1", "pub_tx")
+
+    client, _ = repo._get_resources()
+    orig_transact = client.transact_write_items
+
+    def advance_before_tx(*args, **kwargs):
+        client.update_item(
+            TableName=repo.table_name,
+            Key={"PK": {"S": f"WORKSPACE#{ws}"}, "SK": {"S": f"BUDGET#DOC#{doc_tx}#VER#v1"}},
+            UpdateExpression="SET fence_token = :f2",
+            ExpressionAttributeValues={":f2": {"N": "999"}},
+        )
+        return orig_transact(*args, **kwargs)
+
+    client.transact_write_items = advance_before_tx
+    try:
+        with pytest.raises(RuntimeError) as exc_tx:
+            repo.save_manifest(ws, m_tx, fence_token=r_tx1.fence_token, worker_id="worker_tx1")
+        assert "Worker fenced out" in str(exc_tx.value)
+    finally:
+        client.transact_write_items = orig_transact
+
+
+def test_fenced_publication_authority_at_write_sqlite_and_memory():
+    """Verify fenced write authority across SQLite and InMemory repositories:
+    Missing ledger, expired lease, wrong owner, and stale fence are rejected identically.
+    """
+    db_path = f"/tmp/kre_okf_fenced_auth_{uuid.uuid4().hex[:8]}.db"
+    try:
+        sqlite_repo = SQLiteOkfRepository(db_path=db_path)
+        mem_repo = InMemoryOkfRepository()
+        ws = "ws_auth_sm"
+        now_iso = _test_now_utc()
+
+        for repo in (sqlite_repo, mem_repo):
+            # 1. Missing ledger
+            m = OkfManifest(
+                workspace_id=ws, document_id="d_mis", document_version="v1",
+                entities=(), assertions=(), rejected_assertions_count=0, status="ready",
+                extraction_tokens=0, model_calls=0, idempotency_key=f"{ws}:d_mis:v1",
+                created_at=now_iso, publication_id="p1",
+            )
+            with pytest.raises(RuntimeError):
+                repo.save_manifest(ws, m, fence_token=1, worker_id="w1")
+
+            # 2. Expired lease
+            r_exp = repo.reserve_extraction_budget(ws, "d_exp", "v1", "w1", 500, lease_duration_s=0.01)
+            time.sleep(0.05)
+            m_exp = m.model_copy(update={"document_id": "d_exp", "idempotency_key": f"{ws}:d_exp:v1"})
+            with pytest.raises(RuntimeError):
+                repo.save_manifest(ws, m_exp, fence_token=r_exp.fence_token, worker_id="w1")
+
+            # 3. Wrong owner
+            r_own = repo.reserve_extraction_budget(ws, "d_own", "v1", "w_legit", 500, lease_duration_s=15.0)
+            m_own = m.model_copy(update={"document_id": "d_own", "idempotency_key": f"{ws}:d_own:v1"})
+            with pytest.raises(RuntimeError):
+                repo.save_manifest(ws, m_own, fence_token=r_own.fence_token, worker_id="w_wrong")
+
+            # 4. Stale fence
+            r_stale1 = repo.reserve_extraction_budget(ws, "d_stale", "v1", "w1", 500, lease_duration_s=0.01)
+            assert r_stale1.fence_token == 1
+            time.sleep(0.05)
+            r_stale2 = repo.reserve_extraction_budget(ws, "d_stale", "v1", "w2", 500, lease_duration_s=15.0)
+            assert r_stale2.fence_token == 2
+            m_stale = m.model_copy(update={"document_id": "d_stale", "idempotency_key": f"{ws}:d_stale:v1"})
+            with pytest.raises(RuntimeError):
+                repo.save_manifest(ws, m_stale, fence_token=1, worker_id="w1")
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+def test_reconciliation_preserves_lease_and_allows_legitimate_publication():
+    """Verify that reconciliation does not prematurely clear the worker lease,
+    enabling legitimate manifest publication under the agreed protocol.
+    Exercises DynamoDB Local, SQLite, and InMemory.
+    """
+    ddb_repo = _get_ddb_local_repo("kre_okf_test_reconcile_legit")
+    db_path = f"/tmp/kre_okf_rec_legit_{uuid.uuid4().hex[:8]}.db"
+    try:
+        sqlite_repo = SQLiteOkfRepository(db_path=db_path)
+        mem_repo = InMemoryOkfRepository()
+        ws = "ws_rec_legit"
+        now_iso = _test_now_utc()
+
+        for idx, repo in enumerate((ddb_repo, sqlite_repo, mem_repo)):
+            doc = f"doc_legit_{idx}"
+            ver = "v1"
+            wid = f"worker_legit_{idx}"
+
+            # Step 1: Reserve extraction budget
+            r = repo.reserve_extraction_budget(
+                workspace_id=ws,
+                document_id=doc,
+                document_version=ver,
+                worker_id=wid,
+                estimated_prompt_tokens=500,
+                max_output_tokens=200,
+                lease_duration_s=15.0,
+            )
+            assert r.granted is True
+            fence = r.fence_token
+
+            # Step 2: Reconcile completed call
+            rec = repo.reconcile_extraction_budget(
+                workspace_id=ws,
+                document_id=doc,
+                document_version=ver,
+                worker_id=wid,
+                fence_token=fence,
+                actual_prompt_tokens=450,
+                actual_output_tokens=120,
+            )
+            assert rec.reconciled is True
+            assert rec.fenced_out is False
+
+            # Verify lease is preserved on the ledger
+            ledger = repo.get_budget_ledger(ws, doc, ver, consistent_read=True)
+            assert ledger is not None
+            assert ledger.lease_owner_id == wid
+            assert ledger.lease_expires_at > time.time()
+            assert ledger.completed_calls == 1
+            assert ledger.spent_tokens == 570
+
+            # Step 3: Legitimate publication commit succeeds
+            ent = OkfEntityRecord(
+                workspace_id=ws,
+                entity_id=f"e_legit_{idx}",
+                entity_name="LegitCorp",
+                normalized_name="legitcorp",
+                entity_type="organization",
+                document_id=doc,
+                document_version=ver,
+                created_at=now_iso,
+                publication_id=f"pub_legit_{idx}",
+            )
+            ass = OkfPropertyAssertion(
+                assertion_id=f"a_legit_{idx}",
+                workspace_id=ws,
+                document_id=doc,
+                document_version=ver,
+                entity_id=f"e_legit_{idx}",
+                entity_name="LegitCorp",
+                property_key="status",
+                property_value="operational",
+                source_chunk_id="c1",
+                created_at=now_iso,
+                publication_id=f"pub_legit_{idx}",
+            )
+            man = OkfManifest(
+                workspace_id=ws,
+                document_id=doc,
+                document_version=ver,
+                entities=(ent,),
+                assertions=(ass,),
+                rejected_assertions_count=0,
+                status="ready",
+                extraction_tokens=570,
+                model_calls=1,
+                idempotency_key=f"{ws}:{doc}:{ver}",
+                created_at=now_iso,
+                publication_id=f"pub_legit_{idx}",
+            )
+
+            repo.save_manifest(ws, man, fence_token=fence, worker_id=wid)
+            assert repo.has_ready_okf(ws, doc, ver) is True
+
+            # Step 4: Retrieval returns the facts
+            boundary_repo = InMemoryWorkspaceBoundaryRepository()
+            boundary_repo.save_document_snapshot(DocumentSnapshot(
+                workspace_id=ws,
+                document_id=doc,
+                source=f"{doc}.pdf",
+                version=ver,
+                format="pdf",
+                created_at=now_iso,
+                okf_status="ready",
+            ))
+            retriever = OkfRetriever(repository=repo, boundary_repo=boundary_repo)
+            lookup = retriever.lookup_sync(ws, "What is LegitCorp status?", target_entities=["LegitCorp"], document_ids=[doc])
+            assert lookup.entity_state == "unique"
+            assert [a.property_value for a in lookup.matched_assertions] == ["operational"]
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+def test_dynamodb_stale_entity_pagination_safety_bound_fails_closed():
+    """LIVE DYNAMODB LOCAL EVIDENCE:
+    Verifies that when GSI1 entity resolution encounters excessive stale pages,
+    it enforces the safety bound (max 5 pages) to protect the 50ms retrieval deadline,
+    raises StorageUnavailableError, and fails closed with execution_status='storage_failed'.
+    """
+    repo = _get_ddb_local_repo("kre_okf_test_entity_pagination")
+    ws = "ws_pag_test"
+    doc = "doc_pag"
+    ver = "v1"
+    now_iso = _test_now_utc()
+    cand = "pagcorp"
+
+    # Save a ready manifest so active_ready_versions includes doc
+    man_active = OkfManifest(
+        workspace_id=ws,
+        document_id=doc,
+        document_version=ver,
+        entities=(),
+        assertions=(),
+        rejected_assertions_count=0,
+        status="ready",
+        extraction_tokens=0,
+        model_calls=0,
+        idempotency_key=f"{ws}:{doc}:{ver}",
+        created_at=now_iso,
+        publication_id="pub_active",
+    )
+    repo.save_manifest(ws, man_active)
+
+    _, table = repo._get_resources()
+    with table.batch_writer() as batch:
+        for i in range(60):
+            stale_pub = f"pub_stale_{i:03d}"
+            ent = OkfEntityRecord(
+                workspace_id=ws,
+                entity_id=f"ent_{i}",
+                entity_name="PagCorp",
+                normalized_name=cand,
+                entity_type="organization",
+                document_id=f"doc_old_{i}",
+                document_version="v0",
+                created_at=now_iso,
+                publication_id=stale_pub,
+            )
+            item = {
+                "PK": f"WORKSPACE#{ws}",
+                "SK": f"ENTITY#ent_{i}#DOC#doc_old_{i}#VER#v0#PUB#{stale_pub}",
+                "GSI1PK": f"WORKSPACE#{ws}",
+                "GSI1SK": f"ENTITY_NAME#{cand}#{i:03d}",
+                "record_type": "ENTITY",
+                "workspace_id": ws,
+                "entity_id": f"ent_{i}",
+                "document_id": f"doc_old_{i}",
+                "document_version": "v0",
+                "normalized_name": cand,
+                "publication_id": stale_pub,
+                "data_json": ent.model_dump_json(),
+                "created_at": now_iso,
+            }
+            batch.put_item(Item=item)
+
+    orig_query = table.query
+    query_call_count = [0]
+
+    def paginated_query(**kwargs):
+        query_call_count[0] += 1
+        kwargs.pop("ExclusiveStartKey", None)
+        resp = orig_query(**kwargs)
+        resp["LastEvaluatedKey"] = {
+            "PK": f"WORKSPACE#{ws}",
+            "SK": f"ENTITY#mock#{query_call_count[0]}",
+            "GSI1PK": f"WORKSPACE#{ws}",
+            "GSI1SK": f"ENTITY_NAME#{cand}#{query_call_count[0]:03d}",
+        }
+        return resp
+
+    table.query = paginated_query
+    try:
+        with pytest.raises(StorageUnavailableError) as exc_info:
+            repo.resolve_entities(
+                workspace_id=ws,
+                candidate_names=["PagCorp"],
+                limit=10,
+                active_document_versions={doc: ver},
+                active_publications={doc: "pub_active"},
+            )
+        assert "exceeded safety bound" in str(exc_info.value)
+        assert query_call_count[0] == 5
+
+        boundary_repo = InMemoryWorkspaceBoundaryRepository()
+        boundary_repo.save_document_snapshot(DocumentSnapshot(
+            workspace_id=ws,
+            document_id=doc,
+            source=f"{doc}.pdf",
+            version=ver,
+            format="pdf",
+            created_at=now_iso,
+            okf_status="ready",
+        ))
+        retriever = OkfRetriever(repository=repo, boundary_repo=boundary_repo)
+        result = retriever.lookup_sync(ws, "What is PagCorp?", target_entities=["PagCorp"], document_ids=[doc], deadline_ms=2000)
+        assert result.execution_status == "storage_failed"
+        assert result.entity_state == "none"
+        assert len(result.matched_assertions) == 0
+    finally:
+        table.query = orig_query
+
+
 
 
