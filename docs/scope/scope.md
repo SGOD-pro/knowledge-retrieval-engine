@@ -22,7 +22,7 @@ _These are recommendations to keep your build orderly, not requirements. Skip an
 | 4 | Core walking skeleton | Slice 1 | done |
 | 5 | PageIndex structural retrieval | Slice 2 | done |
 | 6 | OKF integration | Slice 3 | done |
-| 7 | Knowledge graph enrichment | Slice 4 | planned |
+| 7 | Knowledge graph enrichment | Slice 4 | in-progress |
 | 8 | Knowledge Map and requirement router | Slice 5 | planned |
 | 9 | Evidence verification and answer assembly | Slice 6 | planned |
 | 10 | End to end interface integration | Slice 7 | planned |
@@ -147,10 +147,19 @@ Spec [0006](../specs/0006-okf-integration.md) · code in `backend/src/`
 
 ## Slice 4: Knowledge graph enrichment
 
-### 7. Knowledge graph enrichment · needs a decision
-Plan knowledge graph enrichment as a subsequent, independently verifiable slice after the baseline works.
-**Done when:** the knowledge graph is integrated and independently verified.
-- [ ] Design it (spec): `/architect knowledge graph enrichment`
+### 7. Knowledge graph enrichment · in-progress
+Extract typed entity relationships, enforce verbatim grounding and durable budget fencing, run bounded multi hop traversal with targeted chunk hydration, and pool candidates softly into reciprocal rank fusion.
+**Done when:** typed knowledge graph entities and directed relationships are extracted from active chunks with verbatim grounding and durable budget fencing, partitioned storage supports bounded multi hop traversal and targeted chunk hydration without table scans, and candidates pool softly into reciprocal rank fusion without displacing baseline retrieval.
+- [x] Design it (spec): `/architect knowledge graph enrichment`
+- [ ] Build it: `/develop knowledge graph enrichment`
+   - [ ] Typed contracts, partitioned storage repository, and durable budget fencing (AC-1, AC-4, AC-6, AC-7, AC-11)
+   - [ ] Grounded ingestion extraction, verbatim validation, and token accounting (AC-1, AC-2, AC-3, AC-5)
+   - [ ] Bounded multi hop traversal, concurrency admission, and targeted chunk hydration (AC-6, AC-8, AC-9)
+   - [ ] Pipeline reciprocal rank fusion, snapshot metadata, and telemetry trace (AC-10, AC-11, AC-12)
+   - [ ] Offline ablation suite, counterexample safety, and benchmark comparator barrier (AC-10, AC-13)
+- [ ] Verify it: `/check verify knowledge graph enrichment`
+- [ ] Test it: `/test knowledge graph enrichment`
+Spec [0007](../specs/0007-knowledge-graph-enrichment.md) · code in `backend/src/`
 
 ## Slice 5: LAYA bounded escalation
 
