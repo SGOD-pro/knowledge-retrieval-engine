@@ -37,14 +37,16 @@ Prior rounds established and verified:
 This hardening resolves the remaining publication races across [`backend/src/db/okf_repo.py`](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/db/okf_repo.py), [`backend/src/ingestion/okf_builder.py`](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/ingestion/okf_builder.py), and [`backend/tests/test_okf_slice3_1.py`](file:///home/swyra/projects/knowledge-retrieval-engine/backend/tests/test_okf_slice3_1.py):
 
 1. **SQLite publication ordering atomic across separate connections**:
-   * In [`backend/src/db/okf_repo.py`](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/db/okf_repo.py), `SQLiteOkfRepository.save_manifest` replaces deferred pre read assumptions with atomic conditional statements:
-     * When `target_base is None`, executes `INSERT INTO kre_okf_facts ... SELECT ... WHERE NOT EXISTS (SELECT 1 FROM kre_okf_facts WHERE pk = ? AND sk = ?)`.
-     * When `target_base is not None`, executes `INSERT OR REPLACE INTO kre_okf_facts ... SELECT ... WHERE EXISTS (SELECT 1 FROM kre_okf_facts WHERE pk = ? AND sk = ? AND json_extract(data_json, '$.publication_id') = ?)`.
-   * If a concurrent worker committed a manifest between the repository level pre check and the write, `cur.rowcount` is 0. The repository performs a post write inspection and raises `RuntimeError` describing the exact concurrent conflict, leaving the first committed publication intact.
+   * In [`backend/src/db/okf_repo.py`](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/db/okf_repo.py), `SQLiteOkfRepository.save_manifest` combines base publication conditions with all applicable budget ledger, lease expiry, and ready state protections in one atomic conditional SQL statement:
+     * When `target_base is None`, executes `INSERT INTO kre_okf_facts ... SELECT ... WHERE NOT EXISTS (SELECT 1 FROM kre_okf_facts WHERE pk = ? AND sk = ?) AND NOT EXISTS (SELECT 1 FROM kre_okf_facts WHERE pk = ? AND sk = ? AND json_extract(data_json, '$.lease_expires_at') > ? AND json_extract(data_json, '$.status') = 'active')`.
+     * When `target_base is not None`, executes `INSERT OR REPLACE INTO kre_okf_facts ... SELECT ... WHERE EXISTS (SELECT 1 FROM kre_okf_facts WHERE pk = ? AND sk = ? AND json_extract(data_json, '$.publication_id') = ?) AND NOT EXISTS (SELECT 1 FROM kre_okf_facts WHERE pk = ? AND sk = ? AND json_extract(data_json, '$.lease_expires_at') > ? AND json_extract(data_json, '$.status') = 'active')`.
+   * If a concurrent worker committed a manifest or acquired an active extraction lease between the repository level pre check and the write, `cur.rowcount` is 0. The repository performs a post write inspection and raises `RuntimeError` describing the exact concurrent conflict, leaving the first committed publication and lease intact.
    * Deterministic test `test_sqlite_publication_ordering_atomic_across_separate_connections` hooks Worker A's connection, pauses Worker A after its pre check query, allows Worker B on a separate connection to commit a ready manifest, resumes Worker A, and proves Worker A is rejected while Worker B remains authoritative for both absent base and replaced base scenarios.
+   * Deterministic test `test_sqlite_unfenced_publication_ordering_blocked_by_concurrent_lease_across_separate_connections` hooks Worker A's connection, pauses Worker A after its pre check query, allows Worker B on a separate connection to acquire an active Bedrock extraction lease without modifying any manifest, resumes Worker A, and proves Worker A is rejected with `RuntimeError` while Worker B's lease remains active for both absent base and replaced base scenarios.
 
-2. **Lease expiry and clock assumptions at write dispatch**:
-   * Explicit clock and network delay assumptions: DynamoDB condition expressions evaluate client supplied values (`:now_epoch`) because DynamoDB does not evaluate physical wall clock timestamps inside server side expressions. Clocks across workers must remain synchronized within standard NTP tolerances.
+2. **Lease authority, client timeouts, and clock assumptions at write dispatch**:
+   * Pre dispatch timestamp validation versus fence advancement: Expiry validated locally before dispatch checks `now < lease_expires_at`. DynamoDB condition expressions compare client supplied constant epoch values (`:now_epoch`) because DynamoDB does not evaluate physical wall clock timestamps inside server side expressions. Clocks across workers must remain synchronized within standard NTP tolerances.
+   * Socket timeouts and uncertain commit outcomes: Client socket timeouts (such as a 40ms read timeout) do not cancel or bound server side transaction processing in DynamoDB. If a write request experiences network latency and reaches DynamoDB after the local lease duration expires but before a competing worker acquires a new lease or advances the fence, DynamoDB commits the write because the condition expression checks fence equality and client supplied expiration. Strict rejection after lease expiration is guaranteed once another worker advances the monotonic fence token (`fence_token > expected_fence`). Delayed commits and uncertain outcomes are documented without claiming strict server side physical expiry enforcement.
    * Client side re sampling: [`backend/src/db/okf_repo.py`](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/db/okf_repo.py) re samples `tx_now_epoch = Decimal(str(round(time.time(), 4)))` immediately before constructing the transaction condition check, ensuring any delays during serialization or staging invalidate expired leases at dispatch time. SQLite similarly re samples `write_now_ts = time.time()` immediately before statement execution.
    * Deterministic test `test_lease_expiry_and_fence_advancement_during_publication_interval` verifies:
      * A lease that expires after budget ledger validation but before transaction execution fails closed on both DynamoDB Local and SQLite with `RuntimeError`.
@@ -55,25 +57,25 @@ This hardening resolves the remaining publication races across [`backend/src/db/
    * Budget reservations are maintained durably in the dedicated budget ledger (`BUDGET#DOC#{doc}#VER#{ver}`) without modifying the manifest row.
    * When an attempt encounters a failure or timeout, the builder avoids overwriting a prior ready manifest with an in flight failed manifest.
    * In [`backend/src/db/okf_repo.py`](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/db/okf_repo.py), `InMemoryOkfRepository`, `SQLiteOkfRepository`, and `DynamoDBOkfRepository` reject attempts to overwrite a ready manifest with a failed manifest.
-   * Deterministic test `test_preserve_ready_pdf_publication_during_new_attempt_failures` exercises all three engines across four distinct failure modes:
-     * Mid attempt crash after budget reservation.
-     * Provider call timeout (`TimeoutError`).
-     * Budget spend reconciliation storage failure.
-     * Failed final manifest write transaction.
+   * Deterministic test `test_preserve_ready_pdf_publication_during_new_attempt_failures` exercises all three engines across four distinct failure modes on independent documents and budget ledgers:
+     * Mid attempt crash after budget reservation, ensuring reservation succeeds before crash.
+     * Provider call timeout (`TimeoutError`), ensuring reservation succeeds, Converse is dispatched (`call_count >= 1`), and prior publication survives.
+     * Budget spend reconciliation storage failure, ensuring reservation succeeds, reconciliation is intercepted, and prior publication survives.
+     * Failed final manifest write transaction, ensuring reservation succeeds, ready manifest save is attempted, and prior publication survives.
    * In all cases across InMemory, SQLite, and DynamoDB Local, the initial ready publication remains authoritative, and assertions remain fully retrievable via `OkfRetriever.lookup_sync`.
 
 ## Test Suite Execution Results
 
 * Focused test execution:
-  `cd backend && PYTHONPATH=src uv run pytest tests/test_okf_slice3_1.py -k "test_sqlite_publication_ordering_atomic_across_separate_connections or test_lease_expiry_and_fence_advancement_during_publication_interval or test_preserve_ready_pdf_publication_during_new_attempt_failures" -v`
-  3 passed in 4.19s
+  `cd backend && PYTHONPATH=src uv run pytest tests/test_okf_slice3_1.py -k "test_sqlite_publication_ordering_atomic_across_separate_connections or test_sqlite_unfenced_publication_ordering_blocked_by_concurrent_lease_across_separate_connections or test_lease_expiry_and_fence_advancement_during_publication_interval or test_preserve_ready_pdf_publication_during_new_attempt_failures" -v`
+  4 passed in 5.38s
 * Complete Slice 3.1 suite:
   `cd backend && PYTHONPATH=src uv run pytest tests/test_okf_slice3_1.py`
-  56 passed in 10.68s
+  57 passed in 10.44s
 * Complete OKF regression suite:
   `cd backend && PYTHONPATH=src uv run pytest tests/test_okf_slice1.py tests/test_okf_ablation_slice2.py tests/test_okf_correctness_regressions.py tests/test_okf_graph_contract.py tests/test_contracts_and_identity.py`
-  112 passed in 30.06s
-* Total OKF test suite: 168 passed in 40.74s
+  112 passed in 12.74s
+* Total OKF test suite: 169 passed in 23.18s
 * Zero test failures, zero errors, zero skips.
 
 ## Environment and Storage Emulation
@@ -92,6 +94,6 @@ This hardening resolves the remaining publication races across [`backend/src/db/
 ## Specification and Scope Status
 
 * [`docs/specs/0006-okf-integration.md`](file:///home/swyra/projects/knowledge-retrieval-engine/docs/specs/0006-okf-integration.md): Updated with Item 21 in build plan and extended `AC-3` details.
-* [`docs/specs/0006-verify.md`](file:///home/swyra/projects/knowledge-retrieval-engine/docs/specs/0006-verify.md): Updated recording 56 passing tests in `test_okf_slice3_1.py`.
+* [`docs/specs/0006-verify.md`](file:///home/swyra/projects/knowledge-retrieval-engine/docs/specs/0006-verify.md): Updated recording 57 passing tests in `test_okf_slice3_1.py`.
 * [`docs/specs/0007-knowledge-graph-enrichment.md`](file:///home/swyra/projects/knowledge-retrieval-engine/docs/specs/0007-knowledge-graph-enrichment.md): Remains Proposed and planned; zero claims of implementation.
 * Specification 0003: Remains Proposed and deferred.

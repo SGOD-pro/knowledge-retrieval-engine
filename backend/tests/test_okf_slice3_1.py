@@ -4724,6 +4724,185 @@ def test_sqlite_publication_ordering_atomic_across_separate_connections():
             os.remove(db_path)
 
 
+def test_sqlite_unfenced_publication_ordering_blocked_by_concurrent_lease_across_separate_connections():
+    """Verifies that an unfenced manifest write (e.g. CSV) is blocked atomically if a competing
+    worker acquires an active Bedrock extraction lease on the budget ledger, across separate connections:
+    1. Initially absent base manifest (target_base = None):
+       Worker A performs repository-level pre-check (seeing no manifest and no lease), then pauses.
+       Worker B on a separate connection acquires an active Bedrock extraction lease on the budget ledger.
+       Worker B does NOT write or modify any manifest.
+       Worker A resumes; its atomic conditional write fails because active lease exists on budget ledger.
+       Worker A is rejected with RuntimeError ('active lease held'); Worker B's lease remains active.
+    2. Existing base publication (target_base = pub_init):
+       Worker B publishes initial ready publication pub_init.
+       Worker A stages replacement with base_publication_id=pub_init.
+       Worker A performs repository-level pre-check (seeing pub_init and no lease), then pauses.
+       Worker B acquires an active Bedrock extraction lease on the budget ledger without modifying the manifest.
+       Worker A resumes; its atomic conditional write fails because active lease exists on budget ledger.
+       Worker A is rejected with RuntimeError ('active lease held'); manifest remains pub_init."""
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+        db_path = tmp.name
+
+    try:
+        repo_a = SQLiteOkfRepository(db_path=db_path)
+        repo_b = SQLiteOkfRepository(db_path=db_path)
+
+        ws = "ws_unfenced_lease_race"
+        ver = "v1"
+        now_iso = "2026-11-02T00:00:00Z"
+
+        # --- Scenario 1: Initially absent base manifest ---
+        doc1 = "doc_unfenced_absent"
+        pub_a1 = "pub_worker_a_absent"
+        ent_a1 = OkfEntityRecord(
+            workspace_id=ws, entity_id="ent_a1", entity_name="Alpha Corp", normalized_name="alpha corp",
+            entity_type="organization", document_id=doc1, document_version=ver, publication_id=pub_a1, created_at=now_iso,
+        )
+        ass_a1 = OkfPropertyAssertion(
+            assertion_id="ass_a1_1", workspace_id=ws, entity_id="ent_a1", entity_name="Alpha Corp",
+            property_key="metric_a", property_value="val_a", source_chunk_id="c1", document_id=doc1, document_version=ver,
+            confidence_score=1.0, validation_status="verified", created_at=now_iso, publication_id=pub_a1,
+        )
+        man_a1 = OkfManifest(
+            workspace_id=ws, document_id=doc1, document_version=ver,
+            entities=(ent_a1,), assertions=(ass_a1,), rejected_assertions_count=0,
+            status="ready", extraction_tokens=100, model_calls=1,
+            idempotency_key=f"{ws}:{doc1}:{ver}:a1", created_at=now_iso, publication_id=pub_a1,
+            base_publication_id=None,
+        )
+
+        proxy_a = ConnProxy(repo_a._conn)
+        repo_a._conn = proxy_a
+
+        a_checked_event = threading.Event()
+        resume_a_event = threading.Event()
+
+        def hook_1(sql, *args, **kwargs):
+            if "SELECT data_json FROM kre_okf_facts WHERE pk = ? AND sk = ?" in sql and "MANIFEST#" in str(args):
+                a_checked_event.set()
+                resume_a_event.wait(timeout=5.0)
+
+        proxy_a.hook = hook_1
+
+        worker_a_err = []
+        def run_worker_a():
+            try:
+                repo_a.save_manifest(ws, man_a1, base_publication_id=None)
+            except Exception as e:
+                worker_a_err.append(e)
+
+        t_a = threading.Thread(target=run_worker_a, name="WorkerA1")
+        t_a.start()
+
+        # Wait until Worker A finishes its repository-level base/lease check
+        assert a_checked_event.wait(timeout=5.0)
+
+        # Worker B on repo_b acquires an active Bedrock extraction lease on the budget ledger.
+        # Worker B does NOT write or modify any manifest.
+        res_b = repo_b.reserve_extraction_budget(
+            workspace_id=ws, document_id=doc1, document_version=ver,
+            worker_id="worker_b", estimated_prompt_tokens=500, max_output_tokens=300,
+            max_calls=2, lease_duration_s=60.0,
+        )
+        assert res_b.granted is True
+
+        # Resume Worker A
+        resume_a_event.set()
+        t_a.join(timeout=5.0)
+
+        # Worker A must have been rejected by the atomic conditional insert
+        assert len(worker_a_err) == 1
+        assert isinstance(worker_a_err[0], RuntimeError)
+        assert "active lease held" in str(worker_a_err[0])
+
+        # Worker A's manifest was NOT committed; Worker B's lease is intact
+        assert repo_b.has_ready_okf(ws, doc1, ver) is False
+        assert repo_b.get_manifest(ws, doc1, ver) is None
+        ledger1 = repo_b.get_budget_ledger(ws, doc1, ver)
+        assert ledger1 is not None
+        assert ledger1.lease_owner_id == "worker_b"
+
+        # --- Scenario 2: Existing base publication ---
+        doc2 = "doc_unfenced_existing"
+        pub_init = "pub_init_ready"
+        ent_init = OkfEntityRecord(
+            workspace_id=ws, entity_id="ent_init", entity_name="Beta Corp", normalized_name="beta corp",
+            entity_type="organization", document_id=doc2, document_version=ver, publication_id=pub_init, created_at=now_iso,
+        )
+        ass_init = OkfPropertyAssertion(
+            assertion_id="ass_init_1", workspace_id=ws, entity_id="ent_init", entity_name="Beta Corp",
+            property_key="metric_b", property_value="val_b", source_chunk_id="c1", document_id=doc2, document_version=ver,
+            confidence_score=1.0, validation_status="verified", created_at=now_iso, publication_id=pub_init,
+        )
+        man_init = OkfManifest(
+            workspace_id=ws, document_id=doc2, document_version=ver,
+            entities=(ent_init,), assertions=(ass_init,), rejected_assertions_count=0,
+            status="ready", extraction_tokens=100, model_calls=1,
+            idempotency_key=f"{ws}:{doc2}:{ver}:init", created_at=now_iso, publication_id=pub_init,
+        )
+        repo_b.save_manifest(ws, man_init)
+        assert repo_b.has_ready_okf(ws, doc2, ver) is True
+
+        pub_a2 = "pub_worker_a_replacement"
+        man_a2 = OkfManifest(
+            workspace_id=ws, document_id=doc2, document_version=ver,
+            entities=(ent_init,), assertions=(ass_init,), rejected_assertions_count=0,
+            status="ready", extraction_tokens=150, model_calls=1,
+            idempotency_key=f"{ws}:{doc2}:{ver}:a2", created_at=now_iso, publication_id=pub_a2,
+            base_publication_id=pub_init,
+        )
+
+        a_checked_event_2 = threading.Event()
+        resume_a_event_2 = threading.Event()
+
+        def hook_2(sql, *args, **kwargs):
+            if "SELECT data_json FROM kre_okf_facts WHERE pk = ? AND sk = ?" in sql and "MANIFEST#" in str(args):
+                a_checked_event_2.set()
+                resume_a_event_2.wait(timeout=5.0)
+
+        proxy_a.hook = hook_2
+
+        worker_a2_err = []
+        def run_worker_a2():
+            try:
+                repo_a.save_manifest(ws, man_a2, base_publication_id=pub_init)
+            except Exception as e:
+                worker_a2_err.append(e)
+
+        t_a2 = threading.Thread(target=run_worker_a2, name="WorkerA2")
+        t_a2.start()
+
+        assert a_checked_event_2.wait(timeout=5.0)
+
+        # Worker B acquires Bedrock lease on doc2 without modifying the manifest
+        res_b2 = repo_b.reserve_extraction_budget(
+            workspace_id=ws, document_id=doc2, document_version=ver,
+            worker_id="worker_b2", estimated_prompt_tokens=500, max_output_tokens=300,
+            max_calls=2, lease_duration_s=60.0,
+        )
+        assert res_b2.granted is True
+
+        # Resume Worker A2
+        resume_a_event_2.set()
+        t_a2.join(timeout=5.0)
+
+        assert len(worker_a2_err) == 1
+        assert isinstance(worker_a2_err[0], RuntimeError)
+        assert "active lease held" in str(worker_a2_err[0])
+
+        # Manifest remains pub_init; replacement man_a2 was NOT committed
+        cur_man2 = repo_b.get_manifest(ws, doc2, ver)
+        assert cur_man2 is not None
+        assert cur_man2.publication_id == pub_init
+        ledger2 = repo_b.get_budget_ledger(ws, doc2, ver)
+        assert ledger2 is not None
+        assert ledger2.lease_owner_id == "worker_b2"
+
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
 def test_lease_expiry_and_fence_advancement_during_publication_interval():
     """Verifies publication authority enforcement when lease expires or fence advances
     after initial validation but before write execution:
@@ -4845,9 +5024,12 @@ def test_preserve_ready_pdf_publication_during_new_attempt_failures():
     2. Provider call timeout (TimeoutError fails open without replacing manifest)
     3. Spend reconciliation failure (budget reconciliation error fails open)
     4. Failed final manifest write (storage error preserves prior ready manifest)
-    Across InMemory, SQLite, and DynamoDB Local. Prior ready assertions remain retrievable."""
+    Across InMemory, SQLite, and DynamoDB Local. Each scenario runs on an independent document
+    and budget ledger, verifying successful reservation before failure injection, actual dispatch,
+    and survival of prior assertions in retrieval."""
     from unittest.mock import MagicMock
     from src.schemas.contracts.boundary import DocumentSnapshot
+    from src.ingestion.okf_builder import _EXTRACTION_BUDGETS
 
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
         db_path = tmp.name
@@ -4862,85 +5044,94 @@ def test_preserve_ready_pdf_publication_during_new_attempt_failures():
         for repo in (mem_repo, sqlite_repo, ddb_repo):
             engine_name = repo.__class__.__name__
             ws = f"ws_pres_{engine_name}"
-            doc = f"doc_pres_{engine_name}"
             ver = "v1"
 
-            # Step 0: Publish initial ready publication (pub_initial)
-            pub_init = f"pub_init_{engine_name}"
-            ent_init = OkfEntityRecord(
-                workspace_id=ws, entity_id=f"e_{engine_name}", entity_name="AcmeCorp", normalized_name="acmecorp",
-                entity_type="organization", document_id=doc, document_version=ver, publication_id=pub_init, created_at=now_iso,
-            )
-            ass_init = OkfPropertyAssertion(
-                assertion_id=f"a_{engine_name}", workspace_id=ws, entity_id=f"e_{engine_name}", entity_name="AcmeCorp",
-                property_key="revenue", property_value="50M", source_chunk_id="c1", document_id=doc, document_version=ver,
-                page_number=1, confidence_score=1.0, validation_status="verified", created_at=now_iso, publication_id=pub_init,
-            )
-            man_init = OkfManifest(
-                workspace_id=ws, document_id=doc, document_version=ver,
-                entities=(ent_init,), assertions=(ass_init,), rejected_assertions_count=0,
-                status="ready", extraction_tokens=200, model_calls=1,
-                idempotency_key=f"{ws}:{doc}:{ver}:init", created_at=now_iso, publication_id=pub_init,
-            )
-            repo.save_manifest(ws, man_init)
-
-            assert repo.has_ready_okf(ws, doc, ver) is True
-            initial_man = repo.get_manifest(ws, doc, ver)
-            assert initial_man.publication_id == pub_init
-            assert initial_man.status == "ready"
-
             boundary_repo = InMemoryWorkspaceBoundaryRepository()
-            boundary_repo.save_document_snapshot(DocumentSnapshot(
-                workspace_id=ws, document_id=doc, source=f"{doc}.pdf", version=ver,
-                format="pdf", created_at=now_iso, okf_status="ready",
-            ))
             retriever = OkfRetriever(repository=repo, boundary_repo=boundary_repo)
 
-            lookup = retriever.lookup_sync(ws, "What is AcmeCorp revenue?", target_entities=["AcmeCorp"], document_ids=[doc])
-            assert len(lookup.matched_assertions) == 1
-            assert lookup.matched_assertions[0].property_value == "50M"
-
-            test_chunk = Chunk(
-                id="c1", document_id=doc, source_format="pdf", text="AcmeCorp reported revenue of 50M this quarter.",
-                element_type="text", page_number=1,
-            )
+            def setup_ready_doc(doc_id: str, pub_id: str, prop_val: str = "50M"):
+                ent = OkfEntityRecord(
+                    workspace_id=ws, entity_id=f"e_{doc_id}", entity_name="AcmeCorp", normalized_name="acmecorp",
+                    entity_type="organization", document_id=doc_id, document_version=ver, publication_id=pub_id, created_at=now_iso,
+                )
+                ass = OkfPropertyAssertion(
+                    assertion_id=f"a_{doc_id}", workspace_id=ws, entity_id=f"e_{doc_id}", entity_name="AcmeCorp",
+                    property_key="revenue", property_value=prop_val, source_chunk_id="c1", document_id=doc_id, document_version=ver,
+                    page_number=1, confidence_score=1.0, validation_status="verified", created_at=now_iso, publication_id=pub_id,
+                )
+                man = OkfManifest(
+                    workspace_id=ws, document_id=doc_id, document_version=ver,
+                    entities=(ent,), assertions=(ass,), rejected_assertions_count=0,
+                    status="ready", extraction_tokens=0, model_calls=0,
+                    idempotency_key=f"{ws}:{doc_id}:{ver}:init", created_at=now_iso, publication_id=pub_id,
+                )
+                repo.save_manifest(ws, man)
+                boundary_repo.save_document_snapshot(DocumentSnapshot(
+                    workspace_id=ws, document_id=doc_id, source=f"{doc_id}.pdf", version=ver,
+                    format="pdf", created_at=now_iso, okf_status="ready",
+                ))
 
             # --- Failure Mode 1: Crash mid-attempt ---
-            # Worker 2 starts a new attempt, reserves budget, then crashes before provider call
-            res_crash = repo.reserve_extraction_budget(ws, doc, ver, "worker_crash", 100, 200, 2, 3000, 15.0)
+            doc_crash = f"doc_crash_{engine_name}"
+            pub_crash = f"pub_crash_{engine_name}"
+            setup_ready_doc(doc_crash, pub_crash)
+            assert repo.has_ready_okf(ws, doc_crash, ver) is True
+            lookup_pre_1 = retriever.lookup_sync(ws, "What is AcmeCorp revenue?", target_entities=["AcmeCorp"], document_ids=[doc_crash], deadline_ms=200.0)
+            assert len(lookup_pre_1.matched_assertions) == 1 and lookup_pre_1.matched_assertions[0].property_value == "50M"
+
+            # Worker reserves budget and crashes before provider call
+            _EXTRACTION_BUDGETS.clear()
+            res_crash = repo.reserve_extraction_budget(ws, doc_crash, ver, "worker_crash", 100, 200, 2, 3000, 15.0)
             assert res_crash.granted is True
 
             # Assert ready manifest was NOT replaced by in-flight attempt
-            assert repo.has_ready_okf(ws, doc, ver) is True
-            cur_man = repo.get_manifest(ws, doc, ver)
-            assert cur_man.publication_id == pub_init
-            assert cur_man.status == "ready"
-
-            # Assert assertions remain retrievable
-            lookup = retriever.lookup_sync(ws, "What is AcmeCorp revenue?", target_entities=["AcmeCorp"], document_ids=[doc])
-            assert len(lookup.matched_assertions) == 1
-            assert lookup.matched_assertions[0].property_value == "50M"
+            assert repo.has_ready_okf(ws, doc_crash, ver) is True
+            cur_man_1 = repo.get_manifest(ws, doc_crash, ver)
+            assert cur_man_1.publication_id == pub_crash and cur_man_1.status == "ready"
+            lookup_post_1 = retriever.lookup_sync(ws, "What is AcmeCorp revenue?", target_entities=["AcmeCorp"], document_ids=[doc_crash], deadline_ms=200.0)
+            assert len(lookup_post_1.matched_assertions) == 1 and lookup_post_1.matched_assertions[0].property_value == "50M"
 
             # --- Failure Mode 2: Provider call timeout ---
+            doc_timeout = f"doc_timeout_{engine_name}"
+            pub_timeout = f"pub_timeout_{engine_name}"
+            setup_ready_doc(doc_timeout, pub_timeout)
+            assert repo.has_ready_okf(ws, doc_timeout, ver) is True
+
+            # Ensure reservation succeeds before injecting the intended failure
+            _EXTRACTION_BUDGETS.clear()
+            res_timeout = repo.reserve_extraction_budget(ws, doc_timeout, ver, "worker_timeout", 100, 200, 2, 3000, 15.0)
+            assert res_timeout.granted is True
+
             mock_timeout_client = MagicMock()
             mock_timeout_client.count_tokens.return_value = {"inputTokens": 100}
             mock_timeout_client.converse.side_effect = TimeoutError("Read timeout from Bedrock")
 
+            chunk_timeout = Chunk(id="c1", document_id=doc_timeout, source_format="pdf", text="AcmeCorp reported revenue of 50M this quarter.", element_type="text", page_number=1)
             builder_timeout = OkfBuilder(repo=repo, bedrock_client=mock_timeout_client, worker_id="worker_timeout")
-            ret_timeout = builder_timeout.extract_and_persist(ws, doc, ver, "pdf", [test_chunk], force_reextract=True)
+
+            ret_timeout = builder_timeout.extract_and_persist(ws, doc_timeout, ver, "pdf", [chunk_timeout], force_reextract=True)
             assert ret_timeout.status == "failed"
+            # Assert timeout scenario actually dispatched Converse
+            assert mock_timeout_client.converse.call_count >= 1
 
-            # Repository manifest remains the prior ready publication
-            assert repo.has_ready_okf(ws, doc, ver) is True
-            cur_man = repo.get_manifest(ws, doc, ver)
-            assert cur_man.publication_id == pub_init
-            assert cur_man.status == "ready"
-
-            lookup = retriever.lookup_sync(ws, "What is AcmeCorp revenue?", target_entities=["AcmeCorp"], document_ids=[doc])
-            assert len(lookup.matched_assertions) == 1
-            assert lookup.matched_assertions[0].property_value == "50M"
+            # Prior ready publication survives
+            assert repo.has_ready_okf(ws, doc_timeout, ver) is True
+            cur_man_2 = repo.get_manifest(ws, doc_timeout, ver)
+            assert cur_man_2.publication_id == pub_timeout and cur_man_2.status == "ready"
+            lookup_post_2 = retriever.lookup_sync(ws, "What is AcmeCorp revenue?", target_entities=["AcmeCorp"], document_ids=[doc_timeout], deadline_ms=200.0)
+            assert len(lookup_post_2.matched_assertions) == 1 and lookup_post_2.matched_assertions[0].property_value == "50M"
 
             # --- Failure Mode 3: Budget reconciliation failure ---
+            doc_rec = f"doc_rec_{engine_name}"
+            pub_rec = f"pub_rec_{engine_name}"
+            setup_ready_doc(doc_rec, pub_rec)
+            assert repo.has_ready_okf(ws, doc_rec, ver) is True
+
+            # Ensure reservation succeeds before injecting the intended failure
+            _EXTRACTION_BUDGETS.clear()
+            res_rec = repo.reserve_extraction_budget(ws, doc_rec, ver, "worker_rec_fail", 100, 200, 2, 3000, 15.0)
+            assert res_rec.granted is True
+
             mock_success_client = MagicMock()
             mock_success_client.count_tokens.return_value = {"inputTokens": 100}
             mock_success_client.converse.return_value = {
@@ -4956,46 +5147,64 @@ def test_preserve_ready_pdf_publication_during_new_attempt_failures():
                 "usage": {"inputTokens": 100, "outputTokens": 50},
             }
 
-            builder_reconcile_fail = OkfBuilder(repo=repo, bedrock_client=mock_success_client, worker_id="worker_rec_fail")
-            # Force reconciliation to fail
             orig_reconcile = repo.reconcile_extraction_budget
-            repo.reconcile_extraction_budget = MagicMock(side_effect=RuntimeError("Storage connection dropped during reconciliation"))
+            reconcile_calls = []
+            def failing_reconcile(*args, **kwargs):
+                reconcile_calls.append((args, kwargs))
+                raise RuntimeError("Storage connection dropped during reconciliation")
 
-            ret_rec_fail = builder_reconcile_fail.extract_and_persist(ws, doc, ver, "pdf", [test_chunk], force_reextract=True)
-            assert ret_rec_fail.status == "failed"
+            repo.reconcile_extraction_budget = failing_reconcile
+            chunk_rec = Chunk(id="c1", document_id=doc_rec, source_format="pdf", text="AcmeCorp reported revenue of 50M this quarter.", element_type="text", page_number=1)
+            builder_rec = OkfBuilder(repo=repo, bedrock_client=mock_success_client, worker_id="worker_rec_fail")
+
+            ret_rec = builder_rec.extract_and_persist(ws, doc_rec, ver, "pdf", [chunk_rec], force_reextract=True)
+            assert ret_rec.status == "failed"
+            # Assert reconciliation scenario actually reached reconciliation
+            assert len(reconcile_calls) >= 1
             repo.reconcile_extraction_budget = orig_reconcile
 
-            assert repo.has_ready_okf(ws, doc, ver) is True
-            cur_man = repo.get_manifest(ws, doc, ver)
-            assert cur_man.publication_id == pub_init
-            assert cur_man.status == "ready"
-
-            lookup = retriever.lookup_sync(ws, "What is AcmeCorp revenue?", target_entities=["AcmeCorp"], document_ids=[doc])
-            assert len(lookup.matched_assertions) == 1
-            assert lookup.matched_assertions[0].property_value == "50M"
+            # Prior ready publication survives
+            assert repo.has_ready_okf(ws, doc_rec, ver) is True
+            cur_man_3 = repo.get_manifest(ws, doc_rec, ver)
+            assert cur_man_3.publication_id == pub_rec and cur_man_3.status == "ready"
+            lookup_post_3 = retriever.lookup_sync(ws, "What is AcmeCorp revenue?", target_entities=["AcmeCorp"], document_ids=[doc_rec], deadline_ms=200.0)
+            assert len(lookup_post_3.matched_assertions) == 1 and lookup_post_3.matched_assertions[0].property_value == "50M"
 
             # --- Failure Mode 4: Failed final manifest write ---
-            builder_write_fail = OkfBuilder(repo=repo, bedrock_client=mock_success_client, worker_id="worker_write_fail")
-            orig_save_manifest = repo.save_manifest
-            def failing_save_manifest(workspace_id, manifest, *args, **kwargs):
-                if manifest.publication_id != pub_init:
+            doc_write = f"doc_write_{engine_name}"
+            pub_write = f"pub_write_{engine_name}"
+            setup_ready_doc(doc_write, pub_write)
+            assert repo.has_ready_okf(ws, doc_write, ver) is True
+
+            # Ensure reservation succeeds before injecting the intended failure
+            _EXTRACTION_BUDGETS.clear()
+            res_write = repo.reserve_extraction_budget(ws, doc_write, ver, "worker_write_fail", 100, 200, 2, 3000, 15.0)
+            assert res_write.granted is True
+
+            orig_save = repo.save_manifest
+            final_save_calls = []
+            def failing_save(workspace_id, manifest, *args, **kwargs):
+                if manifest.publication_id != pub_write and manifest.status == "ready":
+                    final_save_calls.append((manifest, args, kwargs))
                     raise RuntimeError("DynamoDB save_manifest transaction canceled: network partition")
-                return orig_save_manifest(workspace_id, manifest, *args, **kwargs)
+                return orig_save(workspace_id, manifest, *args, **kwargs)
 
-            repo.save_manifest = failing_save_manifest
-            ret_write_fail = builder_write_fail.extract_and_persist(ws, doc, ver, "pdf", [test_chunk], force_reextract=True)
-            assert ret_write_fail.status == "failed"
-            repo.save_manifest = orig_save_manifest
+            repo.save_manifest = failing_save
+            chunk_write = Chunk(id="c1", document_id=doc_write, source_format="pdf", text="AcmeCorp reported revenue of 50M this quarter.", element_type="text", page_number=1)
+            builder_write = OkfBuilder(repo=repo, bedrock_client=mock_success_client, worker_id="worker_write_fail")
 
-            # Assert authoritative ready publication and assertions remained completely intact
-            assert repo.has_ready_okf(ws, doc, ver) is True
-            cur_man = repo.get_manifest(ws, doc, ver)
-            assert cur_man.publication_id == pub_init
-            assert cur_man.status == "ready"
+            ret_write = builder_write.extract_and_persist(ws, doc_write, ver, "pdf", [chunk_write], force_reextract=True)
+            assert ret_write.status == "failed"
+            # Assert final-write scenario reached ready-manifest save
+            assert len(final_save_calls) >= 1
+            repo.save_manifest = orig_save
 
-            lookup = retriever.lookup_sync(ws, "What is AcmeCorp revenue?", target_entities=["AcmeCorp"], document_ids=[doc])
-            assert len(lookup.matched_assertions) == 1
-            assert lookup.matched_assertions[0].property_value == "50M"
+            # Prior ready publication survives
+            assert repo.has_ready_okf(ws, doc_write, ver) is True
+            cur_man_4 = repo.get_manifest(ws, doc_write, ver)
+            assert cur_man_4.publication_id == pub_write and cur_man_4.status == "ready"
+            lookup_post_4 = retriever.lookup_sync(ws, "What is AcmeCorp revenue?", target_entities=["AcmeCorp"], document_ids=[doc_write], deadline_ms=200.0)
+            assert len(lookup_post_4.matched_assertions) == 1 and lookup_post_4.matched_assertions[0].property_value == "50M"
 
     finally:
         if os.path.exists(db_path):

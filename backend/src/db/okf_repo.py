@@ -1137,55 +1137,42 @@ class SQLiteOkfRepository:
                             raise RuntimeError(f"Fenced manifest write denied: lease owned by {ldata.get('lease_owner_id')}, not {(worker_id or '').strip()}")
                         raise RuntimeError(f"Worker fenced out: lease expired, wrong owner, or fence {fence_token} superseded")
                 else:
-                    if check_base:
-                        if target_base is None:
-                            cond_sql = """
-                                INSERT INTO kre_okf_facts (
-                                    workspace_id, pk, sk, gsi1_pk, gsi1_sk, gsi2_pk, gsi2_sk,
-                                    record_type, entity_id, document_id, document_version,
-                                    normalized_name, property_key, data_json, created_at
-                                )
-                                SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-                                WHERE NOT EXISTS (
-                                    SELECT 1 FROM kre_okf_facts WHERE pk = ? AND sk = ?
-                                )
-                            """
-                            params = [
-                                workspace_id, man_pk, man_sk, gsi1_pk, gsi1_sk, gsi2_pk, gsi2_sk,
-                                "MANIFEST", None, manifest.document_id, manifest.document_version,
-                                None, None, manifest.model_dump_json(), manifest.created_at,
-                                man_pk, man_sk,
-                            ]
-                            cur = self._conn.execute(cond_sql, tuple(params))
-                            if cur.rowcount == 0:
-                                chk_man = self._conn.execute("SELECT data_json FROM kre_okf_facts WHERE pk = ? AND sk = ?", (man_pk, man_sk)).fetchone()
-                                curr_pub = json.loads(chk_man["data_json"]).get("publication_id") if chk_man else None
-                                raise RuntimeError(f"Concurrent publication conflict: manifest was created since staging began (current publication {curr_pub})")
-                        else:
-                            cond_sql = """
-                                INSERT OR REPLACE INTO kre_okf_facts (
-                                    workspace_id, pk, sk, gsi1_pk, gsi1_sk, gsi2_pk, gsi2_sk,
-                                    record_type, entity_id, document_id, document_version,
-                                    normalized_name, property_key, data_json, created_at
-                                )
-                                SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-                                WHERE EXISTS (
-                                    SELECT 1 FROM kre_okf_facts WHERE pk = ? AND sk = ? AND json_extract(data_json, '$.publication_id') = ?
-                                )
-                            """
-                            params = [
-                                workspace_id, man_pk, man_sk, gsi1_pk, gsi1_sk, gsi2_pk, gsi2_sk,
-                                "MANIFEST", None, manifest.document_id, manifest.document_version,
-                                None, None, manifest.model_dump_json(), manifest.created_at,
-                                man_pk, man_sk, str(target_base),
-                            ]
-                            cur = self._conn.execute(cond_sql, tuple(params))
-                            if cur.rowcount == 0:
-                                chk_man = self._conn.execute("SELECT data_json FROM kre_okf_facts WHERE pk = ? AND sk = ?", (man_pk, man_sk)).fetchone()
-                                if chk_man is None:
-                                    raise RuntimeError(f"Concurrent publication conflict: manifest was deleted or missing (expected publication {target_base})")
-                                curr_pub = json.loads(chk_man["data_json"]).get("publication_id")
-                                raise RuntimeError(f"Concurrent publication conflict: manifest publication changed from {target_base} to {curr_pub}")
+                    if check_base and target_base is None:
+                        cond_sql = """
+                            INSERT INTO kre_okf_facts (
+                                workspace_id, pk, sk, gsi1_pk, gsi1_sk, gsi2_pk, gsi2_sk,
+                                record_type, entity_id, document_id, document_version,
+                                normalized_name, property_key, data_json, created_at
+                            )
+                            SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                            WHERE NOT EXISTS (
+                                SELECT 1 FROM kre_okf_facts WHERE pk = ? AND sk = ?
+                            )
+                        """
+                        params = [
+                            workspace_id, man_pk, man_sk, gsi1_pk, gsi1_sk, gsi2_pk, gsi2_sk,
+                            "MANIFEST", None, manifest.document_id, manifest.document_version,
+                            None, None, manifest.model_dump_json(), manifest.created_at,
+                            man_pk, man_sk,
+                        ]
+                    elif check_base and target_base is not None:
+                        cond_sql = """
+                            INSERT OR REPLACE INTO kre_okf_facts (
+                                workspace_id, pk, sk, gsi1_pk, gsi1_sk, gsi2_pk, gsi2_sk,
+                                record_type, entity_id, document_id, document_version,
+                                normalized_name, property_key, data_json, created_at
+                            )
+                            SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                            WHERE EXISTS (
+                                SELECT 1 FROM kre_okf_facts WHERE pk = ? AND sk = ? AND json_extract(data_json, '$.publication_id') = ?
+                            )
+                        """
+                        params = [
+                            workspace_id, man_pk, man_sk, gsi1_pk, gsi1_sk, gsi2_pk, gsi2_sk,
+                            "MANIFEST", None, manifest.document_id, manifest.document_version,
+                            None, None, manifest.model_dump_json(), manifest.created_at,
+                            man_pk, man_sk, str(target_base),
+                        ]
                     else:
                         cond_sql = """
                             INSERT OR REPLACE INTO kre_okf_facts (
@@ -1201,27 +1188,41 @@ class SQLiteOkfRepository:
                             "MANIFEST", None, manifest.document_id, manifest.document_version,
                             None, None, manifest.model_dump_json(), manifest.created_at,
                         ]
-                        if manifest.status in ("failed", "empty"):
-                            cond_sql += " AND NOT EXISTS (SELECT 1 FROM kre_okf_facts WHERE pk = ? AND sk = ? AND json_extract(data_json, '$.status') = 'ready')"
-                            params.extend([man_pk, man_sk])
-                            cond_sql += " AND NOT EXISTS (SELECT 1 FROM kre_okf_facts WHERE pk = ? AND sk = ?)"
-                            params.extend([bpk, bsk])
-                        else:
-                            cond_sql += " AND NOT EXISTS (SELECT 1 FROM kre_okf_facts WHERE pk = ? AND sk = ? AND json_extract(data_json, '$.lease_owner_id') IS NOT NULL AND CAST(json_extract(data_json, '$.lease_expires_at') AS REAL) > ?)"
-                            params.extend([bpk, bsk, write_now_ts])
-                        cur = self._conn.execute(cond_sql, tuple(params))
-                        if cur.rowcount == 0:
-                            chk_man = self._conn.execute("SELECT data_json FROM kre_okf_facts WHERE pk = ? AND sk = ?", (man_pk, man_sk)).fetchone()
-                            if chk_man and json.loads(chk_man["data_json"]).get("status") == "ready" and manifest.status != "ready":
-                                raise RuntimeError(f"Unfenced manifest write denied: cannot overwrite ready manifest with {manifest.status} status")
-                            chk_ledger = self._conn.execute("SELECT data_json FROM kre_okf_facts WHERE pk = ? AND sk = ?", (bpk, bsk)).fetchone()
-                            if chk_ledger:
-                                bdata = json.loads(chk_ledger["data_json"])
-                                if bdata.get("lease_owner_id") and float(bdata.get("lease_expires_at") or 0) > write_now_ts:
-                                    raise RuntimeError(f"Unfenced manifest write denied: active lease held on document {manifest.document_id}")
-                                if manifest.status in ("failed", "empty"):
-                                    raise RuntimeError(f"Unfenced manifest write denied: document {manifest.document_id} has budget ledger; requires fence token")
-                            raise RuntimeError("Unfenced manifest write denied")
+
+                    # Combine ready-state and ledger protections into the atomic write condition for ALL unfenced writes
+                    if manifest.status in ("failed", "empty"):
+                        cond_sql += " AND NOT EXISTS (SELECT 1 FROM kre_okf_facts WHERE pk = ? AND sk = ? AND json_extract(data_json, '$.status') = 'ready')"
+                        params.extend([man_pk, man_sk])
+                        cond_sql += " AND NOT EXISTS (SELECT 1 FROM kre_okf_facts WHERE pk = ? AND sk = ?)"
+                        params.extend([bpk, bsk])
+                    else:
+                        cond_sql += " AND NOT EXISTS (SELECT 1 FROM kre_okf_facts WHERE pk = ? AND sk = ? AND json_extract(data_json, '$.lease_owner_id') IS NOT NULL AND CAST(json_extract(data_json, '$.lease_expires_at') AS REAL) > ?)"
+                        params.extend([bpk, bsk, write_now_ts])
+
+                    cur = self._conn.execute(cond_sql, tuple(params))
+                    if cur.rowcount == 0:
+                        chk_man = self._conn.execute("SELECT data_json FROM kre_okf_facts WHERE pk = ? AND sk = ?", (man_pk, man_sk)).fetchone()
+                        if chk_man and json.loads(chk_man["data_json"]).get("status") == "ready" and manifest.status != "ready":
+                            raise RuntimeError(f"Unfenced manifest write denied: cannot overwrite ready manifest with {manifest.status} status")
+                        chk_ledger = self._conn.execute("SELECT data_json FROM kre_okf_facts WHERE pk = ? AND sk = ?", (bpk, bsk)).fetchone()
+                        if chk_ledger:
+                            bdata = json.loads(chk_ledger["data_json"])
+                            if bdata.get("lease_owner_id") and float(bdata.get("lease_expires_at") or 0) > write_now_ts:
+                                raise RuntimeError(f"Unfenced manifest write denied: active lease held on document {manifest.document_id}")
+                            if manifest.status in ("failed", "empty"):
+                                raise RuntimeError(f"Unfenced manifest write denied: document {manifest.document_id} has budget ledger; requires fence token")
+                        if check_base:
+                            if target_base is None:
+                                if chk_man is not None:
+                                    curr_pub = json.loads(chk_man["data_json"]).get("publication_id")
+                                    raise RuntimeError(f"Concurrent publication conflict: manifest was created since staging began (current publication {curr_pub})")
+                            else:
+                                if chk_man is None:
+                                    raise RuntimeError(f"Concurrent publication conflict: manifest was deleted or missing (expected publication {target_base})")
+                                curr_pub = json.loads(chk_man["data_json"]).get("publication_id")
+                                if curr_pub != target_base:
+                                    raise RuntimeError(f"Concurrent publication conflict: manifest publication changed from {target_base} to {curr_pub}")
+                        raise RuntimeError("Unfenced manifest write denied")
 
                 pub_id = manifest.publication_id or manifest.idempotency_key
 
@@ -2138,6 +2139,24 @@ class DynamoDBOkfRepository:
                 if len(all_items) >= 100:
                     raise ValueError(f"Fenced manifest exceeds atomic transaction limit of 99 items: {len(all_items)}")
 
+                # Lease authority and clock assumptions:
+                # 1. Pre-dispatch client validation:
+                #    tx_now_epoch is re-sampled immediately before building the transaction
+                #    to catch local in-process delays (staging, serialization). If expired locally,
+                #    the worker aborts before network dispatch.
+                # 2. DynamoDB condition evaluation:
+                #    Condition #lexp >= :now_epoch compares the stored ledger lease against the
+                #    client-supplied :now_epoch constant. DynamoDB does not independently evaluate
+                #    physical wall-clock time on the server.
+                # 3. Delayed requests and fence advancement:
+                #    If network delay occurs after :now_epoch sampling and the lease physically expires
+                #    in transit, DynamoDB evaluates the condition using the client-supplied timestamp.
+                #    Rejection in that interval relies on a competing worker advancing the fence token
+                #    (#ft = :expected_fence).
+                # 4. Socket timeouts and uncertain outcomes:
+                #    Client socket timeouts (read_timeout=40ms) drop the HTTP connection on the client
+                #    but do NOT cancel or bound server-side transaction execution in DynamoDB. A client
+                #    timeout produces an uncertain commit outcome that must be verified via consistent read.
                 tx_now_epoch = Decimal(str(round(time.time(), 4)))
                 tx_now_ts = float(tx_now_epoch)
                 if (curr.lease_expires_at or 0.0) < tx_now_ts:
