@@ -1088,10 +1088,12 @@ class OkfBuilder:
                     publication_id=attempt_pub_id,
                 )
                 try:
-                    fence_token = getattr(budget, "last_reservation_fence", None) if 'budget' in locals() else None
-                    if fence_token is not None:
-                        wid = getattr(self, "worker_id", f"worker_{os.getpid()}")
-                        self.repo.save_manifest(workspace_id, failed_manifest, fence_token=fence_token, worker_id=wid)
+                    existing_man = self.repo.get_manifest(workspace_id, document_id, document_version, consistent_read=True)
+                    if existing_man is None or existing_man.status != "ready":
+                        fence_token = getattr(budget, "last_reservation_fence", None) if 'budget' in locals() else None
+                        if fence_token is not None:
+                            wid = getattr(self, "worker_id", f"worker_{os.getpid()}")
+                            self.repo.save_manifest(workspace_id, failed_manifest, fence_token=fence_token, worker_id=wid)
                 except Exception:
                     pass
                 return failed_manifest
@@ -1460,30 +1462,42 @@ class OkfBuilder:
 
         fence_token = getattr(budget, "last_reservation_fence", None)
         if fence_token is not None or manifest.status == "ready":
+            existing_man = None
             try:
-                wid = getattr(self, "worker_id", f"worker_{os.getpid()}")
-                self.repo.save_manifest(workspace_id, manifest, fence_token=fence_token, worker_id=wid)
-            except Exception as save_err:
+                existing_man = self.repo.get_manifest(workspace_id, document_id, document_version, consistent_read=True)
+            except Exception:
+                pass
+
+            if existing_man is not None and existing_man.status == "ready" and manifest.status != "ready":
                 logger.warning(
-                    "okf_builder.final_manifest_save_failed ws=%s doc=%s: %s (failing open per ADR-001)",
-                    workspace_id,
-                    document_id,
-                    save_err,
+                    "okf_builder.preserving_ready_manifest ws=%s doc=%s ver=%s: attempt resulted in status=%s, keeping prior ready manifest",
+                    workspace_id, document_id, document_version, manifest.status,
                 )
-                manifest = OkfManifest(
-                    workspace_id=workspace_id,
-                    document_id=document_id,
-                    document_version=document_version,
-                    entities=(),
-                    assertions=(),
-                    rejected_assertions_count=rejected_count,
-                    status="failed",
-                    extraction_tokens=manifest.extraction_tokens,
-                    model_calls=manifest.model_calls,
-                    idempotency_key=idempotency_key,
-                    created_at=timestamp,
-                    publication_id=pub_id,
-                )
+            else:
+                try:
+                    wid = getattr(self, "worker_id", f"worker_{os.getpid()}")
+                    self.repo.save_manifest(workspace_id, manifest, fence_token=fence_token, worker_id=wid)
+                except Exception as save_err:
+                    logger.warning(
+                        "okf_builder.final_manifest_save_failed ws=%s doc=%s: %s (failing open per ADR-001)",
+                        workspace_id,
+                        document_id,
+                        save_err,
+                    )
+                    manifest = OkfManifest(
+                        workspace_id=workspace_id,
+                        document_id=document_id,
+                        document_version=document_version,
+                        entities=(),
+                        assertions=(),
+                        rejected_assertions_count=rejected_count,
+                        status="failed",
+                        extraction_tokens=manifest.extraction_tokens,
+                        model_calls=manifest.model_calls,
+                        idempotency_key=idempotency_key,
+                        created_at=timestamp,
+                        publication_id=pub_id,
+                    )
         else:
             logger.warning(
                 "okf_builder.unauthorized_worker_skip_manifest_save ws=%s doc=%s ver=%s reason=%s status=%s",
@@ -1713,38 +1727,43 @@ class OkfBuilder:
                 reservation_fence = durable_res.fence_token
                 budget.last_reservation_fence = reservation_fence
 
-            # Persist in-flight attempt reservation to durable repository manifest before provider call
-            # This ensures that if the process crashes or dies mid-call, the durable store records
-            # the attempted model call and does not silently reset upon restart/replay.
-            # If persistence fails, do not call the provider; report failed optional enrichment
-            # and preserve baseline availability per ADR-001.
+            # Preserve an existing ready manifest during a new attempt:
+            # Do not replace an authoritative ready manifest with an in-flight attempt.
+            # Budget reservations are kept durable separately in the budget ledger.
+            existing_man = None
             try:
-                ikey = getattr(budget, "idempotency_key", "") or f"{workspace_id}:{document_id}:{ver}"
-                pub_id = getattr(budget, "publication_id", None) or generate_publication_id()
-                self.repo.save_manifest(
-                    workspace_id,
-                    OkfManifest(
-                        workspace_id=workspace_id,
-                        document_id=document_id,
-                        document_version=ver,
-                        entities=(),
-                        assertions=(),
-                        rejected_assertions_count=0,
-                        status="failed",
-                        extraction_tokens=budget.input_tokens_used + budget.output_tokens_used,
-                        model_calls=budget.calls_made,
-                        idempotency_key=ikey,
-                        created_at=_now_utc(),
-                        publication_id=pub_id,
-                    ),
-                    fence_token=reservation_fence,
-                    worker_id=getattr(self, "worker_id", f"worker_{os.getpid()}"),
-                )
-            except Exception as save_err:
-                logger.error("okf_builder.reservation_persistence_failed: %s", save_err)
-                budget.exhausted = True
-                budget.exhaustion_reason = f"reservation_persistence_failed ({save_err})"
-                return "", {"input_tokens": 0, "output_tokens": 0}
+                existing_man = self.repo.get_manifest(workspace_id, document_id, ver, consistent_read=True)
+            except Exception:
+                pass
+
+            if existing_man is None or existing_man.status != "ready":
+                try:
+                    ikey = getattr(budget, "idempotency_key", "") or f"{workspace_id}:{document_id}:{ver}"
+                    pub_id = getattr(budget, "publication_id", None) or generate_publication_id()
+                    self.repo.save_manifest(
+                        workspace_id,
+                        OkfManifest(
+                            workspace_id=workspace_id,
+                            document_id=document_id,
+                            document_version=ver,
+                            entities=(),
+                            assertions=(),
+                            rejected_assertions_count=0,
+                            status="failed",
+                            extraction_tokens=budget.input_tokens_used + budget.output_tokens_used,
+                            model_calls=budget.calls_made,
+                            idempotency_key=ikey,
+                            created_at=_now_utc(),
+                            publication_id=pub_id,
+                        ),
+                        fence_token=reservation_fence,
+                        worker_id=getattr(self, "worker_id", f"worker_{os.getpid()}"),
+                    )
+                except Exception as save_err:
+                    logger.error("okf_builder.reservation_persistence_failed: %s", save_err)
+                    budget.exhausted = True
+                    budget.exhaustion_reason = f"reservation_persistence_failed ({save_err})"
+                    return "", {"input_tokens": 0, "output_tokens": 0}
 
             call_timeout = max(0.001, budget.max_elapsed_s - (time.perf_counter() - budget.started_at))
             try:

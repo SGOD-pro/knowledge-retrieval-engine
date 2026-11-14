@@ -22,7 +22,7 @@ _These are recommendations to keep your build orderly, not requirements. Skip an
 | 4 | Core walking skeleton | Slice 1 | done |
 | 5 | PageIndex structural retrieval | Slice 2 | done |
 | 6 | OKF integration | Slice 3 | done |
-| 7 | Knowledge graph enrichment | Slice 4 | in-progress |
+| 7 | Knowledge graph enrichment | Slice 4 | planned |
 | 8 | Knowledge Map and requirement router | Slice 5 | planned |
 | 9 | Evidence verification and answer assembly | Slice 6 | planned |
 | 10 | End to end interface integration | Slice 7 | planned |
@@ -147,7 +147,7 @@ Spec [0006](../specs/0006-okf-integration.md) · code in `backend/src/`
 
 ## Slice 4: Knowledge graph enrichment
 
-### 7. Knowledge graph enrichment · in-progress
+### 7. Knowledge graph enrichment · planned
 Extract typed entity relationships, enforce verbatim grounding and durable budget fencing, run bounded multi hop traversal with targeted chunk hydration, and pool candidates softly into reciprocal rank fusion.
 **Done when:** typed knowledge graph entities and directed relationships are extracted from active chunks with verbatim grounding and durable budget fencing, partitioned storage supports bounded multi hop traversal and targeted chunk hydration without table scans, and candidates pool softly into reciprocal rank fusion without displacing baseline retrieval.
 - [x] Design it (spec): `/architect knowledge graph enrichment`
