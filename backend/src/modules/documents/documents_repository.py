@@ -325,6 +325,104 @@ class DocumentsRepository:
         else:
             raise ValueError("workspace_id or document_ids is required to retrieve chunks")
 
+    def get_chunks_by_ids(
+        self,
+        workspace_id: str,
+        chunk_keys: list[Any],
+    ) -> list[Chunk]:
+        """Targeted chunk identifier and version binding for batch hydration.
+        
+        Takes a deduplicated list of ChunkLookupKey capped at at most 15 items.
+        Executes targeted lookup without whole-workspace scans. Missing keys in storage
+        are dropped gracefully without failing the batch. Completely eliminates calling
+        get_all_chunks for hydration.
+        """
+        if not chunk_keys:
+            return []
+
+        # Deduplicate keys while preserving order, capped at at most 15 items
+        seen_keys = set()
+        deduped = []
+        for k in chunk_keys:
+            cid = getattr(k, "chunk_id", None) or k.get("chunk_id")
+            did = getattr(k, "document_id", None) or k.get("document_id")
+            dver = getattr(k, "document_version", None) or k.get("document_version")
+            key_tuple = (str(cid), str(did), str(dver))
+            if key_tuple not in seen_keys:
+                seen_keys.add(key_tuple)
+                deduped.append(k)
+            if len(deduped) >= 15:
+                break
+
+        if _is_test_env():
+            matched: list[Chunk] = []
+            for k in deduped:
+                cid = str(getattr(k, "chunk_id", None) or k.get("chunk_id"))
+                did = str(getattr(k, "document_id", None) or k.get("document_id"))
+                dver = str(getattr(k, "document_version", None) or k.get("document_version"))
+                chunk = _IN_MEMORY_CHUNKS.get(cid)
+                if chunk is not None:
+                    if getattr(chunk, "workspace_id", None) == workspace_id and str(chunk.document_id) == did:
+                        meta = chunk.metadata or {}
+                        chunk_ver = meta.get("version") or meta.get("document_version")
+                        if chunk_ver and str(chunk_ver) != dver:
+                            continue
+                        matched.append(chunk)
+            return matched
+
+        try:
+            req_items = []
+            key_map = {}
+            for k in deduped:
+                cid = str(getattr(k, "chunk_id", None) or k.get("chunk_id"))
+                did = str(getattr(k, "document_id", None) or k.get("document_id"))
+                item_key = {"PK": f"DOC#{did}", "SK": f"CHUNK#{cid}"}
+                req_items.append(item_key)
+                key_map[(f"DOC#{did}", f"CHUNK#{cid}")] = k
+
+            batch_request = {
+                self.table_name: {
+                    "Keys": req_items,
+                    "ConsistentRead": True,
+                }
+            }
+
+            response = self.dynamodb.meta.client.batch_get_item(RequestItems=batch_request)
+            items = response.get("Responses", {}).get(self.table_name, [])
+            unprocessed = response.get("UnprocessedKeys", {}).get(self.table_name, {})
+
+            if unprocessed and unprocessed.get("Keys"):
+                time.sleep(0.02)
+                retry_resp = self.dynamodb.meta.client.batch_get_item(
+                    RequestItems={self.table_name: unprocessed}
+                )
+                items.extend(retry_resp.get("Responses", {}).get(self.table_name, []))
+
+            results: list[Chunk] = []
+            for row in items:
+                pk = row.get("PK")
+                sk = row.get("SK")
+                lookup_k = key_map.get((pk, sk))
+                if not lookup_k:
+                    continue
+                row_ws = row.get("workspace_id")
+                row_doc = row.get("document_id")
+                did = str(getattr(lookup_k, "document_id", None) or lookup_k.get("document_id"))
+                dver = str(getattr(lookup_k, "document_version", None) or lookup_k.get("document_version"))
+                if row_ws != workspace_id or str(row_doc) != did:
+                    continue
+                meta_raw = row.get("metadata")
+                meta = json.loads(meta_raw) if meta_raw and isinstance(meta_raw, str) else (meta_raw or {})
+                row_ver = meta.get("version") or meta.get("document_version")
+                if row_ver and str(row_ver) != dver:
+                    continue
+                results.append(self._parse_chunk(row))
+
+            return results
+        except Exception as e:
+            logger.warning("Targeted chunk batch get failed: %s", e)
+            return []
+
     def add_placeholder_document(
         self,
         workspace_id: str,

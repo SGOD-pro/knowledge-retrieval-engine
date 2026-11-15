@@ -106,6 +106,19 @@ from src.schemas.contracts.verification import (
     VerificationRecord,
     VerifierType,
 )
+from src.schemas.contracts.knowledge_graph import (
+    ChunkLookupKey,
+    GraphStatus,
+    KnowledgeGraphBudgetLedger,
+    KnowledgeGraphEntity,
+    KnowledgeGraphLookupResult,
+    KnowledgeGraphManifest,
+    KnowledgeGraphRelationship,
+    PinnedDocumentVersion,
+    PinnedSnapshotContext,
+    canonicalize_predicate,
+    normalize_mention,
+)
 
 __all__ = [
     # Envelope
@@ -198,4 +211,16 @@ __all__ = [
     "compute_entity_id",
     "compute_assertion_id",
     "compute_idempotency_key",
+    # Knowledge Graph Records
+    "ChunkLookupKey",
+    "GraphStatus",
+    "KnowledgeGraphBudgetLedger",
+    "KnowledgeGraphEntity",
+    "KnowledgeGraphLookupResult",
+    "KnowledgeGraphManifest",
+    "KnowledgeGraphRelationship",
+    "PinnedDocumentVersion",
+    "PinnedSnapshotContext",
+    "canonicalize_predicate",
+    "normalize_mention",
 ]

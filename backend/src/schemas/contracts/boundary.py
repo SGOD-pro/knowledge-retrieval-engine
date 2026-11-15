@@ -112,6 +112,9 @@ class DocumentSnapshot(BaseModel):
     okf_status: Literal["ready", "empty", "failed"] | None = None
     okf_entities_count: int = 0
     okf_properties_count: int = 0
+    graph_status: Literal["pending", "processing", "ready", "failed", "unavailable"] | None = None
+    graph_entities_count: int = 0
+    graph_relations_count: int = 0
 
 
 class BenchmarkRunMetadata(BaseModel):

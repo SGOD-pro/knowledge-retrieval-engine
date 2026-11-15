@@ -92,6 +92,25 @@ class Settings(BaseSettings):
     OKF_REPO_BACKEND: str | None = None
     OKF_SQLITE_PATH: str | None = None
 
+    # Knowledge Graph Bounded Integration Settings
+    GRAPH_ENABLED: bool = False
+    GRAPH_TIMEOUT_MS: int = 75
+    GRAPH_MAX_INPUT_TOKENS_PER_DOC: int = 4000
+    GRAPH_MAX_OUTPUT_TOKENS_PER_DOC: int = 1600
+    GRAPH_MAX_MODEL_CALLS_PER_DOC: int = 2
+    GRAPH_BEDROCK_MODEL_ID: str = "anthropic.claude-3-haiku-20240307-v1:0"
+    GRAPH_FUSION_WEIGHT: float = 1.10
+    GRAPH_AMBIGUOUS_FUSION_WEIGHT: float = 0.55
+    GRAPH_MAX_HOPS: int = 2
+    GRAPH_MAX_NODES: int = 25
+    GRAPH_MAX_EDGES_PER_NODE: int = 10
+    GRAPH_MAX_HYDRATED_CHUNKS: int = 15
+    GRAPH_MAX_CONCURRENCY: int = 4
+    GRAPH_MAX_QUEUE: int = 8
+    DYNAMODB_GRAPH_TABLE_NAME: str = "kre_knowledge_graph"
+    GRAPH_REPO_BACKEND: str | None = None
+    GRAPH_SQLITE_PATH: str | None = None
+
     model_config = {"env_file": _ENV_FILES, "extra": "ignore"}
 
 
