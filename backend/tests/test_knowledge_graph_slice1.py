@@ -21,7 +21,9 @@ Verifies:
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 import os
+import sqlite3
 import tempfile
 import threading
 import time
@@ -1358,4 +1360,570 @@ def test_concurrency_controller_recovery_after_releasing_worker():
     res2, status2 = controller.run_storage_work_sync(lambda rem: "second_job_done", deadline_s=0.5)
     assert status2 == "completed"
     assert res2 == "second_job_done"
+
+
+def test_builder_storage_retriever_real_csv_pipeline_with_source_chunk_bindings():
+    """covers: AC-1, AC-9 Verify real CSV builder-to-retriever pipeline without manual edge repairs."""
+    ws = "ws_real_csv_pipeline"
+    doc_id = "doc_depts_csv"
+    ver = "v_dept_1"
+    repo = InMemoryKnowledgeGraphRepository()
+    doc_repo = DocumentsRepository()
+
+    rows = [
+        {"Department": "Engineering", "Manager": "Alice Smith", "DeptCode": "ENG"},
+        {"Department": "Marketing", "Manager": "Bob Jones", "DeptCode": "MKT"},
+    ]
+    schema_rels = [
+        DirectionalSchemaRelation(
+            source_column="Department",
+            predicate="managed_by",
+            target_column="Manager",
+            source_type="organization",
+            target_type="person",
+            disambiguation_column="DeptCode",
+        )
+    ]
+
+    from schemas.models import Chunk, Document
+    dummy_fast = [0.1] * 384
+    dummy_full = [0.1] * 1024
+    chunks = [
+        Chunk(
+            id=f"{doc_id}:csv:row2",
+            document_id=doc_id,
+            source_format="csv",
+            text="Department: Engineering. Manager: Alice Smith. DeptCode: ENG.",
+            element_type="row",
+            location_reference="Row 2",
+            metadata={"row": 2, "version": ver, "document_version": ver},
+            embedding_fast=dummy_fast,
+            embedding_full=dummy_full,
+            workspace_id=ws,
+        ),
+        Chunk(
+            id=f"{doc_id}:csv:row3",
+            document_id=doc_id,
+            source_format="csv",
+            text="Department: Marketing. Manager: Bob Jones. DeptCode: MKT.",
+            element_type="row",
+            location_reference="Row 3",
+            metadata={"row": 3, "version": ver, "document_version": ver},
+            embedding_fast=dummy_fast,
+            embedding_full=dummy_full,
+            workspace_id=ws,
+        ),
+    ]
+
+    doc_repo.save(Document(
+        id=doc_id,
+        filename="departments.csv",
+        source_format="csv",
+        chunks=tuple(chunks),
+        workspace_id=ws,
+    ))
+
+    # Builder runs with source_chunks provided without manually repairing edges
+    builder = KnowledgeGraphBuilder(repository=repo)
+    manifest = builder.build_and_persist_tabular_graph(
+        workspace_id=ws,
+        document_id=doc_id,
+        document_version=ver,
+        table_name="tbl_departments",
+        rows=rows,
+        schema_relations=schema_rels,
+        source_chunks=chunks,
+    )
+    assert manifest.status == "ready"
+    assert manifest.relationship_count == 2
+
+    # Verify that staged edges automatically carry real source_chunk_ids
+    outgoing, _, _ = repo.get_outgoing_edges(ws, compute_entity_id(ws, doc_id, "organization", "Engineering", "ENG"))
+    assert len(outgoing) == 1
+    assert outgoing[0].source_chunk_ids == (f"{doc_id}:csv:row2",)
+
+    # Retriever expands query and returns hydrated chunks and citations
+    boundary_mock = MagicMock()
+    boundary_mock.has_tombstone.return_value = False
+    boundary_mock.list_document_snapshots.return_value = [MagicMock(document_id=doc_id, version=ver)]
+
+    retriever = KnowledgeGraphRetriever(
+        repository=repo,
+        boundary_repo=boundary_mock,
+        documents_repo=doc_repo,
+    )
+    result = retriever.expand(workspace_id=ws, query="Find Engineering manager", max_hops=1)
+    assert result.execution_status == "completed"
+    assert result.edge_match_count >= 1
+    assert len(result.candidate_chunks) >= 1
+    hydrated = result.candidate_chunks[0]
+    assert hydrated.id == f"{doc_id}:csv:row2"
+    assert "Engineering" in hydrated.text
+    assert hydrated.location_reference == "Row 2"
+
+
+def test_builder_storage_retriever_grounded_tablestore_hydration():
+    """covers: AC-1, AC-9 Verify grounded TableStore evidence hydration using verified row/cell locators."""
+    ws = "ws_tablestore_hydration"
+    doc_id = "doc_table_01"
+    ver = "v_table_1"
+    repo = InMemoryKnowledgeGraphRepository()
+
+    from db.table_store.memory_store import MemoryTableStore
+    from schemas.structured_table import StructuredTable, TableRow, TableCell, TableSchema, ColumnDefinition, HeaderTopology, InferredDtype
+
+    ts = MemoryTableStore()
+    schema = TableSchema(
+        columns=(
+            ColumnDefinition(col_index=0, name="Service", inferred_dtype=InferredDtype.STRING),
+            ColumnDefinition(col_index=1, name="Owner", inferred_dtype=InferredDtype.STRING),
+        ),
+        header_rows=(1,),
+        header_topology=HeaderTopology.SINGLE_ROW,
+        confidence=1.0,
+    )
+    t_rows = [
+        TableRow(
+            row_id="0",
+            row_index=0,
+            cells=(
+                TableCell(cell_id="c1", row_index=0, col_index=0, coordinate="R1C1", raw_value="AuthService", normalized_value="AuthService", inferred_dtype=InferredDtype.STRING),
+                TableCell(cell_id="c2", row_index=0, col_index=1, coordinate="R1C2", raw_value="SecurityTeam", normalized_value="SecurityTeam", inferred_dtype=InferredDtype.STRING),
+            ),
+        ),
+    ]
+    ts.store_schema(table_id="tbl_services", workspace_id=ws, schema=schema, document_id=doc_id, document_version=ver)
+    ts.write_row_batch_with_checkpoint(
+        table_id="tbl_services",
+        workspace_id=ws,
+        document_id=doc_id,
+        version=ver,
+        rows=t_rows,
+        checkpoint_batch=0,
+        source_rows=len(t_rows),
+        attempted_rows=len(t_rows),
+        persisted_rows=len(t_rows),
+        rejected_rows=0,
+        parser_version="1.0.0",
+        schema_version="",
+        content_hash="test_hash",
+    )
+    ts.publish_active_version(
+        table_id="tbl_services",
+        workspace_id=ws,
+        document_id=doc_id,
+        version=ver,
+        manifest={
+            "coverage_complete": True,
+            "source_rows": len(t_rows),
+            "persisted_rows": len(t_rows),
+            "document_version": ver,
+        },
+    )
+
+    rows = [{"Service": "AuthService", "Owner": "SecurityTeam"}]
+    schema_rels = [
+        DirectionalSchemaRelation(
+            source_column="Service",
+            predicate="owned_by",
+            target_column="Owner",
+            source_type="concept",
+            target_type="organization",
+        )
+    ]
+    builder = KnowledgeGraphBuilder(repository=repo)
+    manifest = builder.build_and_persist_tabular_graph(
+        workspace_id=ws,
+        document_id=doc_id,
+        document_version=ver,
+        table_name="tbl_services",
+        rows=rows,
+        schema_relations=schema_rels,
+    )
+    assert manifest.status == "ready"
+
+    boundary_mock = MagicMock()
+    boundary_mock.has_tombstone.return_value = False
+    boundary_mock.list_document_snapshots.return_value = [MagicMock(document_id=doc_id, version=ver)]
+
+    retriever = KnowledgeGraphRetriever(
+        repository=repo,
+        boundary_repo=boundary_mock,
+        table_store=ts,
+    )
+    result = retriever.expand(workspace_id=ws, query="Who owns AuthService?", max_hops=1)
+    assert result.execution_status == "completed"
+    assert result.edge_match_count >= 1
+    assert len(result.candidate_chunks) >= 1
+    hydrated = result.candidate_chunks[0]
+    assert "Table: tbl_services" in hydrated.location_reference
+
+
+def test_sqlite_publication_separate_connections_absent_base_pub_race():
+    """covers: AC-4 Verify atomic publication across separate connections when base publication is absent."""
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
+        db_path = tf.name
+
+    try:
+        repo1 = SQLiteKnowledgeGraphRepository(db_path=db_path)
+        repo2 = SQLiteKnowledgeGraphRepository(db_path=db_path)
+        ws = "ws_sqlite_race"
+        doc = "doc_race_1"
+        ver = "v1"
+
+        man1 = KnowledgeGraphManifest(
+            workspace_id=ws, document_id=doc, document_version=ver, publication_id="pub_first",
+            status="ready", entity_count=1, relationship_count=1, ingested_at_utc=_now_utc(), content_hash="h1"
+        )
+        man2 = KnowledgeGraphManifest(
+            workspace_id=ws, document_id=doc, document_version=ver, publication_id="pub_second",
+            status="ready", entity_count=1, relationship_count=1, ingested_at_utc=_now_utc(), content_hash="h2"
+        )
+
+        repo1.commit_manifest(ws, man1, base_publication_id=None)
+        committed = repo1.get_manifest(ws, doc, ver)
+        assert committed.publication_id == "pub_first"
+
+        with pytest.raises(OptimisticConcurrencyError):
+            repo2.commit_manifest(ws, man2, base_publication_id=None)
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+def test_sqlite_publication_separate_connections_existing_base_pub_race():
+    """covers: AC-4 Verify atomic publication across separate connections on existing base publication."""
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
+        db_path = tf.name
+
+    try:
+        repo1 = SQLiteKnowledgeGraphRepository(db_path=db_path)
+        repo2 = SQLiteKnowledgeGraphRepository(db_path=db_path)
+        ws = "ws_sqlite_existing_race"
+        doc = "doc_race_2"
+        ver = "v1"
+
+        man_base = KnowledgeGraphManifest(
+            workspace_id=ws, document_id=doc, document_version=ver, publication_id="pub_base",
+            status="ready", entity_count=1, relationship_count=1, ingested_at_utc=_now_utc(), content_hash="h0"
+        )
+        repo1.commit_manifest(ws, man_base, base_publication_id=None)
+
+        man_b = KnowledgeGraphManifest(
+            workspace_id=ws, document_id=doc, document_version=ver, publication_id="pub_b",
+            base_publication_id="pub_base", status="ready", entity_count=1, relationship_count=1,
+            ingested_at_utc=_now_utc(), content_hash="hb"
+        )
+        man_c = KnowledgeGraphManifest(
+            workspace_id=ws, document_id=doc, document_version=ver, publication_id="pub_c",
+            base_publication_id="pub_base", status="ready", entity_count=1, relationship_count=1,
+            ingested_at_utc=_now_utc(), content_hash="hc"
+        )
+
+        repo1.commit_manifest(ws, man_b, base_publication_id="pub_base")
+
+        with pytest.raises(OptimisticConcurrencyError):
+            repo2.commit_manifest(ws, man_c, base_publication_id="pub_base")
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+def test_sqlite_publication_pause_after_validation_before_write():
+    """covers: AC-4 Verify SQLite re-verification catches concurrent publication advance during pause."""
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
+        db_path = tf.name
+
+    try:
+        repo1 = SQLiteKnowledgeGraphRepository(db_path=db_path)
+        repo2 = SQLiteKnowledgeGraphRepository(db_path=db_path)
+        ws = "ws_sqlite_pause"
+        doc = "doc_pause_1"
+        ver = "v1"
+
+        man_0 = KnowledgeGraphManifest(
+            workspace_id=ws, document_id=doc, document_version=ver, publication_id="pub_0",
+            status="ready", entity_count=1, relationship_count=1, ingested_at_utc=_now_utc(), content_hash="h0"
+        )
+        repo1.commit_manifest(ws, man_0, base_publication_id=None)
+
+        man_worker1 = KnowledgeGraphManifest(
+            workspace_id=ws, document_id=doc, document_version=ver, publication_id="pub_w1",
+            base_publication_id="pub_0", status="ready", entity_count=1, relationship_count=1,
+            ingested_at_utc=_now_utc(), content_hash="hw1"
+        )
+        man_worker2 = KnowledgeGraphManifest(
+            workspace_id=ws, document_id=doc, document_version=ver, publication_id="pub_w2",
+            base_publication_id="pub_0", status="ready", entity_count=1, relationship_count=1,
+            ingested_at_utc=_now_utc(), content_hash="hw2"
+        )
+
+        pause_invoked = threading.Event()
+        worker2_result = {"error": None}
+
+        def _pause_hook():
+            pause_invoked.set()
+            conn_sneak = sqlite3.connect(db_path, timeout=0.1, isolation_level=None)
+            try:
+                conn_sneak.execute("BEGIN IMMEDIATE")
+                conn_sneak.execute(
+                    "UPDATE kre_knowledge_graph SET data_json = ? WHERE pk = ? AND sk = 'MANIFEST'",
+                    (json.dumps(man_worker2.model_dump()), f"KG#{ws}#DOC#{doc}#V#{ver}"),
+                )
+                conn_sneak.execute("COMMIT")
+            except sqlite3.OperationalError as op_err:
+                worker2_result["error"] = op_err
+            finally:
+                conn_sneak.close()
+
+        repo1._pre_write_hook = _pause_hook
+
+        repo1.commit_manifest(ws, man_worker1, base_publication_id="pub_0")
+        assert pause_invoked.is_set()
+        assert isinstance(worker2_result["error"], sqlite3.OperationalError)
+        assert "locked" in str(worker2_result["error"]).lower()
+
+        current = repo1.get_manifest(ws, doc, ver)
+        assert current.publication_id == "pub_w1"
+
+        with pytest.raises(OptimisticConcurrencyError):
+            repo2.commit_manifest(ws, man_worker2, base_publication_id="pub_0")
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+def test_sqlite_fenced_publication_separate_connection_concurrent_lease_change():
+    """covers: AC-4 Verify SQLite fenced publication atomicity during pause and lease expiration."""
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
+        db_path = tf.name
+
+    try:
+        repo1 = SQLiteKnowledgeGraphRepository(db_path=db_path)
+        repo2 = SQLiteKnowledgeGraphRepository(db_path=db_path)
+        ws = "ws_sqlite_lease_race"
+        doc = "doc_lease_1"
+        ver = "v1"
+
+        ledger = KnowledgeGraphBudgetLedger(
+            workspace_id=ws, document_id=doc, document_version=ver,
+            reserved_calls=5, completed_calls=0, reserved_tokens=1000,
+            fence_token=10, lease_owner_id="worker_alpha", lease_expires_at=time.time() + 60.0,
+            updated_at=_now_utc(),
+        )
+        repo1.save_budget_ledger(ledger)
+
+        man = KnowledgeGraphManifest(
+            workspace_id=ws, document_id=doc, document_version=ver, publication_id="pub_fenced",
+            status="ready", entity_count=1, relationship_count=1, ingested_at_utc=_now_utc(), content_hash="hf"
+        )
+
+        pause_invoked = threading.Event()
+        sneak_err = {"error": None}
+
+        def _steal_lease_hook():
+            pause_invoked.set()
+            conn_sneak = sqlite3.connect(db_path, timeout=0.1, isolation_level=None)
+            try:
+                conn_sneak.execute("BEGIN IMMEDIATE")
+                stolen_ledger = ledger.model_copy(update={"lease_owner_id": "worker_beta"})
+                conn_sneak.execute(
+                    "UPDATE kre_knowledge_graph SET data_json = ? WHERE pk = ? AND sk = 'BUDGET#LEDGER'",
+                    (json.dumps(stolen_ledger.model_dump()), f"KG#{ws}#DOC#{doc}#V#{ver}"),
+                )
+                conn_sneak.execute("COMMIT")
+            except sqlite3.OperationalError as op_err:
+                sneak_err["error"] = op_err
+            finally:
+                conn_sneak.close()
+
+        repo1._pre_write_hook = _steal_lease_hook
+
+        repo1.commit_manifest(ws, man, fence_token=10, worker_id="worker_alpha")
+        assert pause_invoked.is_set()
+        assert isinstance(sneak_err["error"], sqlite3.OperationalError)
+        assert "locked" in str(sneak_err["error"]).lower()
+
+        expired_ledger = ledger.model_copy(update={"lease_expires_at": time.time() - 10.0})
+        repo2.save_budget_ledger(expired_ledger)
+
+        man2 = KnowledgeGraphManifest(
+            workspace_id=ws, document_id=doc, document_version=ver, publication_id="pub_fenced_2",
+            base_publication_id="pub_fenced", status="ready", entity_count=1, relationship_count=1,
+            ingested_at_utc=_now_utc(), content_hash="hf2"
+        )
+        with pytest.raises(FencingConflictError):
+            repo2.commit_manifest(ws, man2, base_publication_id="pub_fenced", fence_token=10, worker_id="worker_alpha")
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+def test_dynamodb_fencing_atomic_validation_and_rejection():
+    """covers: AC-4 Verify DynamoDB rejects un-authorized or fenced operations without silent bypass."""
+    try:
+        import boto3
+        client = boto3.client("dynamodb", endpoint_url="http://localhost:8000", region_name="us-east-1", aws_access_key_id="test", aws_secret_access_key="test")
+        client.list_tables()
+    except Exception:
+        pytest.skip("DynamoDB Local daemon not reachable on port 8000")
+
+    table_name = "kre_kg_test_fencing"
+    existing_tables = client.list_tables().get("TableNames", [])
+    if table_name not in existing_tables:
+        client.create_table(
+            TableName=table_name,
+            KeySchema=[
+                {"AttributeName": "PK", "KeyType": "HASH"},
+                {"AttributeName": "SK", "KeyType": "RANGE"},
+            ],
+            AttributeDefinitions=[
+                {"AttributeName": "PK", "AttributeType": "S"},
+                {"AttributeName": "SK", "AttributeType": "S"},
+                {"AttributeName": "GSI1_PK", "AttributeType": "S"},
+                {"AttributeName": "GSI1_SK", "AttributeType": "S"},
+                {"AttributeName": "GSI2_PK", "AttributeType": "S"},
+                {"AttributeName": "GSI2_SK", "AttributeType": "S"},
+            ],
+            GlobalSecondaryIndexes=[
+                {
+                    "IndexName": "gsi1_target_lookup",
+                    "KeySchema": [
+                        {"AttributeName": "GSI1_PK", "KeyType": "HASH"},
+                        {"AttributeName": "GSI1_SK", "KeyType": "RANGE"},
+                    ],
+                    "Projection": {"ProjectionType": "ALL"},
+                },
+                {
+                    "IndexName": "gsi2_doc_version",
+                    "KeySchema": [
+                        {"AttributeName": "GSI2_PK", "KeyType": "HASH"},
+                        {"AttributeName": "GSI2_SK", "KeyType": "RANGE"},
+                    ],
+                    "Projection": {"ProjectionType": "ALL"},
+                },
+            ],
+            BillingMode="PAY_PER_REQUEST",
+        )
+
+    repo = DynamoDBKnowledgeGraphRepository(table_name=table_name, endpoint_url="http://localhost:8000")
+    ws = f"ws_ddb_fencing_{uuid.uuid4().hex[:6]}"
+    doc = "doc_ddb_fence"
+    ver = "v1"
+
+    manifest = KnowledgeGraphManifest(
+        workspace_id=ws, document_id=doc, document_version=ver, publication_id="pub_ddb_1",
+        status="ready", entity_count=1, relationship_count=1, ingested_at_utc=_now_utc(), content_hash="h_ddb"
+    )
+
+    # 1. Missing worker_id fails
+    with pytest.raises(FencingConflictError):
+        repo.commit_manifest(ws, manifest, fence_token=1, worker_id="")
+
+    # 2. Missing budget ledger fails
+    with pytest.raises(FencingConflictError):
+        repo.commit_manifest(ws, manifest, fence_token=1, worker_id="worker_1")
+
+    # 3. Mismatched fence token fails
+    ledger = KnowledgeGraphBudgetLedger(
+        workspace_id=ws, document_id=doc, document_version=ver,
+        reserved_calls=5, completed_calls=0, reserved_tokens=1000,
+        fence_token=10, lease_owner_id="worker_1", lease_expires_at=time.time() + 60.0,
+        updated_at=_now_utc(),
+    )
+    repo.save_budget_ledger(ledger)
+
+    with pytest.raises(FencingConflictError):
+        repo.commit_manifest(ws, manifest, fence_token=99, worker_id="worker_1")
+
+    # 4. Mismatched worker_id fails
+    with pytest.raises(FencingConflictError):
+        repo.commit_manifest(ws, manifest, fence_token=10, worker_id="worker_imposter")
+
+    # 5. Valid authority succeeds
+    repo.commit_manifest(ws, manifest, fence_token=10, worker_id="worker_1")
+    committed = repo.get_manifest(ws, doc, ver)
+    assert committed is not None
+    assert committed.publication_id == "pub_ddb_1"
+
+
+def test_hydration_missing_or_unverifiable_version_fails_closed():
+    """covers: AC-9, AC-10 Verify hydration version identity strictly fails closed."""
+    ws = "ws_version_fail_closed"
+    doc_repo = DocumentsRepository()
+    doc_id = "doc_v_check"
+
+    from schemas.models import Chunk, Document
+    dummy_fast = [0.1] * 384
+    dummy_full = [0.1] * 1024
+    chunk = Chunk(
+        id="chunk_v1",
+        document_id=doc_id,
+        source_format="csv",
+        text="Sample chunk text",
+        element_type="row",
+        location_reference="Row 1",
+        metadata={"version": "1.0"},
+        embedding_fast=dummy_fast,
+        embedding_full=dummy_full,
+        workspace_id=ws,
+    )
+    doc_repo.save(Document(
+        id=doc_id,
+        filename="test.csv",
+        source_format="csv",
+        chunks=(chunk,),
+        workspace_id=ws,
+    ))
+
+    # 1. Key with missing/empty document_version fails closed -> 0 chunks
+    k_empty = ChunkLookupKey(chunk_id="chunk_v1", document_id=doc_id, document_version="")
+    assert len(doc_repo.get_chunks_by_ids(ws, [k_empty])) == 0
+
+    # 2. Key with mismatched version fails closed -> 0 chunks
+    k_wrong = ChunkLookupKey(chunk_id="chunk_v1", document_id=doc_id, document_version="2.0")
+    assert len(doc_repo.get_chunks_by_ids(ws, [k_wrong])) == 0
+
+    # 3. Key with matching version succeeds
+    k_valid = ChunkLookupKey(chunk_id="chunk_v1", document_id=doc_id, document_version="1.0")
+    res_valid = doc_repo.get_chunks_by_ids(ws, [k_valid])
+    assert len(res_valid) == 1
+    assert res_valid[0].id == "chunk_v1"
+
+    # 4. Chunk with NO metadata version, verified via boundary repo snapshot
+    chunk_no_meta = Chunk(
+        id="chunk_no_meta",
+        document_id="doc_no_meta",
+        source_format="csv",
+        text="No meta version text",
+        element_type="row",
+        location_reference="Row 2",
+        metadata={},  # no version
+        embedding_fast=dummy_fast,
+        embedding_full=dummy_full,
+        workspace_id=ws,
+    )
+    doc_repo.save(Document(
+        id="doc_no_meta",
+        filename="test2.csv",
+        source_format="csv",
+        chunks=(chunk_no_meta,),
+        workspace_id=ws,
+    ))
+
+    with patch("db.workspace_boundary_repo.get_workspace_boundary_repo") as mock_get_b_repo:
+        mock_b_repo = MagicMock()
+        mock_get_b_repo.return_value = mock_b_repo
+
+        mock_b_repo.get_document_snapshot.return_value = MagicMock(version="3.0")
+        k_snap = ChunkLookupKey(chunk_id="chunk_no_meta", document_id="doc_no_meta", document_version="3.0")
+        res_snap = doc_repo.get_chunks_by_ids(ws, [k_snap])
+        assert len(res_snap) == 1
+        assert res_snap[0].id == "chunk_no_meta"
+
+        k_snap_wrong = ChunkLookupKey(chunk_id="chunk_no_meta", document_id="doc_no_meta", document_version="5.0")
+        assert len(doc_repo.get_chunks_by_ids(ws, [k_snap_wrong])) == 0
+
+        mock_b_repo.get_document_snapshot.return_value = None
+        assert len(doc_repo.get_chunks_by_ids(ws, [k_snap])) == 0
 

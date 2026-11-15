@@ -14,6 +14,7 @@ Supports in-memory test storage, durable SQLite persistence (WAL mode), and Dyna
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from decimal import Decimal
 import json
 import logging
 import os
@@ -540,7 +541,8 @@ class SQLiteKnowledgeGraphRepository:
 
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+        self._pre_write_hook: Any | None = None
+        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False, isolation_level=None, timeout=10.0)
         self._conn.row_factory = sqlite3.Row
         self._init_sqlite()
 
@@ -655,7 +657,14 @@ class SQLiteKnowledgeGraphRepository:
         manifest_json = json.dumps(manifest.model_dump())
 
         with self._lock:
-            with self._conn:
+            in_tx = False
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                in_tx = True
+            except sqlite3.OperationalError:
+                raise
+
+            try:
                 cursor = self._conn.execute(
                     "SELECT data_json FROM kre_knowledge_graph WHERE pk = ? AND sk = ?",
                     (pk, sk),
@@ -704,6 +713,51 @@ class SQLiteKnowledgeGraphRepository:
                     if float(ld.get("lease_expires_at", 0.0)) < time.time():
                         raise FencingConflictError("Lease has expired for fenced publication")
 
+                # Test pause hook between validation and write
+                if self._pre_write_hook is not None:
+                    self._pre_write_hook()
+
+                # Re-verify condition right before the write to catch any state transitions
+                v_cursor = self._conn.execute(
+                    "SELECT data_json FROM kre_knowledge_graph WHERE pk = ? AND sk = ?",
+                    (pk, sk),
+                )
+                v_row = v_cursor.fetchone()
+                if v_row is not None:
+                    v_data = json.loads(v_row["data_json"])
+                    v_pub = v_data.get("publication_id")
+                    if base_publication_id is not None:
+                        if v_pub != base_publication_id:
+                            raise OptimisticConcurrencyError(
+                                f"Publication conflict: current publication '{v_pub}' does not match base '{base_publication_id}'"
+                            )
+                    else:
+                        if v_data.get("status") == "ready":
+                            raise OptimisticConcurrencyError(
+                                f"Publication conflict: document already has active publication '{v_pub}'"
+                            )
+                else:
+                    if base_publication_id is not None:
+                        raise OptimisticConcurrencyError(
+                            f"Publication conflict: expected base publication '{base_publication_id}' but none exists"
+                        )
+
+                if fence_token is not None:
+                    l_cur2 = self._conn.execute(
+                        "SELECT data_json FROM kre_knowledge_graph WHERE pk = ? AND sk = ?",
+                        (pk, "BUDGET#LEDGER"),
+                    )
+                    l_row2 = l_cur2.fetchone()
+                    if not l_row2:
+                        raise FencingConflictError("Budget ledger does not exist for fenced publication")
+                    ld2 = json.loads(l_row2["data_json"])
+                    if ld2.get("fence_token") != fence_token:
+                        raise FencingConflictError(f"Fence mismatch: expected {fence_token}, got {ld2.get('fence_token')}")
+                    if ld2.get("lease_owner_id") != worker_id:
+                        raise FencingConflictError(f"Lease owner mismatch: expected {worker_id}, got {ld2.get('lease_owner_id')}")
+                    if float(ld2.get("lease_expires_at", 0.0)) < time.time():
+                        raise FencingConflictError("Lease has expired for fenced publication")
+
                 self._conn.execute(
                     """
                     INSERT OR REPLACE INTO kre_knowledge_graph (
@@ -718,6 +772,15 @@ class SQLiteKnowledgeGraphRepository:
                         manifest.publication_id, manifest_json, now_str
                     ),
                 )
+                self._conn.execute("COMMIT")
+                in_tx = False
+            except Exception:
+                if in_tx:
+                    try:
+                        self._conn.execute("ROLLBACK")
+                    except Exception:
+                        pass
+                raise
 
     def get_manifest(
         self,
@@ -1043,26 +1106,93 @@ class DynamoDBKnowledgeGraphRepository:
             # First publication or empty
             cond_expr = "attribute_not_exists(PK)"
 
-        try:
+        if fence_token is not None:
+            if not worker_id or not worker_id.strip():
+                raise FencingConflictError("Mandatory non-empty worker_id required for fenced publication")
+            ledger_sk = "BUDGET#LEDGER"
+            l_resp = self._table.get_item(
+                Key={"PK": pk, "SK": ledger_sk},
+                ConsistentRead=True,
+            )
+            l_item = l_resp.get("Item")
+            if not l_item:
+                raise FencingConflictError("Budget ledger does not exist for fenced publication")
+
+            ld = json.loads(l_item["data_json"]) if "data_json" in l_item else l_item
+            if ld.get("fence_token") != fence_token:
+                raise FencingConflictError(f"Fence mismatch: expected {fence_token}, got {ld.get('fence_token')}")
+            if ld.get("lease_owner_id") != worker_id:
+                raise FencingConflictError(f"Lease owner mismatch: expected {worker_id}, got {ld.get('lease_owner_id')}")
+            if float(ld.get("lease_expires_at", 0.0)) < time.time():
+                raise FencingConflictError("Lease has expired for fenced publication")
+
+            client = self._table.meta.client
+            table_name = self._table.name
+            now_ts = Decimal(str(time.time()))
+
+            put_dict = {
+                "TableName": table_name,
+                "Item": item,
+            }
             if cond_expr:
-                kwargs = {
-                    "Item": item,
-                    "ConditionExpression": cond_expr,
-                    "ExpressionAttributeValues": expr_vals if expr_vals else None,
-                }
-                if expr_names:
-                    kwargs["ExpressionAttributeNames"] = expr_names
-                kwargs = {k: v for k, v in kwargs.items() if v is not None}
-                self._table.put_item(**kwargs)
-            else:
-                self._table.put_item(Item=item)
-        except botocore.exceptions.ClientError as exc:
-            code = exc.response.get("Error", {}).get("Code")
-            if code == "ConditionalCheckFailedException":
-                raise OptimisticConcurrencyError(
-                    f"Publication conflict on {pk}: condition check failed"
-                ) from exc
-            raise
+                put_dict["ConditionExpression"] = cond_expr
+            if expr_names:
+                put_dict["ExpressionAttributeNames"] = expr_names
+            if expr_vals:
+                put_dict["ExpressionAttributeValues"] = expr_vals
+
+            check_dict = {
+                "TableName": table_name,
+                "Key": {"PK": pk, "SK": "BUDGET#LEDGER"},
+                "ConditionExpression": "attribute_exists(PK) AND #ft = :ft AND #owner = :owner AND #exp >= :now_ts",
+                "ExpressionAttributeNames": {
+                    "#ft": "fence_token",
+                    "#owner": "lease_owner_id",
+                    "#exp": "lease_expires_at",
+                },
+                "ExpressionAttributeValues": {
+                    ":ft": fence_token,
+                    ":owner": worker_id,
+                    ":now_ts": now_ts,
+                },
+            }
+
+            try:
+                client.transact_write_items(
+                    TransactItems=[
+                        {"Put": put_dict},
+                        {"ConditionCheck": check_dict},
+                    ]
+                )
+            except botocore.exceptions.ClientError as exc:
+                code = exc.response.get("Error", {}).get("Code")
+                if code == "TransactionCanceledException":
+                    reasons = exc.response.get("CancellationReasons", [])
+                    if len(reasons) > 1 and reasons[1].get("Code") == "ConditionalCheckFailed":
+                        raise FencingConflictError(f"DynamoDB fenced authority validation failed: {reasons[1]}") from exc
+                    raise OptimisticConcurrencyError(f"Publication conflict on {pk}: {reasons}") from exc
+                raise
+        else:
+            try:
+                if cond_expr:
+                    kwargs = {
+                        "Item": item,
+                        "ConditionExpression": cond_expr,
+                        "ExpressionAttributeValues": expr_vals if expr_vals else None,
+                    }
+                    if expr_names:
+                        kwargs["ExpressionAttributeNames"] = expr_names
+                    kwargs = {k: v for k, v in kwargs.items() if v is not None}
+                    self._table.put_item(**kwargs)
+                else:
+                    self._table.put_item(Item=item)
+            except botocore.exceptions.ClientError as exc:
+                code = exc.response.get("Error", {}).get("Code")
+                if code == "ConditionalCheckFailedException":
+                    raise OptimisticConcurrencyError(
+                        f"Publication conflict on {pk}: condition check failed"
+                    ) from exc
+                raise
 
     def get_manifest(
         self,
@@ -1281,6 +1411,9 @@ class DynamoDBKnowledgeGraphRepository:
                 "record_type": "budget_ledger",
                 "document_id": ledger.document_id,
                 "document_version": ledger.document_version,
+                "fence_token": ledger.fence_token,
+                "lease_owner_id": ledger.lease_owner_id,
+                "lease_expires_at": Decimal(str(ledger.lease_expires_at)),
                 "data_json": json.dumps(ledger.model_dump()),
                 "created_at": now_str,
             }

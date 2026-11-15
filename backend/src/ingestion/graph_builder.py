@@ -188,11 +188,14 @@ def extract_tabular_relationships(
     rows: Sequence[dict[str, Any]],
     schema_relations: Sequence[DirectionalSchemaRelation | TableForeignKey] | None = None,
     publication_id: str | None = None,
+    source_chunk_ids_by_row: Sequence[Sequence[str] | str] | None = None,
+    source_chunks: Sequence[Any] | None = None,
 ) -> tuple[list[KnowledgeGraphEntity], list[KnowledgeGraphRelationship]]:
     """Extract canonical entity relationships from CSV rows strictly using verified directional schema.
     
     Relationships are derived exclusively from explicit schema relations or foreign keys.
     Row co-occurrence alone or speculative column name similarity produces zero relationships.
+    Preserves actual source chunk bindings or derives grounded CSV adapter row chunk locators.
     """
     if not schema_relations or not rows:
         return [], []
@@ -204,6 +207,34 @@ def extract_tabular_relationships(
     relationships: list[KnowledgeGraphRelationship] = []
 
     for row_idx, row in enumerate(rows):
+        # Resolve source chunk bindings for this row
+        row_chunk_ids: list[str] = []
+        if source_chunk_ids_by_row and row_idx < len(source_chunk_ids_by_row):
+            val = source_chunk_ids_by_row[row_idx]
+            if isinstance(val, (list, tuple)):
+                row_chunk_ids.extend([str(x) for x in val if x])
+            elif val:
+                row_chunk_ids.append(str(val))
+        elif source_chunks and row_idx < len(source_chunks):
+            sc = source_chunks[row_idx]
+            sc_id = getattr(sc, "id", None) or (sc.get("id") if isinstance(sc, dict) else None)
+            if sc_id:
+                row_chunk_ids.append(str(sc_id))
+        elif isinstance(row, dict):
+            c_keys = ["source_chunk_ids", "source_chunk_id", "chunk_id", "_chunk_id", "chunk_ids"]
+            for ck in c_keys:
+                if ck in row and row[ck]:
+                    if isinstance(row[ck], (list, tuple)):
+                        row_chunk_ids.extend([str(x) for x in row[ck] if x])
+                    else:
+                        row_chunk_ids.append(str(row[ck]))
+                    break
+
+        if not row_chunk_ids:
+            # Deterministic binding matching csv_adapter row chunks (data row 0 is Row 2)
+            row_num = row_idx + 2 if isinstance(row_idx, int) else 2
+            row_chunk_ids.append(f"{document_id}:csv:row{row_num}")
+
         for schema_rel in schema_relations:
             src_col = schema_rel.source_column
             tgt_col = schema_rel.target_column
@@ -304,7 +335,7 @@ def extract_tabular_relationships(
                 source_document_id=document_id,
                 source_document_version=document_version,
                 publication_id=pub_id,
-                source_chunk_ids=(),
+                source_chunk_ids=tuple(row_chunk_ids),
                 location=loc,
                 verbatim_evidence=verbatim_ev,
                 relationship_state="unique",
@@ -330,6 +361,8 @@ class KnowledgeGraphBuilder:
         rows: Sequence[dict[str, Any]],
         schema_relations: Sequence[DirectionalSchemaRelation | TableForeignKey] | None = None,
         base_publication_id: str | None = None,
+        source_chunk_ids_by_row: Sequence[Sequence[str] | str] | None = None,
+        source_chunks: Sequence[Any] | None = None,
     ) -> KnowledgeGraphManifest:
         """Extract deterministic CSV relationships, stage them, and atomically commit the manifest."""
         pub_id = generate_publication_id()
@@ -344,6 +377,8 @@ class KnowledgeGraphBuilder:
             rows=rows,
             schema_relations=schema_relations,
             publication_id=pub_id,
+            source_chunk_ids_by_row=source_chunk_ids_by_row,
+            source_chunks=source_chunks,
         )
 
         if relationships:

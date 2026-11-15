@@ -145,6 +145,8 @@ record(
 )
 
 # 4. Deterministic CSV schema extraction and directional grounding validation (AC-1, AC-2)
+pub_id = generate_publication_id()
+
 csv_rows = [
     {"DepartmentId": "D01", "DepartmentName": "Engineering", "ManagerEmployeeId": "E101"},
     {"DepartmentId": "D02", "DepartmentName": "Research", "ManagerEmployeeId": "E102"},
@@ -165,6 +167,7 @@ tab_entities, tab_rels = extract_tabular_relationships(
     table_name="tbl_departments",
     rows=csv_rows,
     schema_relations=schema_rels,
+    publication_id=pub_id,
 )
 record(
     "AC-1",
@@ -221,8 +224,6 @@ sqlite_fd, sqlite_path = tempfile.mkstemp(suffix=".db")
 os.close(sqlite_fd)
 sqlite_repo = SQLiteKnowledgeGraphRepository(sqlite_path)
 
-pub_id = generate_publication_id()
-
 # Construct 2-hop connected graph: Engineering -> managed_by -> E101 -> reports_to -> VP_Alice
 vp_entity = KnowledgeGraphEntity(
     entity_id=compute_entity_id(
@@ -260,20 +261,15 @@ vp_rel = KnowledgeGraphRelationship(
     source_document_id=csv_doc_id,
     source_document_version=doc_ver,
     publication_id=pub_id,
-    source_chunk_ids=("chunk_mgr_1",),
+    source_chunk_ids=(f"{csv_doc_id}:csv:row2",),
     location=TableLocation(table_id="tbl_departments", row_id="D01", column_id="ManagerEmployeeId"),
     verbatim_evidence="Row D01: ManagerEmployeeId reports_to VP Alice",
     relationship_state="unique",
     created_at_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
 )
 
-# Update tab_rels to have source_chunk_ids and publication_id
-updated_tab_rels = [
-    r.model_copy(update={"publication_id": pub_id, "source_chunk_ids": ("chunk_dept_1",)})
-    for r in tab_rels
-]
 all_entities = tab_entities + [vp_entity]
-all_rels = updated_tab_rels + [vp_rel]
+all_rels = tab_rels + [vp_rel]
 
 # Pre-commit isolation check: staged items are invisible before manifest commit
 sqlite_repo.stage_relationships(
@@ -394,7 +390,7 @@ record(
 
 # 8. Targeted version-aware chunk hydration with ZERO get_all_chunks calls (AC-9)
 hydration_keys = [
-    ChunkLookupKey(chunk_id="chunk_mgr_1", document_id=csv_doc_id, document_version=doc_ver),
+    ChunkLookupKey(chunk_id=f"{csv_doc_id}:csv:row2", document_id=csv_doc_id, document_version=doc_ver),
 ]
 hydrated_chunks = doc_repo.get_chunks_by_ids(
     workspace_id=ws_id,
@@ -405,7 +401,7 @@ record(
     "Targeted chunk hydration calls get_chunks_by_ids with zero get_all_chunks calls",
     "DocumentsRepository.get_chunks_by_ids()",
     200,
-    isinstance(hydrated_chunks, list),
+    isinstance(hydrated_chunks, list) and len(hydrated_chunks) == 1 and hydrated_chunks[0].id == f"{csv_doc_id}:csv:row2",
     f"hydrated_count={len(hydrated_chunks)} (zero get_all_chunks invocations)",
 )
 

@@ -33,6 +33,8 @@ try:
         PinnedSnapshotContext,
         normalize_mention,
     )
+    from src.schemas.contracts.location import TableLocation
+    from src.schemas.models import Chunk
     from src.db.knowledge_graph_repo import (
         KnowledgeGraphRepositoryBase,
         build_pinned_snapshot_context,
@@ -50,6 +52,8 @@ except ImportError:
         PinnedSnapshotContext,
         normalize_mention,
     )
+    from schemas.contracts.location import TableLocation
+    from schemas.models import Chunk
     from db.knowledge_graph_repo import (
         KnowledgeGraphRepositoryBase,
         build_pinned_snapshot_context,
@@ -251,11 +255,13 @@ class KnowledgeGraphRetriever:
         boundary_repo: Any | None = None,
         documents_repo: DocumentsRepository | None = None,
         concurrency_controller: GraphConcurrencyController | None = None,
+        table_store: Any | None = None,
     ) -> None:
         self.repository = repository or get_knowledge_graph_repository()
         self.boundary_repo = boundary_repo
         self.documents_repo = documents_repo or DocumentsRepository()
         self.concurrency_controller = concurrency_controller or GraphConcurrencyController()
+        self.table_store = table_store
 
     def expand(
         self,
@@ -537,6 +543,61 @@ class KnowledgeGraphRetriever:
                     if self.boundary_repo.has_tombstone(workspace_id, "source", str(cid)):
                         continue
                 hydrated_chunks.append(c)
+
+        # Grounded TableStore evidence hydration for edges with TableLocation when chunks are absent
+        if len(hydrated_chunks) < max_chunks_ceiling and self.table_store is not None:
+            hydrated_ids = {str(getattr(c, "id", None) or getattr(c, "chunk_id", None)) for c in hydrated_chunks}
+            for edge in collected_edges:
+                if len(hydrated_chunks) >= max_chunks_ceiling:
+                    break
+                if isinstance(edge.location, TableLocation):
+                    loc = edge.location
+                    expected_chunk_id = f"{edge.source_document_id}:table:{loc.table_id}:row{loc.row_id}"
+                    if any(cid in hydrated_ids for cid in edge.source_chunk_ids) or expected_chunk_id in hydrated_ids:
+                        continue
+                    if self.boundary_repo and hasattr(self.boundary_repo, "has_tombstone"):
+                        if self.boundary_repo.has_tombstone(workspace_id, "source", edge.source_document_id):
+                            continue
+                    try:
+                        t_rows = self.table_store.query_rows(
+                            table_id=loc.table_id,
+                            workspace_id=workspace_id,
+                            version=edge.source_document_version,
+                        )
+                        target_row = None
+                        target_idx = int(loc.row_id) if str(loc.row_id).isdigit() else None
+                        for r in t_rows:
+                            if target_idx is not None and getattr(r, "row_index", None) == target_idx:
+                                target_row = r
+                                break
+                        row_text = edge.verbatim_evidence
+                        if target_row and getattr(target_row, "cells", None):
+                            cell_parts = [f"Col {cell.col_index}: {cell.raw_value}" for cell in target_row.cells if cell.raw_value]
+                            if cell_parts:
+                                row_text = ". ".join(cell_parts) + "."
+                        synth_chunk = Chunk(
+                            id=expected_chunk_id,
+                            document_id=edge.source_document_id,
+                            source_format="csv",
+                            text=row_text,
+                            element_type="row",
+                            section_path=(f"{loc.table_id}.csv",),
+                            location_reference=f"Table: {loc.table_id}, Row: {loc.row_id}, Column: {loc.column_id}",
+                            metadata={
+                                "table_id": loc.table_id,
+                                "row": loc.row_id,
+                                "column": loc.column_id,
+                                "version": edge.source_document_version,
+                                "document_version": edge.source_document_version,
+                            },
+                            workspace_id=workspace_id,
+                        )
+                        hydrated_chunks.append(synth_chunk)
+                        hydrated_ids.add(expected_chunk_id)
+                        if expected_chunk_id not in matched_chunk_ids:
+                            matched_chunk_ids.append(expected_chunk_id)
+                    except Exception as ts_err:
+                        logger.warning("kg.tablestore_hydration_failed: %s", ts_err)
 
         elapsed_ms = (time.perf_counter() - t_start) * 1000.0
 

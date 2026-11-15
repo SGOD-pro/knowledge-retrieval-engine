@@ -344,15 +344,44 @@ class DocumentsRepository:
         seen_keys = set()
         deduped = []
         for k in chunk_keys:
-            cid = getattr(k, "chunk_id", None) or k.get("chunk_id")
-            did = getattr(k, "document_id", None) or k.get("document_id")
-            dver = getattr(k, "document_version", None) or k.get("document_version")
+            cid = getattr(k, "chunk_id", None) or (k.get("chunk_id") if isinstance(k, dict) else None)
+            did = getattr(k, "document_id", None) or (k.get("document_id") if isinstance(k, dict) else None)
+            dver = getattr(k, "document_version", None) or (k.get("document_version") if isinstance(k, dict) else None)
+            # Missing or unverifiable version bindings must fail closed
+            if not cid or not did or not dver or not str(dver).strip() or str(dver).strip() == "unknown":
+                continue
             key_tuple = (str(cid), str(did), str(dver))
             if key_tuple not in seen_keys:
                 seen_keys.add(key_tuple)
                 deduped.append(k)
             if len(deduped) >= 15:
                 break
+
+        def _verify_chunk_version(chunk_meta: dict, ws_id: str, doc_id: str, req_ver: str) -> bool:
+            chunk_ver = chunk_meta.get("version") or chunk_meta.get("document_version")
+            if chunk_ver is not None and str(chunk_ver).strip() != "":
+                return str(chunk_ver) == str(req_ver)
+
+            # Missing from chunk metadata: verify against actual ingestion metadata
+            try:
+                from db.workspace_boundary_repo import get_workspace_boundary_repo
+                b_repo = get_workspace_boundary_repo()
+                snap = b_repo.get_document_snapshot(ws_id, doc_id)
+                if snap is not None and getattr(snap, "version", None):
+                    return str(snap.version) == str(req_ver)
+            except Exception:
+                pass
+
+            try:
+                from db.table_store import get_shared_table_store
+                ts = get_shared_table_store()
+                man = ts.get_ingestion_manifest(doc_id, ws_id, version=str(req_ver))
+                if man and man.get("document_version") == str(req_ver):
+                    return True
+            except Exception:
+                pass
+
+            return False
 
         if _is_test_env():
             matched: list[Chunk] = []
@@ -364,10 +393,8 @@ class DocumentsRepository:
                 if chunk is not None:
                     if getattr(chunk, "workspace_id", None) == workspace_id and str(chunk.document_id) == did:
                         meta = chunk.metadata or {}
-                        chunk_ver = meta.get("version") or meta.get("document_version")
-                        if chunk_ver and str(chunk_ver) != dver:
-                            continue
-                        matched.append(chunk)
+                        if _verify_chunk_version(meta, workspace_id, did, dver):
+                            matched.append(chunk)
             return matched
 
         try:
@@ -413,10 +440,8 @@ class DocumentsRepository:
                     continue
                 meta_raw = row.get("metadata")
                 meta = json.loads(meta_raw) if meta_raw and isinstance(meta_raw, str) else (meta_raw or {})
-                row_ver = meta.get("version") or meta.get("document_version")
-                if row_ver and str(row_ver) != dver:
-                    continue
-                results.append(self._parse_chunk(row))
+                if _verify_chunk_version(meta, workspace_id, did, dver):
+                    results.append(self._parse_chunk(row))
 
             return results
         except Exception as e:
