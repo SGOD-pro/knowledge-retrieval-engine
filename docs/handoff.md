@@ -130,3 +130,63 @@ Specification 0003 remains Proposed and deferred.
 * Specification 0003: Snapshot registry, publication, and atomic deletion remains Proposed and deferred.
 * Specification 0004: Core engine walking skeleton and benchmarks is fully accepted and closed with all checks passing.
 * Paid benchmark evaluation runs were not re executed during this slice.
+
+## Bounded Open Knowledge Framework (OKF) Integration and Slice 3.1 Hardening (Spec 0006)
+
+* **Date**: November 15 2026
+* **Branch**: `re-factor`
+* **Final implementation commit**: `04cdc6938f9b18eaebb2b5921d49654b96f93e8f`
+* **Review commit**: `e4307091b08b9e7d44289f2ad47f11b00f155369`
+* **Status**: Specification 0006 locally Accepted; Specification 0003 Proposed and deferred; Specification 0007 Proposed and unimplemented.
+
+### Overview
+
+This milestone completes and hardens specification 0006 (Bounded Open Knowledge Framework Integration) across all layers:
+1. Grounded entity extraction: typed `OkfEntityRecord` and `OkfPropertyAssertion` contracts per document version, verbatim chunk grounding validation for PDF text, and curated table schema extraction for CSV files with zero model calls and zero token expense.
+2. Partitioned persistence: workspace scoped partition keys (`WORKSPACE#{workspace_id}`) and secondary indexes (`GSI1` for entity lookup, `GSI2` for readiness discovery) across SQLite, in memory, and DynamoDB Local stores, preventing cross tenant data leakage.
+3. Durable budget ledger coordination (Slice 3.1): atomic reservations and token ceiling enforcement (`max_calls = 2`, `2000` input tokens per call ceiling, `4000` total input token ceiling, `600` output tokens per call ceiling, `1200` total output token ceiling, and 10 second timeout) in dedicated ledger items (`BUDGET#DOC#{doc}#VER#{ver}`).
+4. Authoritative request token bounding: official Bedrock Runtime `count_tokens` API integration bounding converse requests before dispatch, failing closed on missing, malformed, or zero token responses.
+5. Large publication staging: payloads exceeding 99 items stage entities and assertions into distinct attempt publication keys (`PUB#{pub_id}`) before committing visibility atomically via a two item transaction, ensuring staging failures leave the manifest uncommitted and unready.
+6. Same version republication isolation: sort keys and query prefixes embed publication identifiers, and retrieval filters candidate assertions strictly by the active publication identifier discovered from the ready manifest, preventing stale records from diluting bounded query limits.
+7. Publication authority and optimistic ordering: optimistic concurrency against base publication identifiers prevents stale unfenced attempts from replacing newer committed publications. Fenced publication requires existing ledger items, current fence tokens, unexpired leases, and mandatory non empty `worker_id` values.
+8. SQLite publication authority across separate connections: `SQLiteOkfRepository.save_manifest` combines base publication validation and active budget ledger lease protections into a single atomic conditional SQL statement, preventing race conditions between query pre checks and manifest writes across separate database connections.
+9. Ready PDF publication preservation: extraction attempts preserve existing ready manifests during process crashes, provider call timeouts, budget reconciliation errors, and storage write failures, keeping budget reservations durable separately in the budget ledger and ensuring prior ready assertions remain retrievable.
+10. Soft candidate pooling: verified entity assertions pool softly into reciprocal rank fusion with a calibrated weight of 1.15 without hard exclusions or page pruning, while fast path queries bypass OKF lookups.
+
+### Independent Senior Code Review
+
+* Reviewer: Staff Reviewer on contrasting model `claude-3-5-sonnet` (commit [`e430709`](file:///home/swyra/projects/knowledge-retrieval-engine)).
+* Scope: 5 changed files on branch `re-factor` (`backend/src/db/okf_repo.py`, `backend/tests/test_okf_slice3_1.py`, `docs/specs/0006-okf-integration.md`, `docs/specs/0006-verify.md`, `docs/reviews/2026-11-14-re-factor-okf-publication-races-resolved.md`).
+* Verdict: Approve with nits (0 blockers, 0 majors, 0 minors, 2 nits).
+* Findings resolution:
+  * SQL condition documentation alignment: In [`docs/reviews/2026-11-14-re-factor-okf-publication-races-resolved.md`](file:///home/swyra/projects/knowledge-retrieval-engine/docs/reviews/2026-11-14-re-factor-okf-publication-races-resolved.md#L41-L42), aligned the summary SQL condition to reflect the exact implementation in `SQLiteOkfRepository.save_manifest` (`json_extract(data_json, '$.lease_owner_id') IS NOT NULL AND CAST(json_extract(data_json, '$.lease_expires_at') AS REAL) > ?`).
+  * Test budget note: Documented that manual budget pre reservation consumes one call permit, which is valid for single chunk tests but requires accounting awareness for multi chunk tests.
+* Review report: [`docs/reviews/2026-11-15-re-factor-0006-slice3-1-final-repairs.md`](file:///home/swyra/projects/knowledge-retrieval-engine/docs/reviews/2026-11-15-re-factor-0006-slice3-1-final-repairs.md).
+
+### Verification Evidence and Test Suite Summary
+
+* Focused Publication Authority and Preservation Tests:
+  * Command: `cd backend && PYTHONPATH=src uv run pytest tests/test_okf_slice3_1.py -k "test_sqlite_publication_ordering_atomic_across_separate_connections or test_sqlite_unfenced_publication_ordering_blocked_by_concurrent_lease_across_separate_connections or test_lease_expiry_and_fence_advancement_during_publication_interval or test_preserve_ready_pdf_publication_during_new_attempt_failures" -v`
+  * Outcome: 4 passed in 4.99s.
+* Full OKF Slice 3.1 Suite:
+  * Command: `cd backend && PYTHONPATH=src uv run pytest tests/test_okf_slice3_1.py -v`
+  * Outcome: 57 passed in 10.38s.
+* Complete OKF Regression Suite:
+  * Command: `cd backend && PYTHONPATH=src uv run pytest tests/test_okf_slice1.py tests/test_okf_ablation_slice2.py tests/test_okf_correctness_regressions.py tests/test_okf_graph_contract.py tests/test_contracts_and_identity.py -v`
+  * Outcome: 112 passed in 12.29s (19 in `test_okf_slice1.py`, 11 in `test_okf_ablation_slice2.py`, 29 in `test_okf_correctness_regressions.py`, 4 in `test_okf_graph_contract.py`, 49 in `test_contracts_and_identity.py`).
+* Total OKF Test Coverage:
+  * 169 passed, 0 failed, 0 skipped across all test suites in 27.66s.
+
+### Operational Boundaries and Limitations
+
+1. Local acceptance versus live AWS endpoints: All behaviors were verified using local SQLite with WAL mode, in memory repositories, and local Docker DynamoDB Local (`test_ddb_local` on port 8000). Live AWS Bedrock provider calls and live AWS DynamoDB cloud transactions remain unverified in local continuous integration without cloud credentials.
+2. Delayed DynamoDB commit limitations: Client socket timeouts (such as a 40ms read timeout) terminate the client HTTP connection but do not cancel or bound server side transaction processing in DynamoDB. A client timeout produces an uncertain outcome that must be verified by a strongly consistent read. If a commit arrives after lease duration expires but before a competitor worker advances the fence, DynamoDB commits the write because condition checks compare client supplied timestamp constants. Strict rejection after lease expiration is guaranteed once another worker advances the monotonic fence token (`fence_token > expected_fence`).
+3. Deferred DynamoDB record cleanup: Staged and superseded entity and assertion records remain inert in DynamoDB to maintain reader isolation without non atomic cross partition deletes; physical garbage collection remains deferred to background maintenance.
+
+### Project Status and Next Task
+
+* Specification 0006: Locally Accepted and marked done in [`docs/scope/scope.md`](file:///home/swyra/projects/knowledge-retrieval-engine/docs/scope/scope.md).
+* Specification 0003: Snapshot registry, publication, and atomic deletion remains Proposed and deferred.
+* Specification 0007: Knowledge graph enrichment remains Proposed and unimplemented.
+* Next Task: Review the existing specification 0007 design ([`docs/specs/0007-knowledge-graph-enrichment.md`](file:///home/swyra/projects/knowledge-retrieval-engine/docs/specs/0007-knowledge-graph-enrichment.md)).
+* Invariant reminder: Zero paid benchmarks run, zero re ingestion, zero re embedding, and historical benchmark artifacts preserved.
