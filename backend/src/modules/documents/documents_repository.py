@@ -402,13 +402,13 @@ class DocumentsRepository:
                 }
             }
 
-            response = self.dynamodb.meta.client.batch_get_item(RequestItems=batch_request)
+            response = self.dynamodb.batch_get_item(RequestItems=batch_request)
             items = response.get("Responses", {}).get(self.table_name, [])
             unprocessed = response.get("UnprocessedKeys", {}).get(self.table_name, {})
 
             if unprocessed and unprocessed.get("Keys"):
                 time.sleep(0.02)
-                retry_resp = self.dynamodb.meta.client.batch_get_item(
+                retry_resp = self.dynamodb.batch_get_item(
                     RequestItems={self.table_name: unprocessed}
                 )
                 items.extend(retry_resp.get("Responses", {}).get(self.table_name, []))

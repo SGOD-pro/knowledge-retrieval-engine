@@ -60,6 +60,7 @@ from db.knowledge_graph_repo import (
     OptimisticConcurrencyError,
     SQLiteKnowledgeGraphRepository,
     build_pinned_snapshot_context,
+    get_knowledge_graph_repository,
 )
 from ingestion.graph_builder import (
     DirectionalSchemaRelation,
@@ -2987,6 +2988,130 @@ def test_builder_to_retriever_legacy_presence_never_produces_falsely_versioned_e
     assert cand.metadata["document_version"] == v_req
     assert cand.metadata["table_id"] == "tbl_components"
     assert str(cand.metadata["row"]) == "0"
+
+
+def test_mention_lookup_past_alphabetical_threshold():
+    """covers: AC-1 Entity mention lookup finds entities beyond the first 30 alphabetical items."""
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
+        sqlite_path = tf.name
+
+    try:
+        mem_repo = InMemoryKnowledgeGraphRepository()
+        sql_repo = SQLiteKnowledgeGraphRepository(db_path=sqlite_path)
+
+        ws = "ws_alpha_zebra"
+        doc = "doc_az"
+        ver = "v1"
+        pub = "pub_az"
+
+        entities = []
+        for i in range(35):
+            name = f"Alpha Corp {i:02d}"
+            eid = f"ent_alpha_{i:02d}"
+            entities.append(KnowledgeGraphEntity(
+                entity_id=eid,
+                workspace_id=ws,
+                entity_type="organization",
+                name=name,
+                canonical_name=name,
+                aliases=(name.lower(),),
+                source_document_id=doc,
+            ))
+
+        zebra_ent = KnowledgeGraphEntity(
+            entity_id="ent_zebra",
+            workspace_id=ws,
+            entity_type="organization",
+            name="Zebra Analytics",
+            canonical_name="Zebra Analytics",
+            aliases=("zebra analytics",),
+            source_document_id=doc,
+        )
+        entities.append(zebra_ent)
+
+        for repo in (mem_repo, sql_repo):
+            repo.stage_relationships(
+                workspace_id=ws,
+                document_id=doc,
+                document_version=ver,
+                publication_id=pub,
+                entities=entities,
+                relationships=[],
+            )
+
+            results, was_truncated, reason = repo.resolve_mentions(
+                workspace_id=ws,
+                candidate_tokens=["Zebra Analytics"],
+                limit=10,
+                max_pages=3,
+            )
+            assert len(results) >= 1
+            assert results[0]["entity_id"] == "ent_zebra"
+            assert results[0]["canonical_name"] == "Zebra Analytics"
+    finally:
+        if os.path.exists(sqlite_path):
+            os.remove(sqlite_path)
+
+
+def test_factory_isolation_in_test_environment(monkeypatch):
+    """covers: AC-13 get_knowledge_graph_repository() provides isolated repositories across test boundaries."""
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    repo1 = get_knowledge_graph_repository()
+    repo2 = get_knowledge_graph_repository()
+
+    assert repo1 is not repo2
+
+    ws = "ws_factory_test"
+    doc = "doc_f1"
+    ver = "v1"
+    pub = "pub_f1"
+
+    ent = KnowledgeGraphEntity(
+        entity_id="ent_iso",
+        workspace_id=ws,
+        entity_type="organization",
+        name="Isolated Corp",
+        canonical_name="Isolated Corp",
+        aliases=("isolated corp",),
+        source_document_id=doc,
+    )
+    repo1.stage_relationships(
+        workspace_id=ws,
+        document_id=doc,
+        document_version=ver,
+        publication_id=pub,
+        entities=[ent],
+        relationships=[],
+    )
+
+    res1, _, _ = repo1.resolve_mentions(ws, ["Isolated Corp"])
+    assert len(res1) == 1
+
+    res2, _, _ = repo2.resolve_mentions(ws, ["Isolated Corp"])
+    assert len(res2) == 0
+
+
+def test_validate_relationship_grounding_word_boundary_overlap():
+    """covers: AC-2 validate_relationship_grounding handles overlapping entity names with word boundaries."""
+    sentence_sub = "Alpha acquired Beta."
+    ok2, _ = validate_relationship_grounding(
+        chunk_text=sentence_sub,
+        source_entity_name="Alpha",
+        predicate="acquired",
+        target_entity_name="Beta",
+    )
+    assert ok2 is True
+
+    # Check reversed relationship
+    sentence_rev = "Beta was acquired by Alpha."
+    ok_rev, _ = validate_relationship_grounding(
+        chunk_text=sentence_rev,
+        source_entity_name="Alpha",
+        predicate="acquired",
+        target_entity_name="Beta",
+    )
+    assert ok_rev is True
+
 
 
 

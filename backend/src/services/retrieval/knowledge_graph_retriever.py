@@ -310,37 +310,41 @@ def _verify_table_document_binding(
     # 3. Check SQLite connection tables (versioned_schemas, active_versions)
     if hasattr(table_store, "_conn"):
         try:
-            cur = table_store._conn.execute(
-                "SELECT workspace_id, table_id, document_id, version FROM versioned_schemas WHERE workspace_id = ? AND table_id = ? AND version = ?",
-                (workspace_id, table_id, str(document_version)),
-            )
-            row = cur.fetchone()
-            if row:
-                doc_id = row["document_id"] if hasattr(row, "__getitem__") else getattr(row, "document_id", None)
-                ver = row["version"] if hasattr(row, "__getitem__") else getattr(row, "version", None)
-                tid = row["table_id"] if hasattr(row, "__getitem__") else getattr(row, "table_id", None)
-                ws = row["workspace_id"] if hasattr(row, "__getitem__") else getattr(row, "workspace_id", None)
-                if not doc_id or not ver or not tid or not ws:
+            lock = getattr(table_store, "_lock", None)
+            from contextlib import nullcontext
+            lock_ctx = lock if lock is not None else nullcontext()
+            with lock_ctx:
+                cur = table_store._conn.execute(
+                    "SELECT workspace_id, table_id, document_id, version FROM versioned_schemas WHERE workspace_id = ? AND table_id = ? AND version = ?",
+                    (workspace_id, table_id, str(document_version)),
+                )
+                row = cur.fetchone()
+                if row:
+                    doc_id = row["document_id"] if hasattr(row, "__getitem__") else getattr(row, "document_id", None)
+                    ver = row["version"] if hasattr(row, "__getitem__") else getattr(row, "version", None)
+                    tid = row["table_id"] if hasattr(row, "__getitem__") else getattr(row, "table_id", None)
+                    ws = row["workspace_id"] if hasattr(row, "__getitem__") else getattr(row, "workspace_id", None)
+                    if not doc_id or not ver or not tid or not ws:
+                        return False
+                    if doc_id == document_id and str(ver) == str(document_version) and tid == table_id and ws == workspace_id:
+                        return True
                     return False
-                if doc_id == document_id and str(ver) == str(document_version) and tid == table_id and ws == workspace_id:
-                    return True
-                return False
 
-            cur = table_store._conn.execute(
-                "SELECT workspace_id, table_id, document_id, version FROM active_versions WHERE workspace_id = ? AND table_id = ? AND version = ?",
-                (workspace_id, table_id, str(document_version)),
-            )
-            row = cur.fetchone()
-            if row:
-                doc_id = row["document_id"] if hasattr(row, "__getitem__") else getattr(row, "document_id", None)
-                ver = row["version"] if hasattr(row, "__getitem__") else getattr(row, "version", None)
-                tid = row["table_id"] if hasattr(row, "__getitem__") else getattr(row, "table_id", None)
-                ws = row["workspace_id"] if hasattr(row, "__getitem__") else getattr(row, "workspace_id", None)
-                if not doc_id or not ver or not tid or not ws:
+                cur = table_store._conn.execute(
+                    "SELECT workspace_id, table_id, document_id, version FROM active_versions WHERE workspace_id = ? AND table_id = ? AND version = ?",
+                    (workspace_id, table_id, str(document_version)),
+                )
+                row = cur.fetchone()
+                if row:
+                    doc_id = row["document_id"] if hasattr(row, "__getitem__") else getattr(row, "document_id", None)
+                    ver = row["version"] if hasattr(row, "__getitem__") else getattr(row, "version", None)
+                    tid = row["table_id"] if hasattr(row, "__getitem__") else getattr(row, "table_id", None)
+                    ws = row["workspace_id"] if hasattr(row, "__getitem__") else getattr(row, "workspace_id", None)
+                    if not doc_id or not ver or not tid or not ws:
+                        return False
+                    if doc_id == document_id and str(ver) == str(document_version) and tid == table_id and ws == workspace_id:
+                        return True
                     return False
-                if doc_id == document_id and str(ver) == str(document_version) and tid == table_id and ws == workspace_id:
-                    return True
-                return False
         except Exception:
             pass
 
@@ -462,6 +466,7 @@ class KnowledgeGraphRetriever:
                 snapshot_context=snapshot_context,
                 max_hops=max_hops,
                 t_start=t_start,
+                rem_s=rem_s,
             )
 
         result, status = self.concurrency_controller.run_storage_work_sync(_do_expand, deadline_s=deadline_s)
@@ -496,6 +501,7 @@ class KnowledgeGraphRetriever:
         snapshot_context: PinnedSnapshotContext | None,
         max_hops: int,
         t_start: float,
+        rem_s: float | None = None,
     ) -> KnowledgeGraphLookupResult:
         # 1. Dynamic workspace tombstone check
         if self.boundary_repo and hasattr(self.boundary_repo, "has_tombstone"):
@@ -572,6 +578,7 @@ class KnowledgeGraphRetriever:
         collected_edges: list[KnowledgeGraphRelationship] = []
         collected_edge_keys: set[str] = set()
         chunk_keys_map: dict[str, ChunkLookupKey] = {}
+        chunk_priority_map: dict[str, tuple[float, int, str]] = {}
         conflicting_edges = False
 
         # Hop 1 Expansion
@@ -626,6 +633,8 @@ class KnowledgeGraphRetriever:
                                 document_id=edge.source_document_id,
                                 document_version=edge.source_document_version,
                             )
+                        if cid not in chunk_priority_map:
+                            chunk_priority_map[cid] = (-edge.confidence, 1, cid)
 
                     neighbor_id = edge.target_entity_id if edge.source_entity_id == seed_id else edge.source_entity_id
                     if neighbor_id not in visited_nodes:
@@ -633,7 +642,10 @@ class KnowledgeGraphRetriever:
 
         # Hop 2 Expansion
         max_nodes_ceiling = getattr(settings, "GRAPH_MAX_NODES", 25)
-        if max_hops >= 2 and len(visited_nodes) < max_nodes_ceiling and next_frontier:
+        if rem_s is not None and (time.perf_counter() - t_start) >= rem_s:
+            was_truncated = True
+            trunc_reason = "deadline_approaching"
+        elif max_hops >= 2 and len(visited_nodes) < max_nodes_ceiling and next_frontier:
             # Deterministic sorting: confidence DESC, entity_id ASC
             next_frontier.sort(key=lambda x: (-x[1], x[0]))
             # Deduplicate frontier
@@ -684,6 +696,8 @@ class KnowledgeGraphRetriever:
                                     document_id=edge.source_document_id,
                                     document_version=edge.source_document_version,
                                 )
+                            if cid not in chunk_priority_map:
+                                chunk_priority_map[cid] = (-edge.confidence, 2, cid)
 
         # Detect conflicting relationships
         edge_pairs: dict[tuple[str, str], set[str]] = {}
@@ -703,24 +717,28 @@ class KnowledgeGraphRetriever:
         max_chunks_ceiling = getattr(settings, "GRAPH_MAX_HYDRATED_CHUNKS", 15)
 
         if chunk_keys_map:
-            # Deterministic sorting on chunk keys
-            sorted_keys = sorted(
-                chunk_keys_map.values(),
-                key=lambda k: k.chunk_id,
-            )[:max_chunks_ceiling]
+            if rem_s is not None and (time.perf_counter() - t_start) >= rem_s:
+                was_truncated = True
+                trunc_reason = "deadline_approaching"
+            else:
+                # Deterministic sorting: confidence DESC, hop_distance ASC, chunk_id ASC
+                sorted_keys = sorted(
+                    chunk_keys_map.values(),
+                    key=lambda k: chunk_priority_map.get(k.chunk_id, (0.0, 99, k.chunk_id)),
+                )[:max_chunks_ceiling]
 
-            raw_chunks = self.documents_repo.get_chunks_by_ids(
-                workspace_id=workspace_id,
-                chunk_keys=sorted_keys,
-            )
+                raw_chunks = self.documents_repo.get_chunks_by_ids(
+                    workspace_id=workspace_id,
+                    chunk_keys=sorted_keys,
+                )
 
-            # Dynamic source tombstone filter on hydrated chunks
-            for c in raw_chunks:
-                cid = getattr(c, "document_id", None)
-                if cid and self.boundary_repo and hasattr(self.boundary_repo, "has_tombstone"):
-                    if self.boundary_repo.has_tombstone(workspace_id, "source", str(cid)):
-                        continue
-                hydrated_chunks.append(c)
+                # Dynamic source tombstone filter on hydrated chunks
+                for c in raw_chunks:
+                    cid = getattr(c, "document_id", None)
+                    if cid and self.boundary_repo and hasattr(self.boundary_repo, "has_tombstone"):
+                        if self.boundary_repo.has_tombstone(workspace_id, "source", str(cid)):
+                            continue
+                    hydrated_chunks.append(c)
 
         # Grounded TableStore evidence hydration for edges with TableLocation when chunks are absent
         if len(hydrated_chunks) < max_chunks_ceiling and self.table_store is not None:

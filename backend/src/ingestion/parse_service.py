@@ -74,10 +74,11 @@ def parse_file(
 
     chunk_list = []
     for c in raw_chunks:
-        if file_ver:
-            meta = dict(c.metadata or {})
-            meta.setdefault("version", file_ver)
-            meta.setdefault("document_version", file_ver)
+        meta = dict(c.metadata or {})
+        chunk_ver = meta.get("version") or meta.get("document_version") or file_ver
+        if chunk_ver:
+            meta["version"] = chunk_ver
+            meta["document_version"] = chunk_ver
             chunk_list.append(replace(c, metadata=meta))
         else:
             chunk_list.append(c)

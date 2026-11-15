@@ -28,6 +28,10 @@ FastAPI service providing parsing, structural indexing, retrieval orchestration,
 | `src/ingestion/okf_builder.py` | Bounded OKF extraction with chunk grounding verification and curated table schemas |
 | `src/services/retrieval/okf_lookup.py` | Bounded concurrent OKF storage lookup service with capacity retention |
 | `src/services/retrieval/okf_retriever.py` | Authoritative OKF retriever enforcing workspace boundaries and deadlines |
+| `src/schemas/contracts/knowledge_graph.py` | Typed knowledge graph entity, relationship, manifest, ledger, and lookup contracts |
+| `src/db/knowledge_graph_repo.py` | Workspace partitioned knowledge graph storage repository across DynamoDB, SQLite, and memory stores |
+| `src/ingestion/graph_builder.py` | Deterministic CSV relationship extraction and directional grounding validation |
+| `src/services/retrieval/knowledge_graph_retriever.py` | Bounded multi hop knowledge graph retriever with concurrency admission and targeted chunk hydration |
 | `src/services/benchmark/` | Benchmark runner, S3 artifact store, and recoverable metric persistence |
 | `scripts/resume_canonical_qdrant_points.py` | Idempotent canonical Qdrant resume with fail closed preflight and model provenance validation |
 
@@ -53,6 +57,9 @@ uv run pytest tests/test_contracts_and_identity.py
 * Ingestion pipelines produce source backed representations without assuming source truth.
 * Keep query time model work bounded and track token or call budgets across steps.
 * Failed fast path extractions escalate to full retrieval with refreshed candidate state, single generation limits, and structured refusal when evidence is absent.
+* Knowledge graph storage isolates staged records under publication prefixes, visible only after atomic manifest publication commit.
+* Dynamic source and workspace tombstones halt graph traversal and chunk hydration immediately fail closed.
+* Targeted chunk hydration uses point lookups by chunk identifier with zero calls to get_all_chunks.
 
 ## Gotchas
 * Local development defaults to SQLite or in memory TableStore and LocalStack DynamoDB, while Qdrant runs via local container or cloud.
@@ -83,6 +90,7 @@ uv run pytest tests/test_contracts_and_identity.py
 * [docs/specs/0004-core-engine-walking-skeleton.md](../docs/specs/0004-core-engine-walking-skeleton.md)
 * [docs/specs/0005-pageindex-structural-retrieval.md](../docs/specs/0005-pageindex-structural-retrieval.md)
 * [docs/specs/0006-okf-integration.md](../docs/specs/0006-okf-integration.md)
+* [docs/specs/0007-knowledge-graph-enrichment.md](../docs/specs/0007-knowledge-graph-enrichment.md)
 * [docs/TECHNICAL_SPEC.md](../docs/TECHNICAL_SPEC.md)
 * [docs/ARCHITECTURE.md](../docs/ARCHITECTURE.md)
 * [docs/REQUIREMENTS.md](../docs/REQUIREMENTS.md)

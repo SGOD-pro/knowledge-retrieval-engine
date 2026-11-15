@@ -405,28 +405,34 @@ class InMemoryKnowledgeGraphRepository:
             candidates = self._lookup.get(lookup_pk, [])
             results: list[dict[str, Any]] = []
             evaluated_count = 0
-            page_capacity = 10
-            max_eval = page_capacity * max_pages  # 30 items
+            page_capacity = limit
+            max_eval = page_capacity * max_pages
             was_truncated = False
             truncation_reason = None
 
             norm_tokens = {normalize_mention(t) for t in candidate_tokens if t}
-
-            for item in sorted(candidates, key=lambda x: x["SK"]):
-                evaluated_count += 1
-                if evaluated_count > max_eval:
-                    was_truncated = True
-                    truncation_reason = "mention_lookup_page_limit_reached"
-                    break
-
-                sk = item["SK"]  # MENTION#{token}#ENT#{ent_id}...
+            matching_candidates = []
+            for item in candidates:
+                sk = item["SK"]
                 parts = sk.split("#")
                 if len(parts) >= 3 and parts[0] == "MENTION":
                     token = unescape_delimiter(parts[1])
                     if token in norm_tokens or any(token.startswith(nt) for nt in norm_tokens):
-                        results.append(item)
-                        if len(results) >= limit:
-                            break
+                        matching_candidates.append(item)
+
+            matching_candidates.sort(key=lambda x: x["SK"])
+            if len(matching_candidates) > max_eval:
+                was_truncated = True
+                truncation_reason = "mention_lookup_page_limit_reached"
+
+            seen_sks = set()
+            for item in matching_candidates[:max_eval]:
+                if item["SK"] in seen_sks:
+                    continue
+                seen_sks.add(item["SK"])
+                results.append(item)
+                if len(results) >= limit:
+                    break
 
             return results, was_truncated, truncation_reason
 
@@ -445,7 +451,7 @@ class InMemoryKnowledgeGraphRepository:
             ]
             matched.sort(key=lambda x: x["SK"])
 
-            max_eval = 10 * max_pages  # 30 items
+            max_eval = limit * max_pages
             evaluated = len(matched)
             was_truncated = evaluated > max_eval
             truncation_reason = "edge_lookup_page_limit_reached" if was_truncated else None
@@ -468,7 +474,7 @@ class InMemoryKnowledgeGraphRepository:
             ]
             matched.sort(key=lambda x: x["GSI1_SK"])
 
-            max_eval = 10 * max_pages
+            max_eval = limit * max_pages
             evaluated = len(matched)
             was_truncated = evaluated > max_eval
             truncation_reason = "edge_lookup_page_limit_reached" if was_truncated else None
@@ -665,6 +671,10 @@ class SQLiteKnowledgeGraphRepository:
                 raise
 
             try:
+                # Test pause hook right before authoritative in-transaction validation and write
+                if self._pre_write_hook is not None:
+                    self._pre_write_hook()
+
                 cursor = self._conn.execute(
                     "SELECT data_json FROM kre_knowledge_graph WHERE pk = ? AND sk = ?",
                     (pk, sk),
@@ -711,51 +721,6 @@ class SQLiteKnowledgeGraphRepository:
                             f"Lease owner mismatch: expected {worker_id}, got {ld.get('lease_owner_id')}"
                         )
                     if float(ld.get("lease_expires_at", 0.0)) < time.time():
-                        raise FencingConflictError("Lease has expired for fenced publication")
-
-                # Test pause hook between validation and write
-                if self._pre_write_hook is not None:
-                    self._pre_write_hook()
-
-                # Re-verify condition right before the write to catch any state transitions
-                v_cursor = self._conn.execute(
-                    "SELECT data_json FROM kre_knowledge_graph WHERE pk = ? AND sk = ?",
-                    (pk, sk),
-                )
-                v_row = v_cursor.fetchone()
-                if v_row is not None:
-                    v_data = json.loads(v_row["data_json"])
-                    v_pub = v_data.get("publication_id")
-                    if base_publication_id is not None:
-                        if v_pub != base_publication_id:
-                            raise OptimisticConcurrencyError(
-                                f"Publication conflict: current publication '{v_pub}' does not match base '{base_publication_id}'"
-                            )
-                    else:
-                        if v_data.get("status") == "ready":
-                            raise OptimisticConcurrencyError(
-                                f"Publication conflict: document already has active publication '{v_pub}'"
-                            )
-                else:
-                    if base_publication_id is not None:
-                        raise OptimisticConcurrencyError(
-                            f"Publication conflict: expected base publication '{base_publication_id}' but none exists"
-                        )
-
-                if fence_token is not None:
-                    l_cur2 = self._conn.execute(
-                        "SELECT data_json FROM kre_knowledge_graph WHERE pk = ? AND sk = ?",
-                        (pk, "BUDGET#LEDGER"),
-                    )
-                    l_row2 = l_cur2.fetchone()
-                    if not l_row2:
-                        raise FencingConflictError("Budget ledger does not exist for fenced publication")
-                    ld2 = json.loads(l_row2["data_json"])
-                    if ld2.get("fence_token") != fence_token:
-                        raise FencingConflictError(f"Fence mismatch: expected {fence_token}, got {ld2.get('fence_token')}")
-                    if ld2.get("lease_owner_id") != worker_id:
-                        raise FencingConflictError(f"Lease owner mismatch: expected {worker_id}, got {ld2.get('lease_owner_id')}")
-                    if float(ld2.get("lease_expires_at", 0.0)) < time.time():
                         raise FencingConflictError("Lease has expired for fenced publication")
 
                 self._conn.execute(
@@ -813,43 +778,48 @@ class SQLiteKnowledgeGraphRepository:
         if not norm_tokens:
             return [], False, None
 
-        max_eval = 10 * max_pages  # 30 items
+        max_eval = limit * max_pages
         results: list[dict[str, Any]] = []
         was_truncated = False
         truncation_reason = None
+        seen_sks = set()
 
         with self._lock:
-            cursor = self._conn.execute(
-                """
-                SELECT sk, document_id, document_version, publication_id, data_json FROM kre_knowledge_graph
-                WHERE pk = ? AND sk LIKE 'MENTION#%'
-                ORDER BY sk ASC
-                LIMIT ?
-                """,
-                (lookup_pk, max_eval + 1),
-            )
-            rows = cursor.fetchall()
-            if len(rows) > max_eval:
-                was_truncated = True
-                truncation_reason = "mention_lookup_page_limit_reached"
-                rows = rows[:max_eval]
+            for token in norm_tokens:
+                esc_token = escape_delimiter(token)
+                prefix = f"MENTION#{esc_token}%"
+                cursor = self._conn.execute(
+                    """
+                    SELECT sk, document_id, document_version, publication_id, data_json FROM kre_knowledge_graph
+                    WHERE pk = ? AND sk LIKE ?
+                    ORDER BY sk ASC
+                    LIMIT ?
+                    """,
+                    (lookup_pk, prefix, max_eval + 1),
+                )
+                rows = cursor.fetchall()
+                if len(rows) > max_eval:
+                    was_truncated = True
+                    truncation_reason = "mention_lookup_page_limit_reached"
+                    rows = rows[:max_eval]
 
-            for row in rows:
-                sk = row["sk"]
-                parts = sk.split("#")
-                if len(parts) >= 3:
-                    token = unescape_delimiter(parts[1])
-                    if any(token == nt or token.startswith(nt) for nt in norm_tokens):
-                        data = json.loads(row["data_json"])
-                        results.append({
-                            "SK": sk,
-                            "document_id": row["document_id"],
-                            "document_version": row["document_version"],
-                            "publication_id": row["publication_id"],
-                            **data,
-                        })
-                        if len(results) >= limit:
-                            break
+                for row in rows:
+                    sk = row["sk"]
+                    if sk in seen_sks:
+                        continue
+                    seen_sks.add(sk)
+                    data = json.loads(row["data_json"])
+                    results.append({
+                        "SK": sk,
+                        "document_id": row["document_id"],
+                        "document_version": row["document_version"],
+                        "publication_id": row["publication_id"],
+                        **data,
+                    })
+                    if len(results) >= limit:
+                        break
+                if len(results) >= limit:
+                    break
 
         return results, was_truncated, truncation_reason
 
@@ -1143,7 +1113,10 @@ class DynamoDBKnowledgeGraphRepository:
 
             check_dict = {
                 "TableName": table_name,
-                "Key": {"PK": pk, "SK": "BUDGET#LEDGER"},
+                "Key": {
+                    "PK": pk,
+                    "SK": "BUDGET#LEDGER",
+                },
                 "ConditionExpression": "attribute_exists(PK) AND #ft = :ft AND #owner = :owner AND #exp >= :now_ts",
                 "ExpressionAttributeNames": {
                     "#ft": "fence_token",
@@ -1231,6 +1204,7 @@ class DynamoDBKnowledgeGraphRepository:
         truncation_reason = None
         pages_evaluated = 0
 
+        seen_sks = set()
         for token in norm_tokens:
             esc_token = escape_delimiter(token)
             prefix = f"MENTION#{esc_token}"
@@ -1241,6 +1215,9 @@ class DynamoDBKnowledgeGraphRepository:
             pages_evaluated += 1
             items = resp.get("Items", [])
             for row in items:
+                if row["SK"] in seen_sks:
+                    continue
+                seen_sks.add(row["SK"])
                 data = json.loads(row["data_json"])
                 results.append({
                     "SK": row["SK"],
@@ -1264,6 +1241,9 @@ class DynamoDBKnowledgeGraphRepository:
                 )
                 pages_evaluated += 1
                 for row in resp.get("Items", []):
+                    if row["SK"] in seen_sks:
+                        continue
+                    seen_sks.add(row["SK"])
                     data = json.loads(row["data_json"])
                     results.append({
                         "SK": row["SK"],
@@ -1296,14 +1276,14 @@ class DynamoDBKnowledgeGraphRepository:
         )
         pages_evaluated = 1
         items = resp.get("Items", [])
+        was_truncated = False
+        reason = None
 
         while "LastEvaluatedKey" in resp and len(items) < limit:
             if pages_evaluated >= max_pages:
-                return (
-                    [_deserialize_relationship(json.loads(r["data_json"])) for r in items[:limit]],
-                    True,
-                    "edge_lookup_page_limit_reached",
-                )
+                was_truncated = True
+                reason = "edge_lookup_page_limit_reached"
+                break
             resp = self._table.query(
                 KeyConditionExpression=Key("PK").eq(pk) & Key("SK").begins_with("EDGE#"),
                 ExclusiveStartKey=resp["LastEvaluatedKey"],
@@ -1312,8 +1292,11 @@ class DynamoDBKnowledgeGraphRepository:
             pages_evaluated += 1
             items.extend(resp.get("Items", []))
 
-        was_truncated = "LastEvaluatedKey" in resp
-        reason = "edge_lookup_page_limit_reached" if was_truncated else None
+        if not was_truncated:
+            if "LastEvaluatedKey" in resp or len(items) > limit:
+                was_truncated = True
+                reason = "edge_lookup_page_limit_reached"
+
         edges = [_deserialize_relationship(json.loads(r["data_json"])) for r in items[:limit]]
         return edges, was_truncated, reason
 
@@ -1334,14 +1317,14 @@ class DynamoDBKnowledgeGraphRepository:
         )
         pages_evaluated = 1
         items = resp.get("Items", [])
+        was_truncated = False
+        reason = None
 
         while "LastEvaluatedKey" in resp and len(items) < limit:
             if pages_evaluated >= max_pages:
-                return (
-                    [_deserialize_relationship(json.loads(r["data_json"])) for r in items[:limit]],
-                    True,
-                    "edge_lookup_page_limit_reached",
-                )
+                was_truncated = True
+                reason = "edge_lookup_page_limit_reached"
+                break
             resp = self._table.query(
                 IndexName="gsi1_target_lookup",
                 KeyConditionExpression=Key("GSI1_PK").eq(gsi1_pk) & Key("GSI1_SK").begins_with("EDGE#"),
@@ -1351,8 +1334,11 @@ class DynamoDBKnowledgeGraphRepository:
             pages_evaluated += 1
             items.extend(resp.get("Items", []))
 
-        was_truncated = "LastEvaluatedKey" in resp
-        reason = "edge_lookup_page_limit_reached" if was_truncated else None
+        if not was_truncated:
+            if "LastEvaluatedKey" in resp or len(items) > limit:
+                was_truncated = True
+                reason = "edge_lookup_page_limit_reached"
+
         edges = [_deserialize_relationship(json.loads(r["data_json"])) for r in items[:limit]]
         return edges, was_truncated, reason
 
@@ -1429,13 +1415,10 @@ def get_knowledge_graph_repository(
     table_name: str | None = None,
 ) -> KnowledgeGraphRepositoryBase:
     """Factory creating KnowledgeGraphRepository instance according to environment or backend flag."""
-    global _DEFAULT_KG_REPO
     chosen = backend or getattr(settings, "GRAPH_REPO_BACKEND", None)
 
     if chosen == "memory" or os.environ.get("ENVIRONMENT") == "test":
-        if _DEFAULT_KG_REPO is None or not isinstance(_DEFAULT_KG_REPO, InMemoryKnowledgeGraphRepository):
-            _DEFAULT_KG_REPO = InMemoryKnowledgeGraphRepository()
-        return _DEFAULT_KG_REPO
+        return InMemoryKnowledgeGraphRepository()
     elif chosen == "sqlite":
         return SQLiteKnowledgeGraphRepository(db_path=db_path)
     elif chosen == "dynamodb":

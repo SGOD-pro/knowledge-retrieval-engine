@@ -140,41 +140,44 @@ def validate_relationship_grounding(
 
     # Evaluate directional syntax and negation in matching sentences
     for sentence in matched_sentences:
-        s_idx = sentence.find(source_lower)
-        t_idx = sentence.find(target_lower)
-        p_match = re.search(r"\b" + re.escape(pred_stem) + r"\w*\b", sentence)
-        if not p_match:
+        s_matches = [m.start() for m in re.finditer(r"\b" + re.escape(source_lower) + r"\b", sentence)]
+        t_matches = [m.start() for m in re.finditer(r"\b" + re.escape(target_lower) + r"\b", sentence)]
+        if not s_matches or not t_matches:
             continue
-        p_idx = p_match.start()
-        p_end = p_match.end()
 
-        # Check for negation words in the sentence near the predicate
-        words_before_p = sentence[:p_idx].split()[-4:]  # 4 words before predicate
-        if any(w in _NEGATION_WORDS for w in words_before_p):
-            return False, "negated_relationship"
+        p_matches = list(re.finditer(r"\b" + re.escape(pred_stem) + r"\w*\b", sentence))
+        if not p_matches:
+            continue
 
-        # Check passive voice: e.g. "<target> was <predicate> by <source>"
-        # e.g. "Beta Tech was acquired by Acme Corp"
-        is_passive = bool(re.search(r"\b(?:was|is|been|were)\s+" + re.escape(pred_stem) + r"\w*\s+by\b", sentence))
+        for p_match in p_matches:
+            p_idx = p_match.start()
 
-        if is_passive:
-            # In passive voice: Target appears before predicate, Source appears after 'by'
-            # e.g. Target (Beta Tech) was acquired by Source (Acme Corp) -> Source is true acquirer.
-            if t_idx < p_idx < s_idx:
-                # Asserted: (Source, acquired, Target) -> this is valid passive syntax!
-                return True, None
-            elif s_idx < p_idx < t_idx:
-                # "Acme Corp was acquired by Beta Tech" but asserted (Acme Corp, acquired, Beta Tech)
-                # This is reversed relative to fact!
-                return False, "reversed_relationship"
-        else:
-            # Active voice: Source should appear before predicate, Target after predicate
-            # e.g. Source (Acme Corp) acquired Target (Beta Tech)
-            if s_idx < p_idx < t_idx:
-                return True, None
-            elif t_idx < p_idx < s_idx:
-                # Target appears before predicate and Source after in active voice
-                # e.g. "Beta Tech acquired Acme Corp" but asserted (Acme Corp, acquired, Beta Tech)
+            # Check for negation words in the sentence near the predicate
+            words_before_p = sentence[:p_idx].split()[-4:]  # 4 words before predicate
+            if any(w in _NEGATION_WORDS for w in words_before_p):
+                return False, "negated_relationship"
+
+            # Check passive voice: e.g. "<target> was <predicate> by <source>"
+            # e.g. "Beta Tech was acquired by Acme Corp"
+            is_passive = bool(re.search(r"\b(?:was|is|been|were)\s+" + re.escape(pred_stem) + r"\w*\s+by\b", sentence))
+
+            has_reversed = False
+            for s_idx in s_matches:
+                for t_idx in t_matches:
+                    if is_passive:
+                        # In passive voice: Target appears before predicate, Source appears after 'by'
+                        if t_idx < p_idx < s_idx:
+                            return True, None
+                        elif s_idx < p_idx < t_idx:
+                            has_reversed = True
+                    else:
+                        # Active voice: Source should appear before predicate, Target after predicate
+                        if s_idx < p_idx < t_idx:
+                            return True, None
+                        elif t_idx < p_idx < s_idx:
+                            has_reversed = True
+
+            if has_reversed:
                 return False, "reversed_relationship"
 
     return False, "co_occurrence_without_directional_syntax"

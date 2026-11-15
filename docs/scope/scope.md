@@ -157,6 +157,7 @@ Extract typed entity relationships, enforce verbatim grounding and durable budge
    - [ ] Slice 3: Pipeline reciprocal rank fusion, snapshot metadata, telemetry trace, and offline ablation (AC-10, AC-11, AC-12, AC-13)
 - [x] Verify it: `/check verify knowledge graph enrichment` (Slice 1)
 - [x] Test it: `/test knowledge graph enrichment` (Slice 1)
+- [x] Review it (fresh model): `/check review knowledge graph enrichment` (Slice 1)
 Spec [0007](../specs/0007-knowledge-graph-enrichment.md) · code in `backend/src/`
 
 ## Slice 5: LAYA bounded escalation
