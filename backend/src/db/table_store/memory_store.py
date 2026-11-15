@@ -5,7 +5,7 @@ import logging
 from typing import Any
 
 from db.table_store.base import AggregateOp, Predicate, PredicateOp, TableRowList, TableStore
-from schemas.structured_table import StructuredTable, TableRow
+from schemas.structured_table import StructuredTable, TableRow, TableSchema
 
 logger = logging.getLogger(__name__)
 
@@ -230,6 +230,54 @@ class MemoryTableStore:
         except Exception:
             return False
         return False
+
+    def get_schema(
+        self,
+        table_id: str,
+        workspace_id: str,
+        version: str | None = None,
+    ) -> TableSchema | None:
+        if not workspace_id:
+            return None
+        ver = version or self.get_active_version(table_id, workspace_id)
+        if ver:
+            entry = self._schemas.get((workspace_id, table_id, ver))
+            if entry:
+                return entry[0]
+        tbl = self._tables.get((workspace_id, table_id))
+        if tbl:
+            return tbl.schema
+        return None
+
+    def get_row(
+        self,
+        table_id: str,
+        workspace_id: str,
+        row_id: str | int,
+        version: str | None = None,
+    ) -> TableRow | None:
+        if not workspace_id:
+            return None
+        ver = version or self.get_active_version(table_id, workspace_id)
+        if not ver:
+            return None
+
+        row_id_str = str(row_id)
+        row_idx = int(row_id) if row_id_str.isdigit() else None
+
+        rows = self._versioned_rows.get((workspace_id, table_id, ver))
+        if rows is not None:
+            for r in rows:
+                if str(r.row_id) == row_id_str or (row_idx is not None and r.row_index == row_idx):
+                    return r
+            return None
+
+        tbl = self._tables.get((workspace_id, table_id))
+        if tbl:
+            for r in tbl.rows:
+                if str(r.row_id) == row_id_str or (row_idx is not None and r.row_index == row_idx):
+                    return r
+        return None
 
     def query_rows(
         self,

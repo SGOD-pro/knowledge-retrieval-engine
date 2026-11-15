@@ -623,6 +623,70 @@ class DynamoDBTableStore:
 
         return agg_val, total_count, matched_ids, matched_indices, digest
 
+    def get_schema(
+        self,
+        table_id: str,
+        workspace_id: str,
+        version: str | None = None,
+    ) -> TableSchema | None:
+        ver = version or self.get_active_version(table_id, workspace_id)
+        if not ver:
+            return None
+        pk = f"TABLE#{workspace_id}#{table_id}#V#{ver}"
+        resp = self.table.get_item(Key={"PK": pk, "SK": "SCHEMA"})
+        item = resp.get("Item")
+        if item and "schema_json" in item:
+            return _json_to_schema(item["schema_json"])
+        return None
+
+    def get_row(
+        self,
+        table_id: str,
+        workspace_id: str,
+        row_id: str | int,
+        version: str | None = None,
+    ) -> TableRow | None:
+        ver = version or self.get_active_version(table_id, workspace_id)
+        if not ver:
+            return None
+
+        row_id_str = str(row_id)
+        row_idx = int(row_id) if row_id_str.isdigit() else None
+        table_pk = f"TABLE#{workspace_id}#{table_id}#V#{ver}"
+
+        if row_idx is not None:
+            sk = f"ROW#{row_idx:010d}"
+            resp = self.table.get_item(Key={"PK": table_pk, "SK": sk})
+            item = resp.get("Item")
+            if item:
+                cells = _json_to_cells(item.get("cells_json", "[]"))
+                return TableRow(
+                    row_id=item.get("row_id", ""),
+                    row_index=int(item.get("row_index", 0)),
+                    cells=cells,
+                    is_header=item.get("is_header", False),
+                    is_subtotal=item.get("is_subtotal", False),
+                    is_empty=item.get("is_empty", False),
+                )
+
+        query_kwargs: dict[str, Any] = {
+            "KeyConditionExpression": Key("PK").eq(table_pk) & Key("SK").begins_with("ROW#"),
+            "Limit": 50,
+        }
+        resp = self.table.query(**query_kwargs)
+        for item in resp.get("Items", []):
+            if str(item.get("row_id")) == row_id_str:
+                cells = _json_to_cells(item.get("cells_json", "[]"))
+                return TableRow(
+                    row_id=item.get("row_id", ""),
+                    row_index=int(item.get("row_index", 0)),
+                    cells=cells,
+                    is_header=item.get("is_header", False),
+                    is_subtotal=item.get("is_subtotal", False),
+                    is_empty=item.get("is_empty", False),
+                )
+        return None
+
     def query_rows(
         self,
         table_id: str,

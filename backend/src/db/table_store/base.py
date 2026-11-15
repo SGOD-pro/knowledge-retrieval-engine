@@ -67,6 +67,25 @@ class TableStore(Protocol):
         """Retrieve table schema and metadata by table ID."""
         ...
 
+    def get_schema(
+        self,
+        table_id: str,
+        workspace_id: str,
+        version: str | None = None,
+    ) -> TableSchema | None:
+        """Retrieve table schema without fetching or scanning rows."""
+        ...
+
+    def get_row(
+        self,
+        table_id: str,
+        workspace_id: str,
+        row_id: str | int,
+        version: str | None = None,
+    ) -> TableRow | None:
+        """Retrieve an exact targeted row by row_id or row_index without table scanning."""
+        ...
+
     def query_rows(
         self,
         table_id: str,

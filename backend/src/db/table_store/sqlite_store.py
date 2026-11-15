@@ -884,6 +884,97 @@ class SQLiteTableStore:
             col_count=row["col_count"],
         )
 
+    def get_schema(
+        self,
+        table_id: str,
+        workspace_id: str,
+        version: str | None = None,
+    ) -> TableSchema | None:
+        if not workspace_id:
+            return None
+        ver = version or self.get_active_version(table_id, workspace_id)
+        if ver and ver != "legacy":
+            cur = self._conn.execute(
+                "SELECT schema_json FROM versioned_schemas WHERE workspace_id = ? AND table_id = ? AND version = ?",
+                (workspace_id, table_id, ver),
+            )
+            row = cur.fetchone()
+            if row:
+                return _json_to_schema(row["schema_json"])
+        cur = self._conn.execute(
+            "SELECT schema_json FROM tables WHERE workspace_id = ? AND table_id = ?",
+            (workspace_id, table_id),
+        )
+        row = cur.fetchone()
+        if row:
+            schema_raw = json.loads(row["schema_json"])
+            columns = tuple(
+                ColumnDefinition(
+                    col_index=c["col_index"],
+                    name=c["name"],
+                    inferred_dtype=InferredDtype(c.get("inferred_dtype", "string")),
+                )
+                for c in schema_raw.get("columns", [])
+            )
+            return TableSchema(
+                columns=columns,
+                header_rows=tuple(schema_raw.get("header_rows", [0])),
+                header_topology=HeaderTopology(schema_raw.get("header_topology", "single_row")),
+                confidence=float(schema_raw.get("confidence", 1.0)),
+            )
+        return None
+
+    def get_row(
+        self,
+        table_id: str,
+        workspace_id: str,
+        row_id: str | int,
+        version: str | None = None,
+    ) -> TableRow | None:
+        if not workspace_id:
+            return None
+        ver = version or self.get_active_version(table_id, workspace_id)
+        if not ver:
+            return None
+
+        row_id_str = str(row_id)
+        row_idx = int(row_id) if row_id_str.isdigit() else None
+
+        if ver == "legacy":
+            cur = self._conn.execute(
+                """
+                SELECT row_id, row_index, cells_json, is_header, is_subtotal, is_empty
+                FROM table_rows
+                WHERE workspace_id = ? AND table_id = ? AND (row_id = ? OR (? IS NOT NULL AND row_index = ?))
+                LIMIT 1
+                """,
+                (workspace_id, table_id, row_id_str, row_idx, row_idx),
+            )
+        else:
+            cur = self._conn.execute(
+                """
+                SELECT row_id, row_index, cells_json, is_header, is_subtotal, is_empty
+                FROM versioned_rows
+                WHERE workspace_id = ? AND table_id = ? AND version = ? AND (row_id = ? OR (? IS NOT NULL AND row_index = ?))
+                LIMIT 1
+                """,
+                (workspace_id, table_id, ver, row_id_str, row_idx, row_idx),
+            )
+
+        db_row = cur.fetchone()
+        if not db_row:
+            return None
+
+        cells = _json_to_cells(db_row["cells_json"])
+        return TableRow(
+            row_id=db_row["row_id"],
+            row_index=int(db_row["row_index"]),
+            cells=cells,
+            is_header=bool(db_row["is_header"]),
+            is_subtotal=bool(db_row["is_subtotal"]) if "is_subtotal" in db_row.keys() else False,
+            is_empty=bool(db_row["is_empty"]) if "is_empty" in db_row.keys() else False,
+        )
+
     def query_rows(
         self,
         table_id: str,

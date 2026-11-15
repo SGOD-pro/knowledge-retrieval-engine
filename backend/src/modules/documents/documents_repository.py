@@ -357,29 +357,17 @@ class DocumentsRepository:
             if len(deduped) >= 15:
                 break
 
-        def _verify_chunk_version(chunk_meta: dict, ws_id: str, doc_id: str, req_ver: str) -> bool:
-            chunk_ver = chunk_meta.get("version") or chunk_meta.get("document_version")
-            if chunk_ver is not None and str(chunk_ver).strip() != "":
+        def _verify_chunk_version(chunk_obj: Any, chunk_meta: dict, ws_id: str, doc_id: str, req_ver: str) -> bool:
+            # Require a durable binding between the exact chunk and requested version.
+            # An unversioned chunk cannot be certified by document snapshot or manifest alone.
+            chunk_ver = (
+                chunk_meta.get("version")
+                or chunk_meta.get("document_version")
+                or getattr(chunk_obj, "version", None)
+                or getattr(chunk_obj, "document_version", None)
+            )
+            if chunk_ver is not None and str(chunk_ver).strip() != "" and str(chunk_ver).strip().lower() != "unknown":
                 return str(chunk_ver) == str(req_ver)
-
-            # Missing from chunk metadata: verify against actual ingestion metadata
-            try:
-                from db.workspace_boundary_repo import get_workspace_boundary_repo
-                b_repo = get_workspace_boundary_repo()
-                snap = b_repo.get_document_snapshot(ws_id, doc_id)
-                if snap is not None and getattr(snap, "version", None):
-                    return str(snap.version) == str(req_ver)
-            except Exception:
-                pass
-
-            try:
-                from db.table_store import get_shared_table_store
-                ts = get_shared_table_store()
-                man = ts.get_ingestion_manifest(doc_id, ws_id, version=str(req_ver))
-                if man and man.get("document_version") == str(req_ver):
-                    return True
-            except Exception:
-                pass
 
             return False
 
@@ -393,7 +381,7 @@ class DocumentsRepository:
                 if chunk is not None:
                     if getattr(chunk, "workspace_id", None) == workspace_id and str(chunk.document_id) == did:
                         meta = chunk.metadata or {}
-                        if _verify_chunk_version(meta, workspace_id, did, dver):
+                        if _verify_chunk_version(chunk, meta, workspace_id, did, dver):
                             matched.append(chunk)
             return matched
 
@@ -440,8 +428,9 @@ class DocumentsRepository:
                     continue
                 meta_raw = row.get("metadata")
                 meta = json.loads(meta_raw) if meta_raw and isinstance(meta_raw, str) else (meta_raw or {})
-                if _verify_chunk_version(meta, workspace_id, did, dver):
-                    results.append(self._parse_chunk(row))
+                parsed_c = self._parse_chunk(row)
+                if _verify_chunk_version(parsed_c, meta, workspace_id, did, dver):
+                    results.append(parsed_c)
 
             return results
         except Exception as e:

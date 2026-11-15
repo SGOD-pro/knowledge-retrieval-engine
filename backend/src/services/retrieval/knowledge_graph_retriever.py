@@ -246,6 +246,125 @@ class GraphConcurrencyController:
         return None, "caller_timeout"
 
 
+def _verify_table_document_binding(
+    table_store: Any,
+    workspace_id: str,
+    table_id: str,
+    document_id: str,
+    document_version: str,
+) -> bool:
+    """Validate durable binding between table_id, workspace_id, document_id, and document_version."""
+    if not table_store or not workspace_id or not table_id or not document_id or not document_version:
+        return False
+
+    # 1. Check ingestion manifest if available
+    if hasattr(table_store, "get_ingestion_manifest"):
+        try:
+            manifest = table_store.get_ingestion_manifest(document_id, workspace_id, version=document_version)
+            if manifest:
+                m_tid = manifest.get("table_id")
+                if m_tid and m_tid != table_id:
+                    return False
+                m_doc = manifest.get("document_id")
+                if m_doc and m_doc != document_id:
+                    return False
+                m_ver = manifest.get("document_version") or manifest.get("version")
+                if m_ver and str(m_ver) != str(document_version):
+                    return False
+                return True
+        except Exception:
+            pass
+
+    # 2. Check MemoryTableStore internal schemas / active_meta
+    if hasattr(table_store, "_schemas"):
+        key = (workspace_id, table_id, str(document_version))
+        if key in table_store._schemas:
+            _, doc_id_schema, doc_ver_schema, _, _ = table_store._schemas[key]
+            if doc_id_schema == document_id and str(doc_ver_schema) == str(document_version):
+                return True
+            return False
+
+    if hasattr(table_store, "_active_meta"):
+        meta = table_store._active_meta.get((workspace_id, table_id))
+        if meta:
+            if meta.get("document_id") == document_id and str(meta.get("version")) == str(document_version):
+                return True
+            return False
+
+    # 3. Check SQLite connection tables (versioned_schemas, active_versions, tables)
+    if hasattr(table_store, "_conn"):
+        try:
+            cur = table_store._conn.execute(
+                "SELECT document_id FROM versioned_schemas WHERE workspace_id = ? AND table_id = ? AND version = ?",
+                (workspace_id, table_id, str(document_version)),
+            )
+            row = cur.fetchone()
+            if row:
+                return row["document_id"] == document_id
+
+            cur = table_store._conn.execute(
+                "SELECT document_id FROM active_versions WHERE workspace_id = ? AND table_id = ? AND version = ?",
+                (workspace_id, table_id, str(document_version)),
+            )
+            row = cur.fetchone()
+            if row:
+                return row["document_id"] == document_id
+        except Exception:
+            pass
+
+    # 4. Check DynamoDB table items
+    if hasattr(table_store, "table"):
+        try:
+            pk = f"TABLE#{workspace_id}#{table_id}#V#{document_version}"
+            resp = table_store.table.get_item(Key={"PK": pk, "SK": "SCHEMA"})
+            item = resp.get("Item")
+            if item:
+                if item.get("document_id"):
+                    return item["document_id"] == document_id
+                return True
+        except Exception:
+            pass
+
+    # 5. Check legacy get_table if present
+    if hasattr(table_store, "get_table"):
+        try:
+            tbl = table_store.get_table(table_id, workspace_id)
+            if tbl and getattr(tbl, "document_id", None):
+                return tbl.document_id == document_id
+        except Exception:
+            pass
+
+    return False
+
+
+def _fetch_targeted_row(
+    table_store: Any,
+    table_id: str,
+    workspace_id: str,
+    row_id: str | int | None,
+    version: str,
+) -> Any | None:
+    """Targeted row fetch with explicit limits. If targeted interface is missing, disables fallback."""
+    if not table_store or row_id is None:
+        return None
+
+    # Targeted row lookup interface
+    if hasattr(table_store, "get_row"):
+        try:
+            return table_store.get_row(
+                table_id=table_id,
+                workspace_id=workspace_id,
+                row_id=row_id,
+                version=version,
+            )
+        except Exception as e:
+            logger.warning("kg.targeted_row_fetch_failed: %s", e)
+            return None
+
+    # If targeted interface is missing, do not scan the table; disable fallback safely
+    return None
+
+
 class KnowledgeGraphRetriever:
     """Retriever executing bounded multi-hop graph expansion and targeted chunk hydration."""
 
@@ -552,52 +671,115 @@ class KnowledgeGraphRetriever:
                     break
                 if isinstance(edge.location, TableLocation):
                     loc = edge.location
+                    if loc.row_id is None:
+                        continue
                     expected_chunk_id = f"{edge.source_document_id}:table:{loc.table_id}:row{loc.row_id}"
                     if any(cid in hydrated_ids for cid in edge.source_chunk_ids) or expected_chunk_id in hydrated_ids:
                         continue
                     if self.boundary_repo and hasattr(self.boundary_repo, "has_tombstone"):
                         if self.boundary_repo.has_tombstone(workspace_id, "source", edge.source_document_id):
                             continue
-                    try:
-                        t_rows = self.table_store.query_rows(
-                            table_id=loc.table_id,
-                            workspace_id=workspace_id,
-                            version=edge.source_document_version,
-                        )
-                        target_row = None
-                        target_idx = int(loc.row_id) if str(loc.row_id).isdigit() else None
-                        for r in t_rows:
-                            if target_idx is not None and getattr(r, "row_index", None) == target_idx:
-                                target_row = r
+
+                    # 1. Enforce verified document, workspace, and version bindings
+                    if not _verify_table_document_binding(
+                        table_store=self.table_store,
+                        workspace_id=workspace_id,
+                        table_id=loc.table_id,
+                        document_id=edge.source_document_id,
+                        document_version=edge.source_document_version,
+                    ):
+                        continue
+
+                    # 2. Targeted bounded row fetch (explicit limits, no whole-table scan)
+                    target_row = _fetch_targeted_row(
+                        table_store=self.table_store,
+                        table_id=loc.table_id,
+                        workspace_id=workspace_id,
+                        row_id=loc.row_id,
+                        version=edge.source_document_version,
+                    )
+                    if target_row is None or not getattr(target_row, "cells", None):
+                        # Missing row or empty cells: fail closed, return no candidate
+                        continue
+
+                    # 3. Retrieve schema to resolve column names and validate requested cell presence
+                    schema = None
+                    if hasattr(self.table_store, "get_schema"):
+                        try:
+                            schema = self.table_store.get_schema(
+                                table_id=loc.table_id,
+                                workspace_id=workspace_id,
+                                version=edge.source_document_version,
+                            )
+                        except Exception:
+                            pass
+
+                    col_idx_to_name = {c.col_index: c.name for c in schema.columns} if schema else {}
+                    col_name_to_idx = {c.name.lower(): c.col_index for c in schema.columns} if schema else {}
+
+                    # 4. If column_id is specified, validate exact cell presence and value
+                    if loc.column_id:
+                        req_col_names = [c.strip() for c in str(loc.column_id).split("->") if c.strip()]
+                        cell_validation_ok = True
+                        for req_col in req_col_names:
+                            matched_cell = None
+                            target_col_idx = col_name_to_idx.get(req_col.lower())
+                            if target_col_idx is None and req_col.isdigit():
+                                target_col_idx = int(req_col)
+
+                            for cell in target_row.cells:
+                                if target_col_idx is not None and cell.col_index == target_col_idx:
+                                    matched_cell = cell
+                                    break
+                                if str(getattr(cell, "coordinate", "")).lower() == req_col.lower():
+                                    matched_cell = cell
+                                    break
+                                if str(getattr(cell, "cell_id", "")).lower() == req_col.lower():
+                                    matched_cell = cell
+                                    break
+
+                            if matched_cell is None or matched_cell.raw_value is None or str(matched_cell.raw_value).strip() == "":
+                                cell_validation_ok = False
                                 break
-                        row_text = edge.verbatim_evidence
-                        if target_row and getattr(target_row, "cells", None):
-                            cell_parts = [f"Col {cell.col_index}: {cell.raw_value}" for cell in target_row.cells if cell.raw_value]
-                            if cell_parts:
-                                row_text = ". ".join(cell_parts) + "."
-                        synth_chunk = Chunk(
-                            id=expected_chunk_id,
-                            document_id=edge.source_document_id,
-                            source_format="csv",
-                            text=row_text,
-                            element_type="row",
-                            section_path=(f"{loc.table_id}.csv",),
-                            location_reference=f"Table: {loc.table_id}, Row: {loc.row_id}, Column: {loc.column_id}",
-                            metadata={
-                                "table_id": loc.table_id,
-                                "row": loc.row_id,
-                                "column": loc.column_id,
-                                "version": edge.source_document_version,
-                                "document_version": edge.source_document_version,
-                            },
-                            workspace_id=workspace_id,
-                        )
-                        hydrated_chunks.append(synth_chunk)
-                        hydrated_ids.add(expected_chunk_id)
-                        if expected_chunk_id not in matched_chunk_ids:
-                            matched_chunk_ids.append(expected_chunk_id)
-                    except Exception as ts_err:
-                        logger.warning("kg.tablestore_hydration_failed: %s", ts_err)
+
+                        if not cell_validation_ok:
+                            # Missing requested cell: fail closed, return no candidate
+                            continue
+
+                    # 5. Build evidence string strictly from verified retrieved cell data (never substitute edge text)
+                    cell_parts = []
+                    for cell in target_row.cells:
+                        if cell.raw_value is not None and str(cell.raw_value).strip() != "":
+                            h_name = col_idx_to_name.get(cell.col_index, f"Col {cell.col_index}")
+                            cell_parts.append(f"{h_name}: {cell.raw_value}")
+
+                    if not cell_parts:
+                        # No valid cell data: fail closed, return no candidate
+                        continue
+
+                    grounded_text = ". ".join(cell_parts) + "."
+
+                    synth_chunk = Chunk(
+                        id=expected_chunk_id,
+                        document_id=edge.source_document_id,
+                        source_format="csv",
+                        text=grounded_text,
+                        element_type="row",
+                        section_path=(f"{loc.table_id}.csv",),
+                        location_reference=f"Table: {loc.table_id}, Row: {loc.row_id}, Column: {loc.column_id}",
+                        metadata={
+                            "table_id": loc.table_id,
+                            "row": loc.row_id,
+                            "column": loc.column_id,
+                            "version": edge.source_document_version,
+                            "document_version": edge.source_document_version,
+                        },
+                        workspace_id=workspace_id,
+                    )
+                    hydrated_chunks.append(synth_chunk)
+                    hydrated_ids.add(expected_chunk_id)
+                    if expected_chunk_id not in matched_chunk_ids:
+                        matched_chunk_ids.append(expected_chunk_id)
 
         elapsed_ms = (time.perf_counter() - t_start) * 1000.0
 

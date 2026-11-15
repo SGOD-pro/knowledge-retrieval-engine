@@ -1890,7 +1890,7 @@ def test_hydration_missing_or_unverifiable_version_fails_closed():
     assert len(res_valid) == 1
     assert res_valid[0].id == "chunk_v1"
 
-    # 4. Chunk with NO metadata version, verified via boundary repo snapshot
+    # 4. Chunk with NO metadata version cannot be certified by document snapshot alone -> MUST be rejected (0 chunks)
     chunk_no_meta = Chunk(
         id="chunk_no_meta",
         document_id="doc_no_meta",
@@ -1917,13 +1917,697 @@ def test_hydration_missing_or_unverifiable_version_fails_closed():
 
         mock_b_repo.get_document_snapshot.return_value = MagicMock(version="3.0")
         k_snap = ChunkLookupKey(chunk_id="chunk_no_meta", document_id="doc_no_meta", document_version="3.0")
+        # Document snapshot alone CANNOT certify unversioned chunk: strictly fails closed
         res_snap = doc_repo.get_chunks_by_ids(ws, [k_snap])
-        assert len(res_snap) == 1
-        assert res_snap[0].id == "chunk_no_meta"
+        assert len(res_snap) == 0
 
         k_snap_wrong = ChunkLookupKey(chunk_id="chunk_no_meta", document_id="doc_no_meta", document_version="5.0")
         assert len(doc_repo.get_chunks_by_ids(ws, [k_snap_wrong])) == 0
 
         mock_b_repo.get_document_snapshot.return_value = None
         assert len(doc_repo.get_chunks_by_ids(ws, [k_snap])) == 0
+
+
+def test_tablestore_hydration_missing_table_returns_zero_candidates():
+    """covers: AC-1, AC-9 Edge pointing to non-existent table in TableStore returns 0 candidates."""
+    ws = "ws_missing_table"
+    doc_id = "doc_table_missing"
+    ver = "v1"
+    repo = InMemoryKnowledgeGraphRepository()
+    from db.table_store.memory_store import MemoryTableStore
+    ts = MemoryTableStore()
+
+    builder = KnowledgeGraphBuilder(repository=repo)
+    rows = [{"ColA": "ValA", "ColB": "ValB"}]
+    schema_rels = [
+        DirectionalSchemaRelation(
+            source_column="ColA",
+            predicate="relates_to",
+            target_column="ColB",
+            source_type="concept",
+            target_type="concept",
+        )
+    ]
+    builder.build_and_persist_tabular_graph(
+        workspace_id=ws,
+        document_id=doc_id,
+        document_version=ver,
+        table_name="tbl_non_existent",
+        rows=rows,
+        schema_relations=schema_rels,
+    )
+
+    boundary_mock = MagicMock()
+    boundary_mock.has_tombstone.return_value = False
+    boundary_mock.list_document_snapshots.return_value = [MagicMock(document_id=doc_id, version=ver)]
+
+    retriever = KnowledgeGraphRetriever(
+        repository=repo,
+        boundary_repo=boundary_mock,
+        table_store=ts,
+    )
+    res = retriever.expand(workspace_id=ws, query="ValA", max_hops=1)
+    assert res.execution_status == "completed"
+    assert res.edge_match_count >= 1
+    assert len(res.candidate_chunks) == 0
+
+
+def test_tablestore_hydration_missing_row_fails_closed_zero_substitution():
+    """covers: AC-1, AC-9 Missing row in TableStore fails closed without substituting stored graph edge text."""
+    ws = "ws_missing_row"
+    doc_id = "doc_row_missing"
+    ver = "v1"
+    repo = InMemoryKnowledgeGraphRepository()
+    from db.table_store.memory_store import MemoryTableStore
+    from schemas.structured_table import TableRow, TableCell, TableSchema, ColumnDefinition, HeaderTopology, InferredDtype
+
+    ts = MemoryTableStore()
+    schema = TableSchema(
+        columns=(ColumnDefinition(col_index=0, name="User", inferred_dtype=InferredDtype.STRING),),
+        header_rows=(1,),
+        header_topology=HeaderTopology.SINGLE_ROW,
+        confidence=1.0,
+    )
+    ts.store_schema("tbl_users", ws, schema, doc_id, ver)
+    # Store row with row_id="0", but edge will ask for row 999
+    ts.write_row_batch_with_checkpoint(
+        table_id="tbl_users",
+        workspace_id=ws,
+        document_id=doc_id,
+        version=ver,
+        rows=[
+            TableRow(
+                row_id="0",
+                row_index=0,
+                cells=(TableCell(cell_id="c0", row_index=0, col_index=0, coordinate="R1C1", raw_value="Alice", inferred_dtype=InferredDtype.STRING),),
+            )
+        ],
+        checkpoint_batch=0,
+        source_rows=1,
+        attempted_rows=1,
+        persisted_rows=1,
+        rejected_rows=0,
+        parser_version="1.0.0",
+        schema_version="",
+        content_hash="h1",
+    )
+    ts.publish_active_version("tbl_users", ws, doc_id, ver, {"coverage_complete": True, "source_rows": 1, "persisted_rows": 1, "document_version": ver})
+
+    # Stage relationship pointing to row 999 with explicit edge verbatim text
+    pub_id = generate_publication_id()
+    src_ent = KnowledgeGraphEntity(
+        entity_id=compute_entity_id(ws, doc_id, "person", "Bob"),
+        workspace_id=ws,
+        name="Bob",
+        canonical_name="Bob",
+        entity_type="person",
+        source_document_id=doc_id,
+        aliases=("Bob",),
+    )
+    tgt_ent = KnowledgeGraphEntity(
+        entity_id=compute_entity_id(ws, doc_id, "organization", "Acme"),
+        workspace_id=ws,
+        name="Acme",
+        canonical_name="Acme",
+        entity_type="organization",
+        source_document_id=doc_id,
+        aliases=("Acme",),
+    )
+    edge_rel = KnowledgeGraphRelationship(
+        relationship_id=compute_relationship_id(ws, src_ent.entity_id, "MEMBER_OF", tgt_ent.entity_id, doc_id, ver, pub_id),
+        workspace_id=ws,
+        source_entity_id=src_ent.entity_id,
+        source_entity_name=src_ent.canonical_name,
+        predicate="member_of",
+        canonical_predicate="MEMBER_OF",
+        target_entity_id=tgt_ent.entity_id,
+        target_entity_name=tgt_ent.canonical_name,
+        directed=True,
+        confidence=1.0,
+        source_document_id=doc_id,
+        source_document_version=ver,
+        publication_id=pub_id,
+        source_chunk_ids=(),
+        location=TableLocation(table_id="tbl_users", row_id="999", column_id="User"),
+        verbatim_evidence="Bob is member of Acme (stored edge text)",
+        relationship_state="unique",
+        created_at_utc=_now_utc(),
+    )
+    repo.stage_relationships(ws, doc_id, ver, pub_id, [src_ent, tgt_ent], [edge_rel])
+    man = KnowledgeGraphManifest(
+        workspace_id=ws, document_id=doc_id, document_version=ver, publication_id=pub_id,
+        status="ready", entity_count=2, relationship_count=1, ingested_at_utc=_now_utc(), content_hash="h1"
+    )
+    repo.commit_manifest(ws, man)
+
+    boundary_mock = MagicMock()
+    boundary_mock.has_tombstone.return_value = False
+    boundary_mock.list_document_snapshots.return_value = [MagicMock(document_id=doc_id, version=ver)]
+
+    retriever = KnowledgeGraphRetriever(
+        repository=repo,
+        boundary_repo=boundary_mock,
+        table_store=ts,
+    )
+    res = retriever.expand(workspace_id=ws, query="Bob", max_hops=1)
+    # Stored edge text must NEVER be substituted for missing source data
+    assert len(res.candidate_chunks) == 0
+
+
+def test_tablestore_hydration_missing_cells_or_column_returns_zero_candidates():
+    """covers: AC-1, AC-9 Missing cells or missing requested column in TableStore returns 0 candidates."""
+    ws = "ws_missing_cell"
+    doc_id = "doc_cell_missing"
+    ver = "v1"
+    repo = InMemoryKnowledgeGraphRepository()
+    from db.table_store.memory_store import MemoryTableStore
+    from schemas.structured_table import TableRow, TableCell, TableSchema, ColumnDefinition, HeaderTopology, InferredDtype
+
+    ts = MemoryTableStore()
+    schema = TableSchema(
+        columns=(ColumnDefinition(col_index=0, name="City", inferred_dtype=InferredDtype.STRING),),
+        header_rows=(1,),
+        header_topology=HeaderTopology.SINGLE_ROW,
+        confidence=1.0,
+    )
+    ts.store_schema("tbl_cities", ws, schema, doc_id, ver)
+    ts.write_row_batch_with_checkpoint(
+        table_id="tbl_cities",
+        workspace_id=ws,
+        document_id=doc_id,
+        version=ver,
+        rows=[
+            TableRow(
+                row_id="0",
+                row_index=0,
+                cells=(TableCell(cell_id="c0", row_index=0, col_index=0, coordinate="R1C1", raw_value="Paris", inferred_dtype=InferredDtype.STRING),),
+            )
+        ],
+        checkpoint_batch=0,
+        source_rows=1,
+        attempted_rows=1,
+        persisted_rows=1,
+        rejected_rows=0,
+        parser_version="1.0.0",
+        schema_version="",
+        content_hash="h1",
+    )
+    ts.publish_active_version("tbl_cities", ws, doc_id, ver, {"coverage_complete": True, "source_rows": 1, "persisted_rows": 1, "document_version": ver})
+
+    # Location requests non-existent column "Population"
+    pub_id = generate_publication_id()
+    src_ent = KnowledgeGraphEntity(
+        entity_id=compute_entity_id(ws, doc_id, "location", "Paris"),
+        workspace_id=ws,
+        name="Paris",
+        canonical_name="Paris",
+        entity_type="location",
+        source_document_id=doc_id,
+        aliases=("Paris",),
+    )
+    tgt_ent = KnowledgeGraphEntity(
+        entity_id=compute_entity_id(ws, doc_id, "location", "France"),
+        workspace_id=ws,
+        name="France",
+        canonical_name="France",
+        entity_type="location",
+        source_document_id=doc_id,
+        aliases=("France",),
+    )
+    edge_rel = KnowledgeGraphRelationship(
+        relationship_id=compute_relationship_id(ws, src_ent.entity_id, "LOCATED_IN", tgt_ent.entity_id, doc_id, ver, pub_id),
+        workspace_id=ws,
+        source_entity_id=src_ent.entity_id,
+        source_entity_name=src_ent.canonical_name,
+        predicate="located_in",
+        canonical_predicate="LOCATED_IN",
+        target_entity_id=tgt_ent.entity_id,
+        target_entity_name=tgt_ent.canonical_name,
+        directed=True,
+        confidence=1.0,
+        source_document_id=doc_id,
+        source_document_version=ver,
+        publication_id=pub_id,
+        source_chunk_ids=(),
+        location=TableLocation(table_id="tbl_cities", row_id="0", column_id="Population"),
+        verbatim_evidence="Paris located_in France",
+        relationship_state="unique",
+        created_at_utc=_now_utc(),
+    )
+    repo.stage_relationships(ws, doc_id, ver, pub_id, [src_ent, tgt_ent], [edge_rel])
+    man = KnowledgeGraphManifest(
+        workspace_id=ws, document_id=doc_id, document_version=ver, publication_id=pub_id,
+        status="ready", entity_count=2, relationship_count=1, ingested_at_utc=_now_utc(), content_hash="h1"
+    )
+    repo.commit_manifest(ws, man)
+
+    boundary_mock = MagicMock()
+    boundary_mock.has_tombstone.return_value = False
+    boundary_mock.list_document_snapshots.return_value = [MagicMock(document_id=doc_id, version=ver)]
+
+    retriever = KnowledgeGraphRetriever(
+        repository=repo,
+        boundary_repo=boundary_mock,
+        table_store=ts,
+    )
+    res = retriever.expand(workspace_id=ws, query="Paris", max_hops=1)
+    assert len(res.candidate_chunks) == 0
+
+
+def test_tablestore_hydration_wrong_document_id_binding_fails_closed():
+    """covers: AC-1, AC-9 Table belonging to document A requested with document B fails closed."""
+    ws = "ws_wrong_doc"
+    doc_real = "doc_real"
+    doc_imposter = "doc_imposter"
+    ver = "v1"
+    repo = InMemoryKnowledgeGraphRepository()
+    from db.table_store.memory_store import MemoryTableStore
+    from schemas.structured_table import TableRow, TableCell, TableSchema, ColumnDefinition, HeaderTopology, InferredDtype
+
+    ts = MemoryTableStore()
+    schema = TableSchema(
+        columns=(ColumnDefinition(col_index=0, name="K", inferred_dtype=InferredDtype.STRING),),
+        header_rows=(1,),
+        header_topology=HeaderTopology.SINGLE_ROW,
+        confidence=1.0,
+    )
+    ts.store_schema("tbl_doc_test", ws, schema, doc_real, ver)
+    ts.write_row_batch_with_checkpoint(
+        table_id="tbl_doc_test",
+        workspace_id=ws,
+        document_id=doc_real,
+        version=ver,
+        rows=[
+            TableRow(
+                row_id="0",
+                row_index=0,
+                cells=(TableCell(cell_id="c0", row_index=0, col_index=0, coordinate="R1C1", raw_value="V", inferred_dtype=InferredDtype.STRING),),
+            )
+        ],
+        checkpoint_batch=0,
+        source_rows=1,
+        attempted_rows=1,
+        persisted_rows=1,
+        rejected_rows=0,
+        parser_version="1.0.0",
+        schema_version="",
+        content_hash="h1",
+    )
+    ts.publish_active_version("tbl_doc_test", ws, doc_real, ver, {"coverage_complete": True, "source_rows": 1, "persisted_rows": 1, "document_version": ver})
+
+    # Edge forged with doc_imposter as source_document_id
+    pub_id = generate_publication_id()
+    src_ent = KnowledgeGraphEntity(
+        entity_id=compute_entity_id(ws, doc_imposter, "concept", "K1"),
+        workspace_id=ws,
+        name="K1",
+        canonical_name="K1",
+        entity_type="concept",
+        source_document_id=doc_imposter,
+        aliases=("K1",),
+    )
+    tgt_ent = KnowledgeGraphEntity(
+        entity_id=compute_entity_id(ws, doc_imposter, "concept", "V1"),
+        workspace_id=ws,
+        name="V1",
+        canonical_name="V1",
+        entity_type="concept",
+        source_document_id=doc_imposter,
+        aliases=("V1",),
+    )
+    edge_rel = KnowledgeGraphRelationship(
+        relationship_id=compute_relationship_id(ws, src_ent.entity_id, "HAS", tgt_ent.entity_id, doc_imposter, ver, pub_id),
+        workspace_id=ws,
+        source_entity_id=src_ent.entity_id,
+        source_entity_name=src_ent.canonical_name,
+        predicate="has",
+        canonical_predicate="HAS",
+        target_entity_id=tgt_ent.entity_id,
+        target_entity_name=tgt_ent.canonical_name,
+        directed=True,
+        confidence=1.0,
+        source_document_id=doc_imposter,
+        source_document_version=ver,
+        publication_id=pub_id,
+        source_chunk_ids=(),
+        location=TableLocation(table_id="tbl_doc_test", row_id="0", column_id="K"),
+        verbatim_evidence="K1 has V1",
+        relationship_state="unique",
+        created_at_utc=_now_utc(),
+    )
+    repo.stage_relationships(ws, doc_imposter, ver, pub_id, [src_ent, tgt_ent], [edge_rel])
+    man = KnowledgeGraphManifest(
+        workspace_id=ws, document_id=doc_imposter, document_version=ver, publication_id=pub_id,
+        status="ready", entity_count=2, relationship_count=1, ingested_at_utc=_now_utc(), content_hash="h1"
+    )
+    repo.commit_manifest(ws, man)
+
+    boundary_mock = MagicMock()
+    boundary_mock.has_tombstone.return_value = False
+    boundary_mock.list_document_snapshots.return_value = [MagicMock(document_id=doc_imposter, version=ver)]
+
+    retriever = KnowledgeGraphRetriever(
+        repository=repo,
+        boundary_repo=boundary_mock,
+        table_store=ts,
+    )
+    res = retriever.expand(workspace_id=ws, query="K1", max_hops=1)
+    assert len(res.candidate_chunks) == 0
+
+
+def test_tablestore_hydration_wrong_version_binding_fails_closed():
+    """covers: AC-1, AC-9 Table published at v2 requested with v1 fails closed."""
+    ws = "ws_wrong_ver"
+    doc_id = "doc_ver_test"
+    repo = InMemoryKnowledgeGraphRepository()
+    from db.table_store.memory_store import MemoryTableStore
+    from schemas.structured_table import TableRow, TableCell, TableSchema, ColumnDefinition, HeaderTopology, InferredDtype
+
+    ts = MemoryTableStore()
+    schema = TableSchema(
+        columns=(ColumnDefinition(col_index=0, name="Status", inferred_dtype=InferredDtype.STRING),),
+        header_rows=(1,),
+        header_topology=HeaderTopology.SINGLE_ROW,
+        confidence=1.0,
+    )
+    ts.store_schema("tbl_ver", ws, schema, doc_id, "v2")
+    ts.write_row_batch_with_checkpoint(
+        table_id="tbl_ver",
+        workspace_id=ws,
+        document_id=doc_id,
+        version="v2",
+        rows=[
+            TableRow(
+                row_id="0",
+                row_index=0,
+                cells=(TableCell(cell_id="c0", row_index=0, col_index=0, coordinate="R1C1", raw_value="Active", inferred_dtype=InferredDtype.STRING),),
+            )
+        ],
+        checkpoint_batch=0,
+        source_rows=1,
+        attempted_rows=1,
+        persisted_rows=1,
+        rejected_rows=0,
+        parser_version="1.0.0",
+        schema_version="",
+        content_hash="h2",
+    )
+    ts.publish_active_version("tbl_ver", ws, doc_id, "v2", {"coverage_complete": True, "source_rows": 1, "persisted_rows": 1, "document_version": "v2"})
+
+    # Edge requests version "v1"
+    pub_id = generate_publication_id()
+    src_ent = KnowledgeGraphEntity(
+        entity_id=compute_entity_id(ws, doc_id, "concept", "Item"),
+        workspace_id=ws,
+        name="Item",
+        canonical_name="Item",
+        entity_type="concept",
+        source_document_id=doc_id,
+        aliases=("Item",),
+    )
+    tgt_ent = KnowledgeGraphEntity(
+        entity_id=compute_entity_id(ws, doc_id, "concept", "Active"),
+        workspace_id=ws,
+        name="Active",
+        canonical_name="Active",
+        entity_type="concept",
+        source_document_id=doc_id,
+        aliases=("Active",),
+    )
+    edge_rel = KnowledgeGraphRelationship(
+        relationship_id=compute_relationship_id(ws, src_ent.entity_id, "HAS_STATUS", tgt_ent.entity_id, doc_id, "v1", pub_id),
+        workspace_id=ws,
+        source_entity_id=src_ent.entity_id,
+        source_entity_name=src_ent.canonical_name,
+        predicate="has_status",
+        canonical_predicate="HAS_STATUS",
+        target_entity_id=tgt_ent.entity_id,
+        target_entity_name=tgt_ent.canonical_name,
+        directed=True,
+        confidence=1.0,
+        source_document_id=doc_id,
+        source_document_version="v1",
+        publication_id=pub_id,
+        source_chunk_ids=(),
+        location=TableLocation(table_id="tbl_ver", row_id="0", column_id="Status"),
+        verbatim_evidence="Item has_status Active",
+        relationship_state="unique",
+        created_at_utc=_now_utc(),
+    )
+    repo.stage_relationships(ws, doc_id, "v1", pub_id, [src_ent, tgt_ent], [edge_rel])
+    man = KnowledgeGraphManifest(
+        workspace_id=ws, document_id=doc_id, document_version="v1", publication_id=pub_id,
+        status="ready", entity_count=2, relationship_count=1, ingested_at_utc=_now_utc(), content_hash="h1"
+    )
+    repo.commit_manifest(ws, man)
+
+    boundary_mock = MagicMock()
+    boundary_mock.has_tombstone.return_value = False
+    boundary_mock.list_document_snapshots.return_value = [MagicMock(document_id=doc_id, version="v1")]
+
+    retriever = KnowledgeGraphRetriever(
+        repository=repo,
+        boundary_repo=boundary_mock,
+        table_store=ts,
+    )
+    res = retriever.expand(workspace_id=ws, query="Item", max_hops=1)
+    assert len(res.candidate_chunks) == 0
+
+
+def test_tablestore_hydration_large_table_bounded_reads_never_scans_table():
+    """covers: AC-1, AC-6, AC-9 Large table targeted hydration executes bounded read and never scans table."""
+    ws = "ws_large_table"
+    doc_id = "doc_large_table"
+    ver = "v1"
+    repo = InMemoryKnowledgeGraphRepository()
+    from db.table_store.memory_store import MemoryTableStore
+    from schemas.structured_table import TableRow, TableCell, TableSchema, ColumnDefinition, HeaderTopology, InferredDtype
+
+    ts = MemoryTableStore()
+    schema = TableSchema(
+        columns=(
+            ColumnDefinition(col_index=0, name="ID", inferred_dtype=InferredDtype.INTEGER),
+            ColumnDefinition(col_index=1, name="Value", inferred_dtype=InferredDtype.STRING),
+        ),
+        header_rows=(1,),
+        header_topology=HeaderTopology.SINGLE_ROW,
+        confidence=1.0,
+    )
+    ts.store_schema("tbl_large", ws, schema, doc_id, ver)
+    # Populate 100 rows
+    rows_data = [
+        TableRow(
+            row_id=str(i),
+            row_index=i,
+            cells=(
+                TableCell(cell_id=f"c_{i}_0", row_index=i, col_index=0, coordinate=f"R{i}C1", raw_value=i, inferred_dtype=InferredDtype.INTEGER),
+                TableCell(cell_id=f"c_{i}_1", row_index=i, col_index=1, coordinate=f"R{i}C2", raw_value=f"Val_{i}", inferred_dtype=InferredDtype.STRING),
+            ),
+        )
+        for i in range(100)
+    ]
+    ts.write_row_batch_with_checkpoint(
+        table_id="tbl_large",
+        workspace_id=ws,
+        document_id=doc_id,
+        version=ver,
+        rows=rows_data,
+        checkpoint_batch=0,
+        source_rows=100,
+        attempted_rows=100,
+        persisted_rows=100,
+        rejected_rows=0,
+        parser_version="1.0.0",
+        schema_version="",
+        content_hash="h_large",
+    )
+    ts.publish_active_version("tbl_large", ws, doc_id, ver, {"coverage_complete": True, "source_rows": 100, "persisted_rows": 100, "document_version": ver})
+
+    # Edge points to row 42
+    pub_id = generate_publication_id()
+    src_ent = KnowledgeGraphEntity(
+        entity_id=compute_entity_id(ws, doc_id, "concept", "Item42"),
+        workspace_id=ws,
+        name="Item42",
+        canonical_name="Item42",
+        entity_type="concept",
+        source_document_id=doc_id,
+        aliases=("Item42",),
+    )
+    tgt_ent = KnowledgeGraphEntity(
+        entity_id=compute_entity_id(ws, doc_id, "concept", "Val_42"),
+        workspace_id=ws,
+        name="Val_42",
+        canonical_name="Val_42",
+        entity_type="concept",
+        source_document_id=doc_id,
+        aliases=("Val_42",),
+    )
+    edge_rel = KnowledgeGraphRelationship(
+        relationship_id=compute_relationship_id(ws, src_ent.entity_id, "MAPS_TO", tgt_ent.entity_id, doc_id, ver, pub_id),
+        workspace_id=ws,
+        source_entity_id=src_ent.entity_id,
+        source_entity_name=src_ent.canonical_name,
+        predicate="maps_to",
+        canonical_predicate="MAPS_TO",
+        target_entity_id=tgt_ent.entity_id,
+        target_entity_name=tgt_ent.canonical_name,
+        directed=True,
+        confidence=1.0,
+        source_document_id=doc_id,
+        source_document_version=ver,
+        publication_id=pub_id,
+        source_chunk_ids=(),
+        location=TableLocation(table_id="tbl_large", row_id="42", column_id="Value"),
+        verbatim_evidence="Row 42: ID=42 -> Value=Val_42",
+        relationship_state="unique",
+        created_at_utc=_now_utc(),
+    )
+    repo.stage_relationships(ws, doc_id, ver, pub_id, [src_ent, tgt_ent], [edge_rel])
+    man = KnowledgeGraphManifest(
+        workspace_id=ws, document_id=doc_id, document_version=ver, publication_id=pub_id,
+        status="ready", entity_count=2, relationship_count=1, ingested_at_utc=_now_utc(), content_hash="h_large"
+    )
+    repo.commit_manifest(ws, man)
+
+    # Patch query_rows to ensure it is NEVER invoked during table hydration
+    query_rows_called = []
+    orig_query_rows = ts.query_rows
+    def forbidden_query_rows(*args, **kwargs):
+        query_rows_called.append((args, kwargs))
+        raise AssertionError("query_rows was called during targeted hydration! Prohibited by AC-6, AC-9.")
+    ts.query_rows = forbidden_query_rows
+
+    boundary_mock = MagicMock()
+    boundary_mock.has_tombstone.return_value = False
+    boundary_mock.list_document_snapshots.return_value = [MagicMock(document_id=doc_id, version=ver)]
+
+    retriever = KnowledgeGraphRetriever(
+        repository=repo,
+        boundary_repo=boundary_mock,
+        table_store=ts,
+    )
+    res = retriever.expand(workspace_id=ws, query="Item42", max_hops=1)
+    assert len(query_rows_called) == 0
+    assert len(res.candidate_chunks) == 1
+    assert "Val_42" in res.candidate_chunks[0].text
+    assert res.candidate_chunks[0].id == f"{doc_id}:table:tbl_large:row42"
+
+
+def test_hydration_old_unversioned_chunk_coexisting_with_newer_document_snapshot():
+    """covers: AC-9, AC-10 Old unversioned chunk in storage cannot be certified by newer document snapshot."""
+    from schemas.models import Chunk, Document
+    doc_repo = DocumentsRepository()
+    ws = "ws_old_unversioned"
+    doc_id = "doc_snapshot_test"
+    dummy_fast = [0.1] * 384
+    dummy_full = [0.1] * 1024
+
+    old_unversioned_chunk = Chunk(
+        id="chunk_old_unversioned",
+        document_id=doc_id,
+        source_format="csv",
+        text="Old unversioned chunk data",
+        element_type="row",
+        location_reference="Row 1",
+        metadata={},  # No version in metadata
+        embedding_fast=dummy_fast,
+        embedding_full=dummy_full,
+        workspace_id=ws,
+    )
+    doc_repo.save(Document(
+        id=doc_id,
+        filename="test.csv",
+        source_format="csv",
+        chunks=(old_unversioned_chunk,),
+        workspace_id=ws,
+    ))
+
+    with patch("db.workspace_boundary_repo.get_workspace_boundary_repo") as mock_get_b_repo:
+        mock_b_repo = MagicMock()
+        mock_get_b_repo.return_value = mock_b_repo
+        # Newer document snapshot is published at v2.0
+        mock_b_repo.get_document_snapshot.return_value = MagicMock(version="2.0")
+
+        # Requesting v2.0 must reject the old unversioned chunk
+        k_req = ChunkLookupKey(chunk_id="chunk_old_unversioned", document_id=doc_id, document_version="2.0")
+        assert len(doc_repo.get_chunks_by_ids(ws, [k_req])) == 0
+
+        # Requesting v1.0 must also reject the unversioned chunk
+        k_v1 = ChunkLookupKey(chunk_id="chunk_old_unversioned", document_id=doc_id, document_version="1.0")
+        assert len(doc_repo.get_chunks_by_ids(ws, [k_v1])) == 0
+
+
+def test_tablestore_hydration_missing_targeted_interface_disables_fallback_safely():
+    """covers: AC-1, AC-9 Missing targeted interface on custom table_store disables fallback safely without crashing."""
+    ws = "ws_custom_ts"
+    doc_id = "doc_custom"
+    ver = "v1"
+    repo = InMemoryKnowledgeGraphRepository()
+
+    # Custom table store without get_row or get_schema
+    class StubStoreWithoutTargetedAPI:
+        pass
+
+    stub_ts = StubStoreWithoutTargetedAPI()
+
+    pub_id = generate_publication_id()
+    src_ent = KnowledgeGraphEntity(
+        entity_id=compute_entity_id(ws, doc_id, "concept", "A"),
+        workspace_id=ws,
+        name="A",
+        canonical_name="A",
+        entity_type="concept",
+        source_document_id=doc_id,
+        aliases=("A",),
+    )
+    tgt_ent = KnowledgeGraphEntity(
+        entity_id=compute_entity_id(ws, doc_id, "concept", "B"),
+        workspace_id=ws,
+        name="B",
+        canonical_name="B",
+        entity_type="concept",
+        source_document_id=doc_id,
+        aliases=("B",),
+    )
+    edge_rel = KnowledgeGraphRelationship(
+        relationship_id=compute_relationship_id(ws, src_ent.entity_id, "MAPS", tgt_ent.entity_id, doc_id, ver, pub_id),
+        workspace_id=ws,
+        source_entity_id=src_ent.entity_id,
+        source_entity_name=src_ent.canonical_name,
+        predicate="maps",
+        canonical_predicate="MAPS",
+        target_entity_id=tgt_ent.entity_id,
+        target_entity_name=tgt_ent.canonical_name,
+        directed=True,
+        confidence=1.0,
+        source_document_id=doc_id,
+        source_document_version=ver,
+        publication_id=pub_id,
+        source_chunk_ids=(),
+        location=TableLocation(table_id="tbl_stub", row_id="0", column_id="Col"),
+        verbatim_evidence="A maps B",
+        relationship_state="unique",
+        created_at_utc=_now_utc(),
+    )
+    repo.stage_relationships(ws, doc_id, ver, pub_id, [src_ent, tgt_ent], [edge_rel])
+    man = KnowledgeGraphManifest(
+        workspace_id=ws, document_id=doc_id, document_version=ver, publication_id=pub_id,
+        status="ready", entity_count=2, relationship_count=1, ingested_at_utc=_now_utc(), content_hash="h1"
+    )
+    repo.commit_manifest(ws, man)
+
+    boundary_mock = MagicMock()
+    boundary_mock.has_tombstone.return_value = False
+    boundary_mock.list_document_snapshots.return_value = [MagicMock(document_id=doc_id, version=ver)]
+
+    retriever = KnowledgeGraphRetriever(
+        repository=repo,
+        boundary_repo=boundary_mock,
+        table_store=stub_ts,
+    )
+    res = retriever.expand(workspace_id=ws, query="A", max_hops=1)
+    # Disabled fallback safely returns 0 candidate chunks without raising
+    assert len(res.candidate_chunks) == 0
+
 

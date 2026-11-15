@@ -166,6 +166,20 @@ class DocumentsService:
                 provider=settings.MODEL_PROVIDER,
                 workspace_id=workspace_id,
             )
+            if incoming_version and getattr(document, "chunks", None):
+                from dataclasses import replace
+                new_chunks = [
+                    replace(
+                        c,
+                        metadata={
+                            **(c.metadata or {}),
+                            "version": incoming_version,
+                            "document_version": incoming_version,
+                        },
+                    )
+                    for c in document.chunks
+                ]
+                document = replace(document, chunks=tuple(new_chunks))
             self.repo.save(document)
             self.repo.add_document_to_workspace(
                 workspace_id=workspace_id,

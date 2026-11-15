@@ -61,7 +61,28 @@ def parse_file(
     raw_chunks = adapter(path, document_id, workspace_id=workspace_id)
     exclusions = tuple(getattr(raw_chunks, "exclusions", ()))
     incomplete_cov = bool(getattr(raw_chunks, "incomplete_coverage", False))
-    chunks = tuple(raw_chunks)
+
+    file_ver = None
+    if path.exists():
+        try:
+            import hashlib
+            file_ver = hashlib.sha256(path.read_bytes()).hexdigest()[:32]
+        except Exception:
+            pass
+
+    from dataclasses import replace
+
+    chunk_list = []
+    for c in raw_chunks:
+        if file_ver:
+            meta = dict(c.metadata or {})
+            meta.setdefault("version", file_ver)
+            meta.setdefault("document_version", file_ver)
+            chunk_list.append(replace(c, metadata=meta))
+        else:
+            chunk_list.append(c)
+
+    chunks = tuple(chunk_list)
     doc = Document(
         id=document_id,
         filename=doc_filename,
