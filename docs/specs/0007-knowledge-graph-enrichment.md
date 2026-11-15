@@ -58,19 +58,19 @@ To prevent architectural bloat and duplicate work, the division of responsibilit
 - As a tenant administrator, I want graph entities and relationships to be strictly partitioned by workspace identifier and document version so that proprietary organizational relationships never leak across workspace boundaries or surface tombstoned content.
 
 **Acceptance criteria**:
-- **AC-1**: Ingestion extracts and persists typed `KnowledgeGraphEntity` and `KnowledgeGraphRelationship` records per document version for text PDF and structured tabular documents. Relationships represent directed triples `(source_entity, canonical_predicate, target_entity)` with verified source chunk or table cell locators.
-- **AC-2**: Extracted relationships are validated against authorized active chunks or verified table structures before persistence. Candidate relationships must cite an active chunk belonging to the current document version, possess a valid locator, and contain the asserted relationship predicate context and both connected entities verbatim in the source chunk text. For tabular data, relationships are constructed strictly from explicit foreign keys or row level co occurrence, never from fuzzy column name similarity. Unsupported claims are rejected as hallucinations and omitted from storage.
+- **AC-1**: Ingestion extracts and persists typed `KnowledgeGraphEntity` and `KnowledgeGraphRelationship` records per document version for text PDF and structured tabular documents. Relationships represent directed triples `(source_entity, canonical_predicate, target_entity)` with verified source chunk or table cell locators, explicit endpoints, and directional syntax evidence.
+- **AC-2**: Extracted relationships are validated against authorized active chunks or verified table structures before persistence. Candidate relationships must cite an active chunk belonging to the current document version, possess a valid locator, and contain the asserted relationship predicate context and both connected entities verbatim in the source chunk text with directional syntax. Co occurrence alone must not establish a relationship. For tabular data, relationships are constructed strictly from explicit foreign keys or directional column headers with verified schema semantics, never from row co occurrence or fuzzy column name similarity. Unsupported claims are rejected as hallucinations and omitted from storage.
 - **AC-3**: Graph ingestion extraction enforces strict resource bounds per document version: maximum 2 Bedrock completion calls, maximum 4000 total prompt input tokens (capped at 2000 per call), maximum 1600 total output tokens (capped at 800 per call), and a 10.0s total provider deadline per call (3.0s connect, 7.0s read). Retries are capped at at most 1 retry on throttling (HTTP 429), and each retry strictly counts as a reserved call against the 2 call ceiling. Zero retries are permitted on model errors, bad requests, or timeouts. Extraction is idempotent, keyed by `idempotency_key = sha256(f"{workspace_id}:{document_id}:{document_version}:kg")`. Replaying an existing version reuses persisted relationships with zero additional model calls. Baseline publication completes independently per ADR-001.
-- **AC-4**: Durable budget accounting, lease expiry, stale worker fencing, retries, and crash recovery: Aligning with accepted specification 0006 Slice 3.1 and Slice 3.2, graph extraction enforces a durable ledger in `kre_knowledge_graph` (`PK = KG#{workspace_id}#DOC#{document_id}#V#{document_version}`, `SK = BUDGET#LEDGER`) that atomically records call reservations, cumulative token expenditures, active lease ownership, lease expiry timestamp, and a monotonically increasing fence token. Before making a provider call, a worker must atomically acquire a lease permit (`reserved_calls < max_calls`). The lease expires after 15 seconds. Mandatory worker identity (`worker_id`) is enforced on all fenced writes. If a worker call takes longer than the lease window (or if the worker crashes) and another worker takes over by advancing the fence token, the late returning worker is fenced: its write is rejected and no relationships are persisted. The tokens consumed by the stale worker call are reconciled into the ledger cumulative token count. On worker crash or restart, budget recovery performs a strongly consistent read; if `reserved_calls >= max_calls` and extraction is uncompleted, the document version budget fails closed as exhausted with zero additional provider calls.
+- **AC-4**: Durable budget accounting, lease expiry, stale worker fencing, retries, uncertain outcomes, and crash recovery: Aligning with accepted specification 0006 Slice 3.1 and Slice 3.2, graph extraction enforces a durable ledger in `kre_knowledge_graph` (`PK = KG#{workspace_id}#DOC#{document_id}#V#{document_version}`, `SK = BUDGET#LEDGER`) that atomically records call reservations, cumulative token expenditures, active lease ownership, lease expiry timestamp, and a monotonically increasing fence token. Before making a provider call, a worker must atomically acquire a lease permit (`reserved_calls < max_calls`). The lease expires after 15 seconds, with client timestamps re sampled immediately before dispatch. Mandatory non empty worker identity (`worker_id`) is enforced on all fenced writes and reservations. If a worker call takes longer than the lease window (or if the worker crashes) and another worker takes over by advancing the fence token, the late returning worker is fenced: its write is rejected and no relationships are persisted. The tokens consumed by the stale worker call are reconciled into the ledger cumulative token count. Client socket timeouts drop client connections without cancelling server side transactions; recovery requires a strongly consistent read. DynamoDB condition expressions compare client supplied constant timestamps, assuming NTP clock synchronization across workers. Delayed commits can succeed before fence advancement; strict rejection after lease expiry is guaranteed once a competing worker advances the monotonic fence token (`fence_token > expected_fence`). On worker crash or restart, budget recovery performs a strongly consistent read; if `reserved_calls >= max_calls` and extraction is uncompleted, the document version budget fails closed as exhausted with zero additional provider calls.
 - **AC-5**: Mandatory Bedrock CountTokens validation and request token bounding: When a live Bedrock client is configured, authoritative token bounding before dispatch is strictly enforced by the official Bedrock Runtime `count_tokens` API on structured converse payloads. If `count_tokens` is missing, fails, or returns non positive tokens, extraction fails closed immediately with zero provider calls. Heuristic token estimation is strictly prohibited when running against a live provider client and is restricted exclusively to offline unit test fixtures with no client. The complete request payload is bounded by maximum 2000 characters per chunk and 8000 UTF-8 bytes total per call prompt. Any prompt exceeding the 2000 input token ceiling fails closed before network dispatch.
-- **AC-6**: Storage and lookups are strictly partitioned by `workspace_id`. Graph edges are stored in `kre_knowledge_graph` using indexed partition keys (`KG#{workspace_id}#ENTITY#{source_id}`) and sort keys (`EDGE#{target_entity_id}#{canonical_predicate}#{source_document_id}`). Edges record `source_document_id`, `source_document_version`, and `publication_id`. Reverse relationships are indexed via GSI1 (`KG#{workspace_id}#TARGET#{target_id}`). A dedicated entity mention lookup index is maintained at `PK = KG#{workspace_id}#LOOKUP` with sort key `MENTION#{normalized_mention}#ENT#{entity_id}#DOC#{document_id}`. In memory hash calculation is used for exact entity name matching to eliminate redundant lookup queries. Traversal resolves active publications per candidate document via manifest lookup or request level cache; uncommitted, stale, or failed publication edges are rejected. Multi hop traversal executes strictly via indexed queries against primary keys, GSI1, and the lookup index with bounded limits (maximum 10 edges per node, maximum 25 total nodes visited), with zero unconstrained table scans.
+- **AC-6**: Storage and lookups are strictly partitioned by `workspace_id`. Graph edges are stored in `kre_knowledge_graph` using indexed partition keys (`KG#{workspace_id}#ENTITY#{source_id}`) and sort keys embedding document version and publication identity (`EDGE#{target_entity_id}#{canonical_predicate}#DOC#{source_document_id}#V#{source_document_version}#PUB#{publication_id}`). Reverse relationships are indexed via GSI1 (`KG#{workspace_id}#TARGET#{target_id}`) with sort key `EDGE#{source_entity_id}#{canonical_predicate}#DOC#{source_document_id}#V#{source_document_version}#PUB#{publication_id}`. Version scoping and cleanup are indexed via GSI2 (`KG#{workspace_id}#DOC#{document_id}#V#{document_version}`) with sort key `PUB#{publication_id}#EDGE#{source_entity_id}#{target_entity_id}#{canonical_predicate}`. A dedicated entity mention lookup index is maintained at `PK = KG#{workspace_id}#LOOKUP` with sort key `MENTION#{normalized_mention}#ENT#{entity_id}#DOC#{document_id}#V#{document_version}#PUB#{publication_id}`. In memory hash calculation is used for exact entity name matching to eliminate redundant lookup queries. Traversal resolves active publications per candidate document via manifest lookup or request level cache; uncommitted, stale, or failed publication edges are rejected. Multi hop traversal executes strictly via indexed queries against primary keys, GSI1, and the lookup index with bounded limits (maximum 10 edges per node, maximum 25 total nodes visited), with zero unconstrained table scans. Pagination across edges and mentions is strictly bounded to at most 3 pages (at most 30 evaluated items per node), failing closed or recording truncation if limits are reached.
 - **AC-7**: Active deletion tombstones in `WorkspaceBoundaryRepository` filter out relationships belonging to deleted source documents. Tombstone checks execute inside worker tasks and fail closed: any check error or workspace tombstone returns zero graph candidates immediately without throwing unhandled exceptions.
 - **AC-8**: Retrieval latency targets and admission control: Graph lookups enforce a proposed target deadline of 75ms total wall clock time for cloud environments (50ms for local development and cache hits) across entity lookup, graph traversal, and chunk hydration. Lookups are governed by `GraphConcurrencyController` (maximum 4 concurrent workers, maximum 8 queued submissions). When a caller deadline expires, the caller drops the future immediately, logs a timeout, and yields zero candidates to fusion, ensuring zero late candidate publication. Running storage work retains its worker capacity permit until underlying thread execution completes. Baseline retrieval completes independently without degradation.
-- **AC-9**: Graph traversal bounds maximum expansion depth to 2 hops (or 3 hops when explicitly requested by causal query plans), applying cycle detection to prevent infinite loops. Frontier expansion is deterministically ordered by confidence descending and identifier ascending. Total visited nodes are capped at 25. Hydration is capped at 15 chunks, hydrated via targeted batch reads by chunk identifier inside the worker task, never loading entire workspace chunk sets into memory. If traversal terminates early due to limits, partial results are safely returned with truncation telemetry.
-- **AC-10**: Candidate fusion and fast path bypass: Validated source chunks backing traversed edges are pooled into reciprocal rank fusion with a provisional initial weight of 1.10 (divided to 0.55 on entity ambiguity or conflicting edges), explicitly marked as provisional until measured and calibrated against the 60 question benchmark in Slice 2. Graph candidates never exclude or prune chunks from other retrieval strategies. Queries executing on the fast path (`plan.fast_path == True`) bypass graph traversal entirely. Zero model calls and zero embedding invocations are performed during graph retrieval.
+- **AC-9**: Graph traversal bounds maximum expansion depth to 2 hops (or 3 hops when explicitly requested by causal query plans), applying cycle detection to prevent infinite loops. Frontier expansion is deterministically ordered by confidence descending and identifier ascending. Total visited nodes are capped at 25. Hydration is capped at 15 chunks, hydrated via targeted document scoped batch reads by chunk identifier inside the worker task, validating chunk document identity and document version against active ready versions, never loading entire workspace chunk sets into memory. If storage chunks are missing or deleted, missing chunks are dropped gracefully. If traversal terminates early due to limits, deadlines, or pagination boundaries, partial results are safely returned with explicit truncation telemetry (`execution_status = "truncated"`).
+- **AC-10**: Candidate fusion, fast path bypass, and the one generation per query guarantee: Validated source chunks backing traversed edges are pooled into reciprocal rank fusion with a provisional initial weight of 1.10 (divided to 0.55 on entity ambiguity or conflicting edges), explicitly marked as provisional until measured and calibrated against the 60 question benchmark in Slice 2. Graph candidates never exclude or prune chunks from other retrieval strategies. Queries executing on the fast path (`plan.fast_path == True`) bypass graph traversal entirely. Zero model calls and zero embedding invocations are performed during graph retrieval. The retrieval pipeline pins the active workspace snapshot generation `(document_id -> (document_version, publication_id))` at query start, guaranteeing that multi hop traversals, edge filtering, and chunk hydration lookups evaluate against a single consistent snapshot generation without mixed generation anomalies.
 - **AC-11**: Non destructive legacy cutover: Scoped retrieval in `KnowledgeGraphStrategy` queries exclusively through the new workspace partitioned table (`kre_knowledge_graph`), excluding old global unpartitioned records by construction. Legacy tables (`okf_entities`, `okf_properties`, `okf_relations`) and old data are preserved without modification, and deletion is explicitly deferred.
-- **AC-12**: DocumentSnapshot exposes `graph_status`, `graph_entities_count`, and `graph_relations_count` without requiring dedicated administrative HTTP endpoints. Candidate chunk identifiers, latency, traversed node count, edge match counts, and truncation flags are exposed in `QueryResponse.retrieval_candidates` debug trace.
-- **AC-13**: An offline ablation comparison suite evaluates candidate recall, precision, and latency with Knowledge Graph enabled versus disabled against the BM25 and vector baseline across canonical evaluation documents, including a counterexample test proving that an incorrect graph expansion does not prevent retrieval of the true answer page. Benchmark comparison barrier is strictly preserved: no benchmark accuracy claims may be asserted without authorized execution on `ws_canonical_comparison_0004`. Paid benchmark execution is prohibited without explicit authorization.
+- **AC-12**: DocumentSnapshot exposes `graph_status`, `graph_entities_count`, and `graph_relations_count` without requiring dedicated administrative HTTP endpoints. Candidate chunk identifiers, latency, traversed node count, edge match counts, truncation status, and truncation reason are exposed in `QueryResponse.retrieval_candidates` debug trace.
+- **AC-13**: Offline ablation comparison suite, counterexample safety, and explicit verification gates: An offline ablation comparison suite evaluates candidate recall, precision, and latency with Knowledge Graph enabled versus disabled against the BM25 and vector baseline across canonical evaluation documents, including a counterexample test proving that an incorrect graph expansion does not prevent retrieval of the true answer page. Verification strictly distinguishes local development tests (SQLite WAL mode, in memory stores, DynamoDB Local, and mock provider calls) from live AWS verification (live Bedrock Runtime converse and count_tokens calls, live AWS DynamoDB transactions). Benchmark comparison barrier is strictly preserved: no benchmark accuracy claims may be asserted without authorized execution on `ws_canonical_comparison_0004`. Paid benchmark execution is prohibited without explicit authorization.
 
 ## Options considered
 
@@ -154,14 +154,13 @@ class KnowledgeGraphEntity(BaseModel):
     name: str = Field(..., max_length=512)
     canonical_name: str = Field(..., max_length=512)
     entity_type: Literal["organization", "person", "location", "product", "concept", "table", "other"] = "concept"
-    document_ids: tuple[str, ...] = Field(default_factory=tuple)
     aliases: tuple[str, ...] = Field(default_factory=tuple)
 
 class KnowledgeGraphRelationship(BaseModel):
     """Verified directed relationship edge grounded in source document evidence."""
     model_config = ConfigDict(frozen=True, extra="forbid")
     
-    relationship_id: str = Field(description="Deterministic hash: rel_{sha256(ws:src:pred:tgt:doc)[:24]}")
+    relationship_id: str = Field(description="Deterministic hash: rel_{sha256(ws:src:pred:tgt:doc:ver:pub)[:24]}")
     workspace_id: str = Field(..., max_length=64)
     source_entity_id: str = Field(..., max_length=64)
     source_entity_name: str = Field(..., max_length=512)
@@ -200,12 +199,15 @@ class KnowledgeGraphLookupResult(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
     
     seed_entities: tuple[str, ...]
+    pinned_generation: str | None = None
     entity_state: Literal["unique", "ambiguous", "none"] = "none"
     relationship_state: Literal["unique", "conflicting", "none"] = "none"
     traversed_node_count: int = 0
     edge_match_count: int = 0
     matched_chunk_ids: tuple[str, ...] = Field(default_factory=tuple)
     candidate_chunks: tuple[Any, ...] = Field(default_factory=tuple)
+    was_truncated: bool = False
+    truncation_reason: str | None = None
     execution_status: Literal[
         "completed", "truncated", "caller_timeout", "admission_rejected", "tombstoned", "storage_failed"
     ] = "completed"
@@ -236,24 +238,28 @@ class KnowledgeGraphBudgetLedger(BaseModel):
 
 ### 2. Entity Identity, Resolution, and Cross Document Semantics
 
-1. **Deterministic Canonical Identifiers**:
+1. **Deterministic Canonical Identifiers and Homonyms**:
    Entities do not merge purely on shared words. Identity incorporates the active workspace, entity type, and NFKD normalized canonical name:
    `canonical_key = f"{workspace_id}:{entity_type}:{normalized_canonical_name}"`
    `entity_id = f"ent_{hashlib.sha256(canonical_key.encode('utf-8')).hexdigest()[:16]}"`
    This guarantees that "Washington (location)" and "Washington (person)" remain distinct nodes with collision safe identifiers.
+   Where qualifiers are present in source text (for example "Springfield (Illinois)" versus "Springfield (Missouri)", or "John Smith (author)" versus "John Smith (executive)"), the qualifier is included in `normalized_canonical_name` to create distinct nodes.
+   When no qualifier is present and multiple documents mention the same name and entity type, they resolve to the same canonical `entity_id`, enabling cross document relationship traversal across the workspace.
+   Crucially, resolving to the same canonical `entity_id` never merges, overwrites, or conflates document evidence. The document version, publication identifier, and verbatim chunk locator are strictly preserved on the edge and mention records, not on the canonical node.
 
-2. **Mention Lookup and Aliases**:
+2. **Mention Lookup, Aliases, and Publication Isolation**:
    Mention lookup records are stored under:
    `PK = KG#{workspace_id}#LOOKUP`
-   `SK = MENTION#{normalized_mention}#ENT#{entity_id}#DOC#{document_id}`
-   This preserves exact mention provenance across documents. Exact query matches compute `entity_id` directly in memory, saving one network lookup. Prefix matches query `SK begins_with MENTION#{query_token}#` with `Limit=5`.
+   `SK = MENTION#{normalized_mention}#ENT#{entity_id}#DOC#{document_id}#V#{document_version}#PUB#{publication_id}`
+   This preserves exact mention provenance across documents, document versions, and publications. An in flight or newly staged document ingestion writes new mention records without overwriting or mutating existing mention records from previous publications or other documents.
+   Exact query matches compute `entity_id` directly in memory when the normalized mention matches a known canonical name, saving a network query. Prefix matches query `SK begins_with MENTION#{query_token}#` with `Limit=5` and bounded pagination (at most 3 pages, at most 30 evaluated items).
 
 3. **Ambiguity and Conflicting Evidence**:
-   - Entity Ambiguity: If a query token matches multiple distinct `entity_id` values with differing entity types, `entity_state = "ambiguous"` is flagged. The retriever expands all matched entities independently and applies the ambiguity fusion discount (halving fusion weight to 0.55 per affected candidate).
-   - Conflicting Evidence: If two documents assert contradictory predicates between the exact same pair of entities (such as acquired versus divested), both edges are preserved under their distinct document IDs. In retrieval, `relationship_state = "conflicting"` is flagged, distinct citations are surfaced, and fusion weight is halved to 0.55 for chunks backing those edges.
+   - Entity Ambiguity: If a query token matches multiple distinct `entity_id` values (with differing entity types or qualifiers), `entity_state = "ambiguous"` is flagged. The retriever expands all matched entities independently and applies the ambiguity fusion discount (halving provisional fusion weight from 1.10 to 0.55 per affected candidate).
+   - Conflicting Evidence: If two documents assert contradictory predicates between the exact same pair of entities (such as acquired versus divested), both edges are preserved under their distinct document, version, and publication identifiers. In retrieval, `relationship_state = "conflicting"` is flagged, distinct citations are surfaced, and fusion weight is halved to 0.55 for chunks backing those edges. Evidence is never silently merged or overwritten.
 
 4. **Distinction from OKF**:
-   OKF entities are strictly document scoped (`OkfEntityRecord` carries `document_id`) to isolate scalar facts. Knowledge Graph entities are workspace scoped canonical nodes, while directed edges retain document version and publication provenance.
+   OKF entities are strictly document scoped (`OkfEntityRecord` carries `document_id`) to isolate scalar facts. Knowledge Graph canonical nodes are workspace scoped concept records (`KnowledgeGraphEntity`), while directed edges and mention records retain document version and publication provenance.
 
 ### 3. Storage Schema, Indexing, and Publication Staging
 
@@ -262,40 +268,45 @@ Storage is implemented in `kre_knowledge_graph` (DynamoDB in production, SQLite 
 1. **Active Manifest Record**:
    - `PK`: `KG#{workspace_id}#DOC#{document_id}#V#{document_version}`
    - `SK`: `MANIFEST`
-   - Attributes: `workspace_id`, `document_id`, `document_version`, `publication_id`, `status`, `entity_count`, `relationship_count`, `ingested_at_utc`, `content_hash`.
-   - Read consistency: Strongly consistent reads for publication authority and crash recovery.
+   - Attributes: `workspace_id`, `document_id`, `document_version`, `publication_id`, `base_publication_id`, `status`, `entity_count`, `relationship_count`, `ingested_at_utc`, `content_hash`.
+   - Read consistency: Strongly consistent reads (`ConsistentRead=True` in DynamoDB) for publication authority and crash recovery.
 
 2. **Durable Budget Ledger Record**:
    - `PK`: `KG#{workspace_id}#DOC#{document_id}#V#{document_version}`
    - `SK`: `BUDGET#LEDGER`
-   - Attributes: Ledger fields matching `KnowledgeGraphBudgetLedger`.
-   - Read consistency: Strongly consistent reads.
+   - Attributes: Ledger fields matching `KnowledgeGraphBudgetLedger` (`reserved_calls`, `completed_calls`, `reserved_prompt_tokens`, `spent_prompt_tokens`, `reserved_output_tokens`, `spent_output_tokens`, `lease_owner_id`, `lease_expires_at`, `fence_token`, `reconciled_fences`, `status`, `updated_at`).
+   - Read consistency: Strongly consistent reads (`ConsistentRead=True`).
 
-3. **Directed Relationship Edge Records**:
+3. **Directed Relationship Edge Records (Publication Isolated Sort Key)**:
    - `PK`: `KG#{workspace_id}#ENTITY#{source_entity_id}`
-   - `SK`: `EDGE#{target_entity_id}#{canonical_predicate}#{source_document_id}`
+   - `SK`: `EDGE#{target_entity_id}#{canonical_predicate}#DOC#{source_document_id}#V#{source_document_version}#PUB#{publication_id}`
    - Attributes: `workspace_id`, `source_entity_id`, `source_entity_name`, `target_entity_id`, `target_entity_name`, `predicate`, `canonical_predicate`, `confidence`, `source_document_id`, `source_document_version`, `publication_id`, `source_chunk_ids`, `locations_json`, `verbatim_evidence`, `created_at_utc`.
-   - Edge deduplication: By embedding `target_entity_id`, `canonical_predicate`, and `source_document_id` in the sort key, a document holds at most one edge per directed relationship, merging multiple chunk references into `source_chunk_ids`. This prevents intra document edge duplication from starving traversal limits.
+   - Edge deduplication and staging isolation: Embedding `source_document_id`, `source_document_version`, and `publication_id` in the sort key guarantees that a new extraction attempt stages distinct records (`PUB#{new_pub_id}`) without overwriting or mutating current ready edges. Multiple chunk references within the same document version merge into `source_chunk_ids`.
 
 4. **Global Secondary Index 1 (GSI1 Incoming and Reverse Edges)**:
    - Index Name: `gsi1_target_lookup`
    - `GSI1_PK`: `KG#{workspace_id}#TARGET#{target_entity_id}`
-   - `GSI1_SK`: `EDGE#{source_entity_id}#{canonical_predicate}#{source_document_id}`
+   - `GSI1_SK`: `EDGE#{source_entity_id}#{canonical_predicate}#DOC#{source_document_id}#V#{source_document_version}#PUB#{publication_id}`
    - Projection: `ALL`
 
 5. **Global Secondary Index 2 (GSI2 Document Version Scoping and Cleanup)**:
    - Index Name: `gsi2_doc_version`
    - `GSI2_PK`: `KG#{workspace_id}#DOC#{document_id}#V#{document_version}`
-   - `GSI2_SK`: `EDGE#{source_entity_id}#{target_entity_id}#{canonical_predicate}`
+   - `GSI2_SK`: `PUB#{publication_id}#EDGE#{source_entity_id}#{target_entity_id}#{canonical_predicate}`
    - Projection: `KEYS_ONLY`
 
-6. **Publication Staging and Cross Document Visibility**:
+6. **Publication Staging, Atomic Commit, and Stale Publication Rejection**:
    - Extraction generates a fresh `publication_id = f"pub_{uuid.uuid4().hex[:16]}"`.
-   - Staging writes edges with `publication_id` attached.
-   - Atomic Commit: The manifest is committed atomically with the budget ledger condition check and worker identity validation.
-   - Cross Document Resolution: In retrieval, when edges from multiple documents are returned, the retriever checks each edge's `(source_document_id, source_document_version, publication_id)` against the active publication context (cached in a request level dictionary). If an edge's `publication_id` does not match the active ready manifest, it is rejected as uncommitted or stale.
-   - Failed or Fenced Publication: If extraction fails or times out, manifest status is `failed` or uncommitted. Traversal rejects all edges citing that publication.
-   - Inert Record Cleanup: Deletion or version replacement triggers asynchronous cleanup via GSI2 without blocking the publication path.
+   - Staging writes edges with `publication_id` embedded in sort keys.
+   - Atomic Visibility Commit: Once staging completes, the manifest is committed atomically with the budget ledger condition check and worker identity validation in a two item transaction. For unfenced writes, optimistic concurrency against `base_publication_id` ensures that a stale attempt cannot overwrite a newer committed publication. For fenced writes, the transaction asserts ledger existence, fence equality (`fence_token == expected_fence`), valid unexpired lease (`lease_expires_at >= now` re sampled immediately before dispatch), and non empty matching `worker_id`.
+   - Failed or Aborted Staging: If staging fails, times out, or gets fenced, the manifest write is never executed. Staged records under `PUB#{pub_id}` remain inert and are never read by queries.
+   - Cross Document Resolution: In retrieval, when edges from multiple documents are returned, the retriever filters each edge against the query's pinned active publication context: `publication_id == active_publications[source_document_id]`. Stale, uncommitted, or superseded publications are ignored.
+   - Inert Record Cleanup: Deletion or version replacement triggers asynchronous physical cleanup via GSI2 without blocking the publication path.
+
+7. **Operational Boundaries and Preserved 0006 Limitations**:
+   - Client socket timeouts (for example 7.0s read timeout on Bedrock, or 40ms on storage) drop the local client connection without cancelling server side transaction processing. Client timeouts produce uncertain outcomes that must be resolved via strongly consistent reads.
+   - DynamoDB condition expressions compare client supplied constant timestamps (`:now_epoch`) because DynamoDB does not evaluate server side physical wall clock timestamps in condition expressions. NTP clock synchronization is assumed.
+   - Delayed commits: If a commit arrives after lease duration expires but before a competing worker advances the fence, DynamoDB commits the write because condition checks compare client supplied timestamp constants. Strict rejection after lease expiration is guaranteed once another worker advances the monotonic fence token (`fence_token > expected_fence`).
 
 ### 4. Predicate Sanitization and Allowlisted Representation
 
@@ -306,11 +317,11 @@ This eliminates all delimiter collisions in sort keys.
 
 ### 5. Structured Tabular Relationships
 
-1. **Deterministic Construction**:
-   Relationships in CSV or tabular data are derived strictly from:
-   - Explicit foreign key mappings defined in table schemas, or
-   - Verified row level co occurrence of primary entity keys.
-   Inferring relationships from fuzzy column name similarity is strictly prohibited.
+1. **Deterministic Construction and Directional Evidence**:
+   Co occurrence alone must not establish a relationship. Merely having two entity names in the same table row does not provide evidence of relationship direction or predicate semantics. Relationships in CSV or tabular data are derived strictly from:
+   - Explicit foreign key mappings defined in table schemas with directional semantics (for example `parent_company_id` referencing `company_id` with predicate `PARENT_OF`), or
+   - Explicit directional column headers relative to the row primary entity key (for example a row keyed by `company_name` with column `acquired_firm` establishing direction `company_name -> ACQUIRED -> acquired_firm`).
+   Inferring relationships from row co occurrence alone or from speculative column name similarity is strictly prohibited. Both endpoints, the canonical predicate, and direction must be explicitly grounded in table schema definitions or directional column roles.
 2. **Provenance and Evidence**:
    Tabular edges cite a `TableLocation` specifying `table_name`, `row_index`, `source_column`, and `target_column`.
    `verbatim_evidence` records the exact serialized row text: `f"Row {row_index}: {source_col}={source_val} -> {target_col}={target_val}"`.
@@ -320,25 +331,30 @@ This eliminates all delimiter collisions in sort keys.
 ### 6. Bounded Multi Hop Traversal Algorithm
 
 The traversal algorithm executes deterministically:
-1. **Seed Entity Resolution**: Match query tokens deterministically. Exact name matches compute `entity_id` in memory to eliminate a network query. Partial matches query `PK = KG#{workspace_id}#LOOKUP` with `SK begins_with MENTION#{token}#` (Limit 5).
+0. **Pinned Generation Context (One Generation Per Query Guarantee)**:
+   At query start, the retrieval pipeline captures or receives a pinned snapshot generation context: `active_manifest_versions: dict[str, tuple[str, str]]` (`document_id -> (document_version, publication_id)`). All traversal hops, edge checks, and chunk hydration lookups evaluate strictly against this pinned generation. A concurrent publication commit during query execution cannot alter the active versions observed by an in flight query.
+1. **Seed Entity Resolution**: Match query tokens deterministically. Exact name matches compute `entity_id` in memory to eliminate a network query. Partial matches query `PK = KG#{workspace_id}#LOOKUP` with `SK begins_with MENTION#{token}#` (Limit 5, bounded pagination at most 3 pages).
 2. **Hop 1 Expansion**:
    - Outgoing edges: `PK = KG#{ws}#ENTITY#{seed_id}`, `SK begins_with EDGE#` (Limit 10).
    - Incoming edges: `GSI1_PK = KG#{ws}#TARGET#{seed_id}`, `GSI1_SK begins_with EDGE#` (Limit 10).
-   - Filter edges by active publication and document version.
+   - Filter edges by active publication and document version using the query pinned generation map.
    - Add target entities to frontier and mark visited: `visited_entities.add(seed_id)`.
+   - Bounded pagination: at most 3 pages, at most 30 evaluated items per node.
 3. **Hop 2 Expansion** (if `max_hops >= 2` and visited nodes < 25):
    - Sort unvisited frontier nodes deterministically by `(confidence DESC, entity_id ASC)`.
-   - Take top 5 frontier nodes. For each, query outgoing edges (Limit 5) and incoming edges (Limit 5).
+   - Take top 5 frontier nodes. For each, query outgoing edges (Limit 5) and incoming edges (Limit 5) with bounded pagination.
    - Filter by active publication, add to visited set, and detect cycles (`if target_id in visited: skip`).
 4. **Hop 3 Expansion** (only when explicitly requested by causal query plans):
    - Take top 3 frontier nodes, query outgoing edges with Limit 3, respecting the 25 node ceiling.
 5. **Targeted Chunk Hydration**:
    - Collect distinct `source_chunk_ids` from traversed valid edges, capped at 15 chunks.
    - Sort candidate edges by `(confidence DESC, hop_distance ASC, relationship_id ASC)` to select the top 15 chunks.
-   - Hydrate chunks via `batch_get_item` inside the worker task.
+   - Hydrate chunks via targeted document scoped batch reads inside the worker task (`get_all_chunks(workspace_id=workspace_id, document_ids=distinct_docs)` or targeted chunk batch get).
+   - Validate chunk `document_id` and `document_version` against the pinned active ready versions.
    - Filter against active deletion tombstones in `WorkspaceBoundaryRepository`.
-6. **Incomplete Traversal**:
-   If limits or deadlines truncate traversal, `execution_status = "truncated"` is recorded, and collected evidence items are safely returned to fusion.
+   - Missing chunk tolerance: If storage chunks are missing or deleted, missing chunks are dropped gracefully without failing the batch.
+6. **Incomplete Traversal and Truncation Telemetry**:
+   If limits (nodes 25, edges 10, hydrated chunks 15), pagination boundaries (3 pages), or deadlines truncate traversal, `execution_status = "truncated"` and explicit `truncation_reason` ("node_cap_reached", "edge_cap_reached", "pagination_limit_reached", "deadline_approaching") are recorded in telemetry, and collected evidence items are safely returned to fusion.
 
 ### 7. Deadline, Concurrency Control, and Baseline Decoupling
 
@@ -346,7 +362,7 @@ The traversal algorithm executes deterministically:
    Target deadline is 75ms total wall clock time for cloud environments (50ms for local development and cache hits).
 2. **Admission and Capacity Retention**:
    Governed by `GraphConcurrencyController` (maximum 4 concurrent workers, maximum 8 queue limit).
-   When the caller deadline expires, the caller logs a timeout and returns zero candidates to reciprocal rank fusion immediately.
+   When the caller deadline expires, the caller drops the future immediately, logs a timeout, and returns zero candidates to reciprocal rank fusion immediately.
    Worker capacity is retained until the underlying storage thread completes, preventing queue saturation from orphaned tasks. Late candidates are discarded with zero pipeline injection.
 3. **Baseline Decoupling**:
    Ingestion and query retrieval are fully decoupled from graph enrichment per ADR-001. Failures or timeouts fall back immediately to BM25, vector, and PageIndex search.
@@ -363,7 +379,7 @@ The traversal algorithm executes deterministically:
 | Action | Value produced / displayed | Source |
 |---|---|---|
 | Canonical entity creation | `entity_id` | `f"ent_{sha256(ws:type:norm_name)[:16]}"` |
-| Relationship extraction | `relationship_id` | `f"rel_{sha256(ws:src:pred:tgt:doc)[:24]}"` |
+| Relationship extraction | `relationship_id` | `f"rel_{sha256(ws:src:pred:tgt:doc:ver:pub)[:24]}"` |
 | Ingestion extraction | `publication_id` | Fresh UUID generated per extraction attempt (`pub_{uuid[:16]}`) |
 | Relationship extraction | `canonical_predicate` | Allowlisted snake case identifier or URL safe percent encoding |
 | Relationship extraction | `source_chunk_ids` | Deduplicated chunk identifiers from source document chunks |
@@ -382,11 +398,14 @@ The traversal algorithm executes deterministically:
 ### 10. Key Invariants
 
 1. Multi tenant isolation: All partition keys must begin with `KG#{workspace_id}#`. Cross workspace queries return zero entities and zero edges by construction.
-2. Verbatim grounding: Every persisted relationship must have its predicate context and both entity names appear verbatim in the cited chunk text or verified table row. Hallucinated relationships are discarded.
+2. Verbatim directional grounding: Every persisted relationship must have its predicate context and both entity names appear verbatim in the cited chunk text with directional syntax, or in a verified table row with directional column headers or foreign keys. Hallucinated relationships and claims based on co occurrence alone are discarded.
 3. Strict budget ceilings: A document version never consumes more than 2 Bedrock calls, 4000 total prompt tokens, and 1600 output tokens. Throttling retries count against the 2 call ceiling.
 4. ADR-001 decoupling: Graph extraction or lookup failures must never block baseline document publication or baseline query retrieval.
 5. Zero table scans: All storage queries must run against partition keys or indexed sort key prefixes with bounded limits. Whole table or workspace scans are prohibited.
 6. Deterministic retrieval: Retrieval traversals perform zero model calls and zero embedding invocations.
+7. Co occurrence prohibition: Merely finding two entity names in the same chunk or table row without directional syntax or directional schema roles never establishes a relationship.
+8. One generation per query guarantee: All traversal hops, edge checks, and chunk hydration lookups evaluate strictly against the pinned workspace snapshot generation captured at query start.
+9. Publication sort key isolation: Sort keys on edges and mentions embed document version and publication identifier, ensuring in flight staging attempts cannot overwrite ready publications.
 
 ### 11. Configuration Required
 
@@ -411,19 +430,24 @@ Registered in `backend/src/config.py`:
 
 - Happy path extraction: Ingest a multi page text PDF with clear entity relationships; verify persisted entities and relationships with verbatim chunk evidence, verifies **AC-1**, **AC-2**.
 - Verbatim grounding rejection: Mock model output containing relationship not present in source chunk text; verify extraction discards it, verifies **AC-2**.
-- Tabular deterministic extraction: Ingest CSV table with explicit foreign key; verify relationship with `TableLocation` and zero model calls, verifies **AC-1**, **AC-2**.
+- Co occurrence alone rejection: Ingest chunk or table row where two entities co occur without directional syntax or schema roles; verify extraction rejects the relationship, verifies **AC-1**, **AC-2**.
+- Tabular deterministic extraction: Ingest CSV table with explicit foreign key and directional column; verify relationship with `TableLocation` and zero model calls, verifies **AC-1**, **AC-2**.
 - Resource budget and idempotency: Ingest document version twice; verify second ingestion makes zero provider calls, verifies **AC-3**.
 - Throttling retry ceiling: Simulate Bedrock 429 throttling on Call 1; verify retry acquires Call 2 reservation and third attempt fails closed without dispatch, verifies **AC-3**, **AC-4**.
 - Mandatory CountTokens validation: When live client is present and `count_tokens` returns error or missing count; verify extraction fails closed with 0 calls, verifies **AC-5**.
 - Durable budget fencing: Simulate slow or crashed worker whose 15 second lease expires; verify late write is rejected and fence token prevents state corruption, verifies **AC-4**.
-- Cross document publication visibility: Query entity with edges from two documents with different active publication IDs; verify both edges are visible, verifies **AC-6**.
-- Stale publication rejection: Republish Document A to new publication; verify edges from prior publication are rejected during traversal, verifies **AC-6**.
+- Duplicate entity names and cross document resolution: Ingest two documents referencing the same canonical entity name; verify distinct document version mentions and edges without overwriting, verifies **AC-6**.
+- Same version republication staging isolation: While Publication 1 is active, stage Publication 2 for the same document version; verify Publication 1 edges remain retrievable until Publication 2 visibility commits, verifies **AC-4**, **AC-6**.
+- One generation per query pinned traversal: Commit a new publication while a query traversal is running; verify query evaluates exclusively against its pinned initial generation map, verifies **AC-10**.
 - Bounded multi hop traversal: Create cyclic graph with 30 nodes; verify traversal terminates at 2 hops and maximum 25 visited nodes without infinite loop, verifies **AC-6**, **AC-9**.
-- Targeted chunk hydration: Query graph with 20 matching edges; verify only top 15 chunks are hydrated via batch get, verifies **AC-9**.
+- Bounded pagination ceiling: Seed node with 40 outgoing edges across 4 DynamoDB pages; verify evaluation halts at 3 pages, caps at 30 items, and flags truncation telemetry, verifies **AC-6**, **AC-9**.
+- Targeted chunk hydration: Query graph with 20 matching edges; verify only top 15 chunks are hydrated via document scoped batch reads, verifies **AC-9**.
+- Chunk hydration error tolerance: Query graph where 1 chunk is deleted from storage; verify remaining valid chunks are hydrated safely without query failure, verifies **AC-9**.
 - Concurrency and deadline enforcement: Inject 100ms storage delay; verify caller deadline drops graph candidates, retains worker capacity, and falls back cleanly to baseline retrieval, verifies **AC-8**.
 - Cross tenant isolation: Query graph with different workspace ID; verify zero candidate leakage, verifies **AC-6**.
 - Tombstone enforcement: Insert deletion tombstone for source document; verify graph edges from that document are excluded from traversal results, verifies **AC-7**.
 - Reciprocal rank fusion: Verify graph candidate chunks pool into fusion with provisional weight 1.10 and fast path bypasses graph lookup entirely, verifies **AC-10**.
+- Explicit local verification versus live AWS gate: Verify complete Slice 1 test suite passes on local SQLite with WAL mode, in memory stores, and DynamoDB Local with zero cloud credentials, while live Bedrock and live AWS DynamoDB integration tests remain gated behind explicit test markers, verifies **AC-13**.
 - Offline ablation comparison: Run ablation suite across canonical evaluation documents; verify candidate recall and counterexample discovery safety, verifies **AC-13**.
 
 ## Build plan
@@ -432,20 +456,20 @@ Following the Tracer Bullet build approach, this feature is implemented across t
 
 ### Slice 1: Contracts, Storage Schema, Grounded Extraction, Durable Budgeting, and Bounded Traversal
 
-- [ ] 1. **Typed Knowledge Graph Contracts**: Define `KnowledgeGraphEntity`, `KnowledgeGraphRelationship`, `KnowledgeGraphManifest`, `KnowledgeGraphLookupResult`, and `KnowledgeGraphBudgetLedger` in `backend/src/schemas/contracts/knowledge_graph.py` with immutable fields, deterministic ID hashing, and explicit entity typing, satisfying **AC-1**, **AC-4**, **AC-6**.
-- [ ] 2. **Partitioned Storage Repository**: Implement `KnowledgeGraphRepository` supporting DynamoDB, SQLite, and in memory stores with Main table partition keys (`KG#{workspace_id}#ENTITY#{source_id}`), sort keys (`EDGE#{target_id}#{canonical_predicate}#{doc_id}`), lookup index (`KG#{workspace_id}#LOOKUP`), GSI1 (reverse edges), GSI2 (document version scoping), durable budget ledger (`BUDGET#LEDGER`), staged publication, and tombstone checks, satisfying **AC-4**, **AC-6**, **AC-7**, **AC-11**.
-- [ ] 3. **Grounded Ingestion Extraction and Tabular Processing**: Implement `KnowledgeGraphBuilder` in `backend/src/ingestion/graph_builder.py` extracting canonical entity relationship triples from PDF text chunks and CSV foreign keys with strict Bedrock completion caps (max 2 calls, 4000 total prompt tokens, 1600 total output tokens), idempotency hashing, and verbatim chunk grounding validation rejecting unsupported claims, satisfying **AC-1**, **AC-2**, **AC-3**.
-- [ ] 4. **Durable Budget Accounting, Fencing, and Mandatory CountTokens**: Integrate atomic pre call budget reservations, 15 second lease expiries, monotonic fence tokens, stale worker fencing, crash recovery fail closed semantics, throttling retry call accounting, and mandatory Bedrock `count_tokens` validation, satisfying **AC-3**, **AC-4**, **AC-5**.
-- [ ] 5. **Bounded Multi Hop Traversal and Concurrency Admission**: Implement `KnowledgeGraphRetriever` and `GraphConcurrencyController` enforcing seed entity resolution with in memory hash fast path, bounded breadth first traversal (max 2 hops, max 25 nodes, max 10 edges per node, max 15 hydrated chunks), cycle detection, targeted chunk hydration via `batch_get_item`, 75ms caller deadline, worker capacity retention, and zero table scans, satisfying **AC-6**, **AC-8**, **AC-9**.
-- [ ] 6. **Slice 1 Unit and Regression Test Suite**: Implement comprehensive test suite in `backend/tests/test_knowledge_graph_slice1.py` verifying contract immutability, verbatim grounding validation, budget ledger fencing, crash recovery, multi hop traversal limits, cycle detection, targeted chunk batching, tombstone filtering, publication staging, and boundary isolation, satisfying **AC-1**, **AC-2**, **AC-3**, **AC-4**, **AC-5**, **AC-6**, **AC-7**, **AC-8**, **AC-9**.
+- [ ] 1. **Typed Knowledge Graph Contracts**: Define `KnowledgeGraphEntity`, `KnowledgeGraphRelationship`, `KnowledgeGraphManifest`, `KnowledgeGraphLookupResult`, and `KnowledgeGraphBudgetLedger` in `backend/src/schemas/contracts/knowledge_graph.py` with immutable fields, deterministic ID hashing, explicit entity typing, and directional grounding, satisfying **AC-1**, **AC-4**, **AC-6**.
+- [ ] 2. **Partitioned Storage Repository**: Implement `KnowledgeGraphRepository` supporting DynamoDB, SQLite, and in memory stores with Main table partition keys (`KG#{workspace_id}#ENTITY#{source_id}`), sort keys embedding document version and publication identity (`EDGE#{target_id}#{canonical_predicate}#DOC#{doc_id}#V#{ver}#PUB#{pub_id}`), lookup index (`KG#{workspace_id}#LOOKUP`), GSI1 (reverse edges), GSI2 (document version scoping and cleanup), durable budget ledger (`BUDGET#LEDGER`), staged publication, and tombstone checks, satisfying **AC-4**, **AC-6**, **AC-7**, **AC-11**.
+- [ ] 3. **Grounded Extraction for Tabular Schemas and Text Chunks**: Implement `KnowledgeGraphBuilder` in `backend/src/ingestion/graph_builder.py` extracting canonical entity relationship triples from CSV verified foreign keys and directional headers with zero model cost and zero token expense, and validating text chunk relationships against verbatim directional syntax with mock Bedrock provider in tests, satisfying **AC-1**, **AC-2**, **AC-3**.
+- [ ] 4. **Durable Budget Accounting, Fencing, and Mandatory CountTokens**: Integrate atomic pre call budget reservations on `BUDGET#LEDGER`, 15 second lease expiries with client timestamp re sampling, monotonic fence tokens, mandatory non empty worker identity (`worker_id`), stale worker fencing, crash recovery fail closed semantics, throttling retry call accounting, and mandatory Bedrock `count_tokens` validation, satisfying **AC-3**, **AC-4**, **AC-5**.
+- [ ] 5. **Bounded Multi Hop Traversal, Concurrency Admission, and Targeted Chunk Hydration**: Implement `KnowledgeGraphRetriever` and `GraphConcurrencyController` enforcing pinned snapshot generation context (the one generation per query guarantee), seed entity resolution with in memory hash fast path, bounded breadth first traversal (max 2 hops, max 25 nodes, max 10 edges per node, max 3 pages pagination bound), cycle detection, targeted chunk hydration via document scoped batch reads, 75ms caller deadline, worker capacity retention, and zero table scans, satisfying **AC-6**, **AC-8**, **AC-9**, **AC-10**.
+- [ ] 6. **Slice 1 Deterministic Unit and Regression Test Suite**: Implement comprehensive test suite in `backend/tests/test_knowledge_graph_slice1.py` verifying contract immutability, verbatim directional grounding, co occurrence rejection, duplicate entity names without overwriting, publication staging isolation, budget ledger fencing, crash recovery, multi hop traversal limits, pagination bounds, targeted chunk batching, tombstone filtering, and boundary isolation across SQLite, in memory, and DynamoDB Local stores, satisfying **AC-1**, **AC-2**, **AC-3**, **AC-4**, **AC-5**, **AC-6**, **AC-7**, **AC-8**, **AC-9**, **AC-10**, **AC-13**.
 
 ### Slice 2: Pipeline Fusion, Telemetry, and Offline Ablation
 
 - [ ] 7. **Pipeline Fusion and Fast Path Bypass**: Implement `KnowledgeGraphStrategy` and wire `run_graph` in `backend/src/services/langgraph_pipeline.py`, routing graph candidates into reciprocal rank fusion with provisional initial weight (1.10, halved to 0.55 on entity ambiguity or conflicting edges) while bypassing graph lookups entirely on fast path queries, satisfying **AC-10**.
 - [ ] 8. **Decoupled Baseline Ingestion and Snapshot Metadata**: Wire graph extraction as a decoupled background enrichment pass in `backend/src/modules/documents/documents_service.py`, ensuring baseline publication completes independently per ADR-001, and exposing `graph_status`, `graph_entities_count`, and `graph_relations_count` in `DocumentSnapshot`, satisfying **AC-3**, **AC-11**, **AC-12**.
-- [ ] 9. **Retrieval Candidate Telemetry Trace**: Expose `graph_candidate_ids`, `graph_latency_ms`, `graph_traversed_nodes`, `graph_matched_edges`, and `graph_execution_status` in `QueryResponse.retrieval_candidates` debug trace, satisfying **AC-12**.
-- [ ] 10. **Offline Ablation Comparison Suite**: Implement evaluation harness in `backend/tests/test_knowledge_graph_ablation_slice2.py` comparing candidate page recall, precision, and latency with Knowledge Graph enabled versus disabled across canonical evaluation documents, including counterexample test proving incorrect graph expansion never displaces true answer pages, satisfying **AC-10**, **AC-13**.
-- [ ] 11. **Benchmark Comparison Barrier**: Enforce comparator rules ensuring no benchmark accuracy claims are made until controlled canonical comparison run executes on `ws_canonical_comparison_0004`, with zero paid benchmark execution without explicit user authorization, satisfying **AC-13**.
+- [ ] 9. **Retrieval Candidate Telemetry Trace**: Expose `graph_candidate_ids`, `graph_latency_ms`, `graph_traversed_nodes`, `graph_matched_edges`, `graph_was_truncated`, and `graph_truncation_reason` in `QueryResponse.retrieval_candidates` debug trace, satisfying **AC-12**.
+- [ ] 10. **Offline Ablation Comparison Suite and Counterexample Safety**: Implement evaluation harness in `backend/tests/test_knowledge_graph_ablation_slice2.py` comparing candidate page recall, precision, and latency with Knowledge Graph enabled versus disabled across canonical evaluation documents, including counterexample test proving incorrect graph expansion never displaces true answer pages, satisfying **AC-10**, **AC-13**.
+- [ ] 11. **Benchmark Comparison Barrier and Live AWS Verification Gate**: Enforce comparator rules ensuring no benchmark accuracy claims are made until controlled canonical comparison run executes on `ws_canonical_comparison_0004`, with zero paid benchmark execution without explicit user authorization, while gating live AWS DynamoDB and Bedrock verification behind explicit environment credentials, satisfying **AC-13**.
 
 ## Migration plan
 
