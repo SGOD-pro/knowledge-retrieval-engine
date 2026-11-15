@@ -337,6 +337,10 @@ class DynamoDBTableStore:
         # and active manifest pointer SK = MANIFEST
         serialized_manifest = dict(manifest)
         serialized_manifest["updated_at_utc"] = now
+        serialized_manifest.setdefault("table_id", table_id)
+        serialized_manifest.setdefault("workspace_id", workspace_id)
+        serialized_manifest.setdefault("document_id", document_id)
+        serialized_manifest.setdefault("document_version", version)
 
         man_v_item = {
             "PK": f"INGESTION#{workspace_id}#{document_id}",

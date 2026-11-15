@@ -2611,3 +2611,382 @@ def test_tablestore_hydration_missing_targeted_interface_disables_fallback_safel
     assert len(res.candidate_chunks) == 0
 
 
+def test_tablestore_explicit_version_absent_while_legacy_exists_returns_none_memory():
+    """covers: AC-1, AC-9 When explicit version is requested, absent version returns None/empty without legacy substitution (Memory)."""
+    from db.table_store.memory_store import MemoryTableStore
+    from schemas.structured_table import StructuredTable, TableRow, TableCell, TableSchema, ColumnDefinition, HeaderTopology, InferredDtype
+
+    ts = MemoryTableStore()
+    ws = "ws_leg_mem"
+    tid = "tbl_leg"
+
+    schema = TableSchema(
+        columns=(ColumnDefinition(col_index=0, name="ColA", inferred_dtype=InferredDtype.STRING),),
+        header_rows=(0,),
+        header_topology=HeaderTopology.SINGLE_ROW,
+        confidence=1.0,
+    )
+    rows = (
+        TableRow(
+            row_id="0",
+            row_index=0,
+            cells=(TableCell(cell_id="c0", row_index=0, col_index=0, coordinate="R1C1", raw_value="LegacyVal", inferred_dtype=InferredDtype.STRING),),
+        ),
+    )
+    legacy_table = StructuredTable(
+        table_id=tid,
+        document_id="doc_legacy",
+        sheet_name=None,
+        page_number=None,
+        schema=schema,
+        rows=rows,
+        row_count=1,
+        col_count=1,
+    )
+    # Store strictly via unversioned legacy table interface
+    ts.store_table(legacy_table, workspace_id=ws)
+
+    # 1. Explicit absent version reads return None / empty
+    assert ts.get_schema(tid, ws, version="v2") is None
+    assert ts.get_row(tid, ws, row_id="0", version="v2") is None
+    assert ts.get_table(tid, ws, version="v2") is None
+    assert len(ts.query_rows(tid, ws, version="v2")) == 0
+    val, count, r_ids, _, _ = ts.execute_single_pass_query(tid, ws, column_index=0, op=None, version="v2")
+    assert count == 0
+
+    # 2. Explicit legacy reads or unversioned access correctly return legacy data
+    assert ts.get_schema(tid, ws, version="legacy") is not None
+    assert ts.get_schema(tid, ws, version=None) is not None
+    assert ts.get_row(tid, ws, row_id="0", version="legacy") is not None
+    assert ts.get_table(tid, ws, version="legacy") is not None
+    assert len(ts.query_rows(tid, ws, version="legacy")) == 1
+
+
+def test_tablestore_explicit_version_absent_while_legacy_exists_returns_none_sqlite():
+    """covers: AC-1, AC-9 When explicit version is requested, absent version returns None/empty without legacy substitution (SQLite)."""
+    from db.table_store.sqlite_store import SQLiteTableStore
+    from schemas.structured_table import StructuredTable, TableRow, TableCell, TableSchema, ColumnDefinition, HeaderTopology, InferredDtype
+
+    ts = SQLiteTableStore(db_path=":memory:")
+    ws = "ws_leg_sqlite"
+    tid = "tbl_leg_sql"
+
+    schema = TableSchema(
+        columns=(ColumnDefinition(col_index=0, name="ColA", inferred_dtype=InferredDtype.STRING),),
+        header_rows=(0,),
+        header_topology=HeaderTopology.SINGLE_ROW,
+        confidence=1.0,
+    )
+    rows = (
+        TableRow(
+            row_id="0",
+            row_index=0,
+            cells=(TableCell(cell_id="c0", row_index=0, col_index=0, coordinate="R1C1", raw_value="LegacyVal", inferred_dtype=InferredDtype.STRING),),
+        ),
+    )
+    legacy_table = StructuredTable(
+        table_id=tid,
+        document_id="doc_legacy_sql",
+        sheet_name=None,
+        page_number=None,
+        schema=schema,
+        rows=rows,
+        row_count=1,
+        col_count=1,
+    )
+    # Store strictly via legacy store_table interface
+    ts.store_table(legacy_table, workspace_id=ws)
+
+    # 1. Explicit absent version reads return None / empty
+    assert ts.get_schema(tid, ws, version="v2") is None
+    assert ts.get_row(tid, ws, row_id="0", version="v2") is None
+    assert ts.get_table(tid, ws, version="v2") is None
+    assert len(ts.query_rows(tid, ws, version="v2")) == 0
+    val, count, r_ids, _, _ = ts.execute_single_pass_query(tid, ws, column_index=0, op=None, version="v2")
+    assert count == 0
+
+    # 2. Explicit legacy reads or unversioned access correctly return legacy data
+    assert ts.get_schema(tid, ws, version="legacy") is not None
+    assert ts.get_schema(tid, ws, version=None) is not None
+    assert ts.get_row(tid, ws, row_id="0", version="legacy") is not None
+    assert ts.get_table(tid, ws, version="legacy") is not None
+    assert len(ts.query_rows(tid, ws, version="legacy")) == 1
+
+
+def test_tablestore_explicit_version_absent_dynamodb_local_if_available():
+    """covers: AC-1, AC-9 When explicit version is requested on DynamoDB Local, absent version returns None/empty."""
+    import socket
+    try:
+        with socket.create_connection(("127.0.0.1", 8000), timeout=0.1):
+            pass
+    except OSError:
+        pytest.skip("DynamoDB Local is not running on http://localhost:8000")
+
+    import boto3
+    try:
+        client = boto3.client(
+            "dynamodb",
+            endpoint_url="http://localhost:8000",
+            region_name="us-east-1",
+            aws_access_key_id="test",
+            aws_secret_access_key="test",
+        )
+        client.list_tables()
+    except Exception:
+        pytest.skip("DynamoDB Local is not running on http://localhost:8000")
+
+    table_name = "kre_tablestore_reg_absent_ver"
+    try:
+        client.delete_table(TableName=table_name)
+    except Exception:
+        pass
+
+    client.create_table(
+        TableName=table_name,
+        KeySchema=[
+            {"AttributeName": "PK", "KeyType": "HASH"},
+            {"AttributeName": "SK", "KeyType": "RANGE"},
+        ],
+        AttributeDefinitions=[
+            {"AttributeName": "PK", "AttributeType": "S"},
+            {"AttributeName": "SK", "AttributeType": "S"},
+        ],
+        BillingMode="PAY_PER_REQUEST",
+    )
+
+    from db.table_store.dynamodb_store import DynamoDBTableStore
+    resource = boto3.resource(
+        "dynamodb",
+        endpoint_url="http://localhost:8000",
+        region_name="us-east-1",
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+    )
+    ts = DynamoDBTableStore(table_name=table_name, client=client, resource=resource)
+    ws = "ws_ddb_absent"
+    tid = "tbl_ddb"
+
+    # Reading non-existent version returns None / empty
+    assert ts.get_schema(tid, ws, version="v2") is None
+    assert ts.get_row(tid, ws, row_id="0", version="v2") is None
+    assert ts.get_table(tid, ws, version="v2") is None
+    assert len(ts.query_rows(tid, ws, version="v2")) == 0
+
+
+def test_table_document_binding_fails_closed_on_incomplete_manifest_identity():
+    """covers: AC-1, AC-9 Incomplete manifest identity fields fail closed and never authorize hydration."""
+    from services.retrieval.knowledge_graph_retriever import _verify_table_document_binding
+
+    class CustomStoreWithManifest:
+        def __init__(self, manifest):
+            self._m = manifest
+        def get_ingestion_manifest(self, doc_id, ws_id, version=None):
+            return self._m
+
+    ws = "ws_test_binding"
+    doc_id = "doc_test"
+    ver = "v1"
+    tid = "tbl_test"
+
+    # 1. Empty manifest fails closed
+    store_empty = CustomStoreWithManifest({})
+    assert _verify_table_document_binding(store_empty, ws, tid, doc_id, ver) is False
+
+    # 2. Manifest missing table_id fails closed
+    store_no_tid = CustomStoreWithManifest({"document_id": doc_id, "document_version": ver, "workspace_id": ws})
+    assert _verify_table_document_binding(store_no_tid, ws, tid, doc_id, ver) is False
+
+    # 3. Manifest missing document_id fails closed
+    store_no_doc = CustomStoreWithManifest({"table_id": tid, "document_version": ver, "workspace_id": ws})
+    assert _verify_table_document_binding(store_no_doc, ws, tid, doc_id, ver) is False
+
+    # 4. Manifest missing version fails closed
+    store_no_ver = CustomStoreWithManifest({"table_id": tid, "document_id": doc_id, "workspace_id": ws})
+    assert _verify_table_document_binding(store_no_ver, ws, tid, doc_id, ver) is False
+
+    # 5. Manifest with empty string fields fails closed
+    store_empty_strings = CustomStoreWithManifest({"table_id": "", "document_id": doc_id, "document_version": ver})
+    assert _verify_table_document_binding(store_empty_strings, ws, tid, doc_id, ver) is False
+
+    # 6. Complete and matching manifest succeeds
+    store_complete = CustomStoreWithManifest({"table_id": tid, "document_id": doc_id, "document_version": ver, "workspace_id": ws})
+    assert _verify_table_document_binding(store_complete, ws, tid, doc_id, ver) is True
+
+
+def test_table_document_binding_fails_closed_on_correct_document_wrong_table_or_version():
+    """covers: AC-1, AC-9 Correct document with wrong table or wrong version fails closed across storage backends."""
+    from db.table_store.memory_store import MemoryTableStore
+    from services.retrieval.knowledge_graph_retriever import _verify_table_document_binding
+    from schemas.structured_table import TableSchema, ColumnDefinition, HeaderTopology, InferredDtype
+
+    ws = "ws_binding_mismatch"
+    doc_id = "doc_correct"
+    ver = "v1"
+    tid = "tbl_correct"
+
+    schema = TableSchema(
+        columns=(ColumnDefinition(col_index=0, name="Col", inferred_dtype=InferredDtype.STRING),),
+        header_rows=(0,),
+        header_topology=HeaderTopology.SINGLE_ROW,
+        confidence=1.0,
+    )
+
+    ts_mem = MemoryTableStore()
+    ts_mem.store_schema(table_id=tid, workspace_id=ws, schema=schema, document_id=doc_id, document_version=ver)
+    ts_mem.publish_active_version(tid, ws, doc_id, ver, {"coverage_complete": True})
+
+    # Exact matching succeeds
+    assert _verify_table_document_binding(ts_mem, ws, tid, doc_id, ver) is True
+
+    # Correct document but wrong table fails closed
+    assert _verify_table_document_binding(ts_mem, ws, "tbl_WRONG", doc_id, ver) is False
+
+    # Correct document and table but wrong version fails closed
+    assert _verify_table_document_binding(ts_mem, ws, tid, doc_id, "v_WRONG") is False
+
+    # Correct document and table and version but wrong workspace fails closed
+    assert _verify_table_document_binding(ts_mem, "ws_OTHER", tid, doc_id, ver) is False
+
+    # Legacy document identity alone cannot certify a requested version
+    from schemas.structured_table import StructuredTable
+    ts_leg = MemoryTableStore()
+    leg_tbl = StructuredTable(
+        table_id=tid,
+        document_id=doc_id,
+        sheet_name=None,
+        page_number=None,
+        schema=schema,
+        rows=(),
+        row_count=0,
+        col_count=1,
+    )
+    ts_leg.store_table(leg_tbl, workspace_id=ws)
+    # Asking for "v2" when only legacy unversioned table exists must fail closed
+    assert _verify_table_document_binding(ts_leg, ws, tid, doc_id, "v2") is False
+
+
+def test_builder_to_retriever_legacy_presence_never_produces_falsely_versioned_evidence():
+    """covers: AC-1, AC-9 Builder to retriever path emits zero candidates when TableStore only contains legacy/mismatched data."""
+    ws = "ws_b2r_version_provenance"
+    doc_id = "doc_b2r"
+    v_req = "v2"
+    repo = InMemoryKnowledgeGraphRepository()
+
+    from db.table_store.memory_store import MemoryTableStore
+    from schemas.structured_table import StructuredTable, TableRow, TableCell, TableSchema, ColumnDefinition, HeaderTopology, InferredDtype
+
+    ts = MemoryTableStore()
+    schema = TableSchema(
+        columns=(
+            ColumnDefinition(col_index=0, name="Component", inferred_dtype=InferredDtype.STRING),
+            ColumnDefinition(col_index=1, name="Language", inferred_dtype=InferredDtype.STRING),
+        ),
+        header_rows=(0,),
+        header_topology=HeaderTopology.SINGLE_ROW,
+        confidence=1.0,
+    )
+    # Store legacy data under doc_b2r in TableStore
+    leg_rows = (
+        TableRow(
+            row_id="0",
+            row_index=0,
+            cells=(
+                TableCell(cell_id="c0", row_index=0, col_index=0, coordinate="R1C1", raw_value="Backend", inferred_dtype=InferredDtype.STRING),
+                TableCell(cell_id="c1", row_index=0, col_index=1, coordinate="R1C2", raw_value="Python", inferred_dtype=InferredDtype.STRING),
+            ),
+        ),
+    )
+    ts.store_table(
+        StructuredTable(
+            table_id="tbl_components",
+            document_id=doc_id,
+            sheet_name=None,
+            page_number=None,
+            schema=schema,
+            rows=leg_rows,
+            row_count=1,
+            col_count=2,
+        ),
+        workspace_id=ws,
+    )
+
+    # Builder stages graph for version v2
+    rows = [{"Component": "Backend", "Language": "Python"}]
+    schema_rels = [
+        DirectionalSchemaRelation(
+            source_column="Component",
+            predicate="written_in",
+            target_column="Language",
+            source_type="concept",
+            target_type="concept",
+        )
+    ]
+    builder = KnowledgeGraphBuilder(repository=repo)
+    man = builder.build_and_persist_tabular_graph(
+        workspace_id=ws,
+        document_id=doc_id,
+        document_version=v_req,
+        table_name="tbl_components",
+        rows=rows,
+        schema_relations=schema_rels,
+    )
+    assert man.status == "ready"
+
+    boundary_mock = MagicMock()
+    boundary_mock.has_tombstone.return_value = False
+    boundary_mock.list_document_snapshots.return_value = [MagicMock(document_id=doc_id, version=v_req)]
+
+    retriever = KnowledgeGraphRetriever(
+        repository=repo,
+        boundary_repo=boundary_mock,
+        table_store=ts,
+    )
+
+    # 1. Retriever query for v2 when TableStore only has legacy data:
+    # Must FAIL CLOSED and emit 0 candidates; must NEVER substitute legacy table data as v2 evidence!
+    res = retriever.expand(workspace_id=ws, query="What language is Backend written in?", max_hops=1)
+    assert res.execution_status == "completed"
+    assert res.edge_match_count >= 1
+    assert len(res.candidate_chunks) == 0
+
+    # 2. Now store exact versioned table for v2 in TableStore
+    t_rows_v2 = [
+        TableRow(
+            row_id="0",
+            row_index=0,
+            cells=(
+                TableCell(cell_id="c0_v2", row_index=0, col_index=0, coordinate="R1C1", raw_value="Backend", normalized_value="Backend", inferred_dtype=InferredDtype.STRING),
+                TableCell(cell_id="c1_v2", row_index=0, col_index=1, coordinate="R1C2", raw_value="Python", normalized_value="Python", inferred_dtype=InferredDtype.STRING),
+            ),
+        ),
+    ]
+    ts.store_schema(table_id="tbl_components", workspace_id=ws, schema=schema, document_id=doc_id, document_version=v_req)
+    ts.write_row_batch_with_checkpoint(
+        table_id="tbl_components",
+        workspace_id=ws,
+        document_id=doc_id,
+        version=v_req,
+        rows=t_rows_v2,
+        checkpoint_batch=0,
+        source_rows=1,
+        attempted_rows=1,
+        persisted_rows=1,
+        rejected_rows=0,
+        parser_version="1.0.0",
+        schema_version="",
+        content_hash="h_v2",
+    )
+    ts.publish_active_version("tbl_components", ws, doc_id, v_req, {"coverage_complete": True, "source_rows": 1, "persisted_rows": 1, "document_version": v_req})
+
+    # 3. Retriever query now succeeds with grounded v2 evidence
+    res_after = retriever.expand(workspace_id=ws, query="What language is Backend written in?", max_hops=1)
+    assert res_after.execution_status == "completed"
+    assert len(res_after.candidate_chunks) >= 1
+    cand = res_after.candidate_chunks[0]
+    assert "Backend" in cand.text and "Python" in cand.text
+    assert cand.metadata["document_version"] == v_req
+    assert cand.metadata["table_id"] == "tbl_components"
+    assert str(cand.metadata["row"]) == "0"
+
+
+

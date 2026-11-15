@@ -111,13 +111,27 @@ class MemoryTableStore:
         self._active_meta[(workspace_id, table_id)] = {
             "version": version,
             "document_id": document_id,
+            "table_id": table_id,
+            "workspace_id": workspace_id,
             "coverage_complete": manifest.get("coverage_complete", False),
             "processing_finished": manifest.get("processing_finished", False),
             "source_rows": manifest.get("source_rows", 0),
             "persisted_rows": manifest.get("persisted_rows", 0),
         }
-        self._manifests[(workspace_id, document_id, version)] = dict(manifest)
-        self._latest_manifests[(workspace_id, document_id)] = dict(manifest)
+        full_manifest = dict(manifest)
+        full_manifest.setdefault("table_id", table_id)
+        full_manifest.setdefault("workspace_id", workspace_id)
+        full_manifest.setdefault("document_id", document_id)
+        full_manifest.setdefault("document_version", version)
+        self._manifests[(workspace_id, document_id, version)] = full_manifest
+        self._latest_manifests[(workspace_id, document_id)] = full_manifest
+
+        # If table was stored via store_table, populate versioned schema and rows for this published version
+        if (workspace_id, table_id, version) not in self._schemas and (workspace_id, table_id) in self._tables:
+            tbl = self._tables[(workspace_id, table_id)]
+            self._schemas[(workspace_id, table_id, version)] = (tbl.schema, document_id, version, "1.0.0", "")
+            self._versioned_rows[(workspace_id, table_id, version)] = list(tbl.rows)
+
         if workspace_id not in self._workspace_catalogue:
             self._workspace_catalogue[workspace_id] = set()
         self._workspace_catalogue[workspace_id].add(table_id)
@@ -155,21 +169,44 @@ class MemoryTableStore:
     def get_table(self, table_id: str, workspace_id: str, version: str | None = None) -> StructuredTable | None:
         if not workspace_id:
             return None
-        # Check versioned schema
-        ver = version or self.get_active_version(table_id, workspace_id)
-        if ver and (workspace_id, table_id, ver) in self._schemas:
-            schema, doc_id, doc_ver, _, _ = self._schemas[(workspace_id, table_id, ver)]
-            rows = tuple(self._versioned_rows.get((workspace_id, table_id, ver), []))
-            return StructuredTable(
-                table_id=table_id,
-                document_id=doc_id,
-                sheet_name=None,
-                page_number=None,
-                schema=schema,
-                rows=rows,
-                row_count=len(rows),
-                col_count=len(schema.columns) if schema else 0,
-            )
+
+        if version is not None:
+            if version == "legacy":
+                return self._tables.get((workspace_id, table_id))
+            if (workspace_id, table_id, version) in self._schemas:
+                schema, doc_id, doc_ver, _, _ = self._schemas[(workspace_id, table_id, version)]
+                rows = tuple(self._versioned_rows.get((workspace_id, table_id, version), []))
+                return StructuredTable(
+                    table_id=table_id,
+                    document_id=doc_id,
+                    sheet_name=None,
+                    page_number=None,
+                    schema=schema,
+                    rows=rows,
+                    row_count=len(rows),
+                    col_count=len(schema.columns) if schema else 0,
+                )
+            return None
+
+        ver = self.get_active_version(table_id, workspace_id)
+        if ver:
+            if ver == "legacy":
+                return self._tables.get((workspace_id, table_id))
+            if (workspace_id, table_id, ver) in self._schemas:
+                schema, doc_id, doc_ver, _, _ = self._schemas[(workspace_id, table_id, ver)]
+                rows = tuple(self._versioned_rows.get((workspace_id, table_id, ver), []))
+                return StructuredTable(
+                    table_id=table_id,
+                    document_id=doc_id,
+                    sheet_name=None,
+                    page_number=None,
+                    schema=schema,
+                    rows=rows,
+                    row_count=len(rows),
+                    col_count=len(schema.columns) if schema else 0,
+                )
+            return None
+
         return self._tables.get((workspace_id, table_id))
 
     def _matches_predicate(self, row: TableRow, pred: Predicate) -> bool:
@@ -239,15 +276,23 @@ class MemoryTableStore:
     ) -> TableSchema | None:
         if not workspace_id:
             return None
-        ver = version or self.get_active_version(table_id, workspace_id)
+        if version is not None:
+            if version == "legacy":
+                tbl = self._tables.get((workspace_id, table_id))
+                return tbl.schema if tbl else None
+            entry = self._schemas.get((workspace_id, table_id, version))
+            return entry[0] if entry else None
+
+        ver = self.get_active_version(table_id, workspace_id)
         if ver:
+            if ver == "legacy":
+                tbl = self._tables.get((workspace_id, table_id))
+                return tbl.schema if tbl else None
             entry = self._schemas.get((workspace_id, table_id, ver))
-            if entry:
-                return entry[0]
+            return entry[0] if entry else None
+
         tbl = self._tables.get((workspace_id, table_id))
-        if tbl:
-            return tbl.schema
-        return None
+        return tbl.schema if tbl else None
 
     def get_row(
         self,
@@ -258,18 +303,39 @@ class MemoryTableStore:
     ) -> TableRow | None:
         if not workspace_id:
             return None
-        ver = version or self.get_active_version(table_id, workspace_id)
-        if not ver:
-            return None
 
         row_id_str = str(row_id)
         row_idx = int(row_id) if row_id_str.isdigit() else None
 
-        rows = self._versioned_rows.get((workspace_id, table_id, ver))
-        if rows is not None:
-            for r in rows:
-                if str(r.row_id) == row_id_str or (row_idx is not None and r.row_index == row_idx):
-                    return r
+        if version is not None:
+            if version == "legacy":
+                tbl = self._tables.get((workspace_id, table_id))
+                if tbl:
+                    for r in tbl.rows:
+                        if str(r.row_id) == row_id_str or (row_idx is not None and r.row_index == row_idx):
+                            return r
+                return None
+            rows = self._versioned_rows.get((workspace_id, table_id, version))
+            if rows is not None:
+                for r in rows:
+                    if str(r.row_id) == row_id_str or (row_idx is not None and r.row_index == row_idx):
+                        return r
+            return None
+
+        ver = self.get_active_version(table_id, workspace_id)
+        if ver:
+            if ver == "legacy":
+                tbl = self._tables.get((workspace_id, table_id))
+                if tbl:
+                    for r in tbl.rows:
+                        if str(r.row_id) == row_id_str or (row_idx is not None and r.row_index == row_idx):
+                            return r
+                return None
+            rows = self._versioned_rows.get((workspace_id, table_id, ver))
+            if rows is not None:
+                for r in rows:
+                    if str(r.row_id) == row_id_str or (row_idx is not None and r.row_index == row_idx):
+                        return r
             return None
 
         tbl = self._tables.get((workspace_id, table_id))
@@ -355,12 +421,29 @@ class MemoryTableStore:
     ) -> tuple[Decimal | None, int, list[str], list[TableRow], str]:
         import hashlib
 
-        ver = version or self.get_active_version(table_id, workspace_id)
         candidate_rows: list[TableRow] = []
-        if ver and (workspace_id, table_id, ver) in self._versioned_rows:
-            candidate_rows = self._versioned_rows[(workspace_id, table_id, ver)]
-        elif (workspace_id, table_id) in self._tables:
-            candidate_rows = list(self._tables[(workspace_id, table_id)].rows)
+        if version is not None:
+            if version == "legacy":
+                if (workspace_id, table_id) in self._tables:
+                    candidate_rows = list(self._tables[(workspace_id, table_id)].rows)
+            else:
+                if (workspace_id, table_id, version) in self._versioned_rows:
+                    candidate_rows = self._versioned_rows[(workspace_id, table_id, version)]
+                else:
+                    candidate_rows = []
+        else:
+            ver = self.get_active_version(table_id, workspace_id)
+            if ver:
+                if ver == "legacy":
+                    if (workspace_id, table_id) in self._tables:
+                        candidate_rows = list(self._tables[(workspace_id, table_id)].rows)
+                else:
+                    if (workspace_id, table_id, ver) in self._versioned_rows:
+                        candidate_rows = self._versioned_rows[(workspace_id, table_id, ver)]
+                    else:
+                        candidate_rows = []
+            elif (workspace_id, table_id) in self._tables:
+                candidate_rows = list(self._tables[(workspace_id, table_id)].rows)
 
         matched_rows: list[TableRow] = []
         matched_ids: list[str] = []

@@ -402,13 +402,18 @@ class SQLiteTableStore:
                 "UPDATE manifests SET is_latest = 0 WHERE workspace_id = ? AND document_id = ?",
                 (workspace_id, document_id),
             )
+            full_manifest = dict(manifest)
+            full_manifest.setdefault("table_id", table_id)
+            full_manifest.setdefault("workspace_id", workspace_id)
+            full_manifest.setdefault("document_id", document_id)
+            full_manifest.setdefault("document_version", version)
             self._conn.execute(
                 """
                 INSERT OR REPLACE INTO manifests
                 (workspace_id, document_id, version, manifest_json, is_latest)
                 VALUES (?, ?, ?, ?, 1)
                 """,
-                (workspace_id, document_id, version, json.dumps(manifest)),
+                (workspace_id, document_id, version, json.dumps(full_manifest)),
             )
             self._conn.execute(
                 """
@@ -424,6 +429,37 @@ class SQLiteTableStore:
                     1 if manifest.get("coverage_complete") else 0,
                 ),
             )
+            # If table was stored via legacy tables, populate versioned_schemas and versioned_rows for this published version
+            if version != "legacy":
+                cur_check = self._conn.execute(
+                    "SELECT 1 FROM versioned_schemas WHERE workspace_id = ? AND table_id = ? AND version = ?",
+                    (workspace_id, table_id, version),
+                )
+                if not cur_check.fetchone():
+                    cur_tbl = self._conn.execute(
+                        "SELECT schema_json, col_count FROM tables WHERE workspace_id = ? AND table_id = ?",
+                        (workspace_id, table_id),
+                    )
+                    tbl_row = cur_tbl.fetchone()
+                    if tbl_row:
+                        self._conn.execute(
+                            """
+                            INSERT OR REPLACE INTO versioned_schemas
+                            (workspace_id, table_id, version, document_id, parser_version, schema_version, schema_json, col_count, ingested_at_utc)
+                            VALUES (?, ?, ?, ?, '1.0.0', '1.0.0', ?, ?, ?)
+                            """,
+                            (workspace_id, table_id, version, document_id, tbl_row["schema_json"], tbl_row["col_count"], now),
+                        )
+                        self._conn.execute(
+                            """
+                            INSERT OR REPLACE INTO versioned_rows
+                            (workspace_id, table_id, version, row_id, row_index, is_header, is_subtotal, is_empty, cells_json)
+                            SELECT workspace_id, table_id, ?, row_id, row_index, is_header, 0, 0, cells_json
+                            FROM table_rows
+                            WHERE workspace_id = ? AND table_id = ?
+                            """,
+                            (version, workspace_id, table_id),
+                        )
 
     def get_active_version(self, table_id: str, workspace_id: str) -> str | None:
         if not workspace_id:
@@ -587,9 +623,18 @@ class SQLiteTableStore:
         limit: int | None = None,
         version: str | None = None,
     ) -> tuple[Decimal | None, int, list[str], list[int], str]:
-        ver = version or self.get_active_version(table_id, workspace_id)
-        if not ver:
-            return None, 0, [], [], hashlib.sha256(b"").hexdigest()[:16]
+        ver = version
+        if ver is None:
+            ver = self.get_active_version(table_id, workspace_id)
+            if not ver:
+                cur_legacy_check = self._conn.execute(
+                    "SELECT 1 FROM tables WHERE workspace_id = ? AND table_id = ?",
+                    (workspace_id, table_id),
+                )
+                if cur_legacy_check.fetchone():
+                    ver = "legacy"
+                else:
+                    return None, 0, [], [], hashlib.sha256(b"").hexdigest()[:16]
 
         matched_ids: list[str] = []
         matched_indices: list[int] = []
@@ -807,31 +852,25 @@ class SQLiteTableStore:
                 (workspace_id, table.table_id, table.document_id, "legacy", 1),
             )
 
-    def get_table(self, table_id: str, workspace_id: str, version: str | None = None) -> StructuredTable | None:
-        if not workspace_id:
-            return None
-
-        ver = version or self.get_active_version(table_id, workspace_id)
-        if ver and ver != "legacy":
-            cur_ver = self._conn.execute(
-                "SELECT * FROM versioned_schemas WHERE workspace_id = ? AND table_id = ? AND version = ?",
-                (workspace_id, table_id, ver),
+    def _parse_legacy_schema(self, schema_json: str) -> TableSchema:
+        schema_raw = json.loads(schema_json)
+        columns = tuple(
+            ColumnDefinition(
+                col_index=c["col_index"],
+                name=c["name"],
+                inferred_dtype=InferredDtype(c.get("inferred_dtype", "string")),
+                unit=c.get("unit"),
             )
-            v_row = cur_ver.fetchone()
-            if v_row:
-                schema = _json_to_schema(v_row["schema_json"])
-                rows = self.query_rows(table_id, workspace_id, version=ver)
-                return StructuredTable(
-                    table_id=table_id,
-                    document_id=v_row["document_id"],
-                    sheet_name=None,
-                    page_number=None,
-                    schema=schema,
-                    rows=tuple(rows),
-                    row_count=len(rows),
-                    col_count=len(schema.columns),
-                )
+            for c in schema_raw.get("columns", [])
+        )
+        return TableSchema(
+            columns=columns,
+            header_rows=tuple(schema_raw.get("header_rows", [0])),
+            header_topology=HeaderTopology(schema_raw.get("header_topology", "single_row")),
+            confidence=float(schema_raw.get("confidence", 1.0)),
+        )
 
+    def _get_legacy_table(self, table_id: str, workspace_id: str) -> StructuredTable | None:
         cur = self._conn.execute(
             "SELECT * FROM tables WHERE workspace_id = ? AND table_id = ?",
             (workspace_id, table_id),
@@ -840,23 +879,7 @@ class SQLiteTableStore:
         if not row:
             return None
 
-        schema_raw = json.loads(row["schema_json"])
-        columns = tuple(
-            ColumnDefinition(
-                col_index=c["col_index"],
-                name=c["name"],
-                inferred_dtype=InferredDtype(c["inferred_dtype"]),
-                unit=c.get("unit"),
-            )
-            for c in schema_raw["columns"]
-        )
-        schema = TableSchema(
-            columns=columns,
-            header_rows=tuple(schema_raw["header_rows"]),
-            header_topology=HeaderTopology(schema_raw["header_topology"]),
-            confidence=schema_raw["confidence"],
-        )
-
+        schema = self._parse_legacy_schema(row["schema_json"])
         merged_raw = json.loads(row["merged_ranges_json"])
         merged_ranges = tuple(
             MergedRange(
@@ -884,6 +907,59 @@ class SQLiteTableStore:
             col_count=row["col_count"],
         )
 
+    def get_table(self, table_id: str, workspace_id: str, version: str | None = None) -> StructuredTable | None:
+        if not workspace_id:
+            return None
+
+        if version is not None:
+            if version == "legacy":
+                return self._get_legacy_table(table_id, workspace_id)
+            cur_ver = self._conn.execute(
+                "SELECT * FROM versioned_schemas WHERE workspace_id = ? AND table_id = ? AND version = ?",
+                (workspace_id, table_id, version),
+            )
+            v_row = cur_ver.fetchone()
+            if v_row:
+                schema = _json_to_schema(v_row["schema_json"])
+                rows = self.query_rows(table_id, workspace_id, version=version)
+                return StructuredTable(
+                    table_id=table_id,
+                    document_id=v_row["document_id"],
+                    sheet_name=None,
+                    page_number=None,
+                    schema=schema,
+                    rows=tuple(rows),
+                    row_count=len(rows),
+                    col_count=len(schema.columns),
+                )
+            return None
+
+        ver = self.get_active_version(table_id, workspace_id)
+        if ver:
+            if ver == "legacy":
+                return self._get_legacy_table(table_id, workspace_id)
+            cur_ver = self._conn.execute(
+                "SELECT * FROM versioned_schemas WHERE workspace_id = ? AND table_id = ? AND version = ?",
+                (workspace_id, table_id, ver),
+            )
+            v_row = cur_ver.fetchone()
+            if v_row:
+                schema = _json_to_schema(v_row["schema_json"])
+                rows = self.query_rows(table_id, workspace_id, version=ver)
+                return StructuredTable(
+                    table_id=table_id,
+                    document_id=v_row["document_id"],
+                    sheet_name=None,
+                    page_number=None,
+                    schema=schema,
+                    rows=tuple(rows),
+                    row_count=len(rows),
+                    col_count=len(schema.columns),
+                )
+            return None
+
+        return self._get_legacy_table(table_id, workspace_id)
+
     def get_schema(
         self,
         table_id: str,
@@ -892,8 +968,37 @@ class SQLiteTableStore:
     ) -> TableSchema | None:
         if not workspace_id:
             return None
-        ver = version or self.get_active_version(table_id, workspace_id)
-        if ver and ver != "legacy":
+
+        if version is not None:
+            if version == "legacy":
+                cur = self._conn.execute(
+                    "SELECT schema_json FROM tables WHERE workspace_id = ? AND table_id = ?",
+                    (workspace_id, table_id),
+                )
+                row = cur.fetchone()
+                if row:
+                    return self._parse_legacy_schema(row["schema_json"])
+                return None
+            cur = self._conn.execute(
+                "SELECT schema_json FROM versioned_schemas WHERE workspace_id = ? AND table_id = ? AND version = ?",
+                (workspace_id, table_id, version),
+            )
+            row = cur.fetchone()
+            if row:
+                return _json_to_schema(row["schema_json"])
+            return None
+
+        ver = self.get_active_version(table_id, workspace_id)
+        if ver:
+            if ver == "legacy":
+                cur = self._conn.execute(
+                    "SELECT schema_json FROM tables WHERE workspace_id = ? AND table_id = ?",
+                    (workspace_id, table_id),
+                )
+                row = cur.fetchone()
+                if row:
+                    return self._parse_legacy_schema(row["schema_json"])
+                return None
             cur = self._conn.execute(
                 "SELECT schema_json FROM versioned_schemas WHERE workspace_id = ? AND table_id = ? AND version = ?",
                 (workspace_id, table_id, ver),
@@ -901,27 +1006,15 @@ class SQLiteTableStore:
             row = cur.fetchone()
             if row:
                 return _json_to_schema(row["schema_json"])
+            return None
+
         cur = self._conn.execute(
             "SELECT schema_json FROM tables WHERE workspace_id = ? AND table_id = ?",
             (workspace_id, table_id),
         )
         row = cur.fetchone()
         if row:
-            schema_raw = json.loads(row["schema_json"])
-            columns = tuple(
-                ColumnDefinition(
-                    col_index=c["col_index"],
-                    name=c["name"],
-                    inferred_dtype=InferredDtype(c.get("inferred_dtype", "string")),
-                )
-                for c in schema_raw.get("columns", [])
-            )
-            return TableSchema(
-                columns=columns,
-                header_rows=tuple(schema_raw.get("header_rows", [0])),
-                header_topology=HeaderTopology(schema_raw.get("header_topology", "single_row")),
-                confidence=float(schema_raw.get("confidence", 1.0)),
-            )
+            return self._parse_legacy_schema(row["schema_json"])
         return None
 
     def get_row(
@@ -933,9 +1026,19 @@ class SQLiteTableStore:
     ) -> TableRow | None:
         if not workspace_id:
             return None
-        ver = version or self.get_active_version(table_id, workspace_id)
-        if not ver:
-            return None
+
+        ver = version
+        if ver is None:
+            ver = self.get_active_version(table_id, workspace_id)
+            if not ver:
+                cur_legacy_check = self._conn.execute(
+                    "SELECT 1 FROM tables WHERE workspace_id = ? AND table_id = ?",
+                    (workspace_id, table_id),
+                )
+                if cur_legacy_check.fetchone():
+                    ver = "legacy"
+                else:
+                    return None
 
         row_id_str = str(row_id)
         row_idx = int(row_id) if row_id_str.isdigit() else None
@@ -943,7 +1046,7 @@ class SQLiteTableStore:
         if ver == "legacy":
             cur = self._conn.execute(
                 """
-                SELECT row_id, row_index, cells_json, is_header, is_subtotal, is_empty
+                SELECT row_id, row_index, cells_json, is_header
                 FROM table_rows
                 WHERE workspace_id = ? AND table_id = ? AND (row_id = ? OR (? IS NOT NULL AND row_index = ?))
                 LIMIT 1
@@ -966,13 +1069,14 @@ class SQLiteTableStore:
             return None
 
         cells = _json_to_cells(db_row["cells_json"])
+        db_keys = db_row.keys() if hasattr(db_row, "keys") else ()
         return TableRow(
             row_id=db_row["row_id"],
             row_index=int(db_row["row_index"]),
             cells=cells,
             is_header=bool(db_row["is_header"]),
-            is_subtotal=bool(db_row["is_subtotal"]) if "is_subtotal" in db_row.keys() else False,
-            is_empty=bool(db_row["is_empty"]) if "is_empty" in db_row.keys() else False,
+            is_subtotal=bool(db_row["is_subtotal"]) if "is_subtotal" in db_keys else False,
+            is_empty=bool(db_row["is_empty"]) if "is_empty" in db_keys else False,
         )
 
     def query_rows(
@@ -987,9 +1091,18 @@ class SQLiteTableStore:
         if not workspace_id:
             return TableRowList([], is_truncated=False, scanned_count=0)
 
-        ver = version or self.get_active_version(table_id, workspace_id)
-        if not ver:
-            return TableRowList([], is_truncated=False, scanned_count=0)
+        ver = version
+        if ver is None:
+            ver = self.get_active_version(table_id, workspace_id)
+            if not ver:
+                cur_legacy_check = self._conn.execute(
+                    "SELECT 1 FROM tables WHERE workspace_id = ? AND table_id = ?",
+                    (workspace_id, table_id),
+                )
+                if cur_legacy_check.fetchone():
+                    ver = "legacy"
+                else:
+                    return TableRowList([], is_truncated=False, scanned_count=0)
 
         if ver == "legacy":
             cur = self._conn.execute(

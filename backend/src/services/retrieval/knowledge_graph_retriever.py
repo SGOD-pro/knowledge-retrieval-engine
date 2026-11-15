@@ -261,15 +261,17 @@ def _verify_table_document_binding(
     if hasattr(table_store, "get_ingestion_manifest"):
         try:
             manifest = table_store.get_ingestion_manifest(document_id, workspace_id, version=document_version)
-            if manifest:
+            if manifest is not None:
                 m_tid = manifest.get("table_id")
-                if m_tid and m_tid != table_id:
-                    return False
                 m_doc = manifest.get("document_id")
-                if m_doc and m_doc != document_id:
-                    return False
                 m_ver = manifest.get("document_version") or manifest.get("version")
-                if m_ver and str(m_ver) != str(document_version):
+                m_ws = manifest.get("workspace_id")
+                # Missing identity fields fail closed
+                if not m_tid or not m_doc or not m_ver:
+                    return False
+                if m_tid != table_id or m_doc != document_id or str(m_ver) != str(document_version):
+                    return False
+                if m_ws and m_ws != workspace_id:
                     return False
                 return True
         except Exception:
@@ -279,36 +281,66 @@ def _verify_table_document_binding(
     if hasattr(table_store, "_schemas"):
         key = (workspace_id, table_id, str(document_version))
         if key in table_store._schemas:
-            _, doc_id_schema, doc_ver_schema, _, _ = table_store._schemas[key]
-            if doc_id_schema == document_id and str(doc_ver_schema) == str(document_version):
-                return True
+            schema_entry = table_store._schemas[key]
+            if len(schema_entry) >= 3:
+                doc_id_schema = schema_entry[1]
+                doc_ver_schema = schema_entry[2]
+                if doc_id_schema and doc_ver_schema:
+                    if doc_id_schema == document_id and str(doc_ver_schema) == str(document_version):
+                        return True
             return False
 
     if hasattr(table_store, "_active_meta"):
         meta = table_store._active_meta.get((workspace_id, table_id))
         if meta:
-            if meta.get("document_id") == document_id and str(meta.get("version")) == str(document_version):
-                return True
-            return False
+            meta_doc = meta.get("document_id")
+            meta_ver = meta.get("version") or meta.get("document_version")
+            meta_tid = meta.get("table_id")
+            meta_ws = meta.get("workspace_id")
+            if not meta_doc or not meta_ver:
+                return False
+            if meta_doc != document_id or str(meta_ver) != str(document_version):
+                return False
+            if meta_tid and meta_tid != table_id:
+                return False
+            if meta_ws and meta_ws != workspace_id:
+                return False
+            return True
 
-    # 3. Check SQLite connection tables (versioned_schemas, active_versions, tables)
+    # 3. Check SQLite connection tables (versioned_schemas, active_versions)
     if hasattr(table_store, "_conn"):
         try:
             cur = table_store._conn.execute(
-                "SELECT document_id FROM versioned_schemas WHERE workspace_id = ? AND table_id = ? AND version = ?",
+                "SELECT workspace_id, table_id, document_id, version FROM versioned_schemas WHERE workspace_id = ? AND table_id = ? AND version = ?",
                 (workspace_id, table_id, str(document_version)),
             )
             row = cur.fetchone()
             if row:
-                return row["document_id"] == document_id
+                doc_id = row["document_id"] if hasattr(row, "__getitem__") else getattr(row, "document_id", None)
+                ver = row["version"] if hasattr(row, "__getitem__") else getattr(row, "version", None)
+                tid = row["table_id"] if hasattr(row, "__getitem__") else getattr(row, "table_id", None)
+                ws = row["workspace_id"] if hasattr(row, "__getitem__") else getattr(row, "workspace_id", None)
+                if not doc_id or not ver or not tid or not ws:
+                    return False
+                if doc_id == document_id and str(ver) == str(document_version) and tid == table_id and ws == workspace_id:
+                    return True
+                return False
 
             cur = table_store._conn.execute(
-                "SELECT document_id FROM active_versions WHERE workspace_id = ? AND table_id = ? AND version = ?",
+                "SELECT workspace_id, table_id, document_id, version FROM active_versions WHERE workspace_id = ? AND table_id = ? AND version = ?",
                 (workspace_id, table_id, str(document_version)),
             )
             row = cur.fetchone()
             if row:
-                return row["document_id"] == document_id
+                doc_id = row["document_id"] if hasattr(row, "__getitem__") else getattr(row, "document_id", None)
+                ver = row["version"] if hasattr(row, "__getitem__") else getattr(row, "version", None)
+                tid = row["table_id"] if hasattr(row, "__getitem__") else getattr(row, "table_id", None)
+                ws = row["workspace_id"] if hasattr(row, "__getitem__") else getattr(row, "workspace_id", None)
+                if not doc_id or not ver or not tid or not ws:
+                    return False
+                if doc_id == document_id and str(ver) == str(document_version) and tid == table_id and ws == workspace_id:
+                    return True
+                return False
         except Exception:
             pass
 
@@ -319,16 +351,43 @@ def _verify_table_document_binding(
             resp = table_store.table.get_item(Key={"PK": pk, "SK": "SCHEMA"})
             item = resp.get("Item")
             if item:
-                if item.get("document_id"):
-                    return item["document_id"] == document_id
-                return True
+                item_doc = item.get("document_id")
+                item_ver = item.get("document_version") or item.get("version")
+                item_tid = item.get("table_id")
+                item_ws = item.get("workspace_id")
+                if not item_doc or not item_ver:
+                    return False
+                if item_doc == document_id and str(item_ver) == str(document_version):
+                    if item_tid and item_tid != table_id:
+                        return False
+                    if item_ws and item_ws != workspace_id:
+                        return False
+                    return True
+                return False
+
+            resp_act = table_store.table.get_item(Key={"PK": f"TABLE#{workspace_id}#{table_id}", "SK": "ACTIVE_VERSION"})
+            item_act = resp_act.get("Item")
+            if item_act:
+                act_ver = item_act.get("active_version")
+                act_doc = item_act.get("document_id")
+                act_tid = item_act.get("table_id")
+                act_ws = item_act.get("workspace_id")
+                if not act_doc or not act_ver:
+                    return False
+                if act_doc == document_id and str(act_ver) == str(document_version):
+                    if act_tid and act_tid != table_id:
+                        return False
+                    if act_ws and act_ws != workspace_id:
+                        return False
+                    return True
+                return False
         except Exception:
             pass
 
-    # 5. Check legacy get_table if present
-    if hasattr(table_store, "get_table"):
+    # 5. Legacy table check ONLY when document_version is explicitly "legacy"
+    if str(document_version) == "legacy" and hasattr(table_store, "get_table"):
         try:
-            tbl = table_store.get_table(table_id, workspace_id)
+            tbl = table_store.get_table(table_id, workspace_id, version="legacy")
             if tbl and getattr(tbl, "document_id", None):
                 return tbl.document_id == document_id
         except Exception:
