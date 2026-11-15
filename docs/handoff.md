@@ -190,3 +190,64 @@ This milestone completes and hardens specification 0006 (Bounded Open Knowledge 
 * Specification 0007: Knowledge graph enrichment remains Proposed and unimplemented.
 * Next Task: Review the existing specification 0007 design ([`docs/specs/0007-knowledge-graph-enrichment.md`](file:///home/swyra/projects/knowledge-retrieval-engine/docs/specs/0007-knowledge-graph-enrichment.md)).
 * Invariant reminder: Zero paid benchmarks run, zero re ingestion, zero re embedding, and historical benchmark artifacts preserved.
+
+## Bounded Knowledge Graph Enrichment (0007 Slice 1)
+
+* **Date**: November 16 2026
+* **Branch**: `re-factor`
+* **Final implementation commit**: `11bf828287f6e276317b0186e64745d40fb99c75`
+* **Status**: Specification 0007 Slice 1 locally completed and reviewed: Approve with nits. Specification 0007 remains In Progress. Specification 0003 remains Proposed and deferred. Slices 2 and 3 remain unimplemented. `GRAPH_ENABLED=false` remains the default.
+
+### Overview
+
+This milestone completes and hardens Slice 1 of specification 0007 (Bounded Knowledge Graph Enrichment and Multi Hop Relationship Traversal) across all core layers:
+1. Typed contracts and conservative entity identity: immutable Pydantic models for `KnowledgeGraphEntity`, `KnowledgeGraphRelationship`, `KnowledgeGraphManifest`, `KnowledgeGraphLedgerEntry`, and `KnowledgeGraphLookupRequest`. Exact identity hashing combines entity type and canonical name, separating distinct entities while resolving case insensitive homonyms.
+2. Partitioned persistence and publication staging isolation: workspace scoped partition keys (`WORKSPACE#{workspace_id}`) across memory, SQLite WAL, and DynamoDB Local stores. Staged records write under distinct attempt publication sort keys (`PUB#{pub_id}`) before committing visibility atomically via a two item transaction or atomic SQLite conditional commit, ensuring reader isolation and uncommitted attempt invisibility.
+3. Deterministic CSV relationship extraction: directional schema extraction from verified foreign keys and primary keys with zero language model calls and zero token expense. Verbatim grounding validation enforces strict word boundary matching (`\b` + escaped entity + `\b`), rejecting reversed, negated, and arbitrary co occurrence claims.
+4. Fail closed table evidence binding: evidence binding proves exact workspace, table, document, and version association using authoritative storage keys and metadata. Missing requested versions return no result without falling back to legacy rows or schemas. Missing rows, missing cells, or incomplete bindings fail closed with no candidate, eliminating substituted graph edge text for missing source data.
+5. Bounded table hydration and chunk specific version provenance: targeted row and cell lookups use explicit limits (`LIMIT 1`) without full table scans or in memory searches. When targeted interfaces are absent, fallback behavior disables safely. Chunks require durable bindings between the exact chunk and requested version, rejecting unversioned chunks even if document level snapshots exist.
+6. Bounded multi hop traversal: expansion limits depth to at most 2 hops with deterministic frontier sorting, cycle detection, and a 25 node ceiling. Active deadline budget checks halt traversal immediately if remaining time expires.
+7. Targeted chunk hydration: resolves at most 15 chunks via exact point lookups (`DOC#{did}`, `CHUNK#{cid}`) through `DocumentsRepository.get_chunks_by_ids`, completely eliminating calls to `get_all_chunks`.
+8. Concurrency admission and capacity retention: `GraphConcurrencyController` bounds worker concurrency to at most 4 workers and 8 queued requests, retaining admission capacity until underlying storage calls finish. Dynamic source document and workspace deletion tombstones halt traversal and hydration immediately fail closed.
+
+### Independent Senior Code Review
+
+* Reviewer: Gemini Pro (author on Gemini Flash)
+* Scope: 19 files on branch `re-factor` vs base commit `0c6bf35`
+* Verdict: Approve with nits (0 blockers, 0 majors, 0 minors, 3 nits)
+* Review report: [`docs/reviews/2026-11-16-re-factor-0007-slice1-review.md`](file:///home/swyra/projects/knowledge-retrieval-engine/docs/reviews/2026-11-16-re-factor-0007-slice1-review.md)
+* Disposition of the three review nits:
+  1. `backend/src/db/knowledge_graph_repo.py:540` (`WORKSPACE_SQLITE_PATH` fallback for `GRAPH_SQLITE_PATH`): Harmless in local development; flagged for cleaner dedicated configuration separation during Slice 2.
+  2. `backend/src/services/retrieval/knowledge_graph_retriever.py:746` (TableStore row evidence hydration loop deadline check): Individual row lookups take under 1 millisecond, so the loop rarely risks deadline overrun; an explicit deadline check inside the synthesis loop is scheduled for Slice 2.
+  3. `backend/src/db/knowledge_graph_repo.py:982` (hardcoded dummy credentials `aws_access_key_id="test"` for DynamoDB Local): Standard local test convention; live AWS execution uses IAM roles without static keys. Clarifying comments will be maintained.
+
+### Verification Evidence and Test Suite Summary
+
+* Focused Knowledge Graph Slice 1 Suite:
+  * Command: `cd backend && uv run pytest tests/test_knowledge_graph_slice1.py -v`
+  * Outcome: 65 passed in 3.99s.
+  * Coverage: Typed contracts, conservative entity identity, publication isolated graph storage, deterministic CSV relationships from verified directional schema, deeply immutable request local document bindings, bounded traversal, targeted chunk hydration with grounded TableStore row and cell locators, dynamic source and workspace tombstone enforcement, deadline and concurrency retention, separate connection SQLite publication race and pause atomicity, DynamoDB local atomic authority fencing validation and rejection, chunk specific version provenance with fail closed rejection of unversioned chunks, fail closed missing table row and cell evidence without edge text substitution, bounded targeted table reads without full table scans, safe fallback disabling when targeted interfaces are absent, absent requested version returning None without legacy substitution across Memory, SQLite, and DynamoDB Local, incomplete manifest and schema identity failing closed, correct document with wrong table or version failing closed, builder to retriever output containing no falsely versioned evidence, candidate entity mention lookup resolving entities past 30 alphabetical items, test environment factory isolation, and word boundary grounding validation.
+* Live FastAPI Integration Verification:
+  * Command: `cd backend && uv run python ../verify_0007_live.py`
+  * Outcome: 18 passed live over HTTP against local Uvicorn server on port 8001.
+* Regression Test Suites:
+  * Command: `python verify_0004_live.py` (17 passed live over HTTP).
+  * Command: `python verify_0006_live.py` (15 passed live over HTTP).
+  * Command: `cd backend && uv run pytest tests/test_table_store.py tests/test_tablestore_multiyear_coverage_regressions.py tests/test_csv_ingestion_complete.py tests/test_csv_vertical_slice_0004.py tests/test_deterministic_executor.py tests/test_contracts_and_identity.py tests/test_workspace_boundary_isolation.py tests/test_structured_query_service.py` (128 passed in 19.82s).
+
+### Operational Boundaries and Limitations
+
+1. Local acceptance versus live AWS endpoints: All behaviors were verified using local SQLite with WAL mode, in memory repositories, and local Docker DynamoDB Local (`test_ddb_local` on port 8000). Live AWS Bedrock provider calls and live AWS DynamoDB cloud transactions remain unverified in local continuous integration without cloud credentials.
+2. Inactive retrieval integration: `GRAPH_ENABLED=false` remains the default configuration. Query retrieval pipeline routing and reciprocal rank fusion candidate pooling remain inactive until Slice 3.
+3. Unimplemented Slices: Slice 2 (LLM entity and relationship extraction, Bedrock budgeting ledger, and verbatim grounding validation) and Slice 3 (Pipeline reciprocal rank fusion, snapshot metadata, telemetry trace, and offline ablation) remain unimplemented.
+4. Deferred specifications: Specification 0003 (Snapshot registry, publication, and atomic deletion) remains Proposed and deferred. Specification 0007 remains In Progress.
+
+### Project Status and Bounded Next Slice 2 Task
+
+* Specification 0007: Slice 1 is complete and verified. Specification 0007 as a whole remains In Progress.
+* Specification 0003: Snapshot registry, publication, and atomic deletion remains Proposed and deferred.
+* Invariant reminder: Zero paid benchmarks run, zero re ingestion, zero re embedding, and historical benchmark artifacts preserved.
+* Bounded Next Slice 2 Task:
+  1. Implement Bedrock Claude 3 Haiku converse prompt templates and output parsers in `KnowledgeGraphBuilder`, extracting canonical entity relationship triples from PDF text chunks with verbatim directional syntax validation (AC-1, AC-2, AC-3).
+  2. Implement durable budget accounting, fencing, and mandatory Bedrock `count_tokens` validation on `BUDGET#LEDGER`, with 15 second lease expiries, monotonic fence tokens, mandatory non empty worker identity (`worker_id`), and stale worker fencing (AC-3, AC-4, AC-5).
+  3. Implement Slice 2 unit and regression test suite in `backend/tests/test_knowledge_graph_slice2.py` verifying PDF extraction, verbatim grounding, Bedrock count_tokens validation, budget ledger leasing, stale worker fencing, crash recovery, and throttling retry ceilings (AC-2, AC-3, AC-4, AC-5).
