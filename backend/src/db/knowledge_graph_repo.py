@@ -758,7 +758,7 @@ class SQLiteKnowledgeGraphRepository:
         with self._lock:
             cursor = self._conn.execute(
                 """
-                SELECT sk, data_json FROM kre_knowledge_graph
+                SELECT sk, document_id, document_version, publication_id, data_json FROM kre_knowledge_graph
                 WHERE pk = ? AND sk LIKE 'MENTION#%'
                 ORDER BY sk ASC
                 LIMIT ?
@@ -778,7 +778,13 @@ class SQLiteKnowledgeGraphRepository:
                     token = unescape_delimiter(parts[1])
                     if any(token == nt or token.startswith(nt) for nt in norm_tokens):
                         data = json.loads(row["data_json"])
-                        results.append({"SK": sk, **data})
+                        results.append({
+                            "SK": sk,
+                            "document_id": row["document_id"],
+                            "document_version": row["document_version"],
+                            "publication_id": row["publication_id"],
+                            **data,
+                        })
                         if len(results) >= limit:
                             break
 
@@ -1106,7 +1112,13 @@ class DynamoDBKnowledgeGraphRepository:
             items = resp.get("Items", [])
             for row in items:
                 data = json.loads(row["data_json"])
-                results.append({"SK": row["SK"], **data})
+                results.append({
+                    "SK": row["SK"],
+                    "document_id": row.get("document_id"),
+                    "document_version": row.get("document_version"),
+                    "publication_id": row.get("publication_id"),
+                    **data,
+                })
                 if len(results) >= limit:
                     break
 
@@ -1123,7 +1135,13 @@ class DynamoDBKnowledgeGraphRepository:
                 pages_evaluated += 1
                 for row in resp.get("Items", []):
                     data = json.loads(row["data_json"])
-                    results.append({"SK": row["SK"], **data})
+                    results.append({
+                        "SK": row["SK"],
+                        "document_id": row.get("document_id"),
+                        "document_version": row.get("document_version"),
+                        "publication_id": row.get("publication_id"),
+                        **data,
+                    })
                     if len(results) >= limit:
                         break
 

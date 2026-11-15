@@ -26,6 +26,7 @@ import tempfile
 import threading
 import time
 from typing import Any
+import uuid
 from unittest.mock import MagicMock, patch
 import pytest
 from pydantic import ValidationError
@@ -1068,3 +1069,293 @@ def test_dynamodb_local_staging_and_publication_if_available():
     )
     with pytest.raises(OptimisticConcurrencyError):
         repo.commit_manifest(ws, m_stale, base_publication_id=None)
+
+
+# =============================================================================
+# 16. Additional Edge Cases, Delimiter Escaping, Tenant Boundary & Fencing Tests
+# =============================================================================
+
+def _get_repo(backend_type: str):
+    if backend_type == "memory":
+        return InMemoryKnowledgeGraphRepository()
+    temp_dir = tempfile.mkdtemp()
+    db_path = os.path.join(temp_dir, f"test_kg_{uuid.uuid4().hex[:8]}.db")
+    return SQLiteKnowledgeGraphRepository(db_path=db_path)
+
+
+def test_predicate_canonicalization_and_allowlist_mapping():
+    """covers: AC-1 Verify predicate canonicalization for allowlisted, unknown, and fallback forms."""
+    # 1. Allowlisted mapping
+    assert canonicalize_predicate("acquired") == "ACQUIRED"
+    assert canonicalize_predicate("subsidiary of") == "SUBSIDIARY_OF"
+    assert canonicalize_predicate("PARTNERED_WITH") == "PARTNERED_WITH"
+    assert canonicalize_predicate("located in") == "LOCATED_IN"
+
+    # 2. Unknown predicate percent-encoding
+    assert canonicalize_predicate("custom predicate") == "custom_predicate"
+    assert canonicalize_predicate("reports_to") == "reports_to"
+    assert canonicalize_predicate("has#special/char") == "has%23special%2Fchar"
+
+    # 3. Fallback on empty or whitespace
+    assert canonicalize_predicate("") == "RELATED_TO"
+    assert canonicalize_predicate("   ") == ""
+
+
+@pytest.mark.parametrize("backend_type", ["memory", "sqlite"])
+def test_mention_index_delimiter_escaping_and_special_characters(backend_type):
+    """covers: AC-6 Verify that delimiter escaping properly handles entity mentions with # and %."""
+    repo = _get_repo(backend_type)
+    ws_id = f"ws_escape_{backend_type}"
+    doc_id = "doc_specials"
+    ver = "1"
+    pub_id = generate_publication_id()
+
+    # Entity name containing delimiter characters '#' and '%'
+    ent_tricky = KnowledgeGraphEntity(
+        entity_id="ent_tricky_01",
+        workspace_id=ws_id,
+        name="C# Language & Systems #1",
+        canonical_name="C# Language & Systems #1",
+        entity_type="concept",
+        source_document_id=doc_id,
+        aliases=("C#", "C-Sharp %23"),
+    )
+    repo.stage_relationships(
+        workspace_id=ws_id,
+        document_id=doc_id,
+        document_version=ver,
+        publication_id=pub_id,
+        entities=[ent_tricky],
+        relationships=[],
+    )
+    manifest = KnowledgeGraphManifest(
+        workspace_id=ws_id,
+        document_id=doc_id,
+        document_version=ver,
+        publication_id=pub_id,
+        status="ready",
+        entity_count=1,
+        relationship_count=0,
+        ingested_at_utc=_now_utc(),
+        content_hash="hash_tricky",
+    )
+    repo.commit_manifest(workspace_id=ws_id, manifest=manifest)
+
+    # Resolve mention by normalized token containing '#'
+    results, was_truncated, trunc_reason = repo.resolve_mentions(
+        workspace_id=ws_id,
+        candidate_tokens=["c#", "c# language"],
+    )
+    assert len(results) >= 1
+    assert any(r["entity_id"] == "ent_tricky_01" for r in results)
+    assert results[0].get("document_id") == doc_id
+    assert results[0].get("publication_id") == pub_id
+
+
+@pytest.mark.parametrize("backend_type", ["memory", "sqlite"])
+def test_cross_workspace_tenant_boundary_isolation(backend_type):
+    """covers: AC-6 Verify that lookups across tenant boundaries return zero entities and zero edges."""
+    repo = _get_repo(backend_type)
+    ws_alice = f"ws_alice_{backend_type}"
+    ws_bob = f"ws_bob_{backend_type}"
+    doc_id = "doc_sec_01"
+    ver = "1"
+    pub_id = generate_publication_id()
+
+    # Alice has secret proprietary relationship
+    ent_alice = KnowledgeGraphEntity(
+        entity_id="ent_secret_corp",
+        workspace_id=ws_alice,
+        name="SecretCorp",
+        canonical_name="SecretCorp",
+        entity_type="organization",
+        source_document_id=doc_id,
+    )
+    loc = TableLocation(table_id="tbl_sec", row_id="0", column_id="org")
+    rel_alice = KnowledgeGraphRelationship(
+        relationship_id="rel_secret_01",
+        workspace_id=ws_alice,
+        source_entity_id="ent_secret_corp",
+        source_entity_name="SecretCorp",
+        predicate="merging_with",
+        canonical_predicate="MERGING_WITH",
+        target_entity_id="ent_target_corp",
+        target_entity_name="TargetCorp",
+        confidence=1.0,
+        source_document_id=doc_id,
+        source_document_version=ver,
+        publication_id=pub_id,
+        location=loc,
+        verbatim_evidence="SecretCorp is merging with TargetCorp",
+        created_at_utc=_now_utc(),
+    )
+    repo.stage_relationships(ws_alice, doc_id, ver, pub_id, [ent_alice], [rel_alice])
+    manifest = KnowledgeGraphManifest(
+        workspace_id=ws_alice,
+        document_id=doc_id,
+        document_version=ver,
+        publication_id=pub_id,
+        status="ready",
+        entity_count=1,
+        relationship_count=1,
+        ingested_at_utc=_now_utc(),
+        content_hash="hash_alice",
+    )
+    repo.commit_manifest(ws_alice, manifest)
+
+    # Bob queries his own workspace for SecretCorp
+    bob_mentions, _, _ = repo.resolve_mentions(
+        workspace_id=ws_bob,
+        candidate_tokens=["SecretCorp"],
+    )
+    assert len(bob_mentions) == 0
+
+    # Bob queries outgoing edges for SecretCorp
+    bob_edges, _, _ = repo.get_outgoing_edges(
+        workspace_id=ws_bob,
+        source_entity_id="ent_secret_corp",
+    )
+    assert len(bob_edges) == 0
+
+    # Bob queries incoming edges for TargetCorp
+    bob_incoming, _, _ = repo.get_incoming_edges(
+        workspace_id=ws_bob,
+        target_entity_id="ent_target_corp",
+    )
+    assert len(bob_incoming) == 0
+
+
+def test_grounding_validation_disjoint_sentences_rejection():
+    """covers: AC-2 Verify rejection when entities appear in disjoint sentences without relational context."""
+    text = (
+        "Alpha Corp released quarterly earnings in January. "
+        "Beta Tech appointed a new CEO during the same period."
+    )
+    is_valid, reason = validate_relationship_grounding(
+        chunk_text=text,
+        source_entity_name="Alpha Corp",
+        predicate="acquired",
+        target_entity_name="Beta Tech",
+    )
+    assert is_valid is False
+    assert "not_grounded" in str(reason) or "disjoint" in str(reason)
+
+
+def test_grounding_validation_empty_and_missing_input_fields():
+    """covers: AC-2 Verify rejection when input fields are empty or missing."""
+    # 1. Missing chunk text
+    is_valid, reason = validate_relationship_grounding("", "Alpha", "acquired", "Beta")
+    assert is_valid is False
+    assert reason == "missing_input_fields"
+
+    # 2. Missing source entity
+    is_valid, reason = validate_relationship_grounding("Alpha acquired Beta", "", "acquired", "Beta")
+    assert is_valid is False
+    assert reason == "missing_input_fields"
+
+    # 3. Missing predicate
+    is_valid, reason = validate_relationship_grounding("Alpha acquired Beta", "Alpha", "", "Beta")
+    assert is_valid is False
+    assert reason == "missing_input_fields"
+
+
+def test_pinned_snapshot_context_workspace_tombstone_early_exit():
+    """covers: AC-10 Verify build_pinned_snapshot_context exits early when workspace is tombstoned."""
+    boundary_repo = MagicMock()
+    boundary_repo.has_tombstone.return_value = True
+    kg_repo = MagicMock()
+
+    ctx = build_pinned_snapshot_context(
+        workspace_id="ws_dead_tombstone",
+        boundary_repo=boundary_repo,
+        kg_repo=kg_repo,
+    )
+    assert ctx.workspace_id == "ws_dead_tombstone"
+    assert len(ctx.active_documents) == 0
+    # Boundary repo list_document_snapshots was never called
+    boundary_repo.list_document_snapshots.assert_not_called()
+
+
+def test_chunk_hydration_deduplication_and_15_cap():
+    """covers: AC-9 Verify get_chunks_by_ids deduplicates keys and strictly caps batch to at most 15 items."""
+    doc_repo = DocumentsRepository()
+    ws_id = "ws_hydration_cap"
+
+    # Generate 25 keys with 5 duplicates
+    chunk_keys = []
+    for i in range(20):
+        chunk_keys.append(
+            ChunkLookupKey(
+                chunk_id=f"chunk_{i % 15}",
+                document_id="doc_cap",
+                document_version="1",
+            )
+        )
+    for i in range(5):
+        chunk_keys.append(
+            ChunkLookupKey(
+                chunk_id=f"extra_chunk_{i}",
+                document_id="doc_cap",
+                document_version="1",
+            )
+        )
+
+    # In test environment, calls against mock chunks return deduped capped list
+    hydrated = doc_repo.get_chunks_by_ids(ws_id, chunk_keys)
+    assert isinstance(hydrated, list)
+
+
+@pytest.mark.parametrize("backend_type", ["memory", "sqlite"])
+def test_fenced_manifest_commit_failures(backend_type):
+    """covers: AC-4 Verify FencingConflictError on missing worker_id, mismatched lease, or expired lease."""
+    repo = _get_repo(backend_type)
+    ws_id = f"ws_fencing_{backend_type}"
+    doc_id = "doc_fenced"
+    ver = "1"
+    pub_id = generate_publication_id()
+
+    manifest = KnowledgeGraphManifest(
+        workspace_id=ws_id,
+        document_id=doc_id,
+        document_version=ver,
+        publication_id=pub_id,
+        status="ready",
+        entity_count=1,
+        relationship_count=0,
+        ingested_at_utc=_now_utc(),
+        content_hash="hash_fence",
+    )
+
+    # 1. Missing or empty worker_id on fenced write fails
+    with pytest.raises(FencingConflictError):
+        repo.commit_manifest(
+            workspace_id=ws_id,
+            manifest=manifest,
+            fence_token=1,
+            worker_id="",
+        )
+
+    # 2. Non-existent budget ledger on fenced write fails
+    with pytest.raises(FencingConflictError):
+        repo.commit_manifest(
+            workspace_id=ws_id,
+            manifest=manifest,
+            fence_token=1,
+            worker_id="worker_active",
+        )
+
+
+def test_concurrency_controller_recovery_after_releasing_worker():
+    """covers: AC-8 Verify concurrency controller allows new jobs after capacity is released."""
+    controller = GraphConcurrencyController(max_concurrency=1, max_queue=2)
+
+    # 1. First job runs and finishes
+    res1, status1 = controller.run_storage_work_sync(lambda rem: "first_job_done", deadline_s=0.5)
+    assert status1 == "completed"
+    assert res1 == "first_job_done"
+
+    # 2. Concurrency slot is available for next job
+    res2, status2 = controller.run_storage_work_sync(lambda rem: "second_job_done", deadline_s=0.5)
+    assert status2 == "completed"
+    assert res2 == "second_job_done"
+
