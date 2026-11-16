@@ -259,3 +259,35 @@ class KnowledgeGraphBudgetLedger(BaseModel):
     reconciled_fences: tuple[int, ...] = Field(default_factory=tuple)
     status: Literal["active", "completed", "exhausted", "failed"] = "active"
     updated_at: str
+
+
+class KnowledgeGraphReservationResult(BaseModel):
+    """Outcome of attempting to reserve an extraction call permit from durable ledger."""
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    granted: bool
+    fence_token: int = 0
+    call_number: int = 0
+    remaining_calls: int = 0
+    reason: Literal[
+        "granted",
+        "calls_exhausted",
+        "tokens_exhausted",
+        "active_lease_held",
+        "already_completed",
+        "already_exhausted",
+        "already_failed",
+        "storage_error",
+    ]
+    ledger: KnowledgeGraphBudgetLedger | None = None
+
+
+class KnowledgeGraphReconciliationResult(BaseModel):
+    """Outcome of reconciling a completed or failed extraction call."""
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    reconciled: bool
+    fenced_out: bool = False
+    reason: Literal["reconciled", "already_reconciled", "fenced_out", "not_found", "storage_error"]
+    ledger: KnowledgeGraphBudgetLedger | None = None
+

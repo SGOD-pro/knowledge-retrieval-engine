@@ -744,6 +744,10 @@ class KnowledgeGraphRetriever:
         if len(hydrated_chunks) < max_chunks_ceiling and self.table_store is not None:
             hydrated_ids = {str(getattr(c, "id", None) or getattr(c, "chunk_id", None)) for c in hydrated_chunks}
             for edge in collected_edges:
+                if rem_s is not None and (time.perf_counter() - t_start) >= rem_s:
+                    was_truncated = True
+                    trunc_reason = "deadline_exceeded_during_table_hydration"
+                    break
                 if len(hydrated_chunks) >= max_chunks_ceiling:
                     break
                 if isinstance(edge.location, TableLocation):

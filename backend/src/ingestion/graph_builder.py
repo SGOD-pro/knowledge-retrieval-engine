@@ -12,9 +12,13 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import logging
+import os
 import re
+import time
 from typing import Any, Literal, Sequence
 from pydantic import BaseModel, ConfigDict, Field
+
+from config import settings
 
 try:
     from src.schemas.contracts.knowledge_graph import (
@@ -27,7 +31,7 @@ try:
         generate_publication_id,
         normalize_mention,
     )
-    from src.schemas.contracts.location import TableLocation
+    from src.schemas.contracts.location import DocumentLocation, TableLocation
     from src.db.knowledge_graph_repo import KnowledgeGraphRepositoryBase, get_knowledge_graph_repository
 except ImportError:
     from schemas.contracts.knowledge_graph import (
@@ -40,7 +44,7 @@ except ImportError:
         generate_publication_id,
         normalize_mention,
     )
-    from schemas.contracts.location import TableLocation
+    from schemas.contracts.location import DocumentLocation, TableLocation
     from db.knowledge_graph_repo import KnowledgeGraphRepositoryBase, get_knowledge_graph_repository
 
 logger = logging.getLogger(__name__)
@@ -120,8 +124,18 @@ def validate_relationship_grounding(
     # Search for predicate or stem
     pred_tokens = pred_lower.split()
     primary_pred_word = pred_tokens[0] if pred_tokens else pred_lower
-    # Allow stem match (e.g. "acquire" for "acquired")
-    pred_stem = primary_pred_word[:-1] if len(primary_pred_word) > 5 and primary_pred_word.endswith("d") else primary_pred_word
+    # Allow stem match (e.g. "acquire" for "acquired", "partner" for "partnered")
+    pred_stem = primary_pred_word
+    if primary_pred_word.endswith("ed") and len(primary_pred_word) > 4:
+        cand = primary_pred_word[:-2]
+        if cand in text_lower or (cand + "e") in text_lower:
+            pred_stem = cand if cand in text_lower else (cand + "e")
+        else:
+            pred_stem = primary_pred_word[:-1]
+    elif primary_pred_word.endswith("d") and len(primary_pred_word) > 4:
+        pred_stem = primary_pred_word[:-1]
+    elif primary_pred_word.endswith("ing") and len(primary_pred_word) > 5:
+        pred_stem = primary_pred_word[:-3]
 
     if primary_pred_word not in text_lower and pred_stem not in text_lower:
         return False, f"predicate_not_grounded: '{predicate}' (co-occurrence alone rejected)"
@@ -152,9 +166,9 @@ def validate_relationship_grounding(
         for p_match in p_matches:
             p_idx = p_match.start()
 
-            # Check for negation words in the sentence near the predicate
-            words_before_p = sentence[:p_idx].split()[-4:]  # 4 words before predicate
-            if any(w in _NEGATION_WORDS for w in words_before_p):
+            # Check for negation words in the sentence
+            tokens = _clean_text_tokens(sentence)
+            if any(w in _NEGATION_WORDS for w in tokens):
                 return False, "negated_relationship"
 
             # Check passive voice: e.g. "<target> was <predicate> by <source>"
@@ -429,3 +443,480 @@ class KnowledgeGraphBuilder:
         )
 
         return manifest
+
+    def _fail_closed_manifest(
+        self,
+        workspace_id: str,
+        document_id: str,
+        document_version: str,
+        base_publication_id: str | None,
+        existing_manifest: KnowledgeGraphManifest | None,
+        content_hash: str,
+    ) -> KnowledgeGraphManifest:
+        if existing_manifest is not None and existing_manifest.status == "ready":
+            return existing_manifest
+        manifest = KnowledgeGraphManifest(
+            workspace_id=workspace_id,
+            document_id=document_id,
+            document_version=document_version,
+            publication_id=existing_manifest.publication_id if existing_manifest else generate_publication_id(),
+            base_publication_id=base_publication_id,
+            status="failed",
+            entity_count=0,
+            relationship_count=0,
+            ingested_at_utc=_now_utc(),
+            content_hash=content_hash,
+        )
+        try:
+            self.repository.commit_manifest(workspace_id, manifest, base_publication_id=base_publication_id)
+        except Exception:
+            pass
+        return manifest
+
+    def build_and_persist_pdf_graph(
+        self,
+        workspace_id: str,
+        document_id: str,
+        document_version: str,
+        chunks: Sequence[Any],
+        client: Any | None = None,
+        worker_id: str | None = None,
+        base_publication_id: str | None = None,
+        max_calls: int = 2,
+        max_input_tokens: int = 4000,
+        max_output_tokens: int = 800,
+        max_total_tokens: int = 5600,
+        lease_duration_s: float = 15.0,
+        call_deadline_s: float = 10.0,
+    ) -> KnowledgeGraphManifest:
+        """Extract canonical entity relationships from PDF text chunks using Bedrock converse and durable budgeting."""
+        if not worker_id or not worker_id.strip():
+            worker_id = getattr(self, "worker_id", None) or f"kg_worker_{os.getpid()}"
+        worker_id = worker_id.strip()
+
+        idempotency_key = hashlib.sha256(f"{workspace_id}:{document_id}:{document_version}:kg".encode("utf-8")).hexdigest()
+        existing_man = self.repository.get_manifest(workspace_id, document_id, document_version, consistent_read=True)
+        if existing_man is not None and existing_man.status in ("ready", "empty") and existing_man.content_hash == idempotency_key:
+            return existing_man
+
+        ledger = self.repository.get_budget_ledger(workspace_id, document_id, document_version, consistent_read=True)
+        if ledger is not None:
+            if ledger.status in ("exhausted", "failed", "completed") or ledger.reserved_calls >= max_calls:
+                return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
+
+        if not chunks:
+            pub_id = generate_publication_id()
+            manifest = KnowledgeGraphManifest(
+                workspace_id=workspace_id,
+                document_id=document_id,
+                document_version=document_version,
+                publication_id=pub_id,
+                base_publication_id=base_publication_id,
+                status="empty",
+                entity_count=0,
+                relationship_count=0,
+                ingested_at_utc=_now_utc(),
+                content_hash=idempotency_key,
+            )
+            self.repository.commit_manifest(workspace_id, manifest, base_publication_id=base_publication_id)
+            return manifest
+
+        user_content_blocks = []
+        remaining_bytes = 8000
+        for ch in chunks:
+            cid = str(getattr(ch, "id", None) or getattr(ch, "chunk_id", None) or "")
+            text = str(getattr(ch, "text", None) or getattr(ch, "content", None) or "")
+            page = int(getattr(ch, "page", None) or (getattr(ch, "metadata", {}) or {}).get("page", 1))
+            text_bytes = text.encode("utf-8")
+            if len(text_bytes) > 2000:
+                text = text_bytes[:2000].decode("utf-8", errors="ignore")
+            block = f'<chunk id="{cid}" page="{page}">\n{text}\n</chunk>'
+            block_bytes = len(block.encode("utf-8"))
+            if block_bytes > remaining_bytes:
+                break
+            user_content_blocks.append(block)
+            remaining_bytes -= (block_bytes + 2)
+
+        user_prompt = "\n\n".join(user_content_blocks)
+        messages = [{"role": "user", "content": [{"text": user_prompt}]}]
+        system = [{"text": BEDROCK_GRAPH_SYSTEM_PROMPT}]
+        model_id = getattr(settings, "GRAPH_BEDROCK_MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0")
+
+        if client is not None:
+            if not hasattr(client, "count_tokens"):
+                logger.error("Bedrock client missing mandatory count_tokens capability (AC-5)")
+                return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
+            try:
+                count_resp = client.count_tokens(
+                    modelId=model_id,
+                    input={"converse": {"messages": messages, "system": system}},
+                )
+                raw_tokens = count_resp.get("inputTokens", 0) if isinstance(count_resp, dict) else None
+                if not isinstance(raw_tokens, int) or raw_tokens <= 0:
+                    logger.error("Bedrock count_tokens returned non-positive tokens: %s", count_resp)
+                    return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
+                estimated_prompt_tokens = raw_tokens
+            except Exception as count_err:
+                logger.error("Bedrock count_tokens failed: %s", count_err)
+                return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
+        else:
+            estimated_prompt_tokens = max(1, len(user_prompt) // 4 + len(BEDROCK_GRAPH_SYSTEM_PROMPT) // 4)
+
+        if estimated_prompt_tokens > 2000:
+            logger.error("Estimated prompt tokens %d exceed 2000 per-call limit", estimated_prompt_tokens)
+            return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
+
+        res = self.repository.reserve_extraction_budget(
+            workspace_id=workspace_id,
+            document_id=document_id,
+            document_version=document_version,
+            worker_id=worker_id,
+            estimated_prompt_tokens=estimated_prompt_tokens,
+            max_output_tokens=max_output_tokens,
+            max_calls=max_calls,
+            max_total_tokens=max_total_tokens,
+            lease_duration_s=lease_duration_s,
+            max_input_tokens=max_input_tokens,
+            max_output_ceiling=1600,
+        )
+        if not res.granted:
+            logger.warning("Budget reservation denied: %s", res.reason)
+            return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
+        fence_token = res.fence_token
+
+        output_text = ""
+        usage = {"inputTokens": estimated_prompt_tokens, "outputTokens": 0}
+        dispatch_success = False
+
+        if client is None:
+            output_text = "{}"
+            dispatch_success = True
+        else:
+            max_attempts = 2
+            for attempt in range(max_attempts):
+                if attempt > 0:
+                    retry_res = self.repository.reserve_extraction_budget(
+                        workspace_id=workspace_id,
+                        document_id=document_id,
+                        document_version=document_version,
+                        worker_id=worker_id,
+                        estimated_prompt_tokens=estimated_prompt_tokens,
+                        max_output_tokens=max_output_tokens,
+                        max_calls=max_calls,
+                        max_total_tokens=max_total_tokens,
+                        lease_duration_s=lease_duration_s,
+                        max_input_tokens=max_input_tokens,
+                        max_output_ceiling=1600,
+                    )
+                    if not retry_res.granted:
+                        logger.warning("Retry budget reservation denied: %s", retry_res.reason)
+                        self.repository.fail_extraction_budget(
+                            workspace_id=workspace_id,
+                            document_id=document_id,
+                            document_version=document_version,
+                            worker_id=worker_id,
+                            fence_token=fence_token,
+                            error_reason="retry_reservation_denied",
+                            prompt_tokens_spent=estimated_prompt_tokens,
+                        )
+                        return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
+                    fence_token = retry_res.fence_token
+
+                try:
+                    resp = client.converse(
+                        modelId=model_id,
+                        messages=messages,
+                        system=system,
+                        inferenceConfig={"temperature": 0.0, "maxTokens": max_output_tokens},
+                    )
+                    output_text = resp.get("output", {}).get("message", {}).get("content", [{}])[0].get("text", "")
+                    raw_usage = resp.get("usage", {})
+                    usage = {
+                        "inputTokens": raw_usage.get("inputTokens", estimated_prompt_tokens),
+                        "outputTokens": raw_usage.get("outputTokens", 0),
+                    }
+                    dispatch_success = True
+                    break
+                except Exception as exc:
+                    err_str = str(exc)
+                    if ("ThrottlingException" in err_str or "429" in err_str) and attempt < max_attempts - 1:
+                        logger.warning("Bedrock throttled, retrying once...")
+                        time.sleep(1.0)
+                        continue
+                    else:
+                        logger.error("Bedrock converse failed: %s", exc)
+                        self.repository.fail_extraction_budget(
+                            workspace_id=workspace_id,
+                            document_id=document_id,
+                            document_version=document_version,
+                            worker_id=worker_id,
+                            fence_token=fence_token,
+                            error_reason=str(exc),
+                            prompt_tokens_spent=estimated_prompt_tokens,
+                        )
+                        return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
+
+        if not dispatch_success:
+            return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
+
+        actual_in = usage.get("inputTokens", estimated_prompt_tokens)
+        actual_out = usage.get("outputTokens", 0)
+        try:
+            rec_res = self.repository.reconcile_extraction_budget(
+                workspace_id=workspace_id,
+                document_id=document_id,
+                document_version=document_version,
+                worker_id=worker_id,
+                fence_token=fence_token,
+                actual_prompt_tokens=actual_in,
+                actual_output_tokens=actual_out,
+            )
+        except Exception as e:
+            logger.error("Failed to reconcile extraction budget: %s", e)
+            return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
+
+        if not rec_res.reconciled or rec_res.fenced_out:
+            logger.warning("Reconciliation denied: reason=%s fenced=%s", rec_res.reason, rec_res.fenced_out)
+            return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
+
+        pub_id = generate_publication_id()
+        entities, relationships = extract_pdf_relationships(
+            workspace_id=workspace_id,
+            document_id=document_id,
+            document_version=document_version,
+            chunks=chunks,
+            model_output_json=output_text,
+            publication_id=pub_id,
+        )
+
+        if relationships:
+            self.repository.stage_relationships(
+                workspace_id=workspace_id,
+                document_id=document_id,
+                document_version=document_version,
+                publication_id=pub_id,
+                entities=entities,
+                relationships=relationships,
+            )
+            manifest = KnowledgeGraphManifest(
+                workspace_id=workspace_id,
+                document_id=document_id,
+                document_version=document_version,
+                publication_id=pub_id,
+                base_publication_id=base_publication_id,
+                status="ready",
+                entity_count=len(entities),
+                relationship_count=len(relationships),
+                ingested_at_utc=_now_utc(),
+                content_hash=idempotency_key,
+            )
+        else:
+            manifest = KnowledgeGraphManifest(
+                workspace_id=workspace_id,
+                document_id=document_id,
+                document_version=document_version,
+                publication_id=pub_id,
+                base_publication_id=base_publication_id,
+                status="empty",
+                entity_count=0,
+                relationship_count=0,
+                ingested_at_utc=_now_utc(),
+                content_hash=idempotency_key,
+            )
+
+        try:
+            self.repository.commit_manifest(
+                workspace_id=workspace_id,
+                manifest=manifest,
+                base_publication_id=base_publication_id,
+                fence_token=fence_token,
+                worker_id=worker_id,
+            )
+        except Exception as commit_err:
+            logger.warning("Failed to commit manifest: %s", commit_err)
+            return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
+
+        return manifest
+
+
+def _clean_json_payload(raw_text: str) -> str:
+    cleaned = raw_text.strip()
+    if cleaned.startswith("```json"):
+        cleaned = cleaned[7:]
+    elif cleaned.startswith("```"):
+        cleaned = cleaned[3:]
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3]
+    return cleaned.strip()
+
+
+BEDROCK_GRAPH_SYSTEM_PROMPT = (
+    "You are a strict, factual Knowledge Graph extractor.\n"
+    "Extract only canonical directed entity relationships that are explicitly and verbatim stated in the provided chunks.\n"
+    "Rules:\n"
+    "1. Direction matters: source_entity is the subject/actor, target_entity is the object (e.g. 'Acme acquired Beta' -> source: Acme, target: Beta).\n"
+    "2. Do not infer relationships from co-occurrence alone. Entities merely mentioned together without directional syntax connecting them must be omitted.\n"
+    "3. If text contains negation (e.g. 'did not acquire', 'never partnered', 'failed to merge'), do NOT extract any relationship.\n"
+    "4. If text describes reversed roles (e.g. 'Beta was bought by Acme'), ensure source is the buyer (Acme) and target is the acquired (Beta).\n"
+    "5. Entities are document-scoped by default unless backed by an explicit disambiguation token (registration ID, ticker).\n"
+    "6. Output MUST be valid JSON only, with no surrounding commentary or markdown, matching this schema:\n"
+    "{\n"
+    '  "entities": [{"name": "...", "entity_type": "organization"|"person"|"location"|"product"|"concept"|"other", "disambiguation_token": null}],\n'
+    '  "relationships": [{"source_entity": "...", "predicate": "...", "target_entity": "...", "chunk_id": "...", "verbatim_evidence": "..."}]\n'
+    "}"
+)
+
+
+def extract_pdf_relationships(
+    workspace_id: str,
+    document_id: str,
+    document_version: str,
+    chunks: Sequence[Any],
+    model_output_json: str,
+    publication_id: str,
+) -> tuple[list[KnowledgeGraphEntity], list[KnowledgeGraphRelationship]]:
+    """Strictly parse model output JSON and ground candidate entities and relationships against chunk evidence."""
+    try:
+        cleaned = _clean_json_payload(model_output_json)
+        data = json.loads(cleaned)
+    except Exception as exc:
+        logger.warning("Failed to parse model output JSON: %s", exc)
+        return [], []
+
+    if not isinstance(data, dict):
+        return [], []
+
+    raw_entities = data.get("entities", [])
+    raw_relationships = data.get("relationships", [])
+    if not isinstance(raw_relationships, list):
+        return [], []
+
+    chunks_map: dict[str, tuple[Any, str, int]] = {}
+    for ch in chunks:
+        cid = str(getattr(ch, "id", None) or getattr(ch, "chunk_id", None) or "")
+        text = str(getattr(ch, "text", None) or getattr(ch, "content", None) or "")
+        page = int(getattr(ch, "page", None) or (getattr(ch, "metadata", {}) or {}).get("page", 1))
+        if cid:
+            chunks_map[cid] = (ch, text, page)
+
+    entity_info: dict[str, tuple[str, str | None]] = {}
+    if isinstance(raw_entities, list):
+        for ent in raw_entities:
+            if isinstance(ent, dict):
+                ename = str(ent.get("name", "")).strip()
+                etype = str(ent.get("entity_type", "concept")).strip().lower()
+                disambig = ent.get("disambiguation_token")
+                if disambig:
+                    disambig = str(disambig).strip()
+                if ename:
+                    norm = normalize_mention(ename)
+                    entity_info[norm] = (etype, disambig)
+
+    extracted_entities: dict[str, KnowledgeGraphEntity] = {}
+    extracted_relationships: list[KnowledgeGraphRelationship] = []
+
+    for rel in raw_relationships:
+        if not isinstance(rel, dict):
+            continue
+        src_name = str(rel.get("source_entity", "")).strip()
+        pred = str(rel.get("predicate", "")).strip()
+        tgt_name = str(rel.get("target_entity", "")).strip()
+        chunk_id = str(rel.get("chunk_id", "")).strip()
+        verbatim_ev = str(rel.get("verbatim_evidence", "")).strip()
+
+        if not src_name or not pred or not tgt_name or not chunk_id:
+            continue
+
+        if chunk_id not in chunks_map:
+            logger.info("Candidate relationship cited unknown/unauthorized chunk_id: %s", chunk_id)
+            continue
+
+        ch_obj, ch_text, ch_page = chunks_map[chunk_id]
+
+        is_valid, reason = validate_relationship_grounding(
+            chunk_text=ch_text,
+            source_entity_name=src_name,
+            predicate=pred,
+            target_entity_name=tgt_name,
+        )
+        if not is_valid:
+            logger.info("Candidate relationship (%s, %s, %s) rejected by grounding: %s", src_name, pred, tgt_name, reason)
+            continue
+
+        norm_src = normalize_mention(src_name)
+        norm_tgt = normalize_mention(tgt_name)
+        src_type, src_disambig = entity_info.get(norm_src, ("concept", None))
+        tgt_type, tgt_disambig = entity_info.get(norm_tgt, ("concept", None))
+
+        src_ent_id = compute_entity_id(
+            workspace_id=workspace_id,
+            document_id=document_id,
+            entity_type=src_type,
+            name=src_name,
+            disambiguation_token=src_disambig,
+        )
+        tgt_ent_id = compute_entity_id(
+            workspace_id=workspace_id,
+            document_id=document_id,
+            entity_type=tgt_type,
+            name=tgt_name,
+            disambiguation_token=tgt_disambig,
+        )
+
+        canon_pred = canonicalize_predicate(pred)
+        rel_id = compute_relationship_id(
+            workspace_id=workspace_id,
+            source_entity_id=src_ent_id,
+            canonical_predicate=canon_pred,
+            target_entity_id=tgt_ent_id,
+            document_id=document_id,
+            document_version=document_version,
+            publication_id=publication_id,
+        )
+
+        if src_ent_id not in extracted_entities:
+            extracted_entities[src_ent_id] = KnowledgeGraphEntity(
+                entity_id=src_ent_id,
+                workspace_id=workspace_id,
+                name=src_name,
+                canonical_name=norm_src,
+                entity_type=src_type if src_type in ("organization", "person", "location", "product", "concept", "table", "other") else "concept",
+                source_document_id=document_id if not src_disambig else None,
+                disambiguation_token=src_disambig,
+            )
+
+        if tgt_ent_id not in extracted_entities:
+            extracted_entities[tgt_ent_id] = KnowledgeGraphEntity(
+                entity_id=tgt_ent_id,
+                workspace_id=workspace_id,
+                name=tgt_name,
+                canonical_name=norm_tgt,
+                entity_type=tgt_type if tgt_type in ("organization", "person", "location", "product", "concept", "table", "other") else "concept",
+                source_document_id=document_id if not tgt_disambig else None,
+                disambiguation_token=tgt_disambig,
+            )
+
+        location = DocumentLocation(page=ch_page)
+        rel_model = KnowledgeGraphRelationship(
+            relationship_id=rel_id,
+            workspace_id=workspace_id,
+            source_entity_id=src_ent_id,
+            source_entity_name=src_name,
+            predicate=pred,
+            canonical_predicate=canon_pred,
+            target_entity_id=tgt_ent_id,
+            target_entity_name=tgt_name,
+            directed=True,
+            confidence=1.0,
+            source_document_id=document_id,
+            source_document_version=document_version,
+            publication_id=publication_id,
+            source_chunk_ids=(chunk_id,),
+            location=location,
+            verbatim_evidence=verbatim_ev or ch_text[:300],
+            relationship_state="unique",
+            created_at_utc=_now_utc(),
+        )
+        extracted_relationships.append(rel_model)
+
+    return list(extracted_entities.values()), extracted_relationships

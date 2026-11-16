@@ -32,7 +32,9 @@ try:
         KnowledgeGraphEntity,
         KnowledgeGraphLookupResult,
         KnowledgeGraphManifest,
+        KnowledgeGraphReconciliationResult,
         KnowledgeGraphRelationship,
+        KnowledgeGraphReservationResult,
         PinnedDocumentVersion,
         PinnedSnapshotContext,
         canonicalize_predicate,
@@ -48,7 +50,9 @@ except ImportError:
         KnowledgeGraphEntity,
         KnowledgeGraphLookupResult,
         KnowledgeGraphManifest,
+        KnowledgeGraphReconciliationResult,
         KnowledgeGraphRelationship,
+        KnowledgeGraphReservationResult,
         PinnedDocumentVersion,
         PinnedSnapshotContext,
         canonicalize_predicate,
@@ -165,6 +169,51 @@ class KnowledgeGraphRepositoryBase(Protocol):
         ledger: KnowledgeGraphBudgetLedger,
     ) -> None:
         """Save or update budget ledger record."""
+        ...
+
+    def reserve_extraction_budget(
+        self,
+        workspace_id: str,
+        document_id: str,
+        document_version: str,
+        worker_id: str,
+        estimated_prompt_tokens: int,
+        max_output_tokens: int = 800,
+        max_calls: int = 2,
+        max_total_tokens: int = 5600,
+        lease_duration_s: float = 15.0,
+        max_input_tokens: int = 4000,
+        max_output_ceiling: int = 1600,
+    ) -> KnowledgeGraphReservationResult:
+        """Atomically reserve an extraction call permit and token allocation on BUDGET#LEDGER."""
+        ...
+
+    def reconcile_extraction_budget(
+        self,
+        workspace_id: str,
+        document_id: str,
+        document_version: str,
+        worker_id: str,
+        fence_token: int,
+        actual_prompt_tokens: int,
+        actual_output_tokens: int,
+        status: str = "active",
+    ) -> KnowledgeGraphReconciliationResult:
+        """Reconcile completed extraction call against durable ledger and release lease."""
+        ...
+
+    def fail_extraction_budget(
+        self,
+        workspace_id: str,
+        document_id: str,
+        document_version: str,
+        worker_id: str,
+        fence_token: int,
+        error_reason: str,
+        prompt_tokens_spent: int = 0,
+        output_tokens_spent: int = 0,
+    ) -> None:
+        """Record failed or timed out extraction call, releasing lease while retaining reservation."""
         ...
 
 
@@ -368,6 +417,10 @@ class InMemoryKnowledgeGraphRepository:
                     )
                 if float(ld.get("lease_expires_at", 0.0)) < time.time():
                     raise FencingConflictError("Lease has expired for fenced publication")
+                # Release lease now that publication has committed
+                ld["lease_owner_id"] = None
+                ld["lease_expires_at"] = 0.0
+                ld["updated_at"] = _now_utc()
 
             # Save manifest
             self._items[(pk, sk)] = {
@@ -531,13 +584,307 @@ class InMemoryKnowledgeGraphRepository:
                 "data": ledger.model_dump(),
             }
 
+    def reserve_extraction_budget(
+        self,
+        workspace_id: str,
+        document_id: str,
+        document_version: str,
+        worker_id: str,
+        estimated_prompt_tokens: int,
+        max_output_tokens: int = 800,
+        max_calls: int = 2,
+        max_total_tokens: int = 5600,
+        lease_duration_s: float = 15.0,
+        max_input_tokens: int = 4000,
+        max_output_ceiling: int = 1600,
+    ) -> KnowledgeGraphReservationResult:
+        if not worker_id or not worker_id.strip():
+            return KnowledgeGraphReservationResult(granted=False, reason="storage_error")
+        worker_id = worker_id.strip()
+
+        with self._lock:
+            pk = f"KG#{workspace_id}#DOC#{document_id}#V#{document_version}"
+            sk = "BUDGET#LEDGER"
+            item = self._items.get((pk, sk))
+            ledger = KnowledgeGraphBudgetLedger(**item["data"]) if item else None
+            now = time.time()
+            est_tokens = estimated_prompt_tokens + max_output_tokens
+            p_thresh = max_input_tokens - estimated_prompt_tokens
+            o_thresh = max_output_ceiling - max_output_tokens
+            t_thresh = max_total_tokens - est_tokens
+
+            if max_calls < 1:
+                return KnowledgeGraphReservationResult(
+                    granted=False,
+                    reason="calls_exhausted",
+                    ledger=ledger,
+                )
+
+            if p_thresh < 0 or o_thresh < 0 or t_thresh < 0:
+                return KnowledgeGraphReservationResult(
+                    granted=False,
+                    reason="tokens_exhausted",
+                    ledger=ledger,
+                )
+
+            if ledger is not None:
+                if ledger.status == "completed":
+                    return KnowledgeGraphReservationResult(
+                        granted=False,
+                        fence_token=ledger.fence_token,
+                        call_number=ledger.reserved_calls,
+                        remaining_calls=0,
+                        reason="already_completed",
+                        ledger=ledger,
+                    )
+                if ledger.status == "exhausted":
+                    return KnowledgeGraphReservationResult(
+                        granted=False,
+                        fence_token=ledger.fence_token,
+                        call_number=ledger.reserved_calls,
+                        remaining_calls=0,
+                        reason="already_exhausted",
+                        ledger=ledger,
+                    )
+                if ledger.status == "failed":
+                    return KnowledgeGraphReservationResult(
+                        granted=False,
+                        fence_token=ledger.fence_token,
+                        call_number=ledger.reserved_calls,
+                        remaining_calls=0,
+                        reason="already_failed",
+                        ledger=ledger,
+                    )
+                if ledger.reserved_calls >= max_calls:
+                    updated = ledger.model_copy(update={"status": "exhausted", "updated_at": _now_utc()})
+                    self.save_budget_ledger(updated)
+                    return KnowledgeGraphReservationResult(
+                        granted=False,
+                        fence_token=updated.fence_token,
+                        call_number=updated.reserved_calls,
+                        remaining_calls=0,
+                        reason="calls_exhausted",
+                        ledger=updated,
+                    )
+                if (
+                    ledger.reserved_prompt_tokens > p_thresh
+                    or ledger.reserved_output_tokens > o_thresh
+                    or ledger.reserved_tokens > t_thresh
+                ):
+                    updated = ledger.model_copy(update={"status": "exhausted", "updated_at": _now_utc()})
+                    self.save_budget_ledger(updated)
+                    return KnowledgeGraphReservationResult(
+                        granted=False,
+                        fence_token=updated.fence_token,
+                        call_number=updated.reserved_calls,
+                        remaining_calls=0,
+                        reason="tokens_exhausted",
+                        ledger=updated,
+                    )
+                if ledger.lease_expires_at > now and ledger.lease_owner_id != worker_id:
+                    return KnowledgeGraphReservationResult(
+                        granted=False,
+                        fence_token=ledger.fence_token,
+                        call_number=ledger.reserved_calls,
+                        remaining_calls=max(0, max_calls - ledger.reserved_calls),
+                        reason="active_lease_held",
+                        ledger=ledger,
+                    )
+
+                new_calls = ledger.reserved_calls + 1
+                new_fence = ledger.fence_token + 1
+                new_reserved = ledger.reserved_tokens + est_tokens
+                new_reserved_prompt = ledger.reserved_prompt_tokens + estimated_prompt_tokens
+                new_reserved_output = ledger.reserved_output_tokens + max_output_tokens
+                updated = KnowledgeGraphBudgetLedger(
+                    workspace_id=workspace_id,
+                    document_id=document_id,
+                    document_version=document_version,
+                    reserved_calls=new_calls,
+                    completed_calls=ledger.completed_calls,
+                    reserved_tokens=new_reserved,
+                    spent_tokens=ledger.spent_tokens,
+                    reserved_prompt_tokens=new_reserved_prompt,
+                    reserved_output_tokens=new_reserved_output,
+                    spent_prompt_tokens=ledger.spent_prompt_tokens,
+                    spent_output_tokens=ledger.spent_output_tokens,
+                    lease_owner_id=worker_id,
+                    lease_expires_at=now + lease_duration_s,
+                    fence_token=new_fence,
+                    reconciled_fences=ledger.reconciled_fences,
+                    status="active",
+                    updated_at=_now_utc(),
+                )
+                self.save_budget_ledger(updated)
+                return KnowledgeGraphReservationResult(
+                    granted=True,
+                    fence_token=new_fence,
+                    call_number=new_calls,
+                    remaining_calls=max_calls - new_calls,
+                    reason="granted",
+                    ledger=updated,
+                )
+
+            # Initial reservation
+            new_calls = 1
+            new_fence = 1
+            updated = KnowledgeGraphBudgetLedger(
+                workspace_id=workspace_id,
+                document_id=document_id,
+                document_version=document_version,
+                reserved_calls=new_calls,
+                completed_calls=0,
+                reserved_tokens=est_tokens,
+                spent_tokens=0,
+                reserved_prompt_tokens=estimated_prompt_tokens,
+                reserved_output_tokens=max_output_tokens,
+                spent_prompt_tokens=0,
+                spent_output_tokens=0,
+                lease_owner_id=worker_id,
+                lease_expires_at=now + lease_duration_s,
+                fence_token=new_fence,
+                reconciled_fences=(),
+                status="active",
+                updated_at=_now_utc(),
+            )
+            self.save_budget_ledger(updated)
+            return KnowledgeGraphReservationResult(
+                granted=True,
+                fence_token=new_fence,
+                call_number=new_calls,
+                remaining_calls=max_calls - new_calls,
+                reason="granted",
+                ledger=updated,
+            )
+
+    def reconcile_extraction_budget(
+        self,
+        workspace_id: str,
+        document_id: str,
+        document_version: str,
+        worker_id: str,
+        fence_token: int,
+        actual_prompt_tokens: int,
+        actual_output_tokens: int,
+        status: str = "active",
+    ) -> KnowledgeGraphReconciliationResult:
+        worker_id = worker_id.strip() if worker_id else ""
+        with self._lock:
+            pk = f"KG#{workspace_id}#DOC#{document_id}#V#{document_version}"
+            sk = "BUDGET#LEDGER"
+            item = self._items.get((pk, sk))
+            if not item:
+                return KnowledgeGraphReconciliationResult(reconciled=False, reason="not_found")
+            ledger = KnowledgeGraphBudgetLedger(**item["data"])
+
+            if fence_token in ledger.reconciled_fences:
+                return KnowledgeGraphReconciliationResult(reconciled=True, reason="already_reconciled", ledger=ledger)
+
+            fenced_out = (ledger.fence_token != fence_token) or (ledger.lease_owner_id != worker_id)
+
+            actual_total = actual_prompt_tokens + actual_output_tokens
+            new_spent_prompt = ledger.spent_prompt_tokens + actual_prompt_tokens
+            new_spent_output = ledger.spent_output_tokens + actual_output_tokens
+            new_spent = ledger.spent_tokens + actual_total
+            new_completed = ledger.completed_calls + 1
+            new_rf = tuple(list(ledger.reconciled_fences) + [fence_token])
+
+            if fenced_out:
+                updated = ledger.model_copy(update={
+                    "spent_tokens": new_spent,
+                    "spent_prompt_tokens": new_spent_prompt,
+                    "spent_output_tokens": new_spent_output,
+                    "completed_calls": new_completed,
+                    "reconciled_fences": new_rf,
+                    "updated_at": _now_utc(),
+                })
+                self.save_budget_ledger(updated)
+                return KnowledgeGraphReconciliationResult(
+                    reconciled=False,
+                    fenced_out=True,
+                    reason="fenced_out",
+                    ledger=updated,
+                )
+
+            updated = KnowledgeGraphBudgetLedger(
+                workspace_id=workspace_id,
+                document_id=document_id,
+                document_version=document_version,
+                reserved_calls=ledger.reserved_calls,
+                completed_calls=new_completed,
+                reserved_tokens=ledger.reserved_tokens,
+                spent_tokens=new_spent,
+                reserved_prompt_tokens=ledger.reserved_prompt_tokens,
+                reserved_output_tokens=ledger.reserved_output_tokens,
+                spent_prompt_tokens=new_spent_prompt,
+                spent_output_tokens=new_spent_output,
+                lease_owner_id=worker_id,
+                lease_expires_at=ledger.lease_expires_at,
+                fence_token=ledger.fence_token,
+                reconciled_fences=new_rf,
+                status=status if status in ("active", "completed", "exhausted", "failed") else ledger.status,
+                updated_at=_now_utc(),
+            )
+            self.save_budget_ledger(updated)
+            return KnowledgeGraphReconciliationResult(
+                reconciled=True,
+                fenced_out=False,
+                reason="reconciled",
+                ledger=updated,
+            )
+
+    def fail_extraction_budget(
+        self,
+        workspace_id: str,
+        document_id: str,
+        document_version: str,
+        worker_id: str,
+        fence_token: int,
+        error_reason: str,
+        prompt_tokens_spent: int = 0,
+        output_tokens_spent: int = 0,
+    ) -> None:
+        worker_id = worker_id.strip() if worker_id else ""
+        with self._lock:
+            pk = f"KG#{workspace_id}#DOC#{document_id}#V#{document_version}"
+            sk = "BUDGET#LEDGER"
+            item = self._items.get((pk, sk))
+            if not item:
+                return
+            ledger = KnowledgeGraphBudgetLedger(**item["data"])
+            if fence_token in ledger.reconciled_fences:
+                return
+
+            actual_total = prompt_tokens_spent + output_tokens_spent
+            new_spent_prompt = ledger.spent_prompt_tokens + prompt_tokens_spent
+            new_spent_output = ledger.spent_output_tokens + output_tokens_spent
+            new_spent = ledger.spent_tokens + actual_total
+            new_rf = tuple(list(ledger.reconciled_fences) + [fence_token])
+
+            owner = ledger.lease_owner_id
+            expires = ledger.lease_expires_at
+            if ledger.fence_token == fence_token and owner == worker_id:
+                owner = None
+                expires = 0.0
+
+            updated = ledger.model_copy(update={
+                "spent_tokens": new_spent,
+                "spent_prompt_tokens": new_spent_prompt,
+                "spent_output_tokens": new_spent_output,
+                "lease_owner_id": owner,
+                "lease_expires_at": expires,
+                "reconciled_fences": new_rf,
+                "updated_at": _now_utc(),
+            })
+            self.save_budget_ledger(updated)
+
 
 class SQLiteKnowledgeGraphRepository:
     """Durable SQLite storage with WAL mode for Knowledge Graph enrichment."""
 
     def __init__(self, db_path: str | Path | None = None) -> None:
         if db_path is None:
-            configured = getattr(settings, "GRAPH_SQLITE_PATH", None) or getattr(settings, "WORKSPACE_SQLITE_PATH", None)
+            configured = getattr(settings, "GRAPH_SQLITE_PATH", None)
             if configured:
                 self.db_path = Path(configured)
             else:
@@ -722,6 +1069,14 @@ class SQLiteKnowledgeGraphRepository:
                         )
                     if float(ld.get("lease_expires_at", 0.0)) < time.time():
                         raise FencingConflictError("Lease has expired for fenced publication")
+                    # Release lease now that publication has committed
+                    ld["lease_owner_id"] = None
+                    ld["lease_expires_at"] = 0.0
+                    ld["updated_at"] = now_str
+                    self._conn.execute(
+                        "UPDATE kre_knowledge_graph SET data_json = ? WHERE pk = ? AND sk = ?",
+                        (json.dumps(ld), pk, ledger_sk),
+                    )
 
                 self._conn.execute(
                     """
@@ -947,6 +1302,454 @@ class SQLiteKnowledgeGraphRepository:
                     ),
                 )
 
+    def reserve_extraction_budget(
+        self,
+        workspace_id: str,
+        document_id: str,
+        document_version: str,
+        worker_id: str,
+        estimated_prompt_tokens: int,
+        max_output_tokens: int = 800,
+        max_calls: int = 2,
+        max_total_tokens: int = 5600,
+        lease_duration_s: float = 15.0,
+        max_input_tokens: int = 4000,
+        max_output_ceiling: int = 1600,
+    ) -> KnowledgeGraphReservationResult:
+        if not worker_id or not worker_id.strip():
+            return KnowledgeGraphReservationResult(granted=False, reason="storage_error")
+        worker_id = worker_id.strip()
+
+        pk = f"KG#{workspace_id}#DOC#{document_id}#V#{document_version}"
+        sk = "BUDGET#LEDGER"
+        now = time.time()
+        est_tokens = estimated_prompt_tokens + max_output_tokens
+        p_thresh = max_input_tokens - estimated_prompt_tokens
+        o_thresh = max_output_ceiling - max_output_tokens
+        t_thresh = max_total_tokens - est_tokens
+
+        with self._lock:
+            in_tx = False
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                in_tx = True
+            except sqlite3.OperationalError:
+                return KnowledgeGraphReservationResult(granted=False, reason="storage_error")
+
+            try:
+                cursor = self._conn.execute(
+                    "SELECT data_json FROM kre_knowledge_graph WHERE pk = ? AND sk = ?",
+                    (pk, sk),
+                )
+                row = cursor.fetchone()
+                ledger = KnowledgeGraphBudgetLedger(**json.loads(row["data_json"])) if row else None
+
+                if max_calls < 1:
+                    self._conn.execute("COMMIT")
+                    return KnowledgeGraphReservationResult(
+                        granted=False,
+                        reason="calls_exhausted",
+                        ledger=ledger,
+                    )
+
+                if p_thresh < 0 or o_thresh < 0 or t_thresh < 0:
+                    self._conn.execute("COMMIT")
+                    return KnowledgeGraphReservationResult(
+                        granted=False,
+                        reason="tokens_exhausted",
+                        ledger=ledger,
+                    )
+
+                if ledger is not None:
+                    if ledger.status == "completed":
+                        self._conn.execute("COMMIT")
+                        return KnowledgeGraphReservationResult(
+                            granted=False,
+                            fence_token=ledger.fence_token,
+                            call_number=ledger.reserved_calls,
+                            remaining_calls=0,
+                            reason="already_completed",
+                            ledger=ledger,
+                        )
+                    if ledger.status == "exhausted":
+                        self._conn.execute("COMMIT")
+                        return KnowledgeGraphReservationResult(
+                            granted=False,
+                            fence_token=ledger.fence_token,
+                            call_number=ledger.reserved_calls,
+                            remaining_calls=0,
+                            reason="already_exhausted",
+                            ledger=ledger,
+                        )
+                    if ledger.status == "failed":
+                        self._conn.execute("COMMIT")
+                        return KnowledgeGraphReservationResult(
+                            granted=False,
+                            fence_token=ledger.fence_token,
+                            call_number=ledger.reserved_calls,
+                            remaining_calls=0,
+                            reason="already_failed",
+                            ledger=ledger,
+                        )
+                    if ledger.reserved_calls >= max_calls:
+                        updated = ledger.model_copy(update={"status": "exhausted", "updated_at": _now_utc()})
+                        data_json = json.dumps(updated.model_dump())
+                        self._conn.execute(
+                            """
+                            INSERT OR REPLACE INTO kre_knowledge_graph (
+                                workspace_id, pk, sk, gsi1_pk, gsi1_sk, gsi2_pk, gsi2_sk,
+                                record_type, document_id, document_version, publication_id,
+                                data_json, created_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                updated.workspace_id, pk, sk, "", "", "", "",
+                                "budget_ledger", updated.document_id, updated.document_version,
+                                "", data_json, _now_utc()
+                            ),
+                        )
+                        self._conn.execute("COMMIT")
+                        return KnowledgeGraphReservationResult(
+                            granted=False,
+                            fence_token=updated.fence_token,
+                            call_number=updated.reserved_calls,
+                            remaining_calls=0,
+                            reason="calls_exhausted",
+                            ledger=updated,
+                        )
+                    if (
+                        ledger.reserved_prompt_tokens > p_thresh
+                        or ledger.reserved_output_tokens > o_thresh
+                        or ledger.reserved_tokens > t_thresh
+                    ):
+                        updated = ledger.model_copy(update={"status": "exhausted", "updated_at": _now_utc()})
+                        data_json = json.dumps(updated.model_dump())
+                        self._conn.execute(
+                            """
+                            INSERT OR REPLACE INTO kre_knowledge_graph (
+                                workspace_id, pk, sk, gsi1_pk, gsi1_sk, gsi2_pk, gsi2_sk,
+                                record_type, document_id, document_version, publication_id,
+                                data_json, created_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                updated.workspace_id, pk, sk, "", "", "", "",
+                                "budget_ledger", updated.document_id, updated.document_version,
+                                "", data_json, _now_utc()
+                            ),
+                        )
+                        self._conn.execute("COMMIT")
+                        return KnowledgeGraphReservationResult(
+                            granted=False,
+                            fence_token=updated.fence_token,
+                            call_number=updated.reserved_calls,
+                            remaining_calls=0,
+                            reason="tokens_exhausted",
+                            ledger=updated,
+                        )
+                    if ledger.lease_expires_at > now and ledger.lease_owner_id != worker_id:
+                        self._conn.execute("COMMIT")
+                        return KnowledgeGraphReservationResult(
+                            granted=False,
+                            fence_token=ledger.fence_token,
+                            call_number=ledger.reserved_calls,
+                            remaining_calls=max(0, max_calls - ledger.reserved_calls),
+                            reason="active_lease_held",
+                            ledger=ledger,
+                        )
+
+                    new_calls = ledger.reserved_calls + 1
+                    new_fence = ledger.fence_token + 1
+                    new_reserved = ledger.reserved_tokens + est_tokens
+                    new_reserved_prompt = ledger.reserved_prompt_tokens + estimated_prompt_tokens
+                    new_reserved_output = ledger.reserved_output_tokens + max_output_tokens
+                    updated = KnowledgeGraphBudgetLedger(
+                        workspace_id=workspace_id,
+                        document_id=document_id,
+                        document_version=document_version,
+                        reserved_calls=new_calls,
+                        completed_calls=ledger.completed_calls,
+                        reserved_tokens=new_reserved,
+                        spent_tokens=ledger.spent_tokens,
+                        reserved_prompt_tokens=new_reserved_prompt,
+                        reserved_output_tokens=new_reserved_output,
+                        spent_prompt_tokens=ledger.spent_prompt_tokens,
+                        spent_output_tokens=ledger.spent_output_tokens,
+                        lease_owner_id=worker_id,
+                        lease_expires_at=now + lease_duration_s,
+                        fence_token=new_fence,
+                        reconciled_fences=ledger.reconciled_fences,
+                        status="active",
+                        updated_at=_now_utc(),
+                    )
+                else:
+                    new_calls = 1
+                    new_fence = 1
+                    updated = KnowledgeGraphBudgetLedger(
+                        workspace_id=workspace_id,
+                        document_id=document_id,
+                        document_version=document_version,
+                        reserved_calls=new_calls,
+                        completed_calls=0,
+                        reserved_tokens=est_tokens,
+                        spent_tokens=0,
+                        reserved_prompt_tokens=estimated_prompt_tokens,
+                        reserved_output_tokens=max_output_tokens,
+                        spent_prompt_tokens=0,
+                        spent_output_tokens=0,
+                        lease_owner_id=worker_id,
+                        lease_expires_at=now + lease_duration_s,
+                        fence_token=new_fence,
+                        reconciled_fences=(),
+                        status="active",
+                        updated_at=_now_utc(),
+                    )
+
+                data_json = json.dumps(updated.model_dump())
+                self._conn.execute(
+                    """
+                    INSERT OR REPLACE INTO kre_knowledge_graph (
+                        workspace_id, pk, sk, gsi1_pk, gsi1_sk, gsi2_pk, gsi2_sk,
+                        record_type, document_id, document_version, publication_id,
+                        data_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        updated.workspace_id, pk, sk, "", "", "", "",
+                        "budget_ledger", updated.document_id, updated.document_version,
+                        "", data_json, _now_utc()
+                    ),
+                )
+                self._conn.execute("COMMIT")
+                return KnowledgeGraphReservationResult(
+                    granted=True,
+                    fence_token=new_fence,
+                    call_number=new_calls,
+                    remaining_calls=max_calls - new_calls,
+                    reason="granted",
+                    ledger=updated,
+                )
+            except Exception as e:
+                if in_tx:
+                    try:
+                        self._conn.execute("ROLLBACK")
+                    except Exception:
+                        pass
+                logger.error("SQLite reserve_extraction_budget error: %s", e)
+                return KnowledgeGraphReservationResult(granted=False, reason="storage_error")
+
+    def reconcile_extraction_budget(
+        self,
+        workspace_id: str,
+        document_id: str,
+        document_version: str,
+        worker_id: str,
+        fence_token: int,
+        actual_prompt_tokens: int,
+        actual_output_tokens: int,
+        status: str = "active",
+    ) -> KnowledgeGraphReconciliationResult:
+        worker_id = worker_id.strip() if worker_id else ""
+        pk = f"KG#{workspace_id}#DOC#{document_id}#V#{document_version}"
+        sk = "BUDGET#LEDGER"
+
+        with self._lock:
+            in_tx = False
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                in_tx = True
+            except sqlite3.OperationalError:
+                return KnowledgeGraphReconciliationResult(reconciled=False, reason="storage_error")
+
+            try:
+                cursor = self._conn.execute(
+                    "SELECT data_json FROM kre_knowledge_graph WHERE pk = ? AND sk = ?",
+                    (pk, sk),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    self._conn.execute("COMMIT")
+                    return KnowledgeGraphReconciliationResult(reconciled=False, reason="not_found")
+                ledger = KnowledgeGraphBudgetLedger(**json.loads(row["data_json"]))
+
+                if fence_token in ledger.reconciled_fences:
+                    self._conn.execute("COMMIT")
+                    return KnowledgeGraphReconciliationResult(reconciled=True, reason="already_reconciled", ledger=ledger)
+
+                fenced_out = (ledger.fence_token != fence_token) or (ledger.lease_owner_id != worker_id)
+
+                actual_total = actual_prompt_tokens + actual_output_tokens
+                new_spent_prompt = ledger.spent_prompt_tokens + actual_prompt_tokens
+                new_spent_output = ledger.spent_output_tokens + actual_output_tokens
+                new_spent = ledger.spent_tokens + actual_total
+                new_completed = ledger.completed_calls + 1
+                new_rf = tuple(list(ledger.reconciled_fences) + [fence_token])
+
+                if fenced_out:
+                    updated = ledger.model_copy(update={
+                        "spent_tokens": new_spent,
+                        "spent_prompt_tokens": new_spent_prompt,
+                        "spent_output_tokens": new_spent_output,
+                        "completed_calls": new_completed,
+                        "reconciled_fences": new_rf,
+                        "updated_at": _now_utc(),
+                    })
+                    data_json = json.dumps(updated.model_dump())
+                    self._conn.execute(
+                        """
+                        INSERT OR REPLACE INTO kre_knowledge_graph (
+                            workspace_id, pk, sk, gsi1_pk, gsi1_sk, gsi2_pk, gsi2_sk,
+                            record_type, document_id, document_version, publication_id,
+                            data_json, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            updated.workspace_id, pk, sk, "", "", "", "",
+                            "budget_ledger", updated.document_id, updated.document_version,
+                            "", data_json, _now_utc()
+                        ),
+                    )
+                    self._conn.execute("COMMIT")
+                    return KnowledgeGraphReconciliationResult(
+                        reconciled=False,
+                        fenced_out=True,
+                        reason="fenced_out",
+                        ledger=updated,
+                    )
+
+                updated = KnowledgeGraphBudgetLedger(
+                    workspace_id=workspace_id,
+                    document_id=document_id,
+                    document_version=document_version,
+                    reserved_calls=ledger.reserved_calls,
+                    completed_calls=new_completed,
+                    reserved_tokens=ledger.reserved_tokens,
+                    spent_tokens=new_spent,
+                    reserved_prompt_tokens=ledger.reserved_prompt_tokens,
+                    reserved_output_tokens=ledger.reserved_output_tokens,
+                    spent_prompt_tokens=new_spent_prompt,
+                    spent_output_tokens=new_spent_output,
+                    lease_owner_id=worker_id,
+                    lease_expires_at=ledger.lease_expires_at,
+                    fence_token=ledger.fence_token,
+                    reconciled_fences=new_rf,
+                    status=status if status in ("active", "completed", "exhausted", "failed") else ledger.status,
+                    updated_at=_now_utc(),
+                )
+                data_json = json.dumps(updated.model_dump())
+                self._conn.execute(
+                    """
+                    INSERT OR REPLACE INTO kre_knowledge_graph (
+                        workspace_id, pk, sk, gsi1_pk, gsi1_sk, gsi2_pk, gsi2_sk,
+                        record_type, document_id, document_version, publication_id,
+                        data_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        updated.workspace_id, pk, sk, "", "", "", "",
+                        "budget_ledger", updated.document_id, updated.document_version,
+                        "", data_json, _now_utc()
+                    ),
+                )
+                self._conn.execute("COMMIT")
+                return KnowledgeGraphReconciliationResult(
+                    reconciled=True,
+                    fenced_out=False,
+                    reason="reconciled",
+                    ledger=updated,
+                )
+            except Exception as e:
+                if in_tx:
+                    try:
+                        self._conn.execute("ROLLBACK")
+                    except Exception:
+                        pass
+                logger.error("SQLite reconcile_extraction_budget error: %s", e)
+                return KnowledgeGraphReconciliationResult(reconciled=False, reason="storage_error")
+
+    def fail_extraction_budget(
+        self,
+        workspace_id: str,
+        document_id: str,
+        document_version: str,
+        worker_id: str,
+        fence_token: int,
+        error_reason: str,
+        prompt_tokens_spent: int = 0,
+        output_tokens_spent: int = 0,
+    ) -> None:
+        worker_id = worker_id.strip() if worker_id else ""
+        pk = f"KG#{workspace_id}#DOC#{document_id}#V#{document_version}"
+        sk = "BUDGET#LEDGER"
+
+        with self._lock:
+            in_tx = False
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                in_tx = True
+            except sqlite3.OperationalError:
+                return
+
+            try:
+                cursor = self._conn.execute(
+                    "SELECT data_json FROM kre_knowledge_graph WHERE pk = ? AND sk = ?",
+                    (pk, sk),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    self._conn.execute("COMMIT")
+                    return
+                ledger = KnowledgeGraphBudgetLedger(**json.loads(row["data_json"]))
+
+                if fence_token in ledger.reconciled_fences:
+                    self._conn.execute("COMMIT")
+                    return
+
+                actual_total = prompt_tokens_spent + output_tokens_spent
+                new_spent_prompt = ledger.spent_prompt_tokens + prompt_tokens_spent
+                new_spent_output = ledger.spent_output_tokens + output_tokens_spent
+                new_spent = ledger.spent_tokens + actual_total
+                new_rf = tuple(list(ledger.reconciled_fences) + [fence_token])
+
+                owner = ledger.lease_owner_id
+                expires = ledger.lease_expires_at
+                if ledger.fence_token == fence_token and owner == worker_id:
+                    owner = None
+                    expires = 0.0
+
+                updated = ledger.model_copy(update={
+                    "spent_tokens": new_spent,
+                    "spent_prompt_tokens": new_spent_prompt,
+                    "spent_output_tokens": new_spent_output,
+                    "lease_owner_id": owner,
+                    "lease_expires_at": expires,
+                    "reconciled_fences": new_rf,
+                    "updated_at": _now_utc(),
+                })
+                data_json = json.dumps(updated.model_dump())
+                self._conn.execute(
+                    """
+                    INSERT OR REPLACE INTO kre_knowledge_graph (
+                        workspace_id, pk, sk, gsi1_pk, gsi1_sk, gsi2_pk, gsi2_sk,
+                        record_type, document_id, document_version, publication_id,
+                        data_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        updated.workspace_id, pk, sk, "", "", "", "",
+                        "budget_ledger", updated.document_id, updated.document_version,
+                        "", data_json, _now_utc()
+                    ),
+                )
+                self._conn.execute("COMMIT")
+            except Exception as e:
+                if in_tx:
+                    try:
+                        self._conn.execute("ROLLBACK")
+                    except Exception:
+                        pass
+                logger.error("SQLite fail_extraction_budget error: %s", e)
+
 
 class DynamoDBKnowledgeGraphRepository:
     """Production DynamoDB storage implementation for partitioned Knowledge Graph records."""
@@ -958,6 +1761,8 @@ class DynamoDBKnowledgeGraphRepository:
         self.table_name = table_name or getattr(settings, "DYNAMODB_GRAPH_TABLE_NAME", "kre_knowledge_graph")
         self.endpoint_url = endpoint_url
         if endpoint_url:
+            # DynamoDB Local test convention: local emulators require static dummy credentials.
+            # Live production environments leave endpoint_url as None to use IAM roles via ambient AWS credentials.
             self._dynamodb = boto3.resource(
                 "dynamodb",
                 endpoint_url=endpoint_url,
@@ -1137,6 +1942,14 @@ class DynamoDBKnowledgeGraphRepository:
                         {"ConditionCheck": check_dict},
                     ]
                 )
+                try:
+                    self._table.update_item(
+                        Key={"PK": pk, "SK": "BUDGET#LEDGER"},
+                        UpdateExpression="SET lease_owner_id = :none, lease_expires_at = :zero_dec, updated_at = :now_iso",
+                        ExpressionAttributeValues={":none": None, ":zero_dec": Decimal("0.0"), ":now_iso": _now_utc()},
+                    )
+                except Exception:
+                    pass
             except botocore.exceptions.ClientError as exc:
                 code = exc.response.get("Error", {}).get("Code")
                 if code == "TransactionCanceledException":
@@ -1380,7 +2193,31 @@ class DynamoDBKnowledgeGraphRepository:
         item = resp.get("Item")
         if not item:
             return None
-        return KnowledgeGraphBudgetLedger(**json.loads(item["data_json"]))
+        if "reserved_calls" in item:
+            raw_rf = item.get("reconciled_fences", [])
+            reconciled_fences = tuple(int(x) for x in raw_rf) if raw_rf else ()
+            return KnowledgeGraphBudgetLedger(
+                workspace_id=item["workspace_id"],
+                document_id=item["document_id"],
+                document_version=item["document_version"],
+                reserved_calls=int(item.get("reserved_calls", 0)),
+                completed_calls=int(item.get("completed_calls", 0)),
+                reserved_tokens=int(item.get("reserved_tokens", 0)),
+                spent_tokens=int(item.get("spent_tokens", 0)),
+                reserved_prompt_tokens=int(item.get("reserved_prompt_tokens", 0)),
+                reserved_output_tokens=int(item.get("reserved_output_tokens", 0)),
+                spent_prompt_tokens=int(item.get("spent_prompt_tokens", 0)),
+                spent_output_tokens=int(item.get("spent_output_tokens", 0)),
+                lease_owner_id=item.get("lease_owner_id"),
+                lease_expires_at=float(item.get("lease_expires_at", 0.0)),
+                fence_token=int(item.get("fence_token", 0)),
+                reconciled_fences=reconciled_fences,
+                status=item.get("status", "active"),
+                updated_at=item.get("updated_at", _now_utc()),
+            )
+        if "data_json" in item:
+            return KnowledgeGraphBudgetLedger(**json.loads(item["data_json"]))
+        return None
 
     def save_budget_ledger(
         self,
@@ -1397,13 +2234,388 @@ class DynamoDBKnowledgeGraphRepository:
                 "record_type": "budget_ledger",
                 "document_id": ledger.document_id,
                 "document_version": ledger.document_version,
+                "reserved_calls": ledger.reserved_calls,
+                "completed_calls": ledger.completed_calls,
+                "reserved_tokens": ledger.reserved_tokens,
+                "spent_tokens": ledger.spent_tokens,
+                "reserved_prompt_tokens": ledger.reserved_prompt_tokens,
+                "reserved_output_tokens": ledger.reserved_output_tokens,
+                "spent_prompt_tokens": ledger.spent_prompt_tokens,
+                "spent_output_tokens": ledger.spent_output_tokens,
                 "fence_token": ledger.fence_token,
                 "lease_owner_id": ledger.lease_owner_id,
                 "lease_expires_at": Decimal(str(ledger.lease_expires_at)),
+                "reconciled_fences": list(ledger.reconciled_fences),
+                "status": ledger.status,
                 "data_json": json.dumps(ledger.model_dump()),
                 "created_at": now_str,
+                "updated_at": ledger.updated_at or now_str,
             }
         )
+
+    def reserve_extraction_budget(
+        self,
+        workspace_id: str,
+        document_id: str,
+        document_version: str,
+        worker_id: str,
+        estimated_prompt_tokens: int,
+        max_output_tokens: int = 800,
+        max_calls: int = 2,
+        max_total_tokens: int = 5600,
+        lease_duration_s: float = 15.0,
+        max_input_tokens: int = 4000,
+        max_output_ceiling: int = 1600,
+    ) -> KnowledgeGraphReservationResult:
+        if not worker_id or not worker_id.strip():
+            return KnowledgeGraphReservationResult(granted=False, reason="storage_error")
+        worker_id = worker_id.strip()
+
+        pk = f"KG#{workspace_id}#DOC#{document_id}#V#{document_version}"
+        sk = "BUDGET#LEDGER"
+        now = time.time()
+        est_tokens = estimated_prompt_tokens + max_output_tokens
+        p_thresh = max_input_tokens - estimated_prompt_tokens
+        o_thresh = max_output_ceiling - max_output_tokens
+        t_thresh = max_total_tokens - est_tokens
+
+        if max_calls < 1:
+            curr = self.get_budget_ledger(workspace_id, document_id, document_version, consistent_read=True)
+            return KnowledgeGraphReservationResult(granted=False, reason="calls_exhausted", ledger=curr)
+
+        if p_thresh < 0 or o_thresh < 0 or t_thresh < 0:
+            curr = self.get_budget_ledger(workspace_id, document_id, document_version, consistent_read=True)
+            return KnowledgeGraphReservationResult(granted=False, reason="tokens_exhausted", ledger=curr)
+
+        try:
+            resp = self._table.update_item(
+                Key={"PK": pk, "SK": sk},
+                UpdateExpression=(
+                    "SET #rc = if_not_exists(#rc, :zero) + :one, "
+                    "#ft = if_not_exists(#ft, :zero) + :one, "
+                    "#lown = :wid, "
+                    "#lexp = :expires_at, "
+                    "#st = :st_act, "
+                    "#spent = if_not_exists(#spent, :zero), "
+                    "#spt = if_not_exists(#spt, :zero), "
+                    "#sot = if_not_exists(#sot, :zero), "
+                    "#comp = if_not_exists(#comp, :zero), "
+                    "#rt = if_not_exists(#rt, :zero) + :est_tokens, "
+                    "#rpt = if_not_exists(#rpt, :zero) + :est_prompt, "
+                    "#rot = if_not_exists(#rot, :zero) + :max_output, "
+                    "workspace_id = :ws, "
+                    "document_id = :did, "
+                    "document_version = :ver, "
+                    "record_type = :rtype, "
+                    "updated_at = :now_iso"
+                ),
+                ConditionExpression=(
+                    "("
+                    "attribute_not_exists(PK) AND "
+                    ":one <= :max_calls AND "
+                    ":est_prompt <= :max_input AND "
+                    ":max_output <= :max_out_ceiling AND "
+                    ":est_tokens <= :max_total"
+                    ") OR ("
+                    "#rc < :max_calls AND "
+                    "#st = :st_act AND "
+                    "(attribute_not_exists(#rpt) OR #rpt <= :p_thresh) AND "
+                    "(attribute_not_exists(#rot) OR #rot <= :o_thresh) AND "
+                    "(attribute_not_exists(#rt) OR #rt <= :t_thresh) AND "
+                    "(#lexp < :now OR #lown = :wid)"
+                    ")"
+                ),
+                ExpressionAttributeNames={
+                    "#rc": "reserved_calls",
+                    "#ft": "fence_token",
+                    "#lown": "lease_owner_id",
+                    "#lexp": "lease_expires_at",
+                    "#st": "status",
+                    "#spent": "spent_tokens",
+                    "#spt": "spent_prompt_tokens",
+                    "#sot": "spent_output_tokens",
+                    "#comp": "completed_calls",
+                    "#rt": "reserved_tokens",
+                    "#rpt": "reserved_prompt_tokens",
+                    "#rot": "reserved_output_tokens",
+                },
+                ExpressionAttributeValues={
+                    ":zero": 0,
+                    ":one": 1,
+                    ":max_calls": max_calls,
+                    ":max_input": max_input_tokens,
+                    ":max_out_ceiling": max_output_ceiling,
+                    ":max_total": max_total_tokens,
+                    ":p_thresh": p_thresh,
+                    ":o_thresh": o_thresh,
+                    ":t_thresh": t_thresh,
+                    ":est_tokens": est_tokens,
+                    ":est_prompt": estimated_prompt_tokens,
+                    ":max_output": max_output_tokens,
+                    ":wid": worker_id,
+                    ":expires_at": Decimal(str(round(now + lease_duration_s, 4))),
+                    ":now": Decimal(str(round(now, 4))),
+                    ":st_act": "active",
+                    ":ws": workspace_id,
+                    ":did": document_id,
+                    ":ver": document_version,
+                    ":rtype": "budget_ledger",
+                    ":now_iso": _now_utc(),
+                },
+                ReturnValues="ALL_NEW",
+            )
+            attrs = resp.get("Attributes", {})
+            raw_rf = attrs.get("reconciled_fences", [])
+            reconciled_fences = tuple(int(x) for x in raw_rf) if raw_rf else ()
+            ledger = KnowledgeGraphBudgetLedger(
+                workspace_id=workspace_id,
+                document_id=document_id,
+                document_version=document_version,
+                reserved_calls=int(attrs.get("reserved_calls", 1)),
+                completed_calls=int(attrs.get("completed_calls", 0)),
+                reserved_tokens=int(attrs.get("reserved_tokens", est_tokens)),
+                spent_tokens=int(attrs.get("spent_tokens", 0)),
+                reserved_prompt_tokens=int(attrs.get("reserved_prompt_tokens", estimated_prompt_tokens)),
+                reserved_output_tokens=int(attrs.get("reserved_output_tokens", max_output_tokens)),
+                spent_prompt_tokens=int(attrs.get("spent_prompt_tokens", 0)),
+                spent_output_tokens=int(attrs.get("spent_output_tokens", 0)),
+                lease_owner_id=attrs.get("lease_owner_id"),
+                lease_expires_at=float(attrs.get("lease_expires_at", 0.0)),
+                fence_token=int(attrs.get("fence_token", 1)),
+                reconciled_fences=reconciled_fences,
+                status=attrs.get("status", "active"),
+                updated_at=attrs.get("updated_at", _now_utc()),
+            )
+            return KnowledgeGraphReservationResult(
+                granted=True,
+                fence_token=ledger.fence_token,
+                call_number=ledger.reserved_calls,
+                remaining_calls=max_calls - ledger.reserved_calls,
+                reason="granted",
+                ledger=ledger,
+            )
+        except Exception as exc:
+            is_cond_err = False
+            if hasattr(exc, "response") and isinstance(exc.response, dict):
+                if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                    is_cond_err = True
+            elif "ConditionalCheckFailedException" in str(exc):
+                is_cond_err = True
+
+            if is_cond_err:
+                curr = self.get_budget_ledger(workspace_id, document_id, document_version, consistent_read=True)
+                if curr is not None:
+                    if curr.status in ("completed", "exhausted", "failed"):
+                        return KnowledgeGraphReservationResult(
+                            granted=False,
+                            fence_token=curr.fence_token,
+                            call_number=curr.reserved_calls,
+                            remaining_calls=0,
+                            reason=f"already_{curr.status}",  # type: ignore[arg-type]
+                            ledger=curr,
+                        )
+                    if curr.reserved_calls >= max_calls:
+                        return KnowledgeGraphReservationResult(
+                            granted=False,
+                            fence_token=curr.fence_token,
+                            call_number=curr.reserved_calls,
+                            remaining_calls=0,
+                            reason="calls_exhausted",
+                            ledger=curr,
+                        )
+                    if (
+                        curr.reserved_prompt_tokens > p_thresh
+                        or curr.reserved_output_tokens > o_thresh
+                        or curr.reserved_tokens > t_thresh
+                    ):
+                        return KnowledgeGraphReservationResult(
+                            granted=False,
+                            fence_token=curr.fence_token,
+                            call_number=curr.reserved_calls,
+                            remaining_calls=0,
+                            reason="tokens_exhausted",
+                            ledger=curr,
+                        )
+                    if curr.lease_expires_at > now and curr.lease_owner_id != worker_id:
+                        return KnowledgeGraphReservationResult(
+                            granted=False,
+                            fence_token=curr.fence_token,
+                            call_number=curr.reserved_calls,
+                            remaining_calls=max(0, max_calls - curr.reserved_calls),
+                            reason="active_lease_held",
+                            ledger=curr,
+                        )
+                return KnowledgeGraphReservationResult(granted=False, reason="calls_exhausted", ledger=curr)
+
+            logger.error("DynamoDB reserve_extraction_budget error: %s", exc)
+            return KnowledgeGraphReservationResult(granted=False, reason="storage_error", ledger=None)
+
+    def reconcile_extraction_budget(
+        self,
+        workspace_id: str,
+        document_id: str,
+        document_version: str,
+        worker_id: str,
+        fence_token: int,
+        actual_prompt_tokens: int,
+        actual_output_tokens: int,
+        status: str = "active",
+    ) -> KnowledgeGraphReconciliationResult:
+        worker_id = worker_id.strip() if worker_id else ""
+        pk = f"KG#{workspace_id}#DOC#{document_id}#V#{document_version}"
+        sk = "BUDGET#LEDGER"
+
+        curr = self.get_budget_ledger(workspace_id, document_id, document_version, consistent_read=True)
+        if curr is None:
+            return KnowledgeGraphReconciliationResult(reconciled=False, reason="not_found")
+        if fence_token in curr.reconciled_fences:
+            return KnowledgeGraphReconciliationResult(reconciled=True, reason="already_reconciled", ledger=curr)
+
+        fenced_out = (curr.fence_token != fence_token) or (curr.lease_owner_id != worker_id)
+
+        actual_total = actual_prompt_tokens + actual_output_tokens
+        new_rf = list(curr.reconciled_fences) + [fence_token]
+
+        try:
+            if fenced_out:
+                self._table.update_item(
+                    Key={"PK": pk, "SK": sk},
+                    UpdateExpression=(
+                        "SET spent_tokens = if_not_exists(spent_tokens, :zero) + :tot, "
+                        "spent_prompt_tokens = if_not_exists(spent_prompt_tokens, :zero) + :spt, "
+                        "spent_output_tokens = if_not_exists(spent_output_tokens, :zero) + :sot, "
+                        "completed_calls = if_not_exists(completed_calls, :zero) + :one, "
+                        "#rf = :rf, "
+                        "updated_at = :now_iso"
+                    ),
+                    ExpressionAttributeNames={"#rf": "reconciled_fences"},
+                    ExpressionAttributeValues={
+                        ":zero": 0,
+                        ":tot": actual_total,
+                        ":spt": actual_prompt_tokens,
+                        ":sot": actual_output_tokens,
+                        ":one": 1,
+                        ":rf": new_rf,
+                        ":now_iso": _now_utc(),
+                    },
+                    ReturnValues="ALL_NEW",
+                )
+                updated = self.get_budget_ledger(workspace_id, document_id, document_version, consistent_read=True)
+                return KnowledgeGraphReconciliationResult(
+                    reconciled=False,
+                    fenced_out=True,
+                    reason="fenced_out",
+                    ledger=updated,
+                )
+
+            new_status = status if status in ("active", "completed", "exhausted", "failed") else curr.status
+            self._table.update_item(
+                Key={"PK": pk, "SK": sk},
+                UpdateExpression=(
+                    "SET spent_tokens = if_not_exists(spent_tokens, :zero) + :tot, "
+                    "spent_prompt_tokens = if_not_exists(spent_prompt_tokens, :zero) + :spt, "
+                    "spent_output_tokens = if_not_exists(spent_output_tokens, :zero) + :sot, "
+                    "completed_calls = if_not_exists(completed_calls, :zero) + :one, "
+                    "#rf = :rf, "
+                    "#st = :st, "
+                    "updated_at = :now_iso"
+                ),
+                ConditionExpression="fence_token = :exp_fence AND lease_owner_id = :wid",
+                ExpressionAttributeNames={"#rf": "reconciled_fences", "#st": "status"},
+                ExpressionAttributeValues={
+                    ":zero": 0,
+                    ":tot": actual_total,
+                    ":spt": actual_prompt_tokens,
+                    ":sot": actual_output_tokens,
+                    ":one": 1,
+                    ":rf": new_rf,
+                    ":st": new_status,
+                    ":exp_fence": fence_token,
+                    ":wid": worker_id,
+                    ":now_iso": _now_utc(),
+                },
+                ReturnValues="ALL_NEW",
+            )
+            updated = self.get_budget_ledger(workspace_id, document_id, document_version, consistent_read=True)
+            return KnowledgeGraphReconciliationResult(
+                reconciled=True,
+                fenced_out=False,
+                reason="reconciled",
+                ledger=updated,
+            )
+        except Exception as exc:
+            logger.error("DynamoDB reconcile_extraction_budget error: %s", exc)
+            return KnowledgeGraphReconciliationResult(reconciled=False, reason="storage_error")
+
+    def fail_extraction_budget(
+        self,
+        workspace_id: str,
+        document_id: str,
+        document_version: str,
+        worker_id: str,
+        fence_token: int,
+        error_reason: str,
+        prompt_tokens_spent: int = 0,
+        output_tokens_spent: int = 0,
+    ) -> None:
+        worker_id = worker_id.strip() if worker_id else ""
+        pk = f"KG#{workspace_id}#DOC#{document_id}#V#{document_version}"
+        sk = "BUDGET#LEDGER"
+
+        curr = self.get_budget_ledger(workspace_id, document_id, document_version, consistent_read=True)
+        if curr is None or fence_token in curr.reconciled_fences:
+            return
+
+        actual_total = prompt_tokens_spent + output_tokens_spent
+        new_rf = list(curr.reconciled_fences) + [fence_token]
+
+        try:
+            if curr.fence_token == fence_token and curr.lease_owner_id == worker_id:
+                self._table.update_item(
+                    Key={"PK": pk, "SK": sk},
+                    UpdateExpression=(
+                        "SET spent_tokens = if_not_exists(spent_tokens, :zero) + :tot, "
+                        "spent_prompt_tokens = if_not_exists(spent_prompt_tokens, :zero) + :spt, "
+                        "spent_output_tokens = if_not_exists(spent_output_tokens, :zero) + :sot, "
+                        "#rf = :rf, "
+                        "lease_owner_id = :none, "
+                        "lease_expires_at = :zero_dec, "
+                        "updated_at = :now_iso"
+                    ),
+                    ExpressionAttributeNames={"#rf": "reconciled_fences"},
+                    ExpressionAttributeValues={
+                        ":zero": 0,
+                        ":zero_dec": Decimal("0.0"),
+                        ":tot": actual_total,
+                        ":spt": prompt_tokens_spent,
+                        ":sot": output_tokens_spent,
+                        ":rf": new_rf,
+                        ":none": None,
+                        ":now_iso": _now_utc(),
+                    },
+                )
+            else:
+                self._table.update_item(
+                    Key={"PK": pk, "SK": sk},
+                    UpdateExpression=(
+                        "SET spent_tokens = if_not_exists(spent_tokens, :zero) + :tot, "
+                        "spent_prompt_tokens = if_not_exists(spent_prompt_tokens, :zero) + :spt, "
+                        "spent_output_tokens = if_not_exists(spent_output_tokens, :zero) + :sot, "
+                        "#rf = :rf, "
+                        "updated_at = :now_iso"
+                    ),
+                    ExpressionAttributeNames={"#rf": "reconciled_fences"},
+                    ExpressionAttributeValues={
+                        ":zero": 0,
+                        ":tot": actual_total,
+                        ":spt": prompt_tokens_spent,
+                        ":sot": output_tokens_spent,
+                        ":rf": new_rf,
+                        ":now_iso": _now_utc(),
+                    },
+                )
+        except Exception as exc:
+            logger.error("DynamoDB fail_extraction_budget error: %s", exc)
 
 
 _DEFAULT_KG_REPO: KnowledgeGraphRepositoryBase | None = None
