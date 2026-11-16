@@ -30,7 +30,7 @@ FastAPI service providing parsing, structural indexing, retrieval orchestration,
 | `src/services/retrieval/okf_retriever.py` | Authoritative OKF retriever enforcing workspace boundaries and deadlines |
 | `src/schemas/contracts/knowledge_graph.py` | Typed knowledge graph entity, relationship, manifest, ledger, and lookup contracts |
 | `src/db/knowledge_graph_repo.py` | Workspace partitioned knowledge graph storage repository across DynamoDB, SQLite, and memory stores |
-| `src/ingestion/graph_builder.py` | Deterministic CSV relationship extraction and directional grounding validation |
+| `src/ingestion/graph_builder.py` | Deterministic tabular and grounded PDF relationship extraction with directional grounding validation |
 | `src/services/retrieval/knowledge_graph_retriever.py` | Bounded multi hop knowledge graph retriever with concurrency admission and targeted chunk hydration |
 | `src/services/benchmark/` | Benchmark runner, S3 artifact store, and recoverable metric persistence |
 | `scripts/resume_canonical_qdrant_points.py` | Idempotent canonical Qdrant resume with fail closed preflight and model provenance validation |
@@ -60,6 +60,10 @@ uv run pytest tests/test_contracts_and_identity.py
 * Knowledge graph storage isolates staged records under publication prefixes, visible only after atomic manifest publication commit.
 * Dynamic source and workspace tombstones halt graph traversal and chunk hydration immediately fail closed.
 * Targeted chunk hydration uses point lookups by chunk identifier with zero calls to get_all_chunks.
+* Grounded narrative PDF extraction enforces verbatim directional syntax grounding, rejecting reversed voice, sentence negation, disjoint clauses, and co occurrence without directional predicate.
+* Entity identity defaults strictly to document scoped identity; cross document entity joins require verified disambiguation tokens.
+* Ingestion extraction Bedrock Converse dispatch requires authoritative count_tokens pre validation and atomic budget ledger reservations with 15 second worker leases and monotonic fencing, preserving ready publications on failed attempts.
+* TableStore evidence hydration enforces an inner deadline check halting table row hydration immediately on deadline overrun.
 
 ## Gotchas
 * Local development defaults to SQLite or in memory TableStore and LocalStack DynamoDB, while Qdrant runs via local container or cloud.
