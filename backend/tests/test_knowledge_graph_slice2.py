@@ -35,10 +35,13 @@ from src.db.knowledge_graph_repo import (
     FencingConflictError,
     InMemoryKnowledgeGraphRepository,
     SQLiteKnowledgeGraphRepository,
+    disable_client_retries,
 )
 from src.ingestion.graph_builder import (
     KnowledgeGraphBuilder,
     extract_pdf_relationships,
+    get_kg_provider_controller,
+    reset_kg_provider_controller,
     validate_relationship_grounding,
 )
 from src.schemas.contracts.knowledge_graph import (
@@ -311,6 +314,7 @@ def test_extract_pdf_relationships_verified_disambiguation_token_allows_cross_do
         chunks=[chunk],
         model_output_json=output,
         publication_id="pub_1",
+        authoritative_disambiguation={"apple inc": "NASDAQ:AAPL"},
     )
     apple = next(e for e in entities if e.name == "Apple Inc")
     expected_id = compute_entity_id(
@@ -877,6 +881,11 @@ def test_dynamodb_local_budget_ledger_atomic_reservation_and_fencing():
     table_name = "kre_kg_test_slice2_budget"
     # Create test table
     try:
+        client.delete_table(TableName=table_name)
+    except Exception:
+        pass
+
+    try:
         client.create_table(
             TableName=table_name,
             KeySchema=[
@@ -1102,3 +1111,551 @@ def test_sqlite_config_separation():
         with patch.object(settings, "WORKSPACE_SQLITE_PATH", "/tmp/unrelated_workspace.db"):
             repo = SQLiteKnowledgeGraphRepository()
             assert str(repo.db_path) == "/tmp/dedicated_graph.db"
+
+
+# =============================================================================
+# 13. Area 1 & 2: DynamoDB Lease Cleanup Races & Atomic Idempotent Reconciliation
+# =============================================================================
+
+def _get_dynamodb_local_repo(table_name: str = "kre_kg_test_slice2_budget"):
+    import boto3
+    try:
+        client = boto3.client(
+            "dynamodb",
+            endpoint_url="http://localhost:8000",
+            region_name="us-east-1",
+            aws_access_key_id="test",
+            aws_secret_access_key="test",
+        )
+        client.list_tables()
+    except Exception:
+        pytest.skip("DynamoDB Local daemon not reachable on port 8000")
+
+    try:
+        client.delete_table(TableName=table_name)
+    except Exception:
+        pass
+
+    try:
+        client.create_table(
+            TableName=table_name,
+            KeySchema=[
+                {"AttributeName": "PK", "KeyType": "HASH"},
+                {"AttributeName": "SK", "KeyType": "RANGE"},
+            ],
+            AttributeDefinitions=[
+                {"AttributeName": "PK", "AttributeType": "S"},
+                {"AttributeName": "SK", "AttributeType": "S"},
+                {"AttributeName": "GSI1_PK", "AttributeType": "S"},
+                {"AttributeName": "GSI1_SK", "AttributeType": "S"},
+                {"AttributeName": "GSI2_PK", "AttributeType": "S"},
+                {"AttributeName": "GSI2_SK", "AttributeType": "S"},
+            ],
+            GlobalSecondaryIndexes=[
+                {
+                    "IndexName": "gsi1_target_lookup",
+                    "KeySchema": [
+                        {"AttributeName": "GSI1_PK", "KeyType": "HASH"},
+                        {"AttributeName": "GSI1_SK", "KeyType": "RANGE"},
+                    ],
+                    "Projection": {"ProjectionType": "ALL"},
+                },
+                {
+                    "IndexName": "gsi2_doc_version",
+                    "KeySchema": [
+                        {"AttributeName": "GSI2_PK", "KeyType": "HASH"},
+                        {"AttributeName": "GSI2_SK", "KeyType": "RANGE"},
+                    ],
+                    "Projection": {"ProjectionType": "ALL"},
+                },
+            ],
+            BillingMode="PAY_PER_REQUEST",
+        )
+    except client.exceptions.ResourceInUseException:
+        pass
+
+    return DynamoDBKnowledgeGraphRepository(
+        table_name=table_name,
+        endpoint_url="http://localhost:8000",
+    )
+
+
+def test_dynamodb_local_publication_cleanup_never_clears_another_workers_lease():
+    """covers: Area 1 Publication cleanup must never clear another worker's lease when fence token or owner has changed."""
+    dynamodb_local_repo = _get_dynamodb_local_repo("kre_kg_test_slice2_lease_race")
+    ws = "ws_lease_race"
+    doc_id = "doc_race_1"
+    ver = "v1"
+
+    # Worker A acquires initial lease
+    res_a = dynamodb_local_repo.reserve_extraction_budget(
+        workspace_id=ws,
+        document_id=doc_id,
+        document_version=ver,
+        worker_id="worker_a",
+        estimated_prompt_tokens=500,
+        lease_duration_s=1.0,
+    )
+    assert res_a.granted is True
+    assert res_a.fence_token == 1
+
+    # Lease expires on Worker A
+    time.sleep(1.05)
+
+    # Worker B takes over with new fence token
+    res_b = dynamodb_local_repo.reserve_extraction_budget(
+        workspace_id=ws,
+        document_id=doc_id,
+        document_version=ver,
+        worker_id="worker_b",
+        estimated_prompt_tokens=500,
+        lease_duration_s=15.0,
+    )
+    assert res_b.granted is True
+    assert res_b.fence_token == 2
+
+    # Worker A now attempts to commit manifest using its stale fence token 1
+    man_a = KnowledgeGraphManifest(
+        workspace_id=ws,
+        document_id=doc_id,
+        document_version=ver,
+        publication_id="pub_stale_a",
+        status="ready",
+        entity_count=1,
+        relationship_count=1,
+        ingested_at_utc="2026-11-17T00:00:00Z",
+        content_hash="h1",
+    )
+    with pytest.raises(FencingConflictError):
+        dynamodb_local_repo.commit_manifest(
+            workspace_id=ws,
+            manifest=man_a,
+            fence_token=res_a.fence_token,
+            worker_id="worker_a",
+        )
+
+    # Confirm Worker B's lease, owner, and authority remain completely intact
+    ledger = dynamodb_local_repo.get_budget_ledger(ws, doc_id, ver, consistent_read=True)
+    assert ledger.lease_owner_id == "worker_b"
+    assert ledger.fence_token == 2
+    assert ledger.lease_expires_at > time.time()
+
+
+def test_dynamodb_local_failure_cleanup_never_clears_another_workers_lease():
+    """covers: Area 1 Failure cleanup must never clear another worker's lease when fenced out."""
+    dynamodb_local_repo = _get_dynamodb_local_repo("kre_kg_test_slice2_fail_race")
+    ws = "ws_fail_race"
+    doc_id = "doc_fail_1"
+    ver = "v1"
+
+    res_a = dynamodb_local_repo.reserve_extraction_budget(
+        workspace_id=ws,
+        document_id=doc_id,
+        document_version=ver,
+        worker_id="worker_a",
+        estimated_prompt_tokens=500,
+        lease_duration_s=1.0,
+    )
+    assert res_a.granted is True
+
+    # Lease expires
+    time.sleep(1.05)
+
+    # Worker B takes over
+    res_b = dynamodb_local_repo.reserve_extraction_budget(
+        workspace_id=ws,
+        document_id=doc_id,
+        document_version=ver,
+        worker_id="worker_b",
+        estimated_prompt_tokens=500,
+        lease_duration_s=15.0,
+    )
+    assert res_b.granted is True
+    assert res_b.fence_token == 2
+
+    # Worker A fails late and calls fail_extraction_budget
+    dynamodb_local_repo.fail_extraction_budget(
+        workspace_id=ws,
+        document_id=doc_id,
+        document_version=ver,
+        worker_id="worker_a",
+        fence_token=res_a.fence_token,
+        error_reason="late_failure",
+        prompt_tokens_spent=300,
+        output_tokens_spent=50,
+    )
+
+    # Worker B's lease authority must remain completely intact!
+    ledger = dynamodb_local_repo.get_budget_ledger(ws, doc_id, ver, consistent_read=True)
+    assert ledger.lease_owner_id == "worker_b"
+    assert ledger.fence_token == 2
+    assert ledger.lease_expires_at > time.time()
+    # But Worker A's spent tokens and fence marker must be recorded!
+    assert ledger.spent_tokens == 350
+    assert 1 in ledger.reconciled_fences
+
+
+def test_dynamodb_local_atomic_idempotent_reconciliation():
+    """covers: Area 2 Duplicate reconciliation is idempotent and concurrent markers are preserved."""
+    dynamodb_local_repo = _get_dynamodb_local_repo("kre_kg_test_slice2_rec_idem")
+    ws = "ws_rec_idem"
+    doc_id = "doc_rec_1"
+    ver = "v1"
+
+    res = dynamodb_local_repo.reserve_extraction_budget(
+        workspace_id=ws,
+        document_id=doc_id,
+        document_version=ver,
+        worker_id="worker_1",
+        estimated_prompt_tokens=500,
+        lease_duration_s=15.0,
+    )
+    assert res.granted is True
+
+    # First reconciliation
+    r1 = dynamodb_local_repo.reconcile_extraction_budget(
+        workspace_id=ws,
+        document_id=doc_id,
+        document_version=ver,
+        worker_id="worker_1",
+        fence_token=res.fence_token,
+        actual_prompt_tokens=400,
+        actual_output_tokens=100,
+    )
+    assert r1.reconciled is True
+    assert r1.reason == "reconciled"
+
+    # Duplicate reconciliation of the same attempt must be idempotent
+    r2 = dynamodb_local_repo.reconcile_extraction_budget(
+        workspace_id=ws,
+        document_id=doc_id,
+        document_version=ver,
+        worker_id="worker_1",
+        fence_token=res.fence_token,
+        actual_prompt_tokens=400,
+        actual_output_tokens=100,
+    )
+    assert r2.reconciled is True
+    assert r2.reason == "already_reconciled"
+
+    # Verify cumulative spend was not double-counted
+    ledger = dynamodb_local_repo.get_budget_ledger(ws, doc_id, ver, consistent_read=True)
+    assert ledger.spent_tokens == 500
+    assert ledger.reconciled_fences == (1,)
+
+
+# =============================================================================
+# 14. Area 3: Verify PDF Evidence, Provenance, and Identity
+# =============================================================================
+
+def test_extract_pdf_relationships_rejects_empty_or_fabricated_evidence():
+    """covers: Area 3 Require non-empty verbatim evidence present in cited source chunk."""
+    chunk = make_chunk(id="chunk_1", document_id="doc_1", text="Acme Corp acquired Beta Tech in 2024.")
+
+    # 1. Empty verbatim evidence
+    out_empty = json.dumps({
+        "entities": [{"name": "Acme Corp", "entity_type": "organization"}, {"name": "Beta Tech", "entity_type": "organization"}],
+        "relationships": [{
+            "source_entity": "Acme Corp",
+            "predicate": "acquired",
+            "target_entity": "Beta Tech",
+            "chunk_id": "chunk_1",
+            "verbatim_evidence": "",
+        }],
+    })
+    _, rels_empty = extract_pdf_relationships(
+        workspace_id="ws_1",
+        document_id="doc_1",
+        document_version="v1",
+        chunks=[chunk],
+        model_output_json=out_empty,
+        publication_id="pub_1",
+    )
+    assert len(rels_empty) == 0
+
+    # 2. Fabricated verbatim evidence not in chunk text
+    out_fab = json.dumps({
+        "entities": [{"name": "Acme Corp", "entity_type": "organization"}, {"name": "Beta Tech", "entity_type": "organization"}],
+        "relationships": [{
+            "source_entity": "Acme Corp",
+            "predicate": "acquired",
+            "target_entity": "Beta Tech",
+            "chunk_id": "chunk_1",
+            "verbatim_evidence": "Acme Corp completely took over Beta Tech",
+        }],
+    })
+    _, rels_fab = extract_pdf_relationships(
+        workspace_id="ws_1",
+        document_id="doc_1",
+        document_version="v1",
+        chunks=[chunk],
+        model_output_json=out_fab,
+        publication_id="pub_1",
+    )
+    assert len(rels_fab) == 0
+
+
+def test_extract_pdf_relationships_rejects_wrong_source_bindings():
+    """covers: Area 3 Reject chunks whose document/version/workspace bindings conflict with request."""
+    # Chunk with conflicting document_id
+    bad_doc_chunk = make_chunk(id="chunk_1", document_id="doc_WRONG", text="Acme acquired Beta")
+    out = json.dumps({
+        "entities": [{"name": "Acme", "entity_type": "organization"}, {"name": "Beta", "entity_type": "organization"}],
+        "relationships": [{
+            "source_entity": "Acme",
+            "predicate": "acquired",
+            "target_entity": "Beta",
+            "chunk_id": "chunk_1",
+            "verbatim_evidence": "Acme acquired Beta",
+        }],
+    })
+    _, rels = extract_pdf_relationships(
+        workspace_id="ws_1",
+        document_id="doc_1",
+        document_version="v1",
+        chunks=[bad_doc_chunk],
+        model_output_json=out,
+        publication_id="pub_1",
+    )
+    assert len(rels) == 0
+
+
+def test_extract_pdf_relationships_preserves_actual_page_number():
+    """covers: Area 3 Preserves actual page_number metadata from chunk."""
+    chunk = Chunk(
+        id="chunk_page_test",
+        document_id="doc_1",
+        source_format="pdf",
+        text="Acme acquired Beta",
+        element_type="text",
+        page_number=42,
+    )
+    out = json.dumps({
+        "entities": [{"name": "Acme", "entity_type": "organization"}, {"name": "Beta", "entity_type": "organization"}],
+        "relationships": [{
+            "source_entity": "Acme",
+            "predicate": "acquired",
+            "target_entity": "Beta",
+            "chunk_id": "chunk_page_test",
+            "verbatim_evidence": "Acme acquired Beta",
+        }],
+    })
+    _, rels = extract_pdf_relationships(
+        workspace_id="ws_1",
+        document_id="doc_1",
+        document_version="v1",
+        chunks=[chunk],
+        model_output_json=out,
+        publication_id="pub_1",
+    )
+    assert len(rels) == 1
+    assert rels[0].location.page == 42
+
+
+def test_extract_pdf_relationships_rejects_unverified_model_disambiguation_token():
+    """covers: Area 3 Model-supplied disambiguation tokens are never trusted without authoritative verification."""
+    chunk = make_chunk(id="chunk_1", document_id="doc_1", text="Acme Corp acquired Beta Tech")
+    out = json.dumps({
+        "entities": [
+            {"name": "Acme Corp", "entity_type": "organization", "disambiguation_token": "NASDAQ:ACME_FABRICATED"},
+            {"name": "Beta Tech", "entity_type": "organization", "disambiguation_token": None},
+        ],
+        "relationships": [{
+            "source_entity": "Acme Corp",
+            "predicate": "acquired",
+            "target_entity": "Beta Tech",
+            "chunk_id": "chunk_1",
+            "verbatim_evidence": "Acme Corp acquired Beta Tech",
+        }],
+    })
+
+    # Without authoritative verification, model token is stripped
+    entities, _ = extract_pdf_relationships(
+        workspace_id="ws_1",
+        document_id="doc_1",
+        document_version="v1",
+        chunks=[chunk],
+        model_output_json=out,
+        publication_id="pub_1",
+        authoritative_disambiguation=None,
+    )
+    acme = next(e for e in entities if e.name == "Acme Corp")
+    assert acme.disambiguation_token is None
+    expected_doc_scoped_id = compute_entity_id(
+        workspace_id="ws_1",
+        document_id="doc_1",
+        entity_type="organization",
+        name="Acme Corp",
+        disambiguation_token=None,
+    )
+    assert acme.entity_id == expected_doc_scoped_id
+
+
+# =============================================================================
+# 15. Area 4: Reject Unsupported Relationships Within One Sentence
+# =============================================================================
+
+def test_grounding_rejects_unrelated_clauses_in_one_sentence():
+    """covers: Area 4 Reject 'Acme acquired Beta' when text says 'Acme acquired Gamma, while Beta opened an office'."""
+    text1 = "Acme Corp acquired Gamma LLC, while Beta Tech opened a branch office in London."
+    valid1, reason1 = validate_relationship_grounding(
+        chunk_text=text1,
+        source_entity_name="Acme Corp",
+        predicate="acquired",
+        target_entity_name="Beta Tech",
+    )
+    assert valid1 is False
+    assert reason1 == "unrelated_clauses"
+
+    text2 = "Acme Corp acquired Gamma LLC, and Beta Tech opened a branch office."
+    valid2, reason2 = validate_relationship_grounding(
+        chunk_text=text2,
+        source_entity_name="Acme Corp",
+        predicate="acquired",
+        target_entity_name="Beta Tech",
+    )
+    assert valid2 is False
+    assert reason2 == "unrelated_clauses"
+
+
+def test_grounding_rejects_hypothetical_and_reported_claims():
+    """covers: Area 4 Reject hypothetical statements and unverified reported claims."""
+    text_hyp = "Acme Corp might acquire Beta Tech if regulatory approval is granted."
+    v_hyp, r_hyp = validate_relationship_grounding(
+        chunk_text=text_hyp,
+        source_entity_name="Acme Corp",
+        predicate="acquired",
+        target_entity_name="Beta Tech",
+    )
+    assert v_hyp is False
+    assert r_hyp == "hypothetical_or_unsupported_claim"
+
+    text_rep = "Market analysts reported that Acme Corp acquired Beta Tech yesterday."
+    v_rep, r_rep = validate_relationship_grounding(
+        chunk_text=text_rep,
+        source_entity_name="Acme Corp",
+        predicate="acquired",
+        target_entity_name="Beta Tech",
+    )
+    assert v_rep is False
+    assert r_rep == "hypothetical_or_unsupported_claim"
+
+
+# =============================================================================
+# 16. Area 5: Fail Closed on Missing or Invalid Provider Usage
+# =============================================================================
+
+def test_build_pdf_graph_fails_closed_on_invalid_usage():
+    """covers: Area 5 Require authoritative inputTokens and outputTokens; reject missing, boolean, or malformed usage."""
+    repo = InMemoryKnowledgeGraphRepository()
+    builder = KnowledgeGraphBuilder(repository=repo)
+    chunk = make_chunk(id="chunk_1", document_id="doc_u", text="Acme acquired Beta")
+
+    # 1. Missing usage
+    client_missing = MagicMock()
+    client_missing.count_tokens.return_value = {"inputTokens": 100}
+    client_missing.converse.return_value = {
+        "output": {"message": {"content": [{"text": json.dumps({
+            "entities": [{"name": "Acme", "entity_type": "organization"}, {"name": "Beta", "entity_type": "organization"}],
+            "relationships": [{"source_entity": "Acme", "predicate": "acquired", "target_entity": "Beta", "chunk_id": "chunk_1", "verbatim_evidence": "Acme acquired Beta"}],
+        })}]}},
+        # usage omitted!
+    }
+    m1 = builder.build_and_persist_pdf_graph(
+        workspace_id="ws_u",
+        document_id="doc_u",
+        document_version="v1",
+        chunks=[chunk],
+        client=client_missing,
+    )
+    assert m1.status == "failed"
+    assert m1.relationship_count == 0
+
+    # 2. Boolean usage
+    client_bool = MagicMock()
+    client_bool.count_tokens.return_value = {"inputTokens": 100}
+    client_bool.converse.return_value = {
+        "output": {"message": {"content": [{"text": "{}"}]}},
+        "usage": {"inputTokens": True, "outputTokens": False},
+    }
+    m2 = builder.build_and_persist_pdf_graph(
+        workspace_id="ws_u",
+        document_id="doc_u2",
+        document_version="v1",
+        chunks=[chunk],
+        client=client_bool,
+    )
+    assert m2.status == "failed"
+
+    # 3. Negative usage
+    client_neg = MagicMock()
+    client_neg.count_tokens.return_value = {"inputTokens": 100}
+    client_neg.converse.return_value = {
+        "output": {"message": {"content": [{"text": "{}"}]}},
+        "usage": {"inputTokens": -10, "outputTokens": 50},
+    }
+    m3 = builder.build_and_persist_pdf_graph(
+        workspace_id="ws_u",
+        document_id="doc_u3",
+        document_version="v1",
+        chunks=[chunk],
+        client=client_neg,
+    )
+    assert m3.status == "failed"
+
+
+# =============================================================================
+# 17. Area 6: Provider Deadline, Retries Disabled, and Capacity Retention
+# =============================================================================
+
+def test_provider_call_deadline_and_capacity_retention():
+    """covers: Area 6 Call deadline enforcement, caller timeout fail-closed, and capacity recovery."""
+    reset_kg_provider_controller()
+    repo = InMemoryKnowledgeGraphRepository()
+    builder = KnowledgeGraphBuilder(repository=repo)
+    chunk = make_chunk(id="chunk_1", document_id="doc_dl", text="Acme acquired Beta")
+
+    def slow_converse(**kwargs):
+        time.sleep(0.3)
+        return {
+            "output": {"message": {"content": [{"text": "{}"}]}},
+            "usage": {"inputTokens": 100, "outputTokens": 20},
+        }
+
+    client = MagicMock()
+    client.count_tokens.return_value = {"inputTokens": 100}
+    client.converse.side_effect = slow_converse
+
+    t0 = time.perf_counter()
+    manifest = builder.build_and_persist_pdf_graph(
+        workspace_id="ws_dl",
+        document_id="doc_dl",
+        document_version="v1",
+        chunks=[chunk],
+        client=client,
+        call_deadline_s=0.08,  # Caller timeout at 80ms
+    )
+    elapsed = time.perf_counter() - t0
+    assert elapsed < 0.25  # Caller returned promptly on deadline!
+    assert manifest.status == "failed"
+
+    # Check budget ledger recorded failure
+    ledger = repo.get_budget_ledger("ws_dl", "doc_dl", "v1")
+    assert ledger.spent_tokens == 100
+
+    # Wait for the background worker to finish and recover capacity
+    controller = get_kg_provider_controller()
+    time.sleep(0.35)
+    assert controller.active_count == 0
+
+
+def test_disable_client_retries_unregisters_boto3_handlers():
+    """covers: Area 6 Verify disable_client_retries unregisters handlers from client."""
+    mock_events = MagicMock()
+    mock_events._emitter._unique_id_handlers = {"retry-config-bedrock-runtime": MagicMock(), "other-handler": MagicMock()}
+    mock_client = MagicMock()
+    mock_client.meta.events = mock_events
+    mock_client.meta.service_model.service_name = "bedrock-runtime"
+
+    disable_client_retries(mock_client)
+    mock_events.unregister.assert_called()

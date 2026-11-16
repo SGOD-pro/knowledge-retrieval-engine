@@ -65,6 +65,34 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def disable_client_retries(client: Any) -> None:
+    """Explicitly unregister retry handlers from a boto3 client."""
+    try:
+        service_name = getattr(getattr(client, "meta", None), "service_model", None)
+        s_name = service_name.service_name if service_name else None
+        events = getattr(getattr(client, "meta", None), "events", None)
+        if events is None:
+            return
+
+        if s_name:
+            try:
+                events.unregister(f"needs-retry.{s_name}", unique_id=f"retry-config-{s_name}")
+            except Exception:
+                pass
+
+        emitter = getattr(events, "_emitter", None)
+        unique_ids = list(getattr(emitter, "_unique_id_handlers", {}).keys())
+        for uid in unique_ids:
+            if "retry" in uid:
+                event_name = f"needs-retry.{s_name}" if s_name else "needs-retry"
+                try:
+                    events.unregister(event_name, unique_id=uid)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
 def _now_utc() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -1773,6 +1801,9 @@ class DynamoDBKnowledgeGraphRepository:
         else:
             self._dynamodb = get_resource("dynamodb")
         self._table = self._dynamodb.Table(self.table_name)
+        disable_client_retries(self._table.meta.client)
+        if hasattr(self._dynamodb, "meta") and hasattr(self._dynamodb.meta, "client"):
+            disable_client_retries(self._dynamodb.meta.client)
 
     def stage_relationships(
         self,
@@ -1916,12 +1947,13 @@ class DynamoDBKnowledgeGraphRepository:
             if expr_vals:
                 put_dict["ExpressionAttributeValues"] = expr_vals
 
-            check_dict = {
+            update_ledger_dict = {
                 "TableName": table_name,
                 "Key": {
                     "PK": pk,
                     "SK": "BUDGET#LEDGER",
                 },
+                "UpdateExpression": "SET lease_owner_id = :none, lease_expires_at = :zero_dec, updated_at = :now_iso",
                 "ConditionExpression": "attribute_exists(PK) AND #ft = :ft AND #owner = :owner AND #exp >= :now_ts",
                 "ExpressionAttributeNames": {
                     "#ft": "fence_token",
@@ -1932,6 +1964,9 @@ class DynamoDBKnowledgeGraphRepository:
                     ":ft": fence_token,
                     ":owner": worker_id,
                     ":now_ts": now_ts,
+                    ":none": None,
+                    ":zero_dec": Decimal("0.0"),
+                    ":now_iso": _now_utc(),
                 },
             }
 
@@ -1939,17 +1974,9 @@ class DynamoDBKnowledgeGraphRepository:
                 client.transact_write_items(
                     TransactItems=[
                         {"Put": put_dict},
-                        {"ConditionCheck": check_dict},
+                        {"Update": update_ledger_dict},
                     ]
                 )
-                try:
-                    self._table.update_item(
-                        Key={"PK": pk, "SK": "BUDGET#LEDGER"},
-                        UpdateExpression="SET lease_owner_id = :none, lease_expires_at = :zero_dec, updated_at = :now_iso",
-                        ExpressionAttributeValues={":none": None, ":zero_dec": Decimal("0.0"), ":now_iso": _now_utc()},
-                    )
-                except Exception:
-                    pass
             except botocore.exceptions.ClientError as exc:
                 code = exc.response.get("Error", {}).get("Code")
                 if code == "TransactionCanceledException":
@@ -2461,6 +2488,8 @@ class DynamoDBKnowledgeGraphRepository:
         actual_output_tokens: int,
         status: str = "active",
     ) -> KnowledgeGraphReconciliationResult:
+        import botocore.exceptions
+
         worker_id = worker_id.strip() if worker_id else ""
         pk = f"KG#{workspace_id}#DOC#{document_id}#V#{document_version}"
         sk = "BUDGET#LEDGER"
@@ -2471,13 +2500,60 @@ class DynamoDBKnowledgeGraphRepository:
         if fence_token in curr.reconciled_fences:
             return KnowledgeGraphReconciliationResult(reconciled=True, reason="already_reconciled", ledger=curr)
 
-        fenced_out = (curr.fence_token != fence_token) or (curr.lease_owner_id != worker_id)
-
         actual_total = actual_prompt_tokens + actual_output_tokens
-        new_rf = list(curr.reconciled_fences) + [fence_token]
+        fenced_out = (curr.fence_token != fence_token) or (curr.lease_owner_id != worker_id) or (float(curr.lease_expires_at) < time.time())
 
         try:
-            if fenced_out:
+            if not fenced_out:
+                new_status = status if status in ("active", "completed", "exhausted", "failed") else curr.status
+                try:
+                    self._table.update_item(
+                        Key={"PK": pk, "SK": sk},
+                        UpdateExpression=(
+                            "SET spent_tokens = if_not_exists(spent_tokens, :zero) + :tot, "
+                            "spent_prompt_tokens = if_not_exists(spent_prompt_tokens, :zero) + :spt, "
+                            "spent_output_tokens = if_not_exists(spent_output_tokens, :zero) + :sot, "
+                            "completed_calls = if_not_exists(completed_calls, :zero) + :one, "
+                            "#rf = list_append(if_not_exists(#rf, :empty_list), :this_fence), "
+                            "#st = :st, "
+                            "updated_at = :now_iso"
+                        ),
+                        ConditionExpression=(
+                            "attribute_exists(PK) AND fence_token = :exp_fence AND lease_owner_id = :wid "
+                            "AND (attribute_not_exists(#rf) OR NOT contains(#rf, :exp_fence))"
+                        ),
+                        ExpressionAttributeNames={"#rf": "reconciled_fences", "#st": "status"},
+                        ExpressionAttributeValues={
+                            ":zero": 0,
+                            ":tot": actual_total,
+                            ":spt": actual_prompt_tokens,
+                            ":sot": actual_output_tokens,
+                            ":one": 1,
+                            ":empty_list": [],
+                            ":this_fence": [fence_token],
+                            ":st": new_status,
+                            ":exp_fence": fence_token,
+                            ":wid": worker_id,
+                            ":now_iso": _now_utc(),
+                        },
+                    )
+                    updated = self.get_budget_ledger(workspace_id, document_id, document_version, consistent_read=True)
+                    return KnowledgeGraphReconciliationResult(
+                        reconciled=True,
+                        fenced_out=False,
+                        reason="reconciled",
+                        ledger=updated,
+                    )
+                except botocore.exceptions.ClientError as exc:
+                    if exc.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+                        raise
+                    curr2 = self.get_budget_ledger(workspace_id, document_id, document_version, consistent_read=True)
+                    if curr2 and fence_token in curr2.reconciled_fences:
+                        return KnowledgeGraphReconciliationResult(reconciled=True, reason="already_reconciled", ledger=curr2)
+                    fenced_out = True
+
+            # Late or fenced out worker: record spend without altering current lease authority
+            try:
                 self._table.update_item(
                     Key={"PK": pk, "SK": sk},
                     UpdateExpression=(
@@ -2485,9 +2561,10 @@ class DynamoDBKnowledgeGraphRepository:
                         "spent_prompt_tokens = if_not_exists(spent_prompt_tokens, :zero) + :spt, "
                         "spent_output_tokens = if_not_exists(spent_output_tokens, :zero) + :sot, "
                         "completed_calls = if_not_exists(completed_calls, :zero) + :one, "
-                        "#rf = :rf, "
+                        "#rf = list_append(if_not_exists(#rf, :empty_list), :this_fence), "
                         "updated_at = :now_iso"
                     ),
+                    ConditionExpression="attribute_exists(PK) AND (attribute_not_exists(#rf) OR NOT contains(#rf, :exp_fence))",
                     ExpressionAttributeNames={"#rf": "reconciled_fences"},
                     ExpressionAttributeValues={
                         ":zero": 0,
@@ -2495,52 +2572,21 @@ class DynamoDBKnowledgeGraphRepository:
                         ":spt": actual_prompt_tokens,
                         ":sot": actual_output_tokens,
                         ":one": 1,
-                        ":rf": new_rf,
+                        ":empty_list": [],
+                        ":this_fence": [fence_token],
+                        ":exp_fence": fence_token,
                         ":now_iso": _now_utc(),
                     },
-                    ReturnValues="ALL_NEW",
                 )
-                updated = self.get_budget_ledger(workspace_id, document_id, document_version, consistent_read=True)
-                return KnowledgeGraphReconciliationResult(
-                    reconciled=False,
-                    fenced_out=True,
-                    reason="fenced_out",
-                    ledger=updated,
-                )
+            except botocore.exceptions.ClientError as exc:
+                if exc.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+                    raise
 
-            new_status = status if status in ("active", "completed", "exhausted", "failed") else curr.status
-            self._table.update_item(
-                Key={"PK": pk, "SK": sk},
-                UpdateExpression=(
-                    "SET spent_tokens = if_not_exists(spent_tokens, :zero) + :tot, "
-                    "spent_prompt_tokens = if_not_exists(spent_prompt_tokens, :zero) + :spt, "
-                    "spent_output_tokens = if_not_exists(spent_output_tokens, :zero) + :sot, "
-                    "completed_calls = if_not_exists(completed_calls, :zero) + :one, "
-                    "#rf = :rf, "
-                    "#st = :st, "
-                    "updated_at = :now_iso"
-                ),
-                ConditionExpression="fence_token = :exp_fence AND lease_owner_id = :wid",
-                ExpressionAttributeNames={"#rf": "reconciled_fences", "#st": "status"},
-                ExpressionAttributeValues={
-                    ":zero": 0,
-                    ":tot": actual_total,
-                    ":spt": actual_prompt_tokens,
-                    ":sot": actual_output_tokens,
-                    ":one": 1,
-                    ":rf": new_rf,
-                    ":st": new_status,
-                    ":exp_fence": fence_token,
-                    ":wid": worker_id,
-                    ":now_iso": _now_utc(),
-                },
-                ReturnValues="ALL_NEW",
-            )
             updated = self.get_budget_ledger(workspace_id, document_id, document_version, consistent_read=True)
             return KnowledgeGraphReconciliationResult(
-                reconciled=True,
-                fenced_out=False,
-                reason="reconciled",
+                reconciled=False,
+                fenced_out=True,
+                reason="fenced_out",
                 ledger=updated,
             )
         except Exception as exc:
@@ -2558,6 +2604,8 @@ class DynamoDBKnowledgeGraphRepository:
         prompt_tokens_spent: int = 0,
         output_tokens_spent: int = 0,
     ) -> None:
+        import botocore.exceptions
+
         worker_id = worker_id.strip() if worker_id else ""
         pk = f"KG#{workspace_id}#DOC#{document_id}#V#{document_version}"
         sk = "BUDGET#LEDGER"
@@ -2567,53 +2615,75 @@ class DynamoDBKnowledgeGraphRepository:
             return
 
         actual_total = prompt_tokens_spent + output_tokens_spent
-        new_rf = list(curr.reconciled_fences) + [fence_token]
 
         try:
             if curr.fence_token == fence_token and curr.lease_owner_id == worker_id:
+                try:
+                    self._table.update_item(
+                        Key={"PK": pk, "SK": sk},
+                        UpdateExpression=(
+                            "SET spent_tokens = if_not_exists(spent_tokens, :zero) + :tot, "
+                            "spent_prompt_tokens = if_not_exists(spent_prompt_tokens, :zero) + :spt, "
+                            "spent_output_tokens = if_not_exists(spent_output_tokens, :zero) + :sot, "
+                            "#rf = list_append(if_not_exists(#rf, :empty_list), :this_fence), "
+                            "lease_owner_id = :none, "
+                            "lease_expires_at = :zero_dec, "
+                            "updated_at = :now_iso"
+                        ),
+                        ConditionExpression=(
+                            "attribute_exists(PK) AND fence_token = :exp_fence AND lease_owner_id = :wid "
+                            "AND (attribute_not_exists(#rf) OR NOT contains(#rf, :exp_fence))"
+                        ),
+                        ExpressionAttributeNames={"#rf": "reconciled_fences"},
+                        ExpressionAttributeValues={
+                            ":zero": 0,
+                            ":zero_dec": Decimal("0.0"),
+                            ":tot": actual_total,
+                            ":spt": prompt_tokens_spent,
+                            ":sot": output_tokens_spent,
+                            ":empty_list": [],
+                            ":this_fence": [fence_token],
+                            ":none": None,
+                            ":exp_fence": fence_token,
+                            ":wid": worker_id,
+                            ":now_iso": _now_utc(),
+                        },
+                    )
+                    return
+                except botocore.exceptions.ClientError as exc:
+                    if exc.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+                        raise
+                    curr2 = self.get_budget_ledger(workspace_id, document_id, document_version, consistent_read=True)
+                    if curr2 and fence_token in curr2.reconciled_fences:
+                        return
+
+            # Fenced out / late worker: record spend without altering current lease authority
+            try:
                 self._table.update_item(
                     Key={"PK": pk, "SK": sk},
                     UpdateExpression=(
                         "SET spent_tokens = if_not_exists(spent_tokens, :zero) + :tot, "
                         "spent_prompt_tokens = if_not_exists(spent_prompt_tokens, :zero) + :spt, "
                         "spent_output_tokens = if_not_exists(spent_output_tokens, :zero) + :sot, "
-                        "#rf = :rf, "
-                        "lease_owner_id = :none, "
-                        "lease_expires_at = :zero_dec, "
+                        "#rf = list_append(if_not_exists(#rf, :empty_list), :this_fence), "
                         "updated_at = :now_iso"
                     ),
-                    ExpressionAttributeNames={"#rf": "reconciled_fences"},
-                    ExpressionAttributeValues={
-                        ":zero": 0,
-                        ":zero_dec": Decimal("0.0"),
-                        ":tot": actual_total,
-                        ":spt": prompt_tokens_spent,
-                        ":sot": output_tokens_spent,
-                        ":rf": new_rf,
-                        ":none": None,
-                        ":now_iso": _now_utc(),
-                    },
-                )
-            else:
-                self._table.update_item(
-                    Key={"PK": pk, "SK": sk},
-                    UpdateExpression=(
-                        "SET spent_tokens = if_not_exists(spent_tokens, :zero) + :tot, "
-                        "spent_prompt_tokens = if_not_exists(spent_prompt_tokens, :zero) + :spt, "
-                        "spent_output_tokens = if_not_exists(spent_output_tokens, :zero) + :sot, "
-                        "#rf = :rf, "
-                        "updated_at = :now_iso"
-                    ),
+                    ConditionExpression="attribute_exists(PK) AND (attribute_not_exists(#rf) OR NOT contains(#rf, :exp_fence))",
                     ExpressionAttributeNames={"#rf": "reconciled_fences"},
                     ExpressionAttributeValues={
                         ":zero": 0,
                         ":tot": actual_total,
                         ":spt": prompt_tokens_spent,
                         ":sot": output_tokens_spent,
-                        ":rf": new_rf,
+                        ":empty_list": [],
+                        ":this_fence": [fence_token],
+                        ":exp_fence": fence_token,
                         ":now_iso": _now_utc(),
                     },
                 )
+            except botocore.exceptions.ClientError as exc:
+                if exc.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+                    raise
         except Exception as exc:
             logger.error("DynamoDB fail_extraction_budget error: %s", exc)
 

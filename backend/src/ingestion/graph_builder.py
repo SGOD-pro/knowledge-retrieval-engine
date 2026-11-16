@@ -8,12 +8,15 @@ Extracts canonical entity relationships from:
 
 from __future__ import annotations
 
+from collections.abc import Callable
+import concurrent.futures
 from datetime import datetime, timezone
 import hashlib
 import json
 import logging
 import os
 import re
+import threading
 import time
 from typing import Any, Literal, Sequence
 from pydantic import BaseModel, ConfigDict, Field
@@ -32,7 +35,11 @@ try:
         normalize_mention,
     )
     from src.schemas.contracts.location import DocumentLocation, TableLocation
-    from src.db.knowledge_graph_repo import KnowledgeGraphRepositoryBase, get_knowledge_graph_repository
+    from src.db.knowledge_graph_repo import (
+        KnowledgeGraphRepositoryBase,
+        disable_client_retries,
+        get_knowledge_graph_repository,
+    )
 except ImportError:
     from schemas.contracts.knowledge_graph import (
         KnowledgeGraphEntity,
@@ -45,7 +52,11 @@ except ImportError:
         normalize_mention,
     )
     from schemas.contracts.location import DocumentLocation, TableLocation
-    from db.knowledge_graph_repo import KnowledgeGraphRepositoryBase, get_knowledge_graph_repository
+    from db.knowledge_graph_repo import (
+        KnowledgeGraphRepositoryBase,
+        disable_client_retries,
+        get_knowledge_graph_repository,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +94,26 @@ _NEGATION_WORDS = {
     "not", "never", "no", "neither", "nor", "none", "cannot", "without",
     "unlikely", "disproved", "failed", "refused", "denied", "denies",
     "didnt", "didn't", "wasnt", "wasn't", "isnt", "isn't", "hasnt", "hasn't",
+    "wont", "won't", "cant", "can't", "shouldnt", "shouldn't",
+}
+
+_UNSUPPORTED_MODALITY_REGEX = re.compile(
+    r"\b(?:might|could|would|may|if|whether|rumored|rumor|alleged|allegedly|supposedly|purportedly|speculated|hypothetically|hypothetical|considering|proposed|reported\s+that|claimed\s+that|claims\s+that|disputed)\b",
+    re.IGNORECASE,
+)
+
+_CLAUSE_DELIMITER_REGEX = re.compile(
+    r";|,\s*(?:while|whereas|although|though|but|however|yet|meanwhile|despite|when|after|before|since|because|where|and)\b|\b(?:while|whereas|although|though|meanwhile)\b",
+    re.IGNORECASE,
+)
+
+_ALLOWED_ACTIVE_INTERVENING_WORDS = {
+    "the", "a", "an", "its", "their", "both", "all", "several", "each",
+    "with", "in", "to", "into", "for", "of", "on", "from", "over", "by", "as", "at",
+    "subsidiary", "majority", "stake", "shares", "equity", "assets", "firm", "company",
+    "technologies", "corp", "inc", "ltd", "new", "key", "strategic", "global", "local",
+    "primary", "recently", "successfully", "fully", "directly", "indirectly", "partner",
+    "division", "business", "unit", "interest", "entire",
 }
 
 
@@ -103,6 +134,9 @@ def validate_relationship_grounding(
     - Co-occurrence alone without directional syntax connecting them.
     - Reversed relationships (where source and target roles are swapped relative to syntax).
     - Negated relationships (where text explicitly asserts that relationship does not exist).
+    - Hypothetical, conditional, or reported claims.
+    - Entity pairs separated across unrelated clauses within a sentence.
+    - Unsupported syntactic bindings where intervening nouns/clauses decouple predicate and target.
     
     Returns:
         (True, None) if valid, or (False, rejection_reason).
@@ -124,7 +158,6 @@ def validate_relationship_grounding(
     # Search for predicate or stem
     pred_tokens = pred_lower.split()
     primary_pred_word = pred_tokens[0] if pred_tokens else pred_lower
-    # Allow stem match (e.g. "acquire" for "acquired", "partner" for "partnered")
     pred_stem = primary_pred_word
     if primary_pred_word.endswith("ed") and len(primary_pred_word) > 4:
         cand = primary_pred_word[:-2]
@@ -141,7 +174,6 @@ def validate_relationship_grounding(
         return False, f"predicate_not_grounded: '{predicate}' (co-occurrence alone rejected)"
 
     # 2. Sentence-level analysis
-    # Break text into sentences to isolate relational context
     sentences = re.split(r"[.!?\n]+", text_lower)
     matched_sentences = [
         s for s in sentences
@@ -149,47 +181,61 @@ def validate_relationship_grounding(
     ]
 
     if not matched_sentences:
-        # Source, target, and predicate do not co-occur in any single sentence
         return False, "co_occurrence_across_disjoint_sentences"
 
-    # Evaluate directional syntax and negation in matching sentences
     for sentence in matched_sentences:
-        s_matches = [m.start() for m in re.finditer(r"\b" + re.escape(source_lower) + r"\b", sentence)]
-        t_matches = [m.start() for m in re.finditer(r"\b" + re.escape(target_lower) + r"\b", sentence)]
-        if not s_matches or not t_matches:
-            continue
+        tokens = _clean_text_tokens(sentence)
+        if any(w in _NEGATION_WORDS for w in tokens):
+            return False, "negated_relationship"
 
-        p_matches = list(re.finditer(r"\b" + re.escape(pred_stem) + r"\w*\b", sentence))
-        if not p_matches:
-            continue
+        if _UNSUPPORTED_MODALITY_REGEX.search(sentence):
+            return False, "hypothetical_or_unsupported_claim"
 
-        for p_match in p_matches:
-            p_idx = p_match.start()
+        # Split sentence into clauses to prevent cross-clause false relationships
+        clauses = _CLAUSE_DELIMITER_REGEX.split(sentence)
+        matching_clauses = [
+            c for c in clauses
+            if source_lower in c and target_lower in c and (primary_pred_word in c or pred_stem in c)
+        ]
+        if not matching_clauses:
+            return False, "unrelated_clauses"
 
-            # Check for negation words in the sentence
-            tokens = _clean_text_tokens(sentence)
-            if any(w in _NEGATION_WORDS for w in tokens):
-                return False, "negated_relationship"
+        for clause in matching_clauses:
+            s_matches = [m.start() for m in re.finditer(r"\b" + re.escape(source_lower) + r"\b", clause)]
+            t_matches = [m.start() for m in re.finditer(r"\b" + re.escape(target_lower) + r"\b", clause)]
+            if not s_matches or not t_matches:
+                continue
 
-            # Check passive voice: e.g. "<target> was <predicate> by <source>"
-            # e.g. "Beta Tech was acquired by Acme Corp"
-            is_passive = bool(re.search(r"\b(?:was|is|been|were)\s+" + re.escape(pred_stem) + r"\w*\s+by\b", sentence))
+            p_matches = list(re.finditer(r"\b" + re.escape(pred_stem) + r"\w*\b", clause))
+            if not p_matches:
+                continue
+
+            is_passive = bool(re.search(r"\b(?:was|is|been|were)\s+" + re.escape(pred_stem) + r"\w*\s+by\b", clause))
 
             has_reversed = False
-            for s_idx in s_matches:
-                for t_idx in t_matches:
-                    if is_passive:
-                        # In passive voice: Target appears before predicate, Source appears after 'by'
-                        if t_idx < p_idx < s_idx:
-                            return True, None
-                        elif s_idx < p_idx < t_idx:
-                            has_reversed = True
-                    else:
-                        # Active voice: Source should appear before predicate, Target after predicate
-                        if s_idx < p_idx < t_idx:
-                            return True, None
-                        elif t_idx < p_idx < s_idx:
-                            has_reversed = True
+            for p_match in p_matches:
+                p_idx = p_match.start()
+                p_end = p_match.end()
+
+                for s_idx in s_matches:
+                    for t_idx in t_matches:
+                        if is_passive:
+                            # Passive voice: Target was <pred> by Source
+                            if t_idx < p_idx < s_idx:
+                                return True, None
+                            elif s_idx < p_idx < t_idx:
+                                has_reversed = True
+                        else:
+                            # Active voice: Source <pred> Target
+                            if s_idx < p_idx < t_idx:
+                                intervening_span = clause[p_end:t_idx].strip()
+                                inter_tokens = _clean_text_tokens(intervening_span)
+                                if all(tok in _ALLOWED_ACTIVE_INTERVENING_WORDS or tok.isdigit() for tok in inter_tokens) and len(inter_tokens) <= 6:
+                                    return True, None
+                                else:
+                                    return False, "unsupported_syntactic_binding"
+                            elif t_idx < p_idx < s_idx:
+                                has_reversed = True
 
             if has_reversed:
                 return False, "reversed_relationship"
@@ -363,6 +409,143 @@ def extract_tabular_relationships(
     return list(entities_map.values()), relationships
 
 
+class KnowledgeGraphProviderConcurrencyController:
+    """Global concurrency controller for Knowledge Graph Bedrock Converse extraction calls.
+
+    Enforces:
+    - Bounded concurrency across documents (default max 2 concurrent Bedrock calls).
+    - Bounded admission queue with immediate load shedding (default max 4 queued calls).
+    - Capacity retention: when a caller's deadline expires (caller timeout),
+      the underlying worker slot in the semaphore and thread pool is retained until the
+      underlying provider call finishes, preventing caller timeouts from flooding Bedrock.
+    """
+
+    def __init__(
+        self,
+        max_concurrency: int = 2,
+        max_queue: int = 4,
+    ) -> None:
+        self.max_concurrency = max_concurrency
+        self.max_queue = max_queue
+        self._active_workers = 0
+        self._queued_callers = 0
+        self._semaphore = threading.Semaphore(self.max_concurrency)
+        self._lock = threading.Lock()
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.max_concurrency,
+            thread_name_prefix="kg_provider_worker",
+        )
+
+    @property
+    def active_count(self) -> int:
+        with self._lock:
+            return self._active_workers
+
+    @property
+    def queued_count(self) -> int:
+        with self._lock:
+            return self._queued_callers
+
+    def run_provider_call(
+        self,
+        func: Callable[..., Any],
+        *args: Any,
+        timeout_s: float = 10.0,
+        **kwargs: Any,
+    ) -> tuple[Any, str]:
+        """Execute blocking provider call with capacity retention and caller timeout enforcement.
+
+        Returns (result, status) where status is:
+        - "completed": underlying call returned successfully
+        - "caller_timeout": caller deadline expired while waiting for slot or completion
+        - "admission_rejected": queue is saturated
+        - "call_failed": underlying call raised an exception
+        """
+        with self._lock:
+            if self._queued_callers >= self.max_queue:
+                logger.warning(
+                    "kg.provider_admission_rejected queued=%d max=%d",
+                    self._queued_callers,
+                    self.max_queue,
+                )
+                return None, "admission_rejected"
+            self._queued_callers += 1
+
+        t0 = time.perf_counter()
+        acquired = self._semaphore.acquire(timeout=timeout_s)
+        if not acquired:
+            with self._lock:
+                self._queued_callers -= 1
+            logger.warning("kg.provider_timeout stage=queue_admission timeout_s=%.2f", timeout_s)
+            return None, "caller_timeout"
+
+        with self._lock:
+            self._queued_callers -= 1
+            self._active_workers += 1
+
+        elapsed = time.perf_counter() - t0
+        remaining_s = max(0.001, timeout_s - elapsed)
+
+        outcome: dict[str, Any] = {"result": None, "error": None, "status": "running"}
+        call_done = threading.Event()
+
+        def _worker_task() -> None:
+            try:
+                outcome["result"] = func(*args, **kwargs)
+                outcome["status"] = "completed"
+            except Exception as exc:
+                outcome["error"] = exc
+                outcome["status"] = "call_failed"
+            finally:
+                with self._lock:
+                    self._active_workers = max(0, self._active_workers - 1)
+                self._semaphore.release()
+                call_done.set()
+
+        self._executor.submit(_worker_task)
+
+        finished = call_done.wait(timeout=remaining_s)
+        if finished:
+            if outcome["error"] is not None:
+                return outcome["error"], outcome["status"]
+            return outcome["result"], outcome["status"]
+
+        # Caller timeout: capacity in self._semaphore remains retained
+        # until _worker_task actually finishes in the background!
+        logger.warning("kg.provider_timeout stage=call_execution timeout_s=%.2f", timeout_s)
+        return None, "caller_timeout"
+
+
+_KG_PROVIDER_CONTROLLER: KnowledgeGraphProviderConcurrencyController | None = None
+_KG_GLOBAL_LOCK = threading.Lock()
+
+
+def get_kg_provider_controller() -> KnowledgeGraphProviderConcurrencyController:
+    """Return the global shared Knowledge Graph provider concurrency controller."""
+    global _KG_PROVIDER_CONTROLLER
+    with _KG_GLOBAL_LOCK:
+        if _KG_PROVIDER_CONTROLLER is None:
+            max_c = int(getattr(settings, "KG_PROVIDER_MAX_CONCURRENCY", 2))
+            max_q = int(getattr(settings, "KG_PROVIDER_MAX_QUEUE", 4))
+            _KG_PROVIDER_CONTROLLER = KnowledgeGraphProviderConcurrencyController(
+                max_concurrency=max_c,
+                max_queue=max_q,
+            )
+        return _KG_PROVIDER_CONTROLLER
+
+
+def reset_kg_provider_controller() -> None:
+    """Reset the global KG provider concurrency controller for test isolation."""
+    global _KG_PROVIDER_CONTROLLER
+    with _KG_GLOBAL_LOCK:
+        if _KG_PROVIDER_CONTROLLER is not None:
+            try:
+                _KG_PROVIDER_CONTROLLER._executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+            _KG_PROVIDER_CONTROLLER = None
+
+
 class KnowledgeGraphBuilder:
     """Builder service extracting and persisting deterministic Knowledge Graph representations."""
 
@@ -488,6 +671,7 @@ class KnowledgeGraphBuilder:
         max_total_tokens: int = 5600,
         lease_duration_s: float = 15.0,
         call_deadline_s: float = 10.0,
+        authoritative_disambiguation: dict[str, str] | None = None,
     ) -> KnowledgeGraphManifest:
         """Extract canonical entity relationships from PDF text chunks using Bedrock converse and durable budgeting."""
         if not worker_id or not worker_id.strip():
@@ -526,7 +710,15 @@ class KnowledgeGraphBuilder:
         for ch in chunks:
             cid = str(getattr(ch, "id", None) or getattr(ch, "chunk_id", None) or "")
             text = str(getattr(ch, "text", None) or getattr(ch, "content", None) or "")
-            page = int(getattr(ch, "page", None) or (getattr(ch, "metadata", {}) or {}).get("page", 1))
+            page_val = getattr(ch, "page_number", None)
+            if page_val is None:
+                page_val = getattr(ch, "page", None)
+            if page_val is None:
+                page_val = (getattr(ch, "metadata", {}) or {}).get("page", 1)
+            try:
+                page = int(page_val)
+            except (ValueError, TypeError):
+                page = 1
             text_bytes = text.encode("utf-8")
             if len(text_bytes) > 2000:
                 text = text_bytes[:2000].decode("utf-8", errors="ignore")
@@ -543,6 +735,7 @@ class KnowledgeGraphBuilder:
         model_id = getattr(settings, "GRAPH_BEDROCK_MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0")
 
         if client is not None:
+            disable_client_retries(client)
             if not hasattr(client, "count_tokens"):
                 logger.error("Bedrock client missing mandatory count_tokens capability (AC-5)")
                 return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
@@ -585,15 +778,33 @@ class KnowledgeGraphBuilder:
         fence_token = res.fence_token
 
         output_text = ""
-        usage = {"inputTokens": estimated_prompt_tokens, "outputTokens": 0}
+        usage: dict[str, int] = {}
         dispatch_success = False
 
         if client is None:
             output_text = "{}"
+            usage = {"inputTokens": estimated_prompt_tokens, "outputTokens": 0}
             dispatch_success = True
         else:
+            controller = get_kg_provider_controller()
             max_attempts = 2
+            start_time = time.perf_counter()
+
             for attempt in range(max_attempts):
+                rem_deadline = max(0.001, call_deadline_s - (time.perf_counter() - start_time))
+                if rem_deadline <= 0.001 and attempt > 0:
+                    logger.warning("Provider call deadline expired before retry attempt %d", attempt)
+                    self.repository.fail_extraction_budget(
+                        workspace_id=workspace_id,
+                        document_id=document_id,
+                        document_version=document_version,
+                        worker_id=worker_id,
+                        fence_token=fence_token,
+                        error_reason="caller_timeout",
+                        prompt_tokens_spent=estimated_prompt_tokens,
+                    )
+                    return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
+
                 if attempt > 0:
                     retry_res = self.repository.reserve_extraction_budget(
                         workspace_id=workspace_id,
@@ -622,22 +833,43 @@ class KnowledgeGraphBuilder:
                         return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
                     fence_token = retry_res.fence_token
 
-                try:
-                    resp = client.converse(
-                        modelId=model_id,
-                        messages=messages,
-                        system=system,
-                        inferenceConfig={"temperature": 0.0, "maxTokens": max_output_tokens},
+                res_obj, status = controller.run_provider_call(
+                    client.converse,
+                    modelId=model_id,
+                    messages=messages,
+                    system=system,
+                    inferenceConfig={"temperature": 0.0, "maxTokens": max_output_tokens},
+                    timeout_s=rem_deadline,
+                )
+
+                if status == "caller_timeout":
+                    logger.warning("Bedrock converse caller timeout exceeded call_deadline_s=%.2f", call_deadline_s)
+                    self.repository.fail_extraction_budget(
+                        workspace_id=workspace_id,
+                        document_id=document_id,
+                        document_version=document_version,
+                        worker_id=worker_id,
+                        fence_token=fence_token,
+                        error_reason="caller_timeout",
+                        prompt_tokens_spent=estimated_prompt_tokens,
                     )
-                    output_text = resp.get("output", {}).get("message", {}).get("content", [{}])[0].get("text", "")
-                    raw_usage = resp.get("usage", {})
-                    usage = {
-                        "inputTokens": raw_usage.get("inputTokens", estimated_prompt_tokens),
-                        "outputTokens": raw_usage.get("outputTokens", 0),
-                    }
-                    dispatch_success = True
-                    break
-                except Exception as exc:
+                    return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
+
+                if status == "admission_rejected":
+                    logger.warning("Bedrock converse admission rejected due to queue saturation")
+                    self.repository.fail_extraction_budget(
+                        workspace_id=workspace_id,
+                        document_id=document_id,
+                        document_version=document_version,
+                        worker_id=worker_id,
+                        fence_token=fence_token,
+                        error_reason="admission_rejected",
+                        prompt_tokens_spent=0,
+                    )
+                    return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
+
+                if status == "call_failed":
+                    exc = res_obj
                     err_str = str(exc)
                     if ("ThrottlingException" in err_str or "429" in err_str) and attempt < max_attempts - 1:
                         logger.warning("Bedrock throttled, retrying once...")
@@ -656,11 +888,52 @@ class KnowledgeGraphBuilder:
                         )
                         return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
 
+                resp = res_obj
+                raw_usage = resp.get("usage") if isinstance(resp, dict) else None
+                if not isinstance(raw_usage, dict):
+                    logger.error("Bedrock converse response missing or invalid usage dict: %r", raw_usage)
+                    self.repository.fail_extraction_budget(
+                        workspace_id=workspace_id,
+                        document_id=document_id,
+                        document_version=document_version,
+                        worker_id=worker_id,
+                        fence_token=fence_token,
+                        error_reason="missing_provider_usage",
+                        prompt_tokens_spent=estimated_prompt_tokens,
+                    )
+                    return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
+
+                in_tok = raw_usage.get("inputTokens")
+                out_tok = raw_usage.get("outputTokens")
+
+                def _is_valid_token_count(val: Any, min_val: int = 0) -> bool:
+                    if isinstance(val, bool) or not isinstance(val, int):
+                        return False
+                    return min_val <= val <= 100_000
+
+                if not _is_valid_token_count(in_tok, min_val=1) or not _is_valid_token_count(out_tok, min_val=0):
+                    logger.error("Bedrock converse returned invalid usage tokens: inputTokens=%r, outputTokens=%r", in_tok, out_tok)
+                    self.repository.fail_extraction_budget(
+                        workspace_id=workspace_id,
+                        document_id=document_id,
+                        document_version=document_version,
+                        worker_id=worker_id,
+                        fence_token=fence_token,
+                        error_reason="invalid_provider_usage",
+                        prompt_tokens_spent=estimated_prompt_tokens,
+                    )
+                    return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
+
+                output_text = resp.get("output", {}).get("message", {}).get("content", [{}])[0].get("text", "")
+                usage = {"inputTokens": in_tok, "outputTokens": out_tok}
+                dispatch_success = True
+                break
+
         if not dispatch_success:
             return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
 
-        actual_in = usage.get("inputTokens", estimated_prompt_tokens)
-        actual_out = usage.get("outputTokens", 0)
+        actual_in = usage["inputTokens"]
+        actual_out = usage["outputTokens"]
         try:
             rec_res = self.repository.reconcile_extraction_budget(
                 workspace_id=workspace_id,
@@ -687,6 +960,7 @@ class KnowledgeGraphBuilder:
             chunks=chunks,
             model_output_json=output_text,
             publication_id=pub_id,
+            authoritative_disambiguation=authoritative_disambiguation,
         )
 
         if relationships:
@@ -774,6 +1048,7 @@ def extract_pdf_relationships(
     chunks: Sequence[Any],
     model_output_json: str,
     publication_id: str,
+    authoritative_disambiguation: dict[str, str] | None = None,
 ) -> tuple[list[KnowledgeGraphEntity], list[KnowledgeGraphRelationship]]:
     """Strictly parse model output JSON and ground candidate entities and relationships against chunk evidence."""
     try:
@@ -794,10 +1069,39 @@ def extract_pdf_relationships(
     chunks_map: dict[str, tuple[Any, str, int]] = {}
     for ch in chunks:
         cid = str(getattr(ch, "id", None) or getattr(ch, "chunk_id", None) or "")
+        if not cid:
+            continue
+        # Strict provenance: reject chunks whose workspace_id, document_id, or document_version conflicts
+        ch_doc = getattr(ch, "document_id", None)
+        if ch_doc and str(ch_doc) != document_id:
+            logger.warning("Chunk %s rejected: conflicting document_id %s != %s", cid, ch_doc, document_id)
+            continue
+        ch_ws = getattr(ch, "workspace_id", None)
+        if ch_ws and str(ch_ws) != workspace_id:
+            logger.warning("Chunk %s rejected: conflicting workspace_id %s != %s", cid, ch_ws, workspace_id)
+            continue
+        ch_ver = getattr(ch, "document_version", None)
+        if ch_ver and str(ch_ver) != document_version:
+            logger.warning("Chunk %s rejected: conflicting document_version %s != %s", cid, ch_ver, document_version)
+            continue
+
         text = str(getattr(ch, "text", None) or getattr(ch, "content", None) or "")
-        page = int(getattr(ch, "page", None) or (getattr(ch, "metadata", {}) or {}).get("page", 1))
-        if cid:
-            chunks_map[cid] = (ch, text, page)
+        page_val = getattr(ch, "page_number", None)
+        if page_val is None:
+            page_val = getattr(ch, "page", None)
+        if page_val is None:
+            page_val = (getattr(ch, "metadata", {}) or {}).get("page", 1)
+        try:
+            page = int(page_val)
+        except (ValueError, TypeError):
+            page = 1
+        chunks_map[cid] = (ch, text, page)
+
+    auth_map: dict[str, str] = {}
+    if authoritative_disambiguation:
+        for k, v in authoritative_disambiguation.items():
+            if k and v:
+                auth_map[normalize_mention(str(k))] = str(v).strip()
 
     entity_info: dict[str, tuple[str, str | None]] = {}
     if isinstance(raw_entities, list):
@@ -805,12 +1109,16 @@ def extract_pdf_relationships(
             if isinstance(ent, dict):
                 ename = str(ent.get("name", "")).strip()
                 etype = str(ent.get("entity_type", "concept")).strip().lower()
-                disambig = ent.get("disambiguation_token")
-                if disambig:
-                    disambig = str(disambig).strip()
+                disambig_raw = ent.get("disambiguation_token")
+                # Never trust model-supplied disambiguation token without authoritative verification!
+                verified_disambig: str | None = None
                 if ename:
                     norm = normalize_mention(ename)
-                    entity_info[norm] = (etype, disambig)
+                    if disambig_raw and auth_map:
+                        auth_tok = auth_map.get(norm)
+                        if auth_tok and auth_tok == str(disambig_raw).strip():
+                            verified_disambig = auth_tok
+                    entity_info[norm] = (etype, verified_disambig)
 
     extracted_entities: dict[str, KnowledgeGraphEntity] = {}
     extracted_relationships: list[KnowledgeGraphRelationship] = []
@@ -827,14 +1135,22 @@ def extract_pdf_relationships(
         if not src_name or not pred or not tgt_name or not chunk_id:
             continue
 
+        if not verbatim_ev:
+            logger.info("Candidate relationship rejected: empty verbatim_evidence")
+            continue
+
         if chunk_id not in chunks_map:
             logger.info("Candidate relationship cited unknown/unauthorized chunk_id: %s", chunk_id)
             continue
 
         ch_obj, ch_text, ch_page = chunks_map[chunk_id]
 
+        if verbatim_ev not in ch_text:
+            logger.info("Candidate relationship rejected: verbatim_evidence '%s' not present in chunk text", verbatim_ev)
+            continue
+
         is_valid, reason = validate_relationship_grounding(
-            chunk_text=ch_text,
+            chunk_text=verbatim_ev,
             source_entity_name=src_name,
             predicate=pred,
             target_entity_name=tgt_name,
@@ -913,7 +1229,7 @@ def extract_pdf_relationships(
             publication_id=publication_id,
             source_chunk_ids=(chunk_id,),
             location=location,
-            verbatim_evidence=verbatim_ev or ch_text[:300],
+            verbatim_evidence=verbatim_ev,
             relationship_state="unique",
             created_at_utc=_now_utc(),
         )
