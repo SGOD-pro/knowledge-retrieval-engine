@@ -931,7 +931,7 @@ def test_dynamodb_local_budget_ledger_atomic_reservation_and_fencing():
             document_version=ver,
             worker_id="worker_ddb_1",
             estimated_prompt_tokens=400,
-            lease_duration_s=0.1,
+            lease_duration_s=1.0,
         )
         assert res1.granted is True
         assert res1.fence_token == 1
@@ -949,7 +949,7 @@ def test_dynamodb_local_budget_ledger_atomic_reservation_and_fencing():
         assert res2_denied.granted is False
         assert res2_denied.reason == "active_lease_held"
 
-        time.sleep(0.15)  # lease expires
+        time.sleep(1.05)  # lease expires
 
         # 3. Worker 2 takes over
         res2 = repo.reserve_extraction_budget(
