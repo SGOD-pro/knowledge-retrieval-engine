@@ -2865,3 +2865,68 @@ def test_production_pipeline_tablestore_hydration_and_evidence_fusion(monkeypatc
     assert rerank_unavail["top_chunks"][0].id == baseline_chunk.id
 
 
+def test_graph_exception_fallback_storage_failed_preserves_baseline(monkeypatch):
+    """Test that when retriever.expand() raises a storage exception, run_graph
+    catches it without escaping, sets graph_execution_status to 'storage_failed',
+    returns zero graph candidates, and downstream run_reranker preserves baseline retrieval."""
+    from config import settings
+    from schemas.models import Chunk
+    from services.langgraph_pipeline import run_graph, run_reranker
+
+    monkeypatch.setattr(settings, "GRAPH_ENABLED", True)
+    monkeypatch.setattr("providers.reranker_provider._openrouter_reranker", lambda q, docs: [0.99 for _ in docs])
+
+    class StorageException(Exception):
+        pass
+
+    class FaultyRetriever:
+        def expand(self, *args, **kwargs):
+            raise StorageException("Underlying database connection pool exhausted")
+
+    ws_id = "ws_faulty_graph_storage"
+    baseline_chunk = Chunk(
+        id="chunk_baseline_survivor",
+        document_id="doc_survivor",
+        workspace_id=ws_id,
+        text="Baseline narrative document discussing core facts.",
+        source_format="pdf",
+        element_type="paragraph",
+        page_number=1,
+    )
+
+    state = {
+        "workspace_id": ws_id,
+        "query": "What are the core facts?",
+        "kg_retriever": FaultyRetriever(),
+        "stage_timings": {},
+        "candidate_chunks": [baseline_chunk],
+        "bm25_candidates": [baseline_chunk],
+    }
+
+    # 1. Exercise run_graph: ensure no exception escapes
+    graph_out = run_graph(state)
+
+    # 2. Assert fallback telemetry and empty graph candidates
+    assert graph_out["graph_execution_status"] == "storage_failed"
+    assert graph_out["graph_chunks"] == []
+    assert graph_out["graph_results"] == []
+    assert graph_out["graph_candidate_ids"] == []
+    assert graph_out["graph_match_count"] == 0
+    assert graph_out["graph_entity_state"] == "none"
+    assert graph_out["graph_relationship_state"] == "none"
+
+    # 3. Exercise downstream run_reranker: ensure baseline evidence survives intact
+    rerank_state = {**state, **graph_out}
+    rerank_out = run_reranker(rerank_state)
+
+    assert len(rerank_out["top_chunks"]) == 1
+    assert rerank_out["top_chunks"][0].id == baseline_chunk.id
+
+    retained = rerank_out["retained_evidence_items"]
+    assert len(retained) == 1
+    assert retained[0].document_id == "doc_survivor"
+    assert "core facts" in (retained[0].text or "")
+    assert retained[0].strategy != "knowledge_graph"
+
+
+

@@ -780,7 +780,7 @@ def run_graph(state: PipelineState):
     except Exception as e:
         logger.warning("run_graph: retriever.expand failed fail-closed: %s", e)
         lookup_res = KnowledgeGraphLookupResult(
-            execution_status="error",
+            execution_status="storage_failed",
             latency_ms=(time.perf_counter() - t0) * 1000.0,
         )
 

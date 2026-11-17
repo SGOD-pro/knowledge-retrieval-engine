@@ -2,7 +2,7 @@
 _Steps derived from spec 0007 acceptance criteria. /check verify runs these; /test locks the durable ones._
 
 ## Verification Metadata
-* **Tested Commit**: `d7a286b873464d6b801ceaa92ec42cb865d6b41d` (working tree with TableStore pipeline wiring and explicit DynamoDB Local coverage)
+* **Tested Commit**: `a084ed7f83f156e17ee4ffb16e5f1d4112117c3d` (working tree with exception fallback contract repair)
 * **Branch**: `re-factor`
 * **Repository**: `SGOD-pro/knowledge-retrieval-engine`
 * **Execution Date**: 2026-11-18
@@ -26,7 +26,7 @@ Result: **186 passed, 34 skipped in 1038.5s**
 Suite breakdown:
 * `tests/test_knowledge_graph_slice1.py`: 62 passed, 3 skipped in 28.28s
 * `tests/test_knowledge_graph_slice2.py`: 59 passed, 5 skipped in 132.43s
-* `tests/test_knowledge_graph_ablation_slice3.py`: 33 passed, 0 skipped in 16.61s
+* `tests/test_knowledge_graph_ablation_slice3.py`: 34 passed, 0 skipped in 14.01s (includes exception fallback contract regression)
 * `tests/test_okf_slice3_1.py` & `tests/test_table_store.py`: 37 passed, 26 skipped in 670.48s
 
 Complementary Ingestion and Isolation Suites:
@@ -145,6 +145,12 @@ Unavailable Checks and Safe Skips:
 * Explicit DynamoDB Local coverage: parameterized historical stub recovery tests and competing publication CAS race tests across `["memory", "sqlite", "dynamodb"]`, running against live DynamoDB Local with isolated tables and clean teardown.
 * Fixed DynamoDB KnowledgeGraphRepository fence verification in `commit_manifest` to inspect authoritative top level DynamoDB item attributes (`fence_token`, `lease_owner_id`, `lease_expires_at`) instead of stale `data_json`.
 
+### 8. Exception Fallback Contract Enforcement (AC-8, AC-10)
+* Exception fallback contract alignment: In `backend/src/services/langgraph_pipeline.py`, when `retriever.expand()` raises an unexpected storage or operational exception, `run_graph` catches the exception and constructs `KnowledgeGraphLookupResult(execution_status="storage_failed", latency_ms=...)`.
+* Prevented contract violation: Replaced the invalid non specced `"error"` value, preventing a Pydantic `ValidationError` from escaping and interrupting baseline query processing. The contract was not broadened.
+* Preserved fail closed invariants: Returns zero graph candidates, valid failure telemetry, and preserves baseline retrieval intact through downstream `run_reranker`.
+* Regression verified: `test_graph_exception_fallback_storage_failed_preserves_baseline` exercises `run_graph` and `run_reranker` when `expand()` raises a storage exception, proving no exception escapes and baseline evidence is retained.
+
 ## Review Records and Status
 * **Original Slice 2 Review**: `docs/reviews/2026-11-17-re-factor-0007-slice2-acceptance.md` preserved as a historical record (Verdict: Changes requested).
 * **Follow Up Slice 2 Review**: `docs/reviews/2026-11-17-re-factor-0007-slice2-review.md` confirmed as the superseding authoritative review (Verdict: Approve).
@@ -152,7 +158,8 @@ Unavailable Checks and Safe Skips:
 * **Follow Up Slice 3 Review**: `docs/reviews/2026-11-17-re-factor-0007-slice3-followup-review.md` confirmed as the superseding authoritative review (Verdict: Approve, 0 blockers, 0 majors, 0 minors, 0 nits).
 * **Ingestion and Verification Gaps Resolution Review**: `docs/reviews/2026-11-18-re-factor-0007-slice3-ingestion-and-verification-gaps-resolved.md` confirmed as the superseding authoritative review (Verdict: Approve).
 * **Pipeline Wiring and DynamoDB Coverage Resolution Review**: `docs/reviews/2026-11-18-re-factor-0007-slice3-pipeline-wiring-and-dynamodb-coverage-resolved.md` confirmed as the superseding authoritative review (Verdict: Approve).
-* **Wiring and Ingestion Gaps Resolution**: All 0007 Slice 3 production ingestion wiring, TableStore pipeline integration, explicit DynamoDB Local coverage, and verification gaps repaired, covered by 33 ablation and application path tests, and verified locally.
+* **Exception Fallback Contract Resolution Review**: `docs/reviews/2026-11-18-re-factor-0007-slice3-exception-fallback-contract-resolved.md` confirmed as the superseding authoritative review (Verdict: Approve).
+* **Wiring and Ingestion Gaps Resolution**: All 0007 Slice 3 production ingestion wiring, TableStore pipeline integration, explicit DynamoDB Local coverage, exception fallback contract enforcement, and verification gaps repaired, covered by 34 ablation and application path tests, and verified locally.
 * **Current Status**: Slice 1, Slice 2, and Slice 3 are locally verified and approved. Spec 0007 implementation is complete and approved. Spec 0007 remains In Progress until merged.
 
 ## Acceptance Criteria Traceability
