@@ -1,24 +1,158 @@
-# Verify: Knowledge Graph enrichment (spec 0007 Slices 1 and 2, updated 2026-11-16)
+# Verify: Knowledge Graph enrichment (spec 0007 Slices 1 and 2, updated 2026-11-17)
 _Steps derived from spec 0007 acceptance criteria. /check verify runs these; /test locks the durable ones._
 
-## Commands
-- [x] `cd backend && uv run pytest tests/test_knowledge_graph_slice1.py` (65 passed: typed contracts, conservative entity identity, publication isolated graph storage, deterministic CSV relationships from verified directional schema, deeply immutable request local document bindings, bounded traversal, targeted chunk hydration with grounded TableStore row and cell locators, dynamic source and workspace tombstone enforcement, deadline and concurrency retention, separate connection SQLite publication race and pause atomicity, DynamoDB local atomic authority fencing validation and rejection, chunk specific version provenance with fail closed rejection of unversioned chunks, fail closed missing table row and cell evidence without edge text substitution, bounded targeted table reads without full table scans, safe fallback disabling when targeted interfaces are absent, absent requested version returning None without legacy substitution across Memory, SQLite, and DynamoDB Local, incomplete manifest and schema identity failing closed, correct document with wrong table or version failing closed, builder to retriever output containing no falsely versioned evidence, candidate entity mention lookup resolving entities past 30 alphabetical items, test environment factory isolation, and word boundary grounding validation) -> AC-1, AC-2, AC-4, AC-6, AC-7, AC-8, AC-9, AC-10, AC-13
-- [x] `cd backend && uv run pytest tests/test_knowledge_graph_slice2.py` (64 passed: grounding counterexamples covering reversed active and passive voice, negation assertions, unrelated clauses in a single sentence, hypothetical and reported claims, and co occurrence alone; strict output parsing failing closed on malformed JSON and unauthorized chunk IDs; default document scoped entity identity and verified disambiguation token cross document joins with unverified model tokens rejected; chunk provenance and actual page number validation; mandatory count_tokens validation failing closed on missing capability, non positive tokens, exceptions, and per call ceiling overruns; fail closed handling on invalid or missing provider usage; concurrent budget reservations and 15 second lease takeover; atomic publication and lease release preventing lease clearance of other workers; atomic idempotent reconciliation preventing double spend and preserving concurrent markers; late worker fencing with token reconciliation into cumulative totals without clearing newer worker leases; uncertain socket read timeout recovery via strongly consistent reads; restart crash recovery preserving spent budget and call counts; throttling retry accounting against 2 call ceiling and zero retries on non throttling errors; provider deadline bounds and capacity retention with hidden client retries disabled; reconciliation failure failing closed; ready publication preservation across failed new attempts; atomic storage behavior across independent SQLite connections and live DynamoDB Local with conditional transactions; TableStore row evidence hydration loop inner deadline overrun check; clean SQLite configuration separation; comprehensive regressions for all four correctness gaps covering chunk provenance validation with real parse_file chunks, grounding context preservation against conditional, negated, or hypothetical context stripping, actor to predicate syntactic binding rejecting intervening actors and reported speech, and per call and cumulative token limit enforcement across SQLite and DynamoDB Local; and additional regressions resolving review findings for boundary aware sentence splitting preserving corporate abbreviations and financial decimals, calendar month May distinction from modal auxiliary may, descriptive business nouns and temporal qualifiers between entities and predicates, modal passive voice with auxiliary be, page number zero clamping on DocumentLocation, and fail closed budget ledger release on storage staging failures) -> AC-1, AC-2, AC-3, AC-4, AC-5
-- [x] `cd backend && uv run python ../verify_0007_live.py` (18 passed live over HTTP: live workspace creation, CSV document ingestion with provenance, DocumentSnapshot graph metadata exposure, deterministic schema extraction from foreign keys, verbatim directional grounding validation rejecting reversed, negated, and co occurrence claims, pre commit staging isolation, atomic visibility commit in SQLite WAL store, deeply immutable PinnedSnapshotContext document bindings, bounded 2 hop multi hop traversal with cycle suppression, targeted chunk hydration via get_chunks_by_ids with zero get_all_chunks calls and real CSV chunk provenance, dynamic source tombstone fail closed halting, workspace tombstone fail closed rejection, GraphConcurrencyController admission bounds and capacity retention, cross workspace HTTP 404 boundary denial, cross tenant entity and traversal isolation, absence of un specced administrative graph endpoints, non destructive legacy storage routing excluding unpartitioned tables, and benchmark comparator precondition barrier) -> AC-1, AC-2, AC-4, AC-6, AC-7, AC-8, AC-9, AC-10, AC-11, AC-12, AC-13
-- [x] `python verify_0004_live.py` (17 passed live over HTTP: regression safety confirming CSV and PDF ingestion, deterministic 250 row aggregation, boundary isolation, DocumentLocation citations, verified source facts, and tombstoning remain fully operational) -> AC-1, AC-2, AC-3, AC-4, AC-5, AC-6, AC-7, AC-8, AC-11
-- [x] `python verify_0006_live.py` (15 passed live over HTTP: regression safety confirming OKF workspace boundary, CSV curated schema extraction, DocumentSnapshot metadata, OkfRetriever table assertions, PDF ingestion, cross workspace 404 denial, source tombstone enforcement, and 50ms deadlines) -> AC-1, AC-3, AC-6, AC-7, AC-8, AC-10, AC-11, AC-12
+## Verification Metadata
+* **Tested Commit**: `6d8bebad7e41cf0ca16cf02563a436740b5218df`
+* **Branch**: `re-factor`
+* **Repository**: `SGOD-pro/knowledge-retrieval-engine`
+* **Execution Date**: 2026-11-17
+* **Environment**: Linux x86_64, Python 3.12 via uv (host Python 3.14.7), SQLite 3 with WAL journal mode, DynamoDB Local (port 8000), local FastAPI and Uvicorn server (port 8001)
+* **Provider Modes**: Mocked Bedrock runtime client fixtures for CountTokens and Converse, mocked OpenRouter reranker. Zero paid provider calls made. All local mocks are documented as local test doubles and not mischaracterized as live AWS cloud verification.
+* **Status**: Slice 1 and Slice 2 fully verified and approved. Slice 3 pending. Spec 0007 In Progress. Spec 0003 deferred. GRAPH_ENABLED=false preserved.
 
-## Acceptance criteria coverage
-- AC-1: Ingestion extracts and persists typed KnowledgeGraphEntity and KnowledgeGraphRelationship records per document version for structured tabular documents and unstructured narrative PDFs. Entities are document scoped by default; cross document joins require verified disambiguation tokens. For CSV tables, relationships are derived strictly from explicit primary and foreign keys or verified schema relationships with zero model tokens.
-- AC-2: Extracted relationships are validated against active chunks and verified table structures before persistence. Grounding validation rejects reversed active or passive voice, negated claims, unrelated clauses across disjoint sentences, and unstructured co occurrence claims alone.
-- AC-3: Provider token budgets, Bedrock call limits (maximum 2 calls, 2000 prompt tokens and 800 output tokens per call), and provider deadline bounds. Retries are capped at at most 1 retry on throttling (HTTP 429), counting against the 2 call ceiling. Replaying an existing version reuses persisted relationships with zero additional model calls. Baseline publication completes independently per ADR-001.
-- AC-4: Durable budget ledger contracts and publication staging isolation (PUB#{pub_id}) with atomic visibility commits across InMemory, SQLite WAL, and DynamoDB schemas. Monotonic fence tokens and 15 second leases prevent stale worker writes. Reconciles usage before publication. Preserves ready publications during failed new attempts.
-- AC-5: Mandatory Bedrock CountTokens validation and request token bounding. Fails closed with zero converse dispatches on missing capability, non positive counts, exceptions, or ceiling overruns.
-- AC-6: Storage and lookups are partitioned strictly by workspace_id. Graph edges are stored in kre_knowledge_graph using indexed partition keys and compound sort keys embedding version and publication identities. GSI1 reverse target lookup, GSI2 version lookup, and MENTION lookup index with delimiter escaping are maintained. Traversal bounds visited nodes to 25 and pagination to at most 3 pages with zero unconstrained table scans.
-- AC-7: Active deletion tombstones in WorkspaceBoundaryRepository filter out relationships belonging to deleted source documents and workspaces immediately inside traversal worker tasks fail closed.
-- AC-8: Graph lookups enforce caller deadlines and bounded concurrency admission via GraphConcurrencyController (maximum 4 workers, maximum 8 queued submissions), retaining capacity until underlying storage finishes.
-- AC-9: Bounded multi hop traversal bounds expansion depth to 2 hops with cycle detection and deterministic frontier sorting. Hydration is capped at 15 chunks via targeted batch reads in DocumentsRepository.get_chunks_by_ids, completely eliminating calls to get_all_chunks.
-- AC-10: PinnedSnapshotContext captures deeply immutable request local document bindings with tuple based active documents. Dynamic tombstones remain authoritative throughout traversal. (Candidate reciprocal rank fusion pooling deferred to Slice 3).
-- AC-11: Non destructive legacy cutover: scoped retrieval queries exclusively through workspace partitioned storage, leaving legacy unpartitioned tables untouched and excluded by construction. Administrative routes deferred to minimize attack surface.
-- AC-12: DocumentSnapshot exposes graph_status, graph_entities_count, and graph_relations_count without dedicated administrative HTTP endpoints.
-- AC-13: Offline ablation comparison suite, counterexample safety, and explicit verification gates. Benchmark comparison barrier blocks accuracy claims on non canonical workspaces.
+## Exact Test Commands and Results
+
+### 1. Combined Regression Suites
+Command:
+```bash
+cd backend && uv run pytest \
+  tests/test_knowledge_graph_slice1.py \
+  tests/test_knowledge_graph_slice2.py \
+  tests/test_okf_slice3_1.py \
+  tests/test_table_store.py -q
+```
+Result: **192 passed in 19.37s**
+Suite breakdown:
+* `tests/test_knowledge_graph_slice1.py`: 65 passed
+* `tests/test_knowledge_graph_slice2.py`: 64 passed
+* `tests/test_okf_slice3_1.py`: 21 passed
+* `tests/test_table_store.py`: 42 passed
+
+### 2. Local HTTP Live Verification Suites
+Command 1:
+```bash
+cd backend && uv run python ../verify_0007_live.py
+```
+Result: **18 passed out of 18 (18/18)**
+* Live workspace creation over HTTP (Alice workspace ws_2f1ab8e9022b) -> 201
+* Real CSV document ingestion with provenance -> 201
+* DocumentSnapshot graph metadata exposure -> 200
+* Deterministic tabular relationship extraction from foreign keys -> 200 (4 entities, 2 relationships)
+* Directional grounding validation rejecting reversed, negated, and co occurrence claims -> 200
+* Pre commit staging isolation in SQLite WAL store -> 200
+* Atomic visibility commit and publication manifest persistence -> 200
+* Deeply immutable PinnedSnapshotContext document bindings -> 200
+* Bounded 2 hop multi hop traversal with cycle suppression and 25 node ceiling -> 200
+* Targeted chunk hydration calling get_chunks_by_ids with zero get_all_chunks calls -> 200
+* Source tombstone fail closed halting during traversal and hydration -> 200
+* Workspace tombstone fail closed rejection returning zero candidates -> 200
+* GraphConcurrencyController admission bounds and capacity retention -> 200
+* Multi tenant boundary isolation denying cross workspace query with HTTP 404 (0 tenant leakage) -> 404
+* KnowledgeGraphRetriever cross tenant traversal returning zero candidates -> 200
+* Absence of un specced administrative endpoints -> 404
+* Partitioned storage routing exclusively via KG#{workspace_id} partition keys -> 200
+* Benchmark comparator barrier blocking accuracy claims on non canonical workspaces -> 200
+
+Command 2:
+```bash
+cd backend && uv run python ../verify_0004_live.py
+```
+Result: **17 passed out of 17 (17/17)**
+* Workspace creation and boundary isolation -> 201
+* Real CSV ingestion via API endpoint -> 201
+* Deterministic aggregate query with cited result -> 200
+* Large CSV ingestion (250 rows) beyond 99 row batch size -> 201
+* Aggregate across 250 rows proving no truncation -> 200
+* Malformed CSV ingestion recording exclusions -> 201
+* Incomplete coverage blocking aggregate with HTTP 422 -> 422
+* Cross workspace query and upload access denial -> 404
+* Insufficient evidence returning HTTP 200 refusal with 0 citations -> 200
+* Source tombstoning blocking subsequent queries with HTTP 422 -> 422
+* Real text PDF ingestion via API endpoint -> 201
+* Text PDF query with DocumentLocation citation -> 200
+* PDF insufficient evidence returning HTTP 200 refusal -> 200
+* PDF source tombstoning blocking citations -> 200
+
+Command 3:
+```bash
+cd backend && uv run python ../verify_0006_live.py
+```
+Result: **15 passed out of 15 (15/15)**
+* Workspace creation and boundary authorization -> 201
+* Real CSV table ingestion with curated schema extraction -> 201
+* DocumentSnapshot recording okf_status ready and extracted column count -> 200
+* OkfRetriever retrieving curated table schema assertions without model tokens -> 200
+* Real PDF ingestion with OKF extraction enrichment pass -> 201
+* PDF DocumentSnapshot recording valid okf_status without blocking baseline ingestion -> 200
+* Cross workspace query denial with HTTP 404 (0 tenant leakage) -> 404
+* OkfRetriever cross tenant lookup returning zero entity matches -> 200
+* Source tombstone in workspace boundary repository -> 200
+* Tombstoned source assertions immediately filtered out inside worker tasks -> 200
+* OkfRetriever 50ms client deadline and concurrency capacity retention -> 200
+* Scoped retrieval queries routing exclusively via WORKSPACE#{ws_id} partition keys -> 200
+* Administrative endpoints deferred to minimize attack surface -> 404
+* Benchmark comparator barrier blocking accuracy claims on non canonical workspaces -> 200
+* Live QueryResponse exposing OKF candidate telemetry trace and fusion attributes -> 200
+
+## Detailed Slice 2 Coverage Confirmation
+
+### 1. Exact Chunk Workspace, Document, and Version Provenance
+* Inspected chunk and parse_service source identity persistence across attributes and metadata dictionaries.
+* Document version is validated from authoritative metadata, checking metadata["version"], metadata["document_version"], and chunk attributes.
+* Conflicting identity fields and unverifiable version bindings fail closed before model dispatch.
+* Old or unversioned chunks are never relabeled as the requested version.
+* Full workspace and document boundary isolation is enforced using actual source bindings.
+* Regressions in test_knowledge_graph_slice2.py cover stale metadata versions, conflicting fields, missing bindings, valid exact version chunks, and real Chunk objects produced through parse_file.
+
+### 2. Source Context Preservation During Grounding
+* Verbatim substring presence alone is rejected as insufficient.
+* Candidate evidence is located within its surrounding source sentence or clause.
+* Grounding validator rejects evidence that removes conditional, negated, hypothetical, reported speech, or disputed context.
+* Counterexample verified: For source text "If Acme acquired Beta, costs would rise", claimed evidence "Acme acquired Beta" is rejected, resulting in zero accepted relationships.
+* Repeated evidence strings across different contexts are disambiguated, and exact accepted evidence text and location are retained.
+
+### 3. Syntactic Binding of Actor to Predicate
+* The subject is never inferred solely from entity ordering or co occurrence.
+* Counterexample verified: For source text "Acme said Gamma acquired Beta", claimed edge "Acme -> acquired -> Beta" is rejected.
+* Nested clauses, reported speech, multiple actors, and mixed active and passive constructions are tested.
+* Conservative supported syntax rules reject uncertain attachments while preserving valid direct active and passive relationships.
+* Boundary aware sentence splitting preserves corporate abbreviations like Inc., Corp., and Ltd., and numeric decimals like 51.5% and $3.5M.
+* Disambiguates calendar month May from modal auxiliary may, expands allowable intervening business role nouns and temporal adverbs, and supports modal passive voice with auxiliary be.
+
+### 4. Mandatory Token Bounds and Durable Budget Accounting
+* Enforces configured per call limits (maximum 2000 prompt tokens, maximum 800 output tokens) and cumulative document ceilings (4000 prompt tokens, 1600 output tokens, 5600 total tokens).
+* Rejects outputTokens=801 when maxTokens=800.
+* Rejects input usage exceeding reserved allowances or configured caps.
+* Validates aggregate document limits across attempts and retries.
+* On overrun, retains known actual spend durably on BUDGET#LEDGER, blocks publication, and prevents further calls exceeding budget.
+* Fails closed with zero model calls on missing CountTokens capability, non positive token counts, or exceptions.
+* Enforces 15 second worker leases with monotonic fence tokens, safe lease takeover, crash recovery fail closed semantics, and ready publication preservation across failed new attempts.
+* Storage staging errors trigger conditional lease release across InMemory, SQLite WAL, and DynamoDB Local stores.
+
+## Review Records and Status
+* **Original Review**: `docs/reviews/2026-11-17-re-factor-0007-slice2-acceptance.md` preserved as a historical record (Verdict: Changes requested, identifying 3 Major and 4 Minor findings in sentence splitting, calendar modalities, intervening token allowlists, and passive auxiliaries).
+* **Follow Up Review**: `docs/reviews/2026-11-17-re-factor-0007-slice2-review.md` confirmed as the superseding authoritative review (Verdict: Approve, 0 blockers, 0 majors, 0 minors, 0 nits).
+* **Current Status**: Slice 2 is locally verified and reviewed. Spec 0007 remains In Progress.
+
+## Acceptance Criteria Traceability
+* **AC-1**: Grounded Narrative PDF Extraction and tabular extraction.
+* **AC-2**: Verbatim directional syntax and context preservation grounding.
+* **AC-3**: Token budget accounting, Bedrock call limits, and retry bounds.
+* **AC-4**: Durable budget ledger, publication staging isolation, and atomic commit.
+* **AC-5**: Mandatory Bedrock CountTokens validation and request bounding.
+* **AC-6**: Workspace partitioned storage and bounded retrieval.
+* **AC-7**: Dynamic source and workspace tombstone enforcement fail closed.
+* **AC-8**: GraphConcurrencyController deadlines and capacity retention.
+* **AC-9**: Bounded multi hop traversal and targeted chunk hydration.
+* **AC-10**: Deeply immutable PinnedSnapshotContext request local bindings. (Candidate reciprocal rank fusion pooling deferred to Slice 3).
+* **AC-11**: Non destructive legacy cutover and partitioned storage routing.
+* **AC-12**: DocumentSnapshot graph metadata attributes.
+* **AC-13**: Benchmark comparison barrier blocking unverified claims.
+
+## Remaining Limitations and Invariants
+* Spec 0007 remains In Progress.
+* Slice 3 (Pipeline reciprocal rank fusion, snapshot metadata wiring, candidate telemetry trace, and offline ablation) remains pending and was not implemented during this task.
+* Spec 0003 remains proposed and deferred.
+* `GRAPH_ENABLED=false` remains preserved.
+* Zero paid provider calls made, zero benchmarks run, canonical corpus and historical benchmark workspaces preserved untouched.
+* Storage conditions exercised across DynamoDB Local and independent SQLite WAL connections; live AWS Bedrock and DynamoDB cloud services remain unverified in local development.
