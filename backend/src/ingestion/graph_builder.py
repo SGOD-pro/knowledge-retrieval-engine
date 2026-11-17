@@ -98,7 +98,10 @@ _NEGATION_WORDS = {
 }
 
 _UNSUPPORTED_MODALITY_REGEX = re.compile(
-    r"\b(?:might|could|would|may|if|whether|rumored|rumor|alleged|allegedly|supposedly|purportedly|speculated|hypothetically|hypothetical|considering|proposed|reported\s+that|claimed\s+that|claims\s+that|disputed)\b",
+    r"\b(?:might|could|would|may|if|whether|rumored|rumor|alleged|allegedly|supposedly|purportedly|"
+    r"speculated|speculation|hypothetically|hypothetical|assuming|suppose|supposing|considering|"
+    r"proposed|reported\s+that|claimed\s+that|claims\s+that|said\s+that|stated\s+that|"
+    r"disputed|unconfirmed|said|says|stated|states|claimed|claims|reported|reports|believed|believes)\b",
     re.IGNORECASE,
 )
 
@@ -106,6 +109,16 @@ _CLAUSE_DELIMITER_REGEX = re.compile(
     r";|,\s*(?:while|whereas|although|though|but|however|yet|meanwhile|despite|when|after|before|since|because|where|and)\b|\b(?:while|whereas|although|though|meanwhile)\b",
     re.IGNORECASE,
 )
+
+_ALLOWED_PRE_PREDICATE_WORDS = {
+    "has", "had", "have", "having", "is", "was", "were", "are", "been", "being",
+    "will", "would", "shall", "should", "can", "could", "may", "might", "must",
+    "did", "does", "do",
+    "recently", "officially", "formally", "successfully", "directly", "indirectly",
+    "mutually", "jointly", "also", "already", "now", "then", "soon", "currently",
+    "previously", "ultimately", "finally", "subsequently", "unanimously", "proudly",
+    "further", "actively", "to",
+}
 
 _ALLOWED_ACTIVE_INTERVENING_WORDS = {
     "the", "a", "an", "its", "their", "both", "all", "several", "each",
@@ -116,9 +129,121 @@ _ALLOWED_ACTIVE_INTERVENING_WORDS = {
     "division", "business", "unit", "interest", "entire",
 }
 
+_ALLOWED_PASSIVE_AUXILIARIES = {
+    "was", "were", "is", "are", "been", "being", "has", "have", "had",
+    "will", "would", "shall", "should", "can", "could", "may", "might", "must",
+    "recently", "officially", "formally", "successfully", "directly", "indirectly",
+    "jointly", "also", "already", "now", "then", "soon", "currently", "previously",
+    "ultimately", "finally", "subsequently", "unanimously", "proudly", "to",
+}
+
+_ALLOWED_PASSIVE_BY_WORDS = {
+    "by", "the", "its", "their", "a", "an", "new", "strategic", "global",
+    "local", "subsidiary", "firm", "company", "division", "partner", "wholly",
+    "owned", "directly", "indirectly", "jointly", "majority", "stake",
+}
+
 
 def _clean_text_tokens(text: str) -> list[str]:
     return [t.lower() for t in re.findall(r"\b\w+\b", text)]
+
+
+def _find_enclosing_sentence(text: str, start_idx: int, end_idx: int) -> str:
+    """Locate the enclosing sentence surrounding a verbatim evidence span in source text."""
+    prev_text = text[:start_idx]
+    last_term = -1
+    for m in re.finditer(r"[.!?\n]", prev_text):
+        last_term = m.end()
+    sent_start = last_term if last_term != -1 else 0
+
+    after_text = text[end_idx:]
+    term_match = re.search(r"[.!?\n]", after_text)
+    if term_match:
+        sent_end = end_idx + term_match.end()
+    else:
+        sent_end = len(text)
+
+    return text[sent_start:sent_end].strip()
+
+
+def validate_chunk_provenance(
+    chunk: Any,
+    workspace_id: str,
+    document_id: str,
+    document_version: str,
+) -> tuple[bool, str | None]:
+    """Validate that chunk has exact, authoritative, and non-conflicting source provenance.
+
+    Rejects:
+    - Missing chunk ID or unversioned chunks.
+    - Conflicting document_id, workspace_id, or version fields across chunk attributes and metadata.
+    - Stale metadata versions not matching the requested document_version.
+    - Workspace or document boundaries not matching the request.
+    """
+    cid = str(getattr(chunk, "id", None) or getattr(chunk, "chunk_id", None) or "").strip()
+    if not cid:
+        return False, "missing_chunk_id"
+
+    meta = getattr(chunk, "metadata", None)
+    if not isinstance(meta, dict):
+        meta = {}
+
+    # 1. Document ID validation
+    ch_doc = getattr(chunk, "document_id", None)
+    ch_doc_str = str(ch_doc).strip() if (ch_doc is not None and str(ch_doc).strip()) else None
+    meta_doc = meta.get("document_id")
+    meta_doc_str = str(meta_doc).strip() if (meta_doc is not None and str(meta_doc).strip()) else None
+
+    if ch_doc_str and meta_doc_str and ch_doc_str != meta_doc_str:
+        return False, f"conflicting_document_id: attribute '{ch_doc_str}' != metadata '{meta_doc_str}'"
+
+    resolved_doc = ch_doc_str or meta_doc_str
+    if not resolved_doc:
+        return False, "missing_document_id"
+    if resolved_doc != document_id.strip():
+        return False, f"mismatched_document_id: resolved '{resolved_doc}' != expected '{document_id}'"
+
+    # 2. Workspace ID validation
+    ch_ws = getattr(chunk, "workspace_id", None)
+    ch_ws_str = str(ch_ws).strip() if (ch_ws is not None and str(ch_ws).strip()) else None
+    meta_ws = meta.get("workspace_id")
+    meta_ws_str = str(meta_ws).strip() if (meta_ws is not None and str(meta_ws).strip()) else None
+
+    if ch_ws_str and meta_ws_str and ch_ws_str != meta_ws_str:
+        return False, f"conflicting_workspace_id: attribute '{ch_ws_str}' != metadata '{meta_ws_str}'"
+
+    resolved_ws = ch_ws_str or meta_ws_str
+    if not resolved_ws:
+        return False, "missing_workspace_id"
+    if resolved_ws != workspace_id.strip():
+        return False, f"mismatched_workspace_id: resolved '{resolved_ws}' != expected '{workspace_id}'"
+
+    # 3. Document Version validation
+    ch_ver = getattr(chunk, "document_version", None)
+    ch_ver_str = str(ch_ver).strip() if (ch_ver is not None and str(ch_ver).strip()) else None
+    meta_ver = meta.get("document_version")
+    meta_ver_str = str(meta_ver).strip() if (meta_ver is not None and str(meta_ver).strip()) else None
+    meta_v = meta.get("version")
+    meta_v_str = str(meta_v).strip() if (meta_v is not None and str(meta_v).strip()) else None
+
+    # Check for conflicts between metadata version and metadata document_version
+    if meta_ver_str and meta_v_str and meta_ver_str != meta_v_str:
+        return False, f"conflicting_metadata_versions: document_version '{meta_ver_str}' != version '{meta_v_str}'"
+
+    # Check for conflicts between attribute and metadata
+    if ch_ver_str and meta_ver_str and ch_ver_str != meta_ver_str:
+        return False, f"conflicting_version_bindings: attribute '{ch_ver_str}' != metadata document_version '{meta_ver_str}'"
+    if ch_ver_str and meta_v_str and ch_ver_str != meta_v_str:
+        return False, f"conflicting_version_bindings: attribute '{ch_ver_str}' != metadata version '{meta_v_str}'"
+
+    resolved_ver = ch_ver_str or meta_ver_str or meta_v_str
+    if not resolved_ver:
+        return False, "unverifiable_version_binding: chunk has no document_version or version metadata"
+
+    if resolved_ver != document_version.strip():
+        return False, f"stale_document_version: resolved '{resolved_ver}' != expected '{document_version}'"
+
+    return True, None
 
 
 def validate_relationship_grounding(
@@ -126,6 +251,7 @@ def validate_relationship_grounding(
     source_entity_name: str,
     predicate: str,
     target_entity_name: str,
+    evidence_span: str | None = None,
 ) -> tuple[bool, str | None]:
     """Validate that candidate relationship is verbatim and directionally grounded in chunk text.
     
@@ -173,6 +299,13 @@ def validate_relationship_grounding(
     if primary_pred_word not in text_lower and pred_stem not in text_lower:
         return False, f"predicate_not_grounded: '{predicate}' (co-occurrence alone rejected)"
 
+    if evidence_span:
+        ev_lower = evidence_span.strip().lower()
+        if source_lower not in ev_lower or target_lower not in ev_lower:
+            return False, "evidence_span_missing_entities"
+        if primary_pred_word not in ev_lower and pred_stem not in ev_lower:
+            return False, "evidence_span_missing_predicate"
+
     # 2. Sentence-level analysis
     sentences = re.split(r"[.!?\n]+", text_lower)
     matched_sentences = [
@@ -210,7 +343,7 @@ def validate_relationship_grounding(
             if not p_matches:
                 continue
 
-            is_passive = bool(re.search(r"\b(?:was|is|been|were)\s+" + re.escape(pred_stem) + r"\w*\s+by\b", clause))
+            is_passive = bool(re.search(r"\b(?:was|is|been|were|are)\b(?:\s+\w+){0,2}\s+" + re.escape(pred_stem) + r"\w*\s+by\b", clause))
 
             has_reversed = False
             for p_match in p_matches:
@@ -218,16 +351,38 @@ def validate_relationship_grounding(
                 p_end = p_match.end()
 
                 for s_idx in s_matches:
+                    s_end = s_idx + len(source_lower)
                     for t_idx in t_matches:
+                        t_end = t_idx + len(target_lower)
                         if is_passive:
                             # Passive voice: Target was <pred> by Source
                             if t_idx < p_idx < s_idx:
+                                # Validate passive auxiliaries between target and predicate
+                                aux_span = clause[t_end:p_idx].strip()
+                                aux_tokens = _clean_text_tokens(aux_span)
+                                if not all(tok in _ALLOWED_PASSIVE_AUXILIARIES or tok.endswith("ly") or tok.isdigit() for tok in aux_tokens):
+                                    continue
+                                # Validate passive by-phrase between predicate and source
+                                by_span = clause[p_end:s_idx].strip()
+                                by_tokens = _clean_text_tokens(by_span)
+                                if "by" not in by_tokens:
+                                    continue
+                                if not all(tok in _ALLOWED_PASSIVE_BY_WORDS or tok.endswith("ly") or tok.isdigit() for tok in by_tokens):
+                                    continue
                                 return True, None
                             elif s_idx < p_idx < t_idx:
                                 has_reversed = True
                         else:
                             # Active voice: Source <pred> Target
                             if s_idx < p_idx < t_idx:
+                                # Validate actor-predicate binding: tokens between source and predicate
+                                pre_span = clause[s_end:p_idx].strip()
+                                pre_tokens = _clean_text_tokens(pre_span)
+                                if not all(tok in _ALLOWED_PRE_PREDICATE_WORDS or tok.endswith("ly") or tok.isdigit() for tok in pre_tokens):
+                                    continue
+                                if len(pre_tokens) > 5:
+                                    continue
+
                                 intervening_span = clause[p_end:t_idx].strip()
                                 inter_tokens = _clean_text_tokens(intervening_span)
                                 if all(tok in _ALLOWED_ACTIVE_INTERVENING_WORDS or tok.isdigit() for tok in inter_tokens) and len(inter_tokens) <= 6:
@@ -708,6 +863,16 @@ class KnowledgeGraphBuilder:
         user_content_blocks = []
         remaining_bytes = 8000
         for ch in chunks:
+            is_prov_valid, prov_reason = validate_chunk_provenance(
+                chunk=ch,
+                workspace_id=workspace_id,
+                document_id=document_id,
+                document_version=document_version,
+            )
+            if not is_prov_valid:
+                logger.warning("Chunk %s excluded from prompt due to provenance failure: %s", getattr(ch, "id", None), prov_reason)
+                continue
+
             cid = str(getattr(ch, "id", None) or getattr(ch, "chunk_id", None) or "")
             text = str(getattr(ch, "text", None) or getattr(ch, "content", None) or "")
             page_val = getattr(ch, "page_number", None)
@@ -728,6 +893,23 @@ class KnowledgeGraphBuilder:
                 break
             user_content_blocks.append(block)
             remaining_bytes -= (block_bytes + 2)
+
+        if not user_content_blocks:
+            pub_id = generate_publication_id()
+            manifest = KnowledgeGraphManifest(
+                workspace_id=workspace_id,
+                document_id=document_id,
+                document_version=document_version,
+                publication_id=pub_id,
+                base_publication_id=base_publication_id,
+                status="empty",
+                entity_count=0,
+                relationship_count=0,
+                ingested_at_utc=_now_utc(),
+                content_hash=idempotency_key,
+            )
+            self.repository.commit_manifest(workspace_id, manifest, base_publication_id=base_publication_id)
+            return manifest
 
         user_prompt = "\n\n".join(user_content_blocks)
         messages = [{"role": "user", "content": [{"text": user_prompt}]}]
@@ -906,13 +1088,11 @@ class KnowledgeGraphBuilder:
                 in_tok = raw_usage.get("inputTokens")
                 out_tok = raw_usage.get("outputTokens")
 
-                def _is_valid_token_count(val: Any, min_val: int = 0) -> bool:
-                    if isinstance(val, bool) or not isinstance(val, int):
-                        return False
-                    return min_val <= val <= 100_000
+                def _is_valid_token_int(val: Any) -> bool:
+                    return not isinstance(val, bool) and isinstance(val, int)
 
-                if not _is_valid_token_count(in_tok, min_val=1) or not _is_valid_token_count(out_tok, min_val=0):
-                    logger.error("Bedrock converse returned invalid usage tokens: inputTokens=%r, outputTokens=%r", in_tok, out_tok)
+                if not _is_valid_token_int(in_tok) or in_tok <= 0:
+                    logger.error("Bedrock converse returned invalid inputTokens: %r", in_tok)
                     self.repository.fail_extraction_budget(
                         workspace_id=workspace_id,
                         document_id=document_id,
@@ -921,6 +1101,80 @@ class KnowledgeGraphBuilder:
                         fence_token=fence_token,
                         error_reason="invalid_provider_usage",
                         prompt_tokens_spent=estimated_prompt_tokens,
+                    )
+                    return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
+
+                if not _is_valid_token_int(out_tok) or out_tok < 0:
+                    logger.error("Bedrock converse returned invalid outputTokens: %r", out_tok)
+                    self.repository.fail_extraction_budget(
+                        workspace_id=workspace_id,
+                        document_id=document_id,
+                        document_version=document_version,
+                        worker_id=worker_id,
+                        fence_token=fence_token,
+                        error_reason="invalid_provider_usage",
+                        prompt_tokens_spent=in_tok,
+                    )
+                    return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
+
+                # 1. Per-call output token limit (e.g. reject outputTokens=801 when maxTokens=800)
+                if out_tok > max_output_tokens:
+                    logger.error("Bedrock converse outputTokens %d exceeds per-call limit %d", out_tok, max_output_tokens)
+                    self.repository.fail_extraction_budget(
+                        workspace_id=workspace_id,
+                        document_id=document_id,
+                        document_version=document_version,
+                        worker_id=worker_id,
+                        fence_token=fence_token,
+                        error_reason="output_tokens_exceeded_limit",
+                        prompt_tokens_spent=in_tok,
+                        output_tokens_spent=out_tok,
+                    )
+                    return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
+
+                # 2. Per-call input token limit: cannot exceed reserved allowance or configured ceiling (2000)
+                if in_tok > estimated_prompt_tokens or in_tok > 2000:
+                    logger.error("Bedrock converse inputTokens %d exceeds reservation %d or cap 2000", in_tok, estimated_prompt_tokens)
+                    self.repository.fail_extraction_budget(
+                        workspace_id=workspace_id,
+                        document_id=document_id,
+                        document_version=document_version,
+                        worker_id=worker_id,
+                        fence_token=fence_token,
+                        error_reason="input_tokens_exceeded_reservation",
+                        prompt_tokens_spent=in_tok,
+                        output_tokens_spent=out_tok,
+                    )
+                    return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
+
+                # 3. Aggregate document token limits across attempts and retries
+                curr_ledger = self.repository.get_budget_ledger(workspace_id, document_id, document_version, consistent_read=True)
+                prior_spt = curr_ledger.spent_prompt_tokens if curr_ledger else 0
+                prior_sot = curr_ledger.spent_output_tokens if curr_ledger else 0
+                prior_tot = curr_ledger.spent_tokens if curr_ledger else 0
+
+                if (
+                    prior_spt + in_tok > max_input_tokens
+                    or prior_sot + out_tok > 1600
+                    or prior_tot + in_tok + out_tok > max_total_tokens
+                ):
+                    logger.error(
+                        "Aggregate tokens overrun document budget: prompt=%d/%d, output=%d/1600, total=%d/%d",
+                        prior_spt + in_tok,
+                        max_input_tokens,
+                        prior_sot + out_tok,
+                        prior_tot + in_tok + out_tok,
+                        max_total_tokens,
+                    )
+                    self.repository.fail_extraction_budget(
+                        workspace_id=workspace_id,
+                        document_id=document_id,
+                        document_version=document_version,
+                        worker_id=worker_id,
+                        fence_token=fence_token,
+                        error_reason="aggregate_budget_overrun",
+                        prompt_tokens_spent=in_tok,
+                        output_tokens_spent=out_tok,
                     )
                     return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
 
@@ -1071,18 +1325,15 @@ def extract_pdf_relationships(
         cid = str(getattr(ch, "id", None) or getattr(ch, "chunk_id", None) or "")
         if not cid:
             continue
-        # Strict provenance: reject chunks whose workspace_id, document_id, or document_version conflicts
-        ch_doc = getattr(ch, "document_id", None)
-        if ch_doc and str(ch_doc) != document_id:
-            logger.warning("Chunk %s rejected: conflicting document_id %s != %s", cid, ch_doc, document_id)
-            continue
-        ch_ws = getattr(ch, "workspace_id", None)
-        if ch_ws and str(ch_ws) != workspace_id:
-            logger.warning("Chunk %s rejected: conflicting workspace_id %s != %s", cid, ch_ws, workspace_id)
-            continue
-        ch_ver = getattr(ch, "document_version", None)
-        if ch_ver and str(ch_ver) != document_version:
-            logger.warning("Chunk %s rejected: conflicting document_version %s != %s", cid, ch_ver, document_version)
+        # Strict provenance: validate workspace_id, document_id, and document_version
+        is_prov_valid, prov_reason = validate_chunk_provenance(
+            chunk=ch,
+            workspace_id=workspace_id,
+            document_id=document_id,
+            document_version=document_version,
+        )
+        if not is_prov_valid:
+            logger.warning("Chunk %s rejected during extraction: %s", cid, prov_reason)
             continue
 
         text = str(getattr(ch, "text", None) or getattr(ch, "content", None) or "")
@@ -1149,14 +1400,37 @@ def extract_pdf_relationships(
             logger.info("Candidate relationship rejected: verbatim_evidence '%s' not present in chunk text", verbatim_ev)
             continue
 
-        is_valid, reason = validate_relationship_grounding(
-            chunk_text=verbatim_ev,
-            source_entity_name=src_name,
-            predicate=pred,
-            target_entity_name=tgt_name,
-        )
-        if not is_valid:
-            logger.info("Candidate relationship (%s, %s, %s) rejected by grounding: %s", src_name, pred, tgt_name, reason)
+        # Preserve source context during grounding:
+        # Locate the evidence in its surrounding source sentence or clause.
+        # Reject evidence that removes conditional, negated, hypothetical, reported, or disputed context.
+        # Cover repeated evidence strings in different contexts.
+        ev_matches = list(re.finditer(re.escape(verbatim_ev), ch_text))
+        if not ev_matches:
+            logger.info("Candidate relationship rejected: verbatim evidence not found in chunk text")
+            continue
+
+        grounded_occurrence_found = False
+        rejection_reasons = []
+        for m in ev_matches:
+            surrounding_sentence = _find_enclosing_sentence(ch_text, m.start(), m.end())
+            is_valid, reason = validate_relationship_grounding(
+                chunk_text=surrounding_sentence,
+                source_entity_name=src_name,
+                predicate=pred,
+                target_entity_name=tgt_name,
+                evidence_span=verbatim_ev,
+            )
+            if is_valid:
+                grounded_occurrence_found = True
+                break
+            else:
+                rejection_reasons.append(reason or "unsupported")
+
+        if not grounded_occurrence_found:
+            logger.info(
+                "Candidate relationship (%s, %s, %s) rejected by grounding in surrounding source context: %s",
+                src_name, pred, tgt_name, "; ".join(rejection_reasons),
+            )
             continue
 
         norm_src = normalize_mention(src_name)

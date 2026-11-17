@@ -698,6 +698,9 @@ class InMemoryKnowledgeGraphRepository:
                     ledger.reserved_prompt_tokens > p_thresh
                     or ledger.reserved_output_tokens > o_thresh
                     or ledger.reserved_tokens > t_thresh
+                    or ledger.spent_prompt_tokens > p_thresh
+                    or ledger.spent_output_tokens > o_thresh
+                    or ledger.spent_tokens > t_thresh
                 ):
                     updated = ledger.model_copy(update={"status": "exhausted", "updated_at": _now_utc()})
                     self.save_budget_ledger(updated)
@@ -1449,6 +1452,9 @@ class SQLiteKnowledgeGraphRepository:
                         ledger.reserved_prompt_tokens > p_thresh
                         or ledger.reserved_output_tokens > o_thresh
                         or ledger.reserved_tokens > t_thresh
+                        or ledger.spent_prompt_tokens > p_thresh
+                        or ledger.spent_output_tokens > o_thresh
+                        or ledger.spent_tokens > t_thresh
                     ):
                         updated = ledger.model_copy(update={"status": "exhausted", "updated_at": _now_utc()})
                         data_json = json.dumps(updated.model_dump())
@@ -2349,6 +2355,9 @@ class DynamoDBKnowledgeGraphRepository:
                     "(attribute_not_exists(#rpt) OR #rpt <= :p_thresh) AND "
                     "(attribute_not_exists(#rot) OR #rot <= :o_thresh) AND "
                     "(attribute_not_exists(#rt) OR #rt <= :t_thresh) AND "
+                    "(attribute_not_exists(#spt) OR #spt <= :p_thresh) AND "
+                    "(attribute_not_exists(#sot) OR #sot <= :o_thresh) AND "
+                    "(attribute_not_exists(#spent) OR #spent <= :t_thresh) AND "
                     "(#lexp < :now OR #lown = :wid)"
                     ")"
                 ),
@@ -2454,6 +2463,9 @@ class DynamoDBKnowledgeGraphRepository:
                         curr.reserved_prompt_tokens > p_thresh
                         or curr.reserved_output_tokens > o_thresh
                         or curr.reserved_tokens > t_thresh
+                        or curr.spent_prompt_tokens > p_thresh
+                        or curr.spent_output_tokens > o_thresh
+                        or curr.spent_tokens > t_thresh
                     ):
                         return KnowledgeGraphReservationResult(
                             granted=False,

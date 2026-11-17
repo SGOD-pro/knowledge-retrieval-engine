@@ -42,8 +42,10 @@ from src.ingestion.graph_builder import (
     extract_pdf_relationships,
     get_kg_provider_controller,
     reset_kg_provider_controller,
+    validate_chunk_provenance,
     validate_relationship_grounding,
 )
+from src.ingestion.parse_service import parse_file
 from src.schemas.contracts.knowledge_graph import (
     KnowledgeGraphBudgetLedger,
     KnowledgeGraphEntity,
@@ -69,7 +71,16 @@ def make_chunk(
     document_id: str = "doc_1",
     text: str = "Acme acquired Beta",
     page_number: int | None = 1,
+    workspace_id: str = "ws_test",
+    document_version: str | None = "v1",
+    metadata: dict[str, Any] | None = None,
 ) -> Chunk:
+    meta = dict(metadata) if metadata is not None else {}
+    if document_version is not None:
+        if "document_version" not in meta:
+            meta["document_version"] = document_version
+        if "version" not in meta:
+            meta["version"] = document_version
     return Chunk(
         id=id,
         document_id=document_id,
@@ -77,6 +88,8 @@ def make_chunk(
         text=text,
         element_type="text",
         page_number=page_number,
+        workspace_id=workspace_id,
+        metadata=meta if meta else None,
     )
 
 
@@ -1350,7 +1363,7 @@ def test_dynamodb_local_atomic_idempotent_reconciliation():
 
 def test_extract_pdf_relationships_rejects_empty_or_fabricated_evidence():
     """covers: Area 3 Require non-empty verbatim evidence present in cited source chunk."""
-    chunk = make_chunk(id="chunk_1", document_id="doc_1", text="Acme Corp acquired Beta Tech in 2024.")
+    chunk = make_chunk(id="chunk_1", document_id="doc_1", workspace_id="ws_1", text="Acme Corp acquired Beta Tech in 2024.")
 
     # 1. Empty verbatim evidence
     out_empty = json.dumps({
@@ -1422,13 +1435,12 @@ def test_extract_pdf_relationships_rejects_wrong_source_bindings():
 
 def test_extract_pdf_relationships_preserves_actual_page_number():
     """covers: Area 3 Preserves actual page_number metadata from chunk."""
-    chunk = Chunk(
+    chunk = make_chunk(
         id="chunk_page_test",
         document_id="doc_1",
-        source_format="pdf",
-        text="Acme acquired Beta",
-        element_type="text",
+        workspace_id="ws_1",
         page_number=42,
+        text="Acme acquired Beta in 2024.",
     )
     out = json.dumps({
         "entities": [{"name": "Acme", "entity_type": "organization"}, {"name": "Beta", "entity_type": "organization"}],
@@ -1454,7 +1466,7 @@ def test_extract_pdf_relationships_preserves_actual_page_number():
 
 def test_extract_pdf_relationships_rejects_unverified_model_disambiguation_token():
     """covers: Area 3 Model-supplied disambiguation tokens are never trusted without authoritative verification."""
-    chunk = make_chunk(id="chunk_1", document_id="doc_1", text="Acme Corp acquired Beta Tech")
+    chunk = make_chunk(id="chunk_1", document_id="doc_1", workspace_id="ws_1", text="Acme Corp acquired Beta Tech in 2024.")
     out = json.dumps({
         "entities": [
             {"name": "Acme Corp", "entity_type": "organization", "disambiguation_token": "NASDAQ:ACME_FABRICATED"},
@@ -1549,7 +1561,7 @@ def test_build_pdf_graph_fails_closed_on_invalid_usage():
     """covers: Area 5 Require authoritative inputTokens and outputTokens; reject missing, boolean, or malformed usage."""
     repo = InMemoryKnowledgeGraphRepository()
     builder = KnowledgeGraphBuilder(repository=repo)
-    chunk = make_chunk(id="chunk_1", document_id="doc_u", text="Acme acquired Beta")
+    chunk = make_chunk(id="chunk_1", workspace_id="ws_u", document_id="doc_u", text="Acme acquired Beta")
 
     # 1. Missing usage
     client_missing = MagicMock()
@@ -1582,7 +1594,7 @@ def test_build_pdf_graph_fails_closed_on_invalid_usage():
         workspace_id="ws_u",
         document_id="doc_u2",
         document_version="v1",
-        chunks=[chunk],
+        chunks=[make_chunk(id="chunk_1", workspace_id="ws_u", document_id="doc_u2", text="Acme acquired Beta")],
         client=client_bool,
     )
     assert m2.status == "failed"
@@ -1598,7 +1610,7 @@ def test_build_pdf_graph_fails_closed_on_invalid_usage():
         workspace_id="ws_u",
         document_id="doc_u3",
         document_version="v1",
-        chunks=[chunk],
+        chunks=[make_chunk(id="chunk_1", workspace_id="ws_u", document_id="doc_u3", text="Acme acquired Beta")],
         client=client_neg,
     )
     assert m3.status == "failed"
@@ -1613,7 +1625,7 @@ def test_provider_call_deadline_and_capacity_retention():
     reset_kg_provider_controller()
     repo = InMemoryKnowledgeGraphRepository()
     builder = KnowledgeGraphBuilder(repository=repo)
-    chunk = make_chunk(id="chunk_1", document_id="doc_dl", text="Acme acquired Beta")
+    chunk = make_chunk(id="chunk_1", workspace_id="ws_dl", document_id="doc_dl", text="Acme acquired Beta")
 
     def slow_converse(**kwargs):
         time.sleep(0.3)
@@ -1659,3 +1671,584 @@ def test_disable_client_retries_unregisters_boto3_handlers():
 
     disable_client_retries(mock_client)
     mock_events.unregister.assert_called()
+
+
+# =============================================================================
+# 18. Regressions: Four Slice 2 Correctness Gaps
+# =============================================================================
+
+
+def test_chunk_provenance_rejects_stale_metadata_version():
+    """covers: Gap 1 Reject stale metadata versions not matching the requested document version."""
+    c1 = make_chunk(
+        id="chunk_stale_1",
+        workspace_id="ws_prov",
+        document_id="doc_prov",
+        document_version="v0",
+        metadata={"version": "v0", "document_version": "v0"},
+    )
+    ok, reason = validate_chunk_provenance(c1, "ws_prov", "doc_prov", "v1")
+    assert ok is False
+    assert "stale_document_version" in str(reason)
+
+
+def test_chunk_provenance_rejects_conflicting_version_or_identity_fields():
+    """covers: Gap 1 Reject conflicting version, workspace, and document fields across metadata and attributes."""
+    # Conflicting metadata version vs document_version
+    c_meta_ver = make_chunk(
+        id="c1",
+        workspace_id="ws_prov",
+        document_id="doc_prov",
+        document_version=None,
+        metadata={"version": "v1", "document_version": "v2"},
+    )
+    ok, reason = validate_chunk_provenance(c_meta_ver, "ws_prov", "doc_prov", "v1")
+    assert ok is False
+    assert "conflicting_metadata_versions" in str(reason)
+
+    # Conflicting attribute version vs metadata version
+    class _CustomChunk:
+        id = "c2"
+        workspace_id = "ws_prov"
+        document_id = "doc_prov"
+        document_version = "v1"
+        metadata = {"version": "v2", "document_version": "v2"}
+
+    c_attr_ver = _CustomChunk()
+    ok2, reason2 = validate_chunk_provenance(c_attr_ver, "ws_prov", "doc_prov", "v1")
+    assert ok2 is False
+    assert "conflicting_version_bindings" in str(reason2)
+
+    # Conflicting document_id attribute vs metadata
+    c_doc_conflict = make_chunk(
+        id="c3",
+        workspace_id="ws_prov",
+        document_id="doc_a",
+        document_version="v1",
+        metadata={"document_id": "doc_b", "version": "v1", "document_version": "v1"},
+    )
+    ok3, reason3 = validate_chunk_provenance(c_doc_conflict, "ws_prov", "doc_a", "v1")
+    assert ok3 is False
+    assert "conflicting_document_id" in str(reason3)
+
+    # Conflicting workspace_id attribute vs metadata
+    c_ws_conflict = make_chunk(
+        id="c4",
+        workspace_id="ws_a",
+        document_id="doc_prov",
+        document_version="v1",
+        metadata={"workspace_id": "ws_b", "version": "v1", "document_version": "v1"},
+    )
+    ok4, reason4 = validate_chunk_provenance(c_ws_conflict, "ws_a", "doc_prov", "v1")
+    assert ok4 is False
+    assert "conflicting_workspace_id" in str(reason4)
+
+
+def test_chunk_provenance_rejects_missing_bindings_or_unversioned_chunks():
+    """covers: Gap 1 Reject chunks lacking chunk_id, document_id, workspace_id, or version."""
+    # Missing chunk ID
+    c_no_id = make_chunk(id="", workspace_id="ws_prov", document_id="doc_prov", document_version="v1", metadata={"version": "v1"})
+    ok1, reason1 = validate_chunk_provenance(c_no_id, "ws_prov", "doc_prov", "v1")
+    assert ok1 is False
+    assert "missing_chunk_id" in str(reason1)
+
+    # Missing document ID
+    c_no_doc = make_chunk(id="c1", workspace_id="ws_prov", document_id="", document_version="v1", metadata={"version": "v1"})
+    ok2, reason2 = validate_chunk_provenance(c_no_doc, "ws_prov", "doc_prov", "v1")
+    assert ok2 is False
+    assert "missing_document_id" in str(reason2)
+
+    # Missing workspace ID
+    c_no_ws = make_chunk(id="c2", workspace_id="", document_id="doc_prov", document_version="v1", metadata={"version": "v1"})
+    ok3, reason3 = validate_chunk_provenance(c_no_ws, "ws_prov", "doc_prov", "v1")
+    assert ok3 is False
+    assert "missing_workspace_id" in str(reason3)
+
+    # Unversioned chunk (no version in attribute or metadata)
+    c_unversioned = make_chunk(id="c3", workspace_id="ws_prov", document_id="doc_prov", document_version=None, metadata={})
+    ok4, reason4 = validate_chunk_provenance(c_unversioned, "ws_prov", "doc_prov", "v1")
+    assert ok4 is False
+    assert "unverifiable_version_binding" in str(reason4)
+
+    # Mismatched workspace
+    c_match = make_chunk(id="c4", workspace_id="ws_prov", document_id="doc_prov", document_version="v1", metadata={"version": "v1"})
+    ok5, reason5 = validate_chunk_provenance(c_match, "ws_other", "doc_prov", "v1")
+    assert ok5 is False
+    assert "mismatched_workspace_id" in str(reason5)
+
+    # Mismatched document
+    ok6, reason6 = validate_chunk_provenance(c_match, "ws_prov", "doc_other", "v1")
+    assert ok6 is False
+    assert "mismatched_document_id" in str(reason6)
+
+
+def test_chunk_provenance_accepts_valid_exact_version():
+    """covers: Gap 1 Accept valid chunks with exact workspace, document, and version bindings."""
+    c = make_chunk(
+        id="chunk_valid_1",
+        workspace_id="ws_exact",
+        document_id="doc_exact",
+        document_version="v1",
+        metadata={"version": "v1", "document_version": "v1"},
+    )
+    ok, reason = validate_chunk_provenance(c, "ws_exact", "doc_exact", "v1")
+    assert ok is True
+    assert reason is None
+
+
+def test_chunk_provenance_with_real_chunk_from_parse_file(tmp_path):
+    """covers: Gap 1 Test real Chunk objects produced through parse_service parse_file."""
+    csv_file = tmp_path / "test_data.csv"
+    csv_file.write_text("id,name,role\n1,Acme,Corp\n2,Beta,Subsidiary\n", encoding="utf-8")
+
+    doc = parse_file(csv_file, workspace_id="ws_real")
+    assert len(doc.chunks) > 0
+    real_chunk = doc.chunks[0]
+
+    chunk_ver = real_chunk.metadata.get("version")
+    assert chunk_ver is not None
+
+    # Valid exact version passes
+    ok, reason = validate_chunk_provenance(real_chunk, "ws_real", doc.id, chunk_ver)
+    assert ok is True
+    assert reason is None
+
+    # Stale version fails
+    ok_stale, reason_stale = validate_chunk_provenance(real_chunk, "ws_real", doc.id, "v_stale")
+    assert ok_stale is False
+    assert "stale_document_version" in str(reason_stale)
+
+
+def test_grounding_rejects_evidence_stripping_conditional_context():
+    """covers: Gap 2 Reject evidence that strips conditional surrounding context."""
+    chunk = make_chunk(
+        id="c_cond",
+        workspace_id="ws_cond",
+        document_id="doc_cond",
+        text="If Acme acquired Beta, costs would rise.",
+    )
+    payload = json.dumps({
+        "entities": [{"name": "Acme", "entity_type": "organization"}, {"name": "Beta", "entity_type": "organization"}],
+        "relationships": [{
+            "source_entity": "Acme",
+            "predicate": "acquired",
+            "target_entity": "Beta",
+            "chunk_id": "c_cond",
+            "verbatim_evidence": "Acme acquired Beta",
+        }],
+    })
+    entities, rels = extract_pdf_relationships(
+        workspace_id="ws_cond",
+        document_id="doc_cond",
+        document_version="v1",
+        chunks=[chunk],
+        model_output_json=payload,
+        publication_id="pub_test",
+    )
+    assert len(rels) == 0
+
+
+def test_grounding_rejects_evidence_stripping_negation_or_hypothetical():
+    """covers: Gap 2 Reject evidence that strips negated or hypothetical surrounding context."""
+    # Negated context
+    chunk_neg = make_chunk(
+        id="c_neg",
+        workspace_id="ws_g",
+        document_id="doc_g",
+        text="Beta was never acquired by Acme during the restructuring.",
+    )
+    payload_neg = json.dumps({
+        "entities": [{"name": "Acme", "entity_type": "organization"}, {"name": "Beta", "entity_type": "organization"}],
+        "relationships": [{
+            "source_entity": "Acme",
+            "predicate": "acquired",
+            "target_entity": "Beta",
+            "chunk_id": "c_neg",
+            "verbatim_evidence": "Acme",
+        }],
+    })
+    _, rels_neg = extract_pdf_relationships(
+        workspace_id="ws_g",
+        document_id="doc_g",
+        document_version="v1",
+        chunks=[chunk_neg],
+        model_output_json=payload_neg,
+        publication_id="pub_test",
+    )
+    assert len(rels_neg) == 0
+
+    # Hypothetical context
+    chunk_hypo = make_chunk(
+        id="c_hypo",
+        workspace_id="ws_g",
+        document_id="doc_g",
+        text="Acme might acquire Beta next quarter.",
+    )
+    payload_hypo = json.dumps({
+        "entities": [{"name": "Acme", "entity_type": "organization"}, {"name": "Beta", "entity_type": "organization"}],
+        "relationships": [{
+            "source_entity": "Acme",
+            "predicate": "acquire",
+            "target_entity": "Beta",
+            "chunk_id": "c_hypo",
+            "verbatim_evidence": "Acme might acquire Beta",
+        }],
+    })
+    _, rels_hypo = extract_pdf_relationships(
+        workspace_id="ws_g",
+        document_id="doc_g",
+        document_version="v1",
+        chunks=[chunk_hypo],
+        model_output_json=payload_hypo,
+        publication_id="pub_test",
+    )
+    assert len(rels_hypo) == 0
+
+
+def test_grounding_accepts_repeated_evidence_when_one_context_is_factual():
+    """covers: Gap 2 Accept repeated evidence string when at least one occurrence is factual."""
+    chunk = make_chunk(
+        id="c_repeat",
+        workspace_id="ws_g",
+        document_id="doc_g",
+        page_number=3,
+        text="If Acme acquired Beta, costs would rise. However, in 2023 Acme acquired Beta in an all cash transaction.",
+    )
+    payload = json.dumps({
+        "entities": [{"name": "Acme", "entity_type": "organization"}, {"name": "Beta", "entity_type": "organization"}],
+        "relationships": [{
+            "source_entity": "Acme",
+            "predicate": "acquired",
+            "target_entity": "Beta",
+            "chunk_id": "c_repeat",
+            "verbatim_evidence": "Acme acquired Beta",
+        }],
+    })
+    _, rels = extract_pdf_relationships(
+        workspace_id="ws_g",
+        document_id="doc_g",
+        document_version="v1",
+        chunks=[chunk],
+        model_output_json=payload,
+        publication_id="pub_test",
+    )
+    assert len(rels) == 1
+    assert rels[0].source_entity_name == "Acme"
+    assert rels[0].target_entity_name == "Beta"
+    assert rels[0].verbatim_evidence == "Acme acquired Beta"
+    assert rels[0].location.page == 3
+
+
+def test_grounding_rejects_intervening_actor_and_reporting_verb():
+    """covers: Gap 3 Bind actor to predicate and reject intervening actors or reporting verbs."""
+    text = "Acme said Gamma acquired Beta."
+    ok, reason = validate_relationship_grounding(
+        chunk_text=text,
+        source_entity_name="Acme",
+        predicate="acquired",
+        target_entity_name="Beta",
+    )
+    assert ok is False
+
+    chunk = make_chunk(id="c_actor", workspace_id="ws_a", document_id="doc_a", text=text)
+    payload = json.dumps({
+        "entities": [{"name": "Acme", "entity_type": "organization"}, {"name": "Beta", "entity_type": "organization"}],
+        "relationships": [{
+            "source_entity": "Acme",
+            "predicate": "acquired",
+            "target_entity": "Beta",
+            "chunk_id": "c_actor",
+            "verbatim_evidence": "Acme said Gamma acquired Beta",
+        }],
+    })
+    _, rels = extract_pdf_relationships(
+        workspace_id="ws_a",
+        document_id="doc_a",
+        document_version="v1",
+        chunks=[chunk],
+        model_output_json=payload,
+        publication_id="pub_test",
+    )
+    assert len(rels) == 0
+
+
+def test_grounding_rejects_nested_clause_reported_speech():
+    """covers: Gap 3 Reject nested clause reported speech."""
+    text = "Acme reported that Gamma acquired Beta yesterday."
+    ok, reason = validate_relationship_grounding(
+        chunk_text=text,
+        source_entity_name="Acme",
+        predicate="acquired",
+        target_entity_name="Beta",
+    )
+    assert ok is False
+
+
+def test_grounding_rejects_multiple_actors_or_unrelated_clauses():
+    """covers: Gap 3 Reject entity pairs across unrelated clauses."""
+    text = "Acme acquired Gamma, while Beta opened an office."
+    ok, reason = validate_relationship_grounding(
+        chunk_text=text,
+        source_entity_name="Acme",
+        predicate="acquired",
+        target_entity_name="Beta",
+    )
+    assert ok is False
+    assert reason == "unrelated_clauses"
+
+
+def test_grounding_preserves_valid_active_and_passive_attachment():
+    """covers: Gap 3 Preserve direct active and passive relationships."""
+    active_text = "Acme officially acquired Beta yesterday."
+    ok_act, _ = validate_relationship_grounding(
+        chunk_text=active_text,
+        source_entity_name="Acme",
+        predicate="acquired",
+        target_entity_name="Beta",
+    )
+    assert ok_act is True
+
+    passive_text = "Beta was officially acquired by Acme yesterday."
+    ok_pass, _ = validate_relationship_grounding(
+        chunk_text=passive_text,
+        source_entity_name="Acme",
+        predicate="acquired",
+        target_entity_name="Beta",
+    )
+    assert ok_pass is True
+
+
+def test_build_pdf_graph_rejects_output_tokens_exceeding_call_limit():
+    """covers: Gap 4 Reject output tokens exceeding call limit (801 > 800) and retain spent budget."""
+    repo = InMemoryKnowledgeGraphRepository()
+    builder = KnowledgeGraphBuilder(repository=repo)
+    chunk = make_chunk(id="c_lim1", workspace_id="ws_lim", document_id="doc_lim1", text="Acme acquired Beta")
+
+    client = MagicMock()
+    client.count_tokens.return_value = {"inputTokens": 200}
+    client.converse.return_value = {
+        "output": {"message": {"content": [{"text": json.dumps({
+            "entities": [{"name": "Acme", "entity_type": "organization"}, {"name": "Beta", "entity_type": "organization"}],
+            "relationships": [{"source_entity": "Acme", "predicate": "acquired", "target_entity": "Beta", "chunk_id": "c_lim1", "verbatim_evidence": "Acme acquired Beta"}],
+        })}]}},
+        "usage": {"inputTokens": 200, "outputTokens": 801},
+    }
+
+    manifest = builder.build_and_persist_pdf_graph(
+        workspace_id="ws_lim",
+        document_id="doc_lim1",
+        document_version="v1",
+        chunks=[chunk],
+        client=client,
+    )
+    assert manifest.status == "failed"
+    assert manifest.relationship_count == 0
+
+    ledger = repo.get_budget_ledger("ws_lim", "doc_lim1", "v1")
+    assert ledger.spent_prompt_tokens == 200
+    assert ledger.spent_output_tokens == 801
+    assert ledger.spent_tokens == 1001
+
+
+def test_build_pdf_graph_rejects_input_tokens_exceeding_reservation_or_cap():
+    """covers: Gap 4 Reject input tokens exceeding reservation or per-call 2000 cap."""
+    repo = InMemoryKnowledgeGraphRepository()
+    builder = KnowledgeGraphBuilder(repository=repo)
+    chunk = make_chunk(id="c_lim2", workspace_id="ws_lim", document_id="doc_lim2", text="Acme acquired Beta")
+
+    client = MagicMock()
+    client.count_tokens.return_value = {"inputTokens": 200}
+    client.converse.return_value = {
+        "output": {"message": {"content": [{"text": json.dumps({
+            "entities": [{"name": "Acme", "entity_type": "organization"}, {"name": "Beta", "entity_type": "organization"}],
+            "relationships": [{"source_entity": "Acme", "predicate": "acquired", "target_entity": "Beta", "chunk_id": "c_lim2", "verbatim_evidence": "Acme acquired Beta"}],
+        })}]}},
+        "usage": {"inputTokens": 2050, "outputTokens": 50},
+    }
+
+    manifest = builder.build_and_persist_pdf_graph(
+        workspace_id="ws_lim",
+        document_id="doc_lim2",
+        document_version="v1",
+        chunks=[chunk],
+        client=client,
+    )
+    assert manifest.status == "failed"
+    assert manifest.relationship_count == 0
+
+    ledger = repo.get_budget_ledger("ws_lim", "doc_lim2", "v1")
+    assert ledger.spent_prompt_tokens == 2050
+    assert ledger.spent_output_tokens == 50
+
+
+def test_build_pdf_graph_rejects_aggregate_tokens_overrun_across_retries():
+    """covers: Gap 4 Reject cumulative token overrun across attempts (prior 3500 + new 600 > 4000)."""
+    repo = InMemoryKnowledgeGraphRepository()
+    builder = KnowledgeGraphBuilder(repository=repo)
+
+    # Seed prior attempt spend into ledger
+    prior_ledger = KnowledgeGraphBudgetLedger(
+        workspace_id="ws_lim",
+        document_id="doc_lim3",
+        document_version="v1",
+        spent_prompt_tokens=3500,
+        spent_output_tokens=500,
+        spent_tokens=4000,
+        completed_calls=1,
+        updated_at="2026-11-17T00:00:00Z",
+    )
+    repo.save_budget_ledger(prior_ledger)
+
+    chunk = make_chunk(id="c_lim3", workspace_id="ws_lim", document_id="doc_lim3", text="Acme acquired Beta")
+    client = MagicMock()
+    # Count tokens estimates 300 (3500 + 300 = 3800 <= 4000, reservation granted)
+    client.count_tokens.return_value = {"inputTokens": 300}
+    # Converse returns 600 (3500 + 600 = 4100 > 4000, aggregate limit overrun during call)
+    client.converse.return_value = {
+        "output": {"message": {"content": [{"text": json.dumps({
+            "entities": [{"name": "Acme", "entity_type": "organization"}, {"name": "Beta", "entity_type": "organization"}],
+            "relationships": [{"source_entity": "Acme", "predicate": "acquired", "target_entity": "Beta", "chunk_id": "c_lim3", "verbatim_evidence": "Acme acquired Beta"}],
+        })}]}},
+        "usage": {"inputTokens": 600, "outputTokens": 50},
+    }
+
+    manifest = builder.build_and_persist_pdf_graph(
+        workspace_id="ws_lim",
+        document_id="doc_lim3",
+        document_version="v1",
+        chunks=[chunk],
+        client=client,
+    )
+    assert manifest.status == "failed"
+    assert manifest.relationship_count == 0
+
+    ledger = repo.get_budget_ledger("ws_lim", "doc_lim3", "v1")
+    assert ledger.spent_prompt_tokens == 4100
+    assert ledger.spent_output_tokens == 550
+    assert ledger.spent_tokens == 4650
+
+
+def test_build_pdf_graph_valid_boundary_counts():
+    """covers: Gap 4 Accept valid boundary usage (exact 2000 input, exact 800 output)."""
+    repo = InMemoryKnowledgeGraphRepository()
+    builder = KnowledgeGraphBuilder(repository=repo)
+    chunk = make_chunk(id="c_bound", workspace_id="ws_bnd", document_id="doc_bnd", text="Acme acquired Beta")
+
+    client = MagicMock()
+    client.count_tokens.return_value = {"inputTokens": 2000}
+    client.converse.return_value = {
+        "output": {"message": {"content": [{"text": json.dumps({
+            "entities": [{"name": "Acme", "entity_type": "organization"}, {"name": "Beta", "entity_type": "organization"}],
+            "relationships": [{"source_entity": "Acme", "predicate": "acquired", "target_entity": "Beta", "chunk_id": "c_bound", "verbatim_evidence": "Acme acquired Beta"}],
+        })}]}},
+        "usage": {"inputTokens": 2000, "outputTokens": 800},
+    }
+
+    manifest = builder.build_and_persist_pdf_graph(
+        workspace_id="ws_bnd",
+        document_id="doc_bnd",
+        document_version="v1",
+        chunks=[chunk],
+        client=client,
+    )
+    assert manifest.status == "ready"
+    assert manifest.relationship_count == 1
+
+
+def test_build_pdf_graph_preserves_ready_publication_on_usage_overrun():
+    """covers: Gap 4 Preserve existing ready publication when a new attempt encounters usage overrun."""
+    repo = InMemoryKnowledgeGraphRepository()
+    builder = KnowledgeGraphBuilder(repository=repo)
+
+    existing_manifest = KnowledgeGraphManifest(
+        workspace_id="ws_pres",
+        document_id="doc_pres",
+        document_version="v1",
+        publication_id="pub_existing_ready",
+        status="ready",
+        entity_count=2,
+        relationship_count=1,
+        ingested_at_utc="2026-11-17T00:00:00Z",
+        content_hash="older_hash",
+    )
+    repo.commit_manifest("ws_pres", existing_manifest)
+
+    chunk = make_chunk(id="c_pres", workspace_id="ws_pres", document_id="doc_pres", text="Acme acquired Beta")
+    client = MagicMock()
+    client.count_tokens.return_value = {"inputTokens": 200}
+    client.converse.return_value = {
+        "output": {"message": {"content": [{"text": "{}"}]}},
+        "usage": {"inputTokens": 200, "outputTokens": 801},  # overrun
+    }
+
+    manifest = builder.build_and_persist_pdf_graph(
+        workspace_id="ws_pres",
+        document_id="doc_pres",
+        document_version="v1",
+        chunks=[chunk],
+        client=client,
+    )
+    assert manifest.status == "ready"
+    assert manifest.publication_id == "pub_existing_ready"
+
+    active = repo.get_manifest("ws_pres", "doc_pres", "v1")
+    assert active is not None
+    assert active.status == "ready"
+    assert active.publication_id == "pub_existing_ready"
+
+
+def test_durable_token_limit_accounting_across_sqlite_and_dynamodb_local():
+    """covers: Gap 4 Verify durable cumulative token limit accounting across SQLite and DynamoDB Local."""
+    # 1. SQLite repository
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
+        sqlite_path = tf.name
+    try:
+        sqlite_repo = SQLiteKnowledgeGraphRepository(db_path=sqlite_path)
+        ledger_sqlite = KnowledgeGraphBudgetLedger(
+            workspace_id="ws_dur",
+            document_id="doc_dur",
+            document_version="v1",
+            spent_prompt_tokens=4001,
+            spent_output_tokens=100,
+            spent_tokens=4101,
+            completed_calls=1,
+            updated_at="2026-11-17T00:00:00Z",
+        )
+        sqlite_repo.save_budget_ledger(ledger_sqlite)
+
+        res_sqlite = sqlite_repo.reserve_extraction_budget(
+            workspace_id="ws_dur",
+            document_id="doc_dur",
+            document_version="v1",
+            worker_id="worker_sqlite",
+            estimated_prompt_tokens=100,
+        )
+        assert res_sqlite.granted is False
+        assert res_sqlite.reason == "tokens_exhausted"
+    finally:
+        if os.path.exists(sqlite_path):
+            os.remove(sqlite_path)
+
+    # 2. DynamoDB Local repository
+    dynamodb_repo = _get_dynamodb_local_repo("kre_kg_test_slice2_token_limits")
+    ledger_ddb = KnowledgeGraphBudgetLedger(
+        workspace_id="ws_dur_ddb",
+        document_id="doc_dur_ddb",
+        document_version="v1",
+        spent_prompt_tokens=4001,
+        spent_output_tokens=100,
+        spent_tokens=4101,
+        completed_calls=1,
+        updated_at="2026-11-17T00:00:00Z",
+    )
+    dynamodb_repo.save_budget_ledger(ledger_ddb)
+
+    res_ddb = dynamodb_repo.reserve_extraction_budget(
+        workspace_id="ws_dur_ddb",
+        document_id="doc_dur_ddb",
+        document_version="v1",
+        worker_id="worker_ddb",
+        estimated_prompt_tokens=100,
+    )
+    assert res_ddb.granted is False
+    assert res_ddb.reason == "tokens_exhausted"
