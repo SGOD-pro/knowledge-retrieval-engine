@@ -8,7 +8,7 @@ _Steps derived from spec 0007 acceptance criteria. /check verify runs these; /te
 * **Execution Date**: 2026-11-17
 * **Environment**: Linux x86_64, Python 3.12 via uv (host Python 3.14.7), SQLite 3 with WAL journal mode, DynamoDB Local (port 8000), local FastAPI and Uvicorn server (port 8001)
 * **Provider Modes**: Mocked Bedrock runtime client fixtures for CountTokens and Converse, mocked OpenRouter reranker. Zero paid provider calls made. All local mocks are documented as local test doubles and not mischaracterized as live AWS cloud verification.
-* **Status**: Slice 1, Slice 2, and Slice 3 fully verified. Spec 0007 implementation complete, ready for review. Spec 0003 deferred. GRAPH_ENABLED=false preserved.
+* **Status**: Slice 1, Slice 2, and Slice 3 fully verified and approved. Spec 0007 complete and approved. Spec 0003 deferred. GRAPH_ENABLED=false preserved.
 
 ## Exact Test Commands and Results
 
@@ -22,11 +22,11 @@ cd backend && uv run pytest \
   tests/test_okf_slice3_1.py \
   tests/test_table_store.py -q
 ```
-Result: **204 passed in 19.89s**
+Result: **205 passed in 20.72s**
 Suite breakdown:
 * `tests/test_knowledge_graph_slice1.py`: 65 passed
 * `tests/test_knowledge_graph_slice2.py`: 64 passed
-* `tests/test_knowledge_graph_ablation_slice3.py`: 12 passed
+* `tests/test_knowledge_graph_ablation_slice3.py`: 13 passed
 * `tests/test_okf_slice3_1.py`: 21 passed
 * `tests/test_table_store.py`: 42 passed
 
@@ -162,7 +162,9 @@ Result: **15 passed out of 15 (15/15)**
 ## Review Records and Status
 * **Original Slice 2 Review**: `docs/reviews/2026-11-17-re-factor-0007-slice2-acceptance.md` preserved as a historical record (Verdict: Changes requested).
 * **Follow Up Slice 2 Review**: `docs/reviews/2026-11-17-re-factor-0007-slice2-review.md` confirmed as the superseding authoritative review (Verdict: Approve).
-* **Current Status**: Slice 1, Slice 2, and Slice 3 are locally verified. Spec 0007 is ready for Slice 3 review. Spec 0007 remains In Progress until merged.
+* **Original Slice 3 Review**: `docs/reviews/2026-11-17-re-factor-0007-slice3-review.md` preserved as a historical record (Verdict: Changes requested).
+* **Follow Up Slice 3 Review**: `docs/reviews/2026-11-17-re-factor-0007-slice3-followup-review.md` confirmed as the superseding authoritative review (Verdict: Approve, 0 blockers, 0 majors, 0 minors, 0 nits).
+* **Current Status**: Slice 1, Slice 2, and Slice 3 are locally verified and approved. Spec 0007 implementation is complete and approved. Spec 0007 remains In Progress until merged.
 
 ## Acceptance Criteria Traceability
 * **AC-1**: Grounded Narrative PDF Extraction and tabular extraction.
