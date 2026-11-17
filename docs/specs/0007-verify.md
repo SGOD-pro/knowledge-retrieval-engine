@@ -2,7 +2,7 @@
 _Steps derived from spec 0007 acceptance criteria. /check verify runs these; /test locks the durable ones._
 
 ## Verification Metadata
-* **Tested Commit**: `3fec4aa63609d0a09e0847daeb44dba1b3105559` (working tree with exact version CSV authority, stub recovery repair, and grounded evidence hydration)
+* **Tested Commit**: `d7a286b873464d6b801ceaa92ec42cb865d6b41d` (working tree with TableStore pipeline wiring and explicit DynamoDB Local coverage)
 * **Branch**: `re-factor`
 * **Repository**: `SGOD-pro/knowledge-retrieval-engine`
 * **Execution Date**: 2026-11-18
@@ -26,7 +26,7 @@ Result: **186 passed, 34 skipped in 1038.5s**
 Suite breakdown:
 * `tests/test_knowledge_graph_slice1.py`: 62 passed, 3 skipped in 28.28s
 * `tests/test_knowledge_graph_slice2.py`: 59 passed, 5 skipped in 132.43s
-* `tests/test_knowledge_graph_ablation_slice3.py`: 28 passed, 0 skipped in 39.68s
+* `tests/test_knowledge_graph_ablation_slice3.py`: 33 passed, 0 skipped in 16.61s
 * `tests/test_okf_slice3_1.py` & `tests/test_table_store.py`: 37 passed, 26 skipped in 670.48s
 
 Complementary Ingestion and Isolation Suites:
@@ -138,13 +138,21 @@ Unavailable Checks and Safe Skips:
 * Valid zero relationships distinction: narrative documents with valid Bedrock responses returning zero entity relationships publish an `empty` manifest with spent tokens accounted for in the budget ledger.
 * Bounded recovery: legacy stub empty manifests created by missing provider runs (zero completed calls and zero spent output tokens) are safely recovered when an authoritative provider is supplied, without re ingesting the corpus or resetting spent budgets.
 
+### 7. Pipeline TableStore Wiring and Explicit DynamoDB Local Verification (AC-6, AC-9, AC-10, AC-11)
+* Pipeline TableStore integration: `run_graph` resolves `table_store` via `get_shared_table_store()` and injects it into `KnowledgeGraphRetriever`, while supporting explicit caller injection in `PipelineState` and `Pipeline.run(...)`.
+* Production pipeline path test: `test_production_pipeline_tablestore_hydration_and_evidence_fusion` tests end to end tabular retrieval through `run_graph` to `run_reranker` with document chunks absent, proving that stored table cells hydrate into `Chunk` objects and survive reranking into `retained_evidence_items` with strategy `knowledge_graph`.
+* Negative controls verified: missing table rows, wrong document versions, cross workspace access, source tombstones, and unavailable TableStore each yield zero graph candidates while baseline retrieval remains intact.
+* Explicit DynamoDB Local coverage: parameterized historical stub recovery tests and competing publication CAS race tests across `["memory", "sqlite", "dynamodb"]`, running against live DynamoDB Local with isolated tables and clean teardown.
+* Fixed DynamoDB KnowledgeGraphRepository fence verification in `commit_manifest` to inspect authoritative top level DynamoDB item attributes (`fence_token`, `lease_owner_id`, `lease_expires_at`) instead of stale `data_json`.
+
 ## Review Records and Status
 * **Original Slice 2 Review**: `docs/reviews/2026-11-17-re-factor-0007-slice2-acceptance.md` preserved as a historical record (Verdict: Changes requested).
 * **Follow Up Slice 2 Review**: `docs/reviews/2026-11-17-re-factor-0007-slice2-review.md` confirmed as the superseding authoritative review (Verdict: Approve).
 * **Original Slice 3 Review**: `docs/reviews/2026-11-17-re-factor-0007-slice3-review.md` preserved as a historical record (Verdict: Changes requested).
 * **Follow Up Slice 3 Review**: `docs/reviews/2026-11-17-re-factor-0007-slice3-followup-review.md` confirmed as the superseding authoritative review (Verdict: Approve, 0 blockers, 0 majors, 0 minors, 0 nits).
 * **Ingestion and Verification Gaps Resolution Review**: `docs/reviews/2026-11-18-re-factor-0007-slice3-ingestion-and-verification-gaps-resolved.md` confirmed as the superseding authoritative review (Verdict: Approve).
-* **Wiring and Ingestion Gaps Resolution**: All 0007 Slice 3 production ingestion wiring and verification gaps (exact version CSV schema authority, historical stub state recovery repair, and grounded application path evidence hydration) repaired, covered by 28 ablation and application path tests, and verified locally.
+* **Pipeline Wiring and DynamoDB Coverage Resolution Review**: `docs/reviews/2026-11-18-re-factor-0007-slice3-pipeline-wiring-and-dynamodb-coverage-resolved.md` confirmed as the superseding authoritative review (Verdict: Approve).
+* **Wiring and Ingestion Gaps Resolution**: All 0007 Slice 3 production ingestion wiring, TableStore pipeline integration, explicit DynamoDB Local coverage, and verification gaps repaired, covered by 33 ablation and application path tests, and verified locally.
 * **Current Status**: Slice 1, Slice 2, and Slice 3 are locally verified and approved. Spec 0007 implementation is complete and approved. Spec 0007 remains In Progress until merged.
 
 ## Acceptance Criteria Traceability

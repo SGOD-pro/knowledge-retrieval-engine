@@ -1822,82 +1822,73 @@ def test_csv_same_table_name_collision_across_documents_rejected():
     assert len(res.candidate_chunks) == 0
 
 
-def test_recovery_on_historical_stub_with_completed_calls_and_zero_tokens_memory_sqlite_ddb(tmp_path):
-    """Verify historical client=None stubs with completed_calls>=1 and spent_output_tokens=0 recover cleanly."""
-    import hashlib
-    import json
+def _get_test_kg_repo(backend_type: str, tmp_path):
     import uuid
+    import pytest
     from db.knowledge_graph_repo import (
         InMemoryKnowledgeGraphRepository,
         SQLiteKnowledgeGraphRepository,
         DynamoDBKnowledgeGraphRepository,
     )
+    if backend_type == "memory":
+        return InMemoryKnowledgeGraphRepository(), None
+    elif backend_type == "sqlite":
+        db_path = str(tmp_path / f"kg_{uuid.uuid4().hex[:8]}.sqlite")
+        return SQLiteKnowledgeGraphRepository(db_path=db_path), None
+    elif backend_type == "dynamodb":
+        try:
+            import boto3
+            ddb_c = boto3.client(
+                "dynamodb",
+                endpoint_url="http://localhost:8000",
+                region_name="us-east-1",
+                aws_access_key_id="test",
+                aws_secret_access_key="test",
+            )
+            ddb_c.list_tables()
+        except Exception as e:
+            pytest.skip(f"DynamoDB Local daemon is not reachable at http://localhost:8000: {e}")
+
+        table_name = f"kre_kg_test_{uuid.uuid4().hex[:8]}"
+        ddb_c.create_table(
+            TableName=table_name,
+            KeySchema=[
+                {"AttributeName": "PK", "KeyType": "HASH"},
+                {"AttributeName": "SK", "KeyType": "RANGE"},
+            ],
+            AttributeDefinitions=[
+                {"AttributeName": "PK", "AttributeType": "S"},
+                {"AttributeName": "SK", "AttributeType": "S"},
+            ],
+            BillingMode="PAY_PER_REQUEST",
+        )
+
+        def cleanup():
+            ddb_c.delete_table(TableName=table_name)
+
+        repo = DynamoDBKnowledgeGraphRepository(
+            table_name=table_name,
+            endpoint_url="http://localhost:8000",
+        )
+        return repo, cleanup
+    else:
+        raise ValueError(f"Unknown backend_type: {backend_type}")
+
+
+@pytest.mark.parametrize("backend_type", ["memory", "sqlite", "dynamodb"])
+def test_recovery_on_historical_stub_with_completed_calls_and_zero_tokens(backend_type, tmp_path):
+    """Verify historical client=None stubs with completed_calls>=1 and spent_output_tokens=0 recover cleanly."""
+    import hashlib
+    import json
     from schemas.contracts.knowledge_graph import KnowledgeGraphManifest, KnowledgeGraphBudgetLedger
     from ingestion.graph_builder import KnowledgeGraphBuilder
 
-    # Repositories to exercise
-    repos: list[tuple[str, Any]] = [
-        ("Memory", InMemoryKnowledgeGraphRepository()),
-        ("SQLite", SQLiteKnowledgeGraphRepository(db_path=str(tmp_path / "kg_recovery.sqlite"))),
-    ]
-
-    # Check if DynamoDB Local is reachable
+    repo, cleanup = _get_test_kg_repo(backend_type, tmp_path)
     try:
-        import boto3
-        ddb_c = boto3.client("dynamodb", endpoint_url="http://localhost:8000", region_name="us-east-1", aws_access_key_id="test", aws_secret_access_key="test")
-        ddb_c.list_tables()
-        ddb_table = f"kre_kg_recov_{uuid.uuid4().hex[:8]}"
-        ddb_c.create_table(
-            TableName=ddb_table,
-            KeySchema=[{"AttributeName": "PK", "KeyType": "HASH"}, {"AttributeName": "SK", "KeyType": "RANGE"}],
-            AttributeDefinitions=[{"AttributeName": "PK", "AttributeType": "S"}, {"AttributeName": "SK", "AttributeType": "S"}],
-            BillingMode="PAY_PER_REQUEST",
-        )
-        repos.append(("DynamoDB", DynamoDBKnowledgeGraphRepository(table_name=ddb_table, endpoint_url="http://localhost:8000")))
-    except Exception:
-        pass
-
-    class MockBedrockClient:
-        def __init__(self):
-            self.calls = 0
-
-        def count_tokens(self, modelId, input):
-            return {"inputTokens": 140}
-
-        def converse(self, modelId, messages, system=None, inferenceConfig=None, timeout_s=None):
-            self.calls += 1
-            return {
-                "output": {
-                    "message": {
-                        "content": [
-                            {
-                                "text": json.dumps({
-                                    "entities": [
-                                        {"name": "Alpha Corp", "entity_type": "organization"},
-                                        {"name": "Omega Ltd", "entity_type": "organization"},
-                                    ],
-                                    "relationships": [
-                                        {
-                                            "source_entity": "Alpha Corp",
-                                            "predicate": "partnered_with",
-                                            "target_entity": "Omega Ltd",
-                                            "chunk_id": "doc_stub:c1",
-                                            "verbatim_evidence": "Alpha Corp partnered with Omega Ltd in 2024.",
-                                        }
-                                    ],
-                                })
-                            }
-                        ]
-                    }
-                },
-                "usage": {"inputTokens": 140, "outputTokens": 45},
-            }
-
-    for repo_name, repo in repos:
-        ws_id = f"ws_stub_rec_{repo_name.lower()}"
+        ws_id = f"ws_stub_rec_{backend_type}"
         doc_id = "doc_stub_1"
         doc_ver = "v1"
-        stub_pub_id = f"pub_stub_{repo_name.lower()}"
+        stub_pub_id = f"pub_stub_{backend_type}"
         idemp = hashlib.sha256(f"{ws_id}:{doc_id}:{doc_ver}:kg".encode("utf-8")).hexdigest()
 
         # 1. Populate actual historical stub shape: completed_calls=1, spent_output_tokens=0
@@ -1932,6 +1923,42 @@ def test_recovery_on_historical_stub_with_completed_calls_and_zero_tokens_memory
             content_hash=idemp,
         )
         repo.commit_manifest(ws_id, stub_manifest)
+
+        class MockBedrockClient:
+            def __init__(self):
+                self.calls = 0
+
+            def count_tokens(self, modelId, input):
+                return {"inputTokens": 140}
+
+            def converse(self, modelId, messages, system=None, inferenceConfig=None, timeout_s=None):
+                self.calls += 1
+                return {
+                    "output": {
+                        "message": {
+                            "content": [
+                                {
+                                    "text": json.dumps({
+                                        "entities": [
+                                            {"name": "Alpha Corp", "entity_type": "organization"},
+                                            {"name": "Omega Ltd", "entity_type": "organization"},
+                                        ],
+                                        "relationships": [
+                                            {
+                                                "source_entity": "Alpha Corp",
+                                                "predicate": "partnered_with",
+                                                "target_entity": "Omega Ltd",
+                                                "chunk_id": "doc_stub:c1",
+                                                "verbatim_evidence": "Alpha Corp partnered with Omega Ltd in 2024.",
+                                            }
+                                        ],
+                                    })
+                                }
+                            ]
+                        }
+                    },
+                    "usage": {"inputTokens": 140, "outputTokens": 45},
+                }
 
         client = MockBedrockClient()
         builder = KnowledgeGraphBuilder(repository=repo)
@@ -1984,6 +2011,9 @@ def test_recovery_on_historical_stub_with_completed_calls_and_zero_tokens_memory
         assert final_ledger.spent_prompt_tokens == 280  # 140 prior + 140 new
         assert final_ledger.spent_output_tokens == 45
         assert final_ledger.fence_token == 2
+    finally:
+        if cleanup:
+            cleanup()
 
 
 def test_recovery_preserves_legitimate_empty_publication():
@@ -2074,51 +2104,23 @@ def test_recovery_preserves_legitimate_empty_publication():
     assert spy_client.calls == 0  # Bedrock was never called
 
 
-def test_recovery_fails_on_competing_publication_cas_conflict(tmp_path):
+@pytest.mark.parametrize("backend_type", ["memory", "sqlite", "dynamodb"])
+def test_recovery_fails_on_competing_publication_cas_conflict(backend_type, tmp_path):
     """Verify recovery raises OptimisticConcurrencyError and preserves competing publication when concurrent publication commits."""
     import hashlib
     import json
     import pytest
-    from db.knowledge_graph_repo import (
-        InMemoryKnowledgeGraphRepository,
-        SQLiteKnowledgeGraphRepository,
-        OptimisticConcurrencyError,
-    )
+    from db.knowledge_graph_repo import OptimisticConcurrencyError
     from schemas.contracts.knowledge_graph import KnowledgeGraphManifest, KnowledgeGraphBudgetLedger
     from ingestion.graph_builder import KnowledgeGraphBuilder
 
-    repos = [
-        ("Memory", InMemoryKnowledgeGraphRepository()),
-        ("SQLite", SQLiteKnowledgeGraphRepository(db_path=str(tmp_path / "kg_cas_recovery.sqlite"))),
-    ]
-
-    class MockBedrockClient:
-        def count_tokens(self, modelId, input):
-            return {"inputTokens": 140}
-
-        def converse(self, *args, **kwargs):
-            return {
-                "output": {
-                    "message": {
-                        "content": [
-                            {
-                                "text": json.dumps({
-                                    "entities": [{"name": "A", "entity_type": "organization"}],
-                                    "relationships": [],
-                                })
-                            }
-                        ]
-                    }
-                },
-                "usage": {"inputTokens": 140, "outputTokens": 20},
-            }
-
-    for name, repo in repos:
-        ws_id = f"ws_cas_{name.lower()}"
+    repo, cleanup = _get_test_kg_repo(backend_type, tmp_path)
+    try:
+        ws_id = f"ws_cas_{backend_type}"
         doc_id = "doc_cas_1"
         doc_ver = "v1"
-        stub_pub_id = f"pub_stub_{name.lower()}"
-        competing_pub_id = f"pub_competing_{name.lower()}"
+        stub_pub_id = f"pub_stub_{backend_type}"
+        competing_pub_id = f"pub_competing_{backend_type}"
         idemp = hashlib.sha256(f"{ws_id}:{doc_id}:{doc_ver}:kg".encode("utf-8")).hexdigest()
 
         # 1. Historical stub
@@ -2218,6 +2220,9 @@ def test_recovery_fails_on_competing_publication_cas_conflict(tmp_path):
         current_man = repo.get_manifest(ws_id, doc_id, doc_ver, consistent_read=True)
         assert current_man is not None
         assert current_man.publication_id == competing_pub_id
+    finally:
+        if cleanup:
+            cleanup()
 
 
 def test_hydrated_evidence_negative_controls():
@@ -2466,5 +2471,397 @@ def test_hydrated_evidence_negative_controls():
     res_ver = retriever.expand(workspace_id=ws_id, query="Epsilon", caller_deadline_ms=5000.0)
     assert res_ver.edge_match_count >= 1
     assert len(res_ver.candidate_chunks) == 0  # Version mismatch rejected by table store authority
+
+
+def test_production_pipeline_tablestore_hydration_and_evidence_fusion(monkeypatch):
+    """Test production query pipeline path: run_graph and downstream evidence/fusion with TableStore hydration."""
+    import dataclasses
+    import hashlib
+    from config import settings
+    from db.knowledge_graph_repo import InMemoryKnowledgeGraphRepository
+    from db.table_store.memory_store import MemoryTableStore
+    from db.workspace_boundary_repo import get_workspace_boundary_repo
+    from schemas.contracts.boundary import DocumentSnapshot
+    from schemas.contracts.knowledge_graph import (
+        KnowledgeGraphEntity,
+        KnowledgeGraphRelationship,
+        KnowledgeGraphManifest,
+    )
+    from schemas.contracts.location import TableLocation
+    from schemas.structured_table import (
+        TableSchema,
+        ColumnDefinition,
+        HeaderTopology,
+        TableRow,
+        TableCell,
+    )
+    from schemas.models import Chunk
+    from services.langgraph_pipeline import run_graph, run_reranker
+
+    monkeypatch.setattr(settings, "GRAPH_ENABLED", True)
+    monkeypatch.setattr("providers.reranker_provider._openrouter_reranker", lambda q, docs: [0.95 for _ in docs])
+
+    ws_id = "ws_pipeline_table_test"
+    doc_id = "doc_fin_metrics"
+    doc_ver = "v1"
+    table_id = "metrics_table"
+
+    b_repo = get_workspace_boundary_repo()
+    b_repo.create_workspace(name="Pipeline Table WS", owner_principal_id="alice", workspace_id=ws_id)
+    b_repo.save_document_snapshot(
+        DocumentSnapshot(
+            workspace_id=ws_id,
+            document_id=doc_id,
+            source="metrics.csv",
+            version=doc_ver,
+            format="csv",
+            incomplete_coverage_flag=False,
+            exclusions=(),
+            persisted_rows=2,
+            total_rows=2,
+            created_at="2026-11-18T00:00:00Z",
+            graph_status="ready",
+        )
+    )
+
+    # 1. Authoritative exact-version TableStore data
+    table_store = MemoryTableStore()
+    schema = TableSchema(
+        columns=(
+            ColumnDefinition(col_index=0, name="division"),
+            ColumnDefinition(col_index=1, name="operating_income"),
+            ColumnDefinition(col_index=2, name="margin_pct"),
+        ),
+        header_rows=(0,),
+        header_topology=HeaderTopology.SINGLE_ROW,
+        confidence=1.0,
+        metadata={
+            "workspace_id": ws_id,
+            "document_id": doc_id,
+            "document_version": doc_ver,
+            "table_id": table_id,
+        },
+    )
+    table_store.store_schema(table_id, ws_id, schema, document_id=doc_id, document_version=doc_ver)
+    table_store.publish_active_version(
+        table_id=table_id,
+        workspace_id=ws_id,
+        document_id=doc_id,
+        version=doc_ver,
+        manifest={
+            "document_id": doc_id,
+            "workspace_id": ws_id,
+            "document_version": doc_ver,
+            "table_id": table_id,
+            "coverage_complete": True,
+            "processing_finished": True,
+        },
+    )
+    table_store.write_row_batch_with_checkpoint(
+        table_id=table_id,
+        workspace_id=ws_id,
+        document_id=doc_id,
+        version=doc_ver,
+        rows=[
+            TableRow(
+                row_id="1",
+                row_index=1,
+                cells=(
+                    TableCell(cell_id="c0", row_index=1, col_index=0, coordinate="A1", raw_value="Cloud Division"),
+                    TableCell(cell_id="c1", row_index=1, col_index=1, coordinate="B1", raw_value="$1.2B"),
+                    TableCell(cell_id="c2", row_index=1, col_index=2, coordinate="C1", raw_value="34.5%"),
+                ),
+            ),
+            TableRow(
+                row_id="2",
+                row_index=2,
+                cells=(
+                    TableCell(cell_id="c0", row_index=2, col_index=0, coordinate="A2", raw_value="Retail Division"),
+                    TableCell(cell_id="c1", row_index=2, col_index=1, coordinate="B2", raw_value="$800M"),
+                    TableCell(cell_id="c2", row_index=2, col_index=2, coordinate="C2", raw_value="12.0%"),
+                ),
+            ),
+        ],
+        checkpoint_batch=1,
+        source_rows=2,
+        attempted_rows=2,
+        persisted_rows=2,
+        rejected_rows=0,
+        parser_version="1.0.0",
+        schema_version="s1",
+        content_hash="hash1",
+    )
+
+    # 2. Real KnowledgeGraphRepository with TableLocation
+    kg_repo = InMemoryKnowledgeGraphRepository()
+    e_cloud = KnowledgeGraphEntity(
+        workspace_id=ws_id,
+        entity_id="entity_cloud",
+        name="Cloud Division",
+        canonical_name="Cloud Division",
+        entity_type="organization",
+        source_document_id=doc_id,
+    )
+    e_income = KnowledgeGraphEntity(
+        workspace_id=ws_id,
+        entity_id="entity_income",
+        name="Operating Income",
+        canonical_name="Operating Income",
+        entity_type="concept",
+        source_document_id=doc_id,
+    )
+    rel = KnowledgeGraphRelationship(
+        relationship_id="rel_cloud_income",
+        workspace_id=ws_id,
+        source_entity_id=e_cloud.entity_id,
+        source_entity_name=e_cloud.name,
+        target_entity_id=e_income.entity_id,
+        target_entity_name=e_income.name,
+        predicate="reported_income",
+        canonical_predicate="reported_income",
+        directed=True,
+        confidence=1.0,
+        source_chunk_ids=(),  # Document chunks explicitly absent
+        source_document_id=doc_id,
+        source_document_version=doc_ver,
+        publication_id="pub_pipeline_test",
+        location=TableLocation(
+            table_id=table_id,
+            row_id="1",
+            column_id="operating_income",
+        ),
+        verbatim_evidence="Cloud Division operating income is $1.2B.",
+        relationship_state="unique",
+        created_at_utc="2026-11-18T00:00:00Z",
+    )
+    idemp = hashlib.sha256(f"{ws_id}:{doc_id}:{doc_ver}:kg".encode("utf-8")).hexdigest()
+    man = KnowledgeGraphManifest(
+        workspace_id=ws_id,
+        document_id=doc_id,
+        document_version=doc_ver,
+        publication_id="pub_pipeline_test",
+        status="ready",
+        entity_count=2,
+        relationship_count=1,
+        ingested_at_utc="2026-11-18T00:00:00Z",
+        content_hash=idemp,
+    )
+    kg_repo.stage_relationships(
+        workspace_id=ws_id,
+        document_id=doc_id,
+        document_version=doc_ver,
+        publication_id="pub_pipeline_test",
+        entities=[e_cloud, e_income],
+        relationships=[rel],
+    )
+    kg_repo.commit_manifest(ws_id, man)
+
+    # 3. Document chunks absent: doc_repo returns zero chunks
+    class EmptyDocRepo:
+        def get_chunks_by_ids(self, workspace_id, chunk_keys):
+            return []
+    doc_repo = EmptyDocRepo()
+
+    # 4. Exercise run_graph with TableStore injected
+    state = {
+        "workspace_id": ws_id,
+        "query": "What is the operating income of Cloud Division?",
+        "knowledge_graph_repo": kg_repo,
+        "boundary_repo": b_repo,
+        "doc_repo": doc_repo,
+        "table_store": table_store,
+        "stage_timings": {},
+    }
+    graph_out = run_graph(state)
+
+    # Assert nonempty graph candidates with stored cells, row/table location, and exact source identity
+    assert len(graph_out["graph_chunks"]) >= 1
+    g_chunk = graph_out["graph_chunks"][0]
+    assert "Cloud Division" in g_chunk.text
+    assert "$1.2B" in g_chunk.text
+    assert "division: Cloud Division" in g_chunk.text
+    assert "operating_income: $1.2B" in g_chunk.text
+    assert g_chunk.document_id == doc_id
+    assert g_chunk.workspace_id == ws_id
+    assert g_chunk.element_type == "row"
+    assert f"Table: {table_id}" in g_chunk.location_reference
+    assert "Row: 1" in g_chunk.location_reference
+
+    # 5. Downstream evidence and fusion conversion (run_reranker)
+    baseline_chunk = Chunk(
+        id="chunk_baseline_1",
+        document_id="doc_base",
+        workspace_id=ws_id,
+        text="Baseline narrative document discussing cloud computing generalities.",
+        source_format="pdf",
+        element_type="paragraph",
+        page_number=1,
+    )
+    rerank_state = {
+        **state,
+        **graph_out,
+        "bm25_candidates": [baseline_chunk],
+        "candidate_chunks": [baseline_chunk],
+    }
+    rerank_out = run_reranker(rerank_state)
+
+    # Prove candidates reach pipeline evidence output
+    assert len(rerank_out["top_chunks"]) >= 1
+    assert "graph" in rerank_out["retrieval_candidates"]
+    assert g_chunk.id in rerank_out["retrieval_candidates"]["graph"]
+
+    retained_items = rerank_out["retained_evidence_items"]
+    assert len(retained_items) >= 1
+    kg_ev_items = [ev for ev in retained_items if ev.strategy == "knowledge_graph"]
+    assert len(kg_ev_items) == 1
+    ev = kg_ev_items[0]
+    assert ev.workspace_id == ws_id
+    assert ev.document_id == doc_id
+    assert "$1.2B" in (ev.text or "")
+    assert f"Table: {table_id}" in ev.locator["location_reference"]
+    assert "Row: 1" in ev.locator["location_reference"]
+    assert ev.provenance["metadata"]["table_id"] == table_id
+    assert str(ev.provenance["metadata"]["row"]) == "1"
+
+    # 6. Negative controls:
+    # A. Missing row in TableStore
+    rel_missing_row = rel.model_copy(
+        update={
+            "relationship_id": "rel_missing_row",
+            "location": TableLocation(table_id=table_id, row_id=999, column_id="operating_income"),
+        }
+    )
+    kg_repo_missing = InMemoryKnowledgeGraphRepository()
+    kg_repo_missing.stage_relationships(
+        workspace_id=ws_id,
+        document_id=doc_id,
+        document_version=doc_ver,
+        publication_id="pub_missing",
+        entities=[e_cloud, e_income],
+        relationships=[rel_missing_row],
+    )
+    kg_repo_missing.commit_manifest(ws_id, man.model_copy(update={"publication_id": "pub_missing"}))
+
+    state_missing = {**state, "knowledge_graph_repo": kg_repo_missing}
+    out_missing = run_graph(state_missing)
+    assert len(out_missing["graph_chunks"]) == 0
+    # Baseline retrieval preserved:
+    rerank_missing = run_reranker({**state_missing, **out_missing, "candidate_chunks": [baseline_chunk]})
+    assert len(rerank_missing["top_chunks"]) == 1
+    assert rerank_missing["top_chunks"][0].id == baseline_chunk.id
+
+    # B. Wrong version
+    rel_wrong_ver = rel.model_copy(
+        update={
+            "relationship_id": "rel_wrong_ver",
+            "source_document_version": "v2",
+        }
+    )
+    kg_repo_wrong_ver = InMemoryKnowledgeGraphRepository()
+    kg_repo_wrong_ver.stage_relationships(
+        workspace_id=ws_id,
+        document_id=doc_id,
+        document_version="v2",
+        publication_id="pub_wv",
+        entities=[e_cloud, e_income],
+        relationships=[rel_wrong_ver],
+    )
+    kg_repo_wrong_ver.commit_manifest(ws_id, man.model_copy(update={"document_version": "v2", "publication_id": "pub_wv"}))
+
+    state_wv = {**state, "knowledge_graph_repo": kg_repo_wrong_ver}
+    out_wv = run_graph(state_wv)
+    assert len(out_wv["graph_chunks"]) == 0
+    rerank_wv = run_reranker({**state_wv, **out_wv, "candidate_chunks": [baseline_chunk]})
+    assert len(rerank_wv["top_chunks"]) == 1
+
+    # C. Cross-workspace access
+    state_cross = {**state, "workspace_id": "ws_other_tenant"}
+    out_cross = run_graph(state_cross)
+    assert len(out_cross["graph_chunks"]) == 0
+
+    # D. Source tombstone
+    b_repo.record_source_tombstone(workspace_id=ws_id, source_id=doc_id, caller_principal_id="alice")
+    out_tomb = run_graph(state)
+    assert len(out_tomb["graph_chunks"]) == 0
+    rerank_tomb = run_reranker({**state, **out_tomb, "candidate_chunks": [baseline_chunk]})
+    assert len(rerank_tomb["top_chunks"]) == 1
+
+    # E. Unavailable TableStore
+    ws_unavail = "ws_unavail_tablestore"
+    b_repo.create_workspace(name="Unavail WS", owner_principal_id="alice", workspace_id=ws_unavail)
+    b_repo.save_document_snapshot(
+        DocumentSnapshot(
+            workspace_id=ws_unavail,
+            document_id="doc_unavail",
+            source="unavail.csv",
+            version="v1",
+            format="csv",
+            incomplete_coverage_flag=False,
+            exclusions=(),
+            persisted_rows=1,
+            total_rows=1,
+            created_at="2026-11-18T00:00:00Z",
+            graph_status="ready",
+        )
+    )
+    kg_repo_unavail = InMemoryKnowledgeGraphRepository()
+    e_u1 = KnowledgeGraphEntity(workspace_id=ws_unavail, entity_id="eu1", name="Cloud Division", canonical_name="Cloud Division", entity_type="organization", source_document_id="doc_unavail")
+    e_u2 = KnowledgeGraphEntity(workspace_id=ws_unavail, entity_id="eu2", name="Operating Income", canonical_name="Operating Income", entity_type="concept", source_document_id="doc_unavail")
+    rel_u = KnowledgeGraphRelationship(
+        workspace_id=ws_unavail,
+        relationship_id="relu",
+        source_entity_id="eu1",
+        source_entity_name="Cloud Division",
+        target_entity_id="eu2",
+        target_entity_name="Operating Income",
+        predicate="reported_income",
+        canonical_predicate="reported_income",
+        directed=True,
+        confidence=1.0,
+        source_chunk_ids=(),
+        source_document_id="doc_unavail",
+        source_document_version="v1",
+        publication_id="pub_u",
+        location=TableLocation(table_id="tbl_unavail", row_id="1", column_id="operating_income"),
+        verbatim_evidence="Cloud Division operating income.",
+        relationship_state="unique",
+        created_at_utc="2026-11-18T00:00:00Z",
+    )
+    kg_repo_unavail.stage_relationships(
+        workspace_id=ws_unavail,
+        document_id="doc_unavail",
+        document_version="v1",
+        publication_id="pub_u",
+        entities=[e_u1, e_u2],
+        relationships=[rel_u],
+    )
+    kg_repo_unavail.commit_manifest(
+        ws_unavail,
+        KnowledgeGraphManifest(
+            workspace_id=ws_unavail,
+            document_id="doc_unavail",
+            document_version="v1",
+            publication_id="pub_u",
+            status="ready",
+            entity_count=2,
+            relationship_count=1,
+            ingested_at_utc="2026-11-18T00:00:00Z",
+            content_hash="hu",
+        ),
+    )
+    state_unavail = {
+        "workspace_id": ws_unavail,
+        "query": "What is the operating income of Cloud Division?",
+        "knowledge_graph_repo": kg_repo_unavail,
+        "boundary_repo": b_repo,
+        "doc_repo": doc_repo,
+        "table_store": None,  # Explicitly unavailable TableStore
+        "stage_timings": {},
+    }
+    out_unavail = run_graph(state_unavail)
+    assert len(out_unavail["graph_chunks"]) == 0
+    rerank_unavail = run_reranker({**state_unavail, **out_unavail, "candidate_chunks": [baseline_chunk]})
+    assert len(rerank_unavail["top_chunks"]) == 1
+    assert rerank_unavail["top_chunks"][0].id == baseline_chunk.id
 
 

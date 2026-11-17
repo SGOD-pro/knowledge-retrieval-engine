@@ -106,6 +106,12 @@ class PipelineState(TypedDict):
     okf_entity_state: str
     okf_property_state: str
     okf_execution_status: str
+    table_store: Any | None
+    knowledge_graph_repo: Any | None
+    boundary_repo: Any | None
+    doc_repo: Any | None
+    kg_retriever: Any | None
+    retriever: Any | None
 
 
 # ---------------------------------------------------------------------------
@@ -716,32 +722,67 @@ def run_graph(state: PipelineState):
         from db.knowledge_graph_repo import get_shared_knowledge_graph_repository
         from db.workspace_boundary_repo import get_workspace_boundary_repo
         from modules.documents.documents_repository import DocumentsRepository
-        from services.retrieval.knowledge_graph_retriever import KnowledgeGraphRetriever
+        from services.retrieval.knowledge_graph_retriever import (
+            KnowledgeGraphLookupResult,
+            KnowledgeGraphRetriever,
+        )
     except ImportError:
         from src.db.knowledge_graph_repo import get_shared_knowledge_graph_repository
         from src.db.workspace_boundary_repo import get_workspace_boundary_repo
         from src.modules.documents.documents_repository import DocumentsRepository
-        from src.services.retrieval.knowledge_graph_retriever import KnowledgeGraphRetriever
+        from src.services.retrieval.knowledge_graph_retriever import (
+            KnowledgeGraphLookupResult,
+            KnowledgeGraphRetriever,
+        )
+
+    try:
+        from db.table_store import get_shared_table_store
+    except ImportError:
+        try:
+            from src.db.table_store import get_shared_table_store
+        except ImportError:
+            get_shared_table_store = None
 
     kg_repo = state.get("knowledge_graph_repo") or get_shared_knowledge_graph_repository()
     boundary_repo = state.get("boundary_repo") or get_workspace_boundary_repo()
     doc_repo = state.get("doc_repo") or _get_repo()
-    retriever = KnowledgeGraphRetriever(
-        repository=kg_repo,
-        boundary_repo=boundary_repo,
-        documents_repo=doc_repo,
-    )
+
+    table_store = state.get("table_store")
+    if table_store is None and "table_store" not in state and get_shared_table_store is not None:
+        try:
+            table_store = get_shared_table_store()
+        except Exception as e:
+            logger.warning("Failed to resolve shared table store for run_graph: %s", e)
+            table_store = None
+
+    retriever = state.get("kg_retriever") or state.get("retriever")
+    if retriever is None:
+        retriever = KnowledgeGraphRetriever(
+            repository=kg_repo,
+            boundary_repo=boundary_repo,
+            documents_repo=doc_repo,
+            table_store=table_store,
+        )
+    elif getattr(retriever, "table_store", None) is None and table_store is not None:
+        retriever.table_store = table_store
 
     timeout_ms = float(getattr(settings, "GRAPH_TIMEOUT_MS", 75))
     max_hops = int(getattr(settings, "GRAPH_MAX_HOPS", 2))
 
-    lookup_res = retriever.expand(
-        workspace_id=ws_id,
-        query=query,
-        max_hops=max_hops,
-        caller_deadline_ms=timeout_ms,
-        snapshot_context=state.get("snapshot_context"),
-    )
+    try:
+        lookup_res = retriever.expand(
+            workspace_id=ws_id,
+            query=query,
+            max_hops=max_hops,
+            caller_deadline_ms=timeout_ms,
+            snapshot_context=state.get("snapshot_context"),
+        )
+    except Exception as e:
+        logger.warning("run_graph: retriever.expand failed fail-closed: %s", e)
+        lookup_res = KnowledgeGraphLookupResult(
+            execution_status="error",
+            latency_ms=(time.perf_counter() - t0) * 1000.0,
+        )
 
     # 4. Calibrate RRF weight (AC-10)
     base_weight = float(getattr(settings, "GRAPH_FUSION_WEIGHT", 1.10))
@@ -887,19 +928,26 @@ def run_reranker(state: PipelineState):
     from services.retrieval.evidence_contract import evidence_item_from_chunk
     retained_evidence_items = []
     ws_id = state.get("workspace_id", "")
+    okf_ids = {str(getattr(x, "id", "")) for x in okf_candidates}
+    structural_ids = {str(getattr(x, "id", "")) for x in structural}
+    graph_ids = {str(getattr(x, "id", "")) for x in graph}
+    vector_ids = {str(getattr(x, "id", "")) for x in vector}
+    bm25_ids = {str(getattr(x, "id", "")) for x in bm25}
+
     for c in top_chunks:
         strat = getattr(c, "strategy", None) or (c.metadata.get("strategy") if isinstance(getattr(c, "metadata", None), dict) else None)
         if not strat:
-            if c in okf_candidates:
+            cid = str(getattr(c, "id", ""))
+            if cid in okf_ids:
                 strat = "okf"
-            elif c in structural:
+            elif cid in structural_ids:
                 strat = "page_index"
-            elif c in vector:
-                strat = "vector_rerank"
-            elif c in bm25:
-                strat = "bm25"
-            elif c in graph:
+            elif cid in graph_ids:
                 strat = "knowledge_graph"
+            elif cid in vector_ids:
+                strat = "vector_rerank"
+            elif cid in bm25_ids:
+                strat = "bm25"
             else:
                 strat = "vector_rerank"
         if isinstance(getattr(c, "metadata", None), dict):
@@ -1635,6 +1683,12 @@ class Pipeline:
         query_embedding: list[float] | None = None,
         query_embedding_provenance: str | None = None,
         benchmark_mode: bool = False,
+        table_store: Any | None = None,
+        knowledge_graph_repo: Any | None = None,
+        boundary_repo: Any | None = None,
+        doc_repo: Any | None = None,
+        retriever: Any | None = None,
+        **kwargs,
     ):
         if not workspace_id:
             raise ValueError("workspace_id is required for pipeline execution")
@@ -1701,6 +1755,20 @@ class Pipeline:
             "graph_relationship_state": "none",
             "graph_execution_status": "none",
         }
+
+        if table_store is not None:
+            initial_state["table_store"] = table_store
+        if knowledge_graph_repo is not None:
+            initial_state["knowledge_graph_repo"] = knowledge_graph_repo
+        if boundary_repo is not None:
+            initial_state["boundary_repo"] = boundary_repo
+        if doc_repo is not None:
+            initial_state["doc_repo"] = doc_repo
+        if retriever is not None:
+            initial_state["retriever"] = retriever
+        for k, v in kwargs.items():
+            if k not in initial_state:
+                initial_state[k] = v
 
         final_state = app.invoke(initial_state)
 

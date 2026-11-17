@@ -1949,12 +1949,26 @@ class DynamoDBKnowledgeGraphRepository:
             if not l_item:
                 raise FencingConflictError("Budget ledger does not exist for fenced publication")
 
-            ld = json.loads(l_item["data_json"]) if "data_json" in l_item else l_item
-            if ld.get("fence_token") != fence_token:
-                raise FencingConflictError(f"Fence mismatch: expected {fence_token}, got {ld.get('fence_token')}")
-            if ld.get("lease_owner_id") != worker_id:
-                raise FencingConflictError(f"Lease owner mismatch: expected {worker_id}, got {ld.get('lease_owner_id')}")
-            if float(ld.get("lease_expires_at", 0.0)) < time.time():
+            item_fence = l_item.get("fence_token")
+            item_owner = l_item.get("lease_owner_id")
+            item_expires = l_item.get("lease_expires_at")
+            if item_fence is None and "data_json" in l_item:
+                try:
+                    ld = json.loads(l_item["data_json"])
+                    item_fence = ld.get("fence_token")
+                    item_owner = ld.get("lease_owner_id")
+                    item_expires = ld.get("lease_expires_at")
+                except Exception:
+                    pass
+
+            if item_fence is not None:
+                item_fence = int(item_fence)
+
+            if item_fence != fence_token:
+                raise FencingConflictError(f"Fence mismatch: expected {fence_token}, got {item_fence}")
+            if item_owner != worker_id:
+                raise FencingConflictError(f"Lease owner mismatch: expected {worker_id}, got {item_owner}")
+            if float(item_expires or 0.0) < time.time():
                 raise FencingConflictError("Lease has expired for fenced publication")
 
             client = self._table.meta.client
