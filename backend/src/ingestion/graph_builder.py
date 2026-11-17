@@ -1763,3 +1763,44 @@ def extract_pdf_relationships(
         extracted_relationships.append(rel_model)
 
     return list(extracted_entities.values()), extracted_relationships
+
+
+def extract_and_persist_graph(
+    workspace_id: str,
+    document_id: str,
+    document_version: str,
+    format: str,
+    chunks: Sequence[Any] | None = None,
+    table_name: str | None = None,
+    table_store: Any | None = None,
+    client: Any | None = None,
+    repository: KnowledgeGraphRepositoryBase | None = None,
+) -> KnowledgeGraphManifest | None:
+    """Convenience helper extracting and persisting knowledge graph records across formats."""
+    builder = KnowledgeGraphBuilder(repository=repository)
+    fmt = format.lower().replace(".", "")
+    if fmt == "csv":
+        rows: list[dict[str, Any]] = []
+        if table_store and table_name:
+            try:
+                rows = list(table_store.query_rows(table_name, workspace_id, version=document_version))
+            except Exception as e:
+                logger.warning("Failed to query rows from table_store for kg: %s", e)
+        return builder.build_and_persist_tabular_graph(
+            workspace_id=workspace_id,
+            document_id=document_id,
+            document_version=document_version,
+            table_name=table_name or document_id,
+            rows=rows,
+            source_chunks=chunks,
+        )
+    elif fmt == "pdf":
+        return builder.build_and_persist_pdf_graph(
+            workspace_id=workspace_id,
+            document_id=document_id,
+            document_version=document_version,
+            chunks=chunks or [],
+            client=client,
+        )
+    return None
+

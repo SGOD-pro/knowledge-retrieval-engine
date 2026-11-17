@@ -25,6 +25,7 @@ class Chunk:
     similarity_score: float | None = None
     reranker_score: float | None = None
     okf_weight: float | None = None
+    graph_weight: float | None = None
     provider: str = "dev"
     embedding_fast: list[float] | None = None
     embedding_full: list[float] | None = None
@@ -193,6 +194,15 @@ class QueryResponse(BaseModel):
     okf_latency_ms: float = 0.0
     okf_entity_state: str = "none"
     okf_property_state: str = "none"
+    graph_candidate_ids: list[str] = Field(default_factory=list)
+    graph_match_count: int = 0
+    graph_latency_ms: float = 0.0
+    graph_traversed_nodes: int = 0
+    graph_matched_edges: int = 0
+    graph_was_truncated: bool = False
+    graph_truncation_reason: str | None = None
+    graph_entity_state: str = "none"
+    graph_relationship_state: str = "none"
     reranker_mode: str = "bypassed"
 
 

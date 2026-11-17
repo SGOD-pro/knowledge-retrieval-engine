@@ -2737,7 +2737,8 @@ class DynamoDBKnowledgeGraphRepository:
             logger.error("DynamoDB fail_extraction_budget error: %s", exc)
 
 
-_DEFAULT_KG_REPO: KnowledgeGraphRepositoryBase | None = None
+_SHARED_KG_REPO: KnowledgeGraphRepositoryBase | None = None
+_KG_REPO_LOCK = threading.Lock()
 
 
 def get_knowledge_graph_repository(
@@ -2757,6 +2758,25 @@ def get_knowledge_graph_repository(
     else:
         # Default for local development
         return SQLiteKnowledgeGraphRepository(db_path=db_path)
+
+
+def get_shared_knowledge_graph_repository(
+    backend: str | None = None,
+    db_path: str | Path | None = None,
+    table_name: str | None = None,
+    reset: bool = False,
+) -> KnowledgeGraphRepositoryBase:
+    """Resolve and return singleton Knowledge Graph repository matching configured environment."""
+    global _SHARED_KG_REPO
+    with _KG_REPO_LOCK:
+        if reset:
+            _SHARED_KG_REPO = None
+            return None
+        if _SHARED_KG_REPO is None:
+            _SHARED_KG_REPO = get_knowledge_graph_repository(
+                backend=backend, db_path=db_path, table_name=table_name
+            )
+        return _SHARED_KG_REPO
 
 
 def build_pinned_snapshot_context(
@@ -2816,3 +2836,9 @@ def build_pinned_snapshot_context(
         captured_at_utc=now_utc,
         active_documents=tuple(pinned_docs),
     )
+
+
+import sys
+if __name__ in ("db.knowledge_graph_repo", "src.db.knowledge_graph_repo"):
+    sys.modules["db.knowledge_graph_repo"] = sys.modules[__name__]
+    sys.modules["src.db.knowledge_graph_repo"] = sys.modules[__name__]

@@ -99,6 +99,43 @@ class DocumentsService:
             logger.warning("Could not persist OKF for %s: %s", doc_id, okf_err)
             return "failed", 0, 0
 
+    @staticmethod
+    def _enrich_graph_snapshot_metadata(
+        workspace_id: str,
+        doc_id: str,
+        doc_ver: str,
+        filename: str,
+        chunks: Any,
+        table_name: str | None = None,
+        table_store: Any | None = None,
+    ) -> tuple[str | None, int, int]:
+        """Resolve or extract Knowledge Graph relationships and return (status, entities_count, relations_count)."""
+        suffix = Path(filename).suffix.lower()
+        if suffix not in (".pdf", ".csv"):
+            return None, 0, 0
+        if not getattr(settings, "GRAPH_ENABLED", False):
+            return None, 0, 0
+        try:
+            from ingestion.graph_builder import extract_and_persist_graph
+            manifest = extract_and_persist_graph(
+                workspace_id=workspace_id,
+                document_id=doc_id,
+                document_version=doc_ver,
+                format=suffix.replace(".", ""),
+                chunks=chunks,
+                table_name=table_name,
+                table_store=table_store,
+            )
+            if manifest:
+                stat = getattr(manifest, "status", None) or (manifest.get("status") if isinstance(manifest, dict) else None)
+                ecnt = getattr(manifest, "entity_count", None) or (manifest.get("entities_count") if isinstance(manifest, dict) else 0) or 0
+                rcnt = getattr(manifest, "relationship_count", None) or (manifest.get("relations_count") if isinstance(manifest, dict) else 0) or 0
+                return stat or "ready", int(ecnt), int(rcnt)
+            return "failed", 0, 0
+        except Exception as kg_err:
+            logger.warning("Could not persist Knowledge Graph for %s: %s", doc_id, kg_err)
+            return "failed", 0, 0
+
     def background_ingest(
         self,
         temp_path_str: str,
@@ -284,7 +321,23 @@ class DocumentsService:
                     logger.warning("OKF enrichment failed for %s: %s", doc_id, okf_err)
                     okf_stat, okf_e_count, okf_p_count = "failed", 0, 0
 
-                # 4. Update DocumentSnapshot with enrichment outcomes while preserving Ready status
+                # 4. Decoupled enrichment pass for Knowledge Graph (ADR-001)
+                graph_stat, graph_e_count, graph_r_count = None, 0, 0
+                try:
+                    graph_stat, graph_e_count, graph_r_count = self._enrich_graph_snapshot_metadata(
+                        workspace_id=workspace_id,
+                        doc_id=doc_id,
+                        doc_ver=doc_ver,
+                        filename=filename,
+                        chunks=document.chunks,
+                        table_name=t_name,
+                        table_store=store_ref,
+                    )
+                except Exception as kg_err:
+                    logger.warning("Knowledge Graph enrichment failed for %s: %s", doc_id, kg_err)
+                    graph_stat, graph_e_count, graph_r_count = "failed", 0, 0
+
+                # 5. Update DocumentSnapshot with enrichment outcomes while preserving Ready status
                 enriched_snapshot = DocumentSnapshot(
                     workspace_id=workspace_id,
                     document_id=doc_id,
@@ -301,6 +354,9 @@ class DocumentsService:
                     okf_status=okf_stat,
                     okf_entities_count=okf_e_count,
                     okf_properties_count=okf_p_count,
+                    graph_status=graph_stat,
+                    graph_entities_count=graph_e_count,
+                    graph_relations_count=graph_r_count,
                 )
                 try:
                     boundary_repo.save_document_snapshot(enriched_snapshot)
@@ -524,7 +580,23 @@ class DocumentsService:
                         logger.warning("OKF enrichment failed for %s: %s", doc.id, okf_err)
                         okf_stat, okf_e_count, okf_p_count = "failed", 0, 0
 
-                    # 4. Update DocumentSnapshot with enrichment outcomes while preserving Ready status
+                    # 4. Decoupled enrichment pass for Knowledge Graph (ADR-001)
+                    graph_stat, graph_e_count, graph_r_count = None, 0, 0
+                    try:
+                        graph_stat, graph_e_count, graph_r_count = self._enrich_graph_snapshot_metadata(
+                            workspace_id=workspace_id,
+                            doc_id=doc.id,
+                            doc_ver=doc_ver,
+                            filename=file.filename or "unknown",
+                            chunks=doc.chunks,
+                            table_name=t_name,
+                            table_store=store_ref,
+                        )
+                    except Exception as kg_err:
+                        logger.warning("Knowledge Graph enrichment failed for %s: %s", doc.id, kg_err)
+                        graph_stat, graph_e_count, graph_r_count = "failed", 0, 0
+
+                    # 5. Update DocumentSnapshot with enrichment outcomes while preserving Ready status
                     enriched_snapshot = DocumentSnapshot(
                         workspace_id=workspace_id,
                         document_id=doc.id,
@@ -541,6 +613,9 @@ class DocumentsService:
                         okf_status=okf_stat,
                         okf_entities_count=okf_e_count,
                         okf_properties_count=okf_p_count,
+                        graph_status=graph_stat,
+                        graph_entities_count=graph_e_count,
+                        graph_relations_count=graph_r_count,
                     )
                     try:
                         boundary_repo.save_document_snapshot(enriched_snapshot)

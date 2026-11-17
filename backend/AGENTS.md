@@ -32,6 +32,7 @@ FastAPI service providing parsing, structural indexing, retrieval orchestration,
 | `src/db/knowledge_graph_repo.py` | Workspace partitioned knowledge graph storage repository across DynamoDB, SQLite, and memory stores |
 | `src/ingestion/graph_builder.py` | Deterministic tabular and grounded PDF relationship extraction with directional grounding validation |
 | `src/services/retrieval/knowledge_graph_retriever.py` | Bounded multi hop knowledge graph retriever with concurrency admission and targeted chunk hydration |
+| `src/services/retrieval/strategies/knowledge_graph.py` | Knowledge graph retrieval strategy with fast path bypass, caller deadline, and reciprocal rank fusion candidate scoring |
 | `src/services/benchmark/` | Benchmark runner, S3 artifact store, and recoverable metric persistence |
 | `scripts/resume_canonical_qdrant_points.py` | Idempotent canonical Qdrant resume with fail closed preflight and model provenance validation |
 
@@ -63,6 +64,7 @@ uv run pytest tests/test_contracts_and_identity.py
 * Grounded narrative PDF extraction enforces verbatim directional syntax grounding, rejecting reversed voice, sentence negation, disjoint clauses, and co occurrence without directional predicate.
 * Grounding preserves source context by locating candidate evidence within enclosing sentences, rejecting evidence that removes conditional, negated, hypothetical, or reported speech framing.
 * Sentence boundary splitting respects corporate abbreviations (Inc., Corp., Ltd.) and numeric decimals, distinguishes calendar month May from modal auxiliary may, accommodates descriptive business role nouns and temporal qualifiers between entities and predicates, and detects modal passive constructions with auxiliary be.
+* Knowledge graph retrieval strategy bypasses fast path queries, enforces caller deadlines, pools candidates into reciprocal rank fusion with calibrated initial weight (1.10, halved to 0.55 on ambiguity or conflict), and exposes full graph candidate telemetry.
 * Entity identity defaults strictly to document scoped identity; cross document entity joins require verified disambiguation tokens.
 * Chunk provenance validation checks document version and identity across attributes and metadata, rejecting stale versions and conflicting fields before Bedrock dispatch.
 * Ingestion extraction Bedrock Converse dispatch requires authoritative count_tokens pre validation and atomic budget ledger reservations with 15 second worker leases and monotonic fencing, preserving ready publications on failed attempts.

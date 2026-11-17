@@ -151,11 +151,11 @@ Spec [0006](../specs/0006-okf-integration.md) · code in `backend/src/`
 Extract typed entity relationships, enforce verbatim grounding and durable budget fencing, run bounded multi hop traversal with targeted chunk hydration, and pool candidates softly into reciprocal rank fusion.
 **Done when:** typed knowledge graph entities and directed relationships are extracted from active chunks with verbatim grounding and durable budget fencing, partitioned storage supports bounded multi hop traversal and targeted chunk hydration without table scans, and candidates pool softly into reciprocal rank fusion without displacing baseline retrieval.
 - [x] Design it (spec): `/architect knowledge graph enrichment`
-- [ ] Build it: `/develop knowledge graph enrichment`
+- [x] Build it: `/develop knowledge graph enrichment`
    - [x] Slice 1: Typed contracts, conservative entity identity, publication isolated storage, deterministic tabular relationships, bounded traversal, dynamic tombstones, and targeted chunk hydration (AC-1, AC-4, AC-6, AC-7, AC-8, AC-9)
    - [x] Slice 2: LLM entity/relationship extraction, Bedrock budgeting ledger, and verbatim grounding validation (AC-1, AC-2, AC-3, AC-5, AC-11)
-   - [ ] Slice 3: Pipeline reciprocal rank fusion, snapshot metadata, telemetry trace, and offline ablation (AC-10, AC-11, AC-12, AC-13)
-- [x] Verify it: `/check verify knowledge graph enrichment` (Slices 1 and 2)
+   - [x] Slice 3: Pipeline reciprocal rank fusion, snapshot metadata, telemetry trace, and offline ablation (AC-10, AC-11, AC-12, AC-13)
+- [x] Verify it: `/check verify knowledge graph enrichment` (Slices 1, 2, and 3)
 - [x] Test it: `/test knowledge graph enrichment` (Slice 1)
 - [x] Review it (fresh model): `/check review knowledge graph enrichment` (Slices 1 and 2)
 Spec [0007](../specs/0007-knowledge-graph-enrichment.md) · code in `backend/src/`

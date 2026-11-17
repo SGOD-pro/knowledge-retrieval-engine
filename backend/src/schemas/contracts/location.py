@@ -132,3 +132,8 @@ Location = Annotated[
     Union[DocumentLocation, TableLocation, SlideLocation, SectionLocation],
     Field(discriminator="type"),
 ]
+
+import sys
+if __name__ in ("schemas.contracts.location", "src.schemas.contracts.location"):
+    sys.modules["schemas.contracts.location"] = sys.modules[__name__]
+    sys.modules["src.schemas.contracts.location"] = sys.modules[__name__]

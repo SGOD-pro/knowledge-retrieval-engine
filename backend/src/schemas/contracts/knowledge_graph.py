@@ -291,3 +291,9 @@ class KnowledgeGraphReconciliationResult(BaseModel):
     reason: Literal["reconciled", "already_reconciled", "fenced_out", "not_found", "storage_error"]
     ledger: KnowledgeGraphBudgetLedger | None = None
 
+
+import sys
+if __name__ in ("schemas.contracts.knowledge_graph", "src.schemas.contracts.knowledge_graph"):
+    sys.modules["schemas.contracts.knowledge_graph"] = sys.modules[__name__]
+    sys.modules["src.schemas.contracts.knowledge_graph"] = sys.modules[__name__]
+

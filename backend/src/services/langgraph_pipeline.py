@@ -78,6 +78,16 @@ class PipelineState(TypedDict):
     executed_path: str
     candidate_page_scopes: list[tuple[str, int]] | None
     graph_chunks: list[Chunk]
+    graph_candidate_ids: list[str]
+    graph_match_count: int
+    graph_latency_ms: float
+    graph_traversed_nodes: int
+    graph_matched_edges: int
+    graph_was_truncated: bool
+    graph_truncation_reason: str | None
+    graph_entity_state: str
+    graph_relationship_state: str
+    graph_execution_status: str
     retrieval_candidates: dict[str, list[str]]
     reranker_mode: str
     status: str | None
@@ -110,13 +120,14 @@ def _rrf_merge(
     structural_chunks: list | None = None,
     okf_chunks: list | None = None,
     k: int = 60,
-    graph_weight: float = 1.2,
+    graph_weight: float | None = None,
     structural_weight: float = 1.1,
     okf_weight: float = 1.15,
 ) -> list:
     """Reciprocal Rank Fusion with graph, structural PageIndex, and OKF factual signals.
     k=60 per Cormack et al. 2009.
     Returns deduplicated list of Chunk objects ordered by descending RRF score."""
+    g_weight = graph_weight if graph_weight is not None else float(getattr(settings, "GRAPH_FUSION_WEIGHT", 1.10))
     scores: dict[str, float] = {}
     by_id: dict[str, object] = {}
     for rank, chunk in enumerate(bm25_chunks):
@@ -127,7 +138,9 @@ def _rrf_merge(
         by_id[chunk.id] = chunk
     if graph_chunks:
         for rank, chunk in enumerate(graph_chunks):
-            scores[chunk.id] = scores.get(chunk.id, 0.0) + (graph_weight / (k + rank + 1))
+            chunk_w = getattr(chunk, "graph_weight", None)
+            w = float(chunk_w) if chunk_w is not None else g_weight
+            scores[chunk.id] = scores.get(chunk.id, 0.0) + (w / (k + rank + 1))
             by_id[chunk.id] = chunk
     if structural_chunks:
         for rank, chunk in enumerate(structural_chunks):
@@ -632,57 +645,143 @@ def run_vector(state: PipelineState):
 
 
 def run_graph(state: PipelineState):
-    """Graph traversal with provenance-backed source chunk extraction."""
-    from services.retrieval.planner import extract_entities
-
+    """Bounded Knowledge Graph candidate retrieval (Spec 0007 Slice 3 / AC-10).
+    Traverses workspace-partitioned graph with caller deadline (75ms).
+    Yields candidate chunks for soft pooling into reciprocal rank fusion with
+    provisional initial weight (1.10), dividing weight by 2 (0.55) for ambiguous or
+    conflicting relationships.
+    Bypasses graph lookups completely on fast-path queries (0 tokens, 0ms)."""
     t0 = time.perf_counter()
-    entities = extract_entities(state["query"])
+    existing = state.get("stage_timings", {})
 
-    retriever = GraphRetriever()
-    results = retriever.expand(entities)
+    # 1. Check feature toggle
+    if not getattr(settings, "GRAPH_ENABLED", False):
+        return {
+            "graph_results": [],
+            "graph_chunks": [],
+            "graph_candidate_ids": [],
+            "graph_match_count": 0,
+            "graph_latency_ms": 0.0,
+            "graph_traversed_nodes": 0,
+            "graph_matched_edges": 0,
+            "graph_was_truncated": False,
+            "graph_truncation_reason": None,
+            "graph_entity_state": "none",
+            "graph_relationship_state": "none",
+            "graph_execution_status": "disabled",
+            "stage_timings": {**existing, "graph_ms": 0.0},
+        }
 
-    # Convert graph traversal outputs to provenance-backed chunk IDs
-    graph_chunks = []
-    repo = _get_repo()
+    # 2. Fast-path query bypass (AC-10)
+    plan = state.get("plan")
+    if plan and getattr(plan, "fast_path", False):
+        logger.info("run_graph.fast_path_bypass query=%s", state.get("query", "")[:50])
+        return {
+            "graph_results": [],
+            "graph_chunks": [],
+            "graph_candidate_ids": [],
+            "graph_match_count": 0,
+            "graph_latency_ms": 0.0,
+            "graph_traversed_nodes": 0,
+            "graph_matched_edges": 0,
+            "graph_was_truncated": False,
+            "graph_truncation_reason": None,
+            "graph_entity_state": "none",
+            "graph_relationship_state": "none",
+            "graph_execution_status": "fast_path_bypassed",
+            "stage_timings": {**existing, "graph_ms": 0.0},
+        }
+
     ws_id = state.get("workspace_id", "")
-    chunk_ids_to_fetch = set()
+    query = state.get("query", "")
+    if not ws_id or not query:
+        return {
+            "graph_results": [],
+            "graph_chunks": [],
+            "graph_candidate_ids": [],
+            "graph_match_count": 0,
+            "graph_latency_ms": 0.0,
+            "graph_traversed_nodes": 0,
+            "graph_matched_edges": 0,
+            "graph_was_truncated": False,
+            "graph_truncation_reason": None,
+            "graph_entity_state": "none",
+            "graph_relationship_state": "none",
+            "graph_execution_status": "empty_input",
+            "stage_timings": {**existing, "graph_ms": 0.0},
+        }
 
-    for item in results:
-        c_id = item.get("source_chunk_id") or item.get("chunk_id")
-        if c_id:
-            chunk_ids_to_fetch.add(str(c_id))
+    # 3. Execute authoritative KnowledgeGraphRetriever expansion
+    try:
+        from db.knowledge_graph_repo import get_shared_knowledge_graph_repository
+        from db.workspace_boundary_repo import get_workspace_boundary_repo
+        from modules.documents.documents_repository import DocumentsRepository
+        from services.retrieval.knowledge_graph_retriever import KnowledgeGraphRetriever
+    except ImportError:
+        from src.db.knowledge_graph_repo import get_shared_knowledge_graph_repository
+        from src.db.workspace_boundary_repo import get_workspace_boundary_repo
+        from src.modules.documents.documents_repository import DocumentsRepository
+        from src.services.retrieval.knowledge_graph_retriever import KnowledgeGraphRetriever
 
-    if entities and repo:
-        try:
-            okf_props = repo.get_okf_properties(entities)
-            for p in okf_props:
-                sc = p.get("source_chunk_id")
-                if sc:
-                    chunk_ids_to_fetch.add(str(sc))
-        except Exception:
-            pass
+    kg_repo = state.get("knowledge_graph_repo") or get_shared_knowledge_graph_repository()
+    boundary_repo = state.get("boundary_repo") or get_workspace_boundary_repo()
+    doc_repo = state.get("doc_repo") or _get_repo()
+    retriever = KnowledgeGraphRetriever(
+        repository=kg_repo,
+        boundary_repo=boundary_repo,
+        documents_repo=doc_repo,
+    )
 
-    if chunk_ids_to_fetch and repo:
-        try:
-            all_ws_chunks = repo.get_all_chunks(workspace_id=ws_id)
-            ws_by_id = {str(c.id): c for c in all_ws_chunks}
-            for cid in chunk_ids_to_fetch:
-                if cid in ws_by_id:
-                    graph_chunks.append(ws_by_id[cid])
-        except Exception as e:
-            logger.debug("graph_chunk_fetch_failed error=%s", e)
+    timeout_ms = float(getattr(settings, "GRAPH_TIMEOUT_MS", 75))
+    max_hops = int(getattr(settings, "GRAPH_MAX_HOPS", 2))
+
+    lookup_res = retriever.expand(
+        workspace_id=ws_id,
+        query=query,
+        max_hops=max_hops,
+        caller_deadline_ms=timeout_ms,
+    )
+
+    # 4. Calibrate RRF weight (AC-10)
+    base_weight = float(getattr(settings, "GRAPH_FUSION_WEIGHT", 1.10))
+    is_ambiguous_or_conflicting = (
+        lookup_res.entity_state == "ambiguous"
+        or lookup_res.relationship_state == "conflicting"
+    )
+    ambiguous_weight = float(getattr(settings, "GRAPH_AMBIGUOUS_FUSION_WEIGHT", 0.55))
+    calibrated_weight = ambiguous_weight if is_ambiguous_or_conflicting else base_weight
+
+    graph_chunks = [
+        dataclasses.replace(c, graph_weight=calibrated_weight) if hasattr(c, "graph_weight") else c
+        for c in lookup_res.candidate_chunks
+    ]
+
+    candidate_ids = [str(c.id) for c in graph_chunks] or list(lookup_res.matched_chunk_ids)
 
     latency_ms = (time.perf_counter() - t0) * 1000.0
     logger.info(
-        "graph.latency_ms=%.2f graph.result_count=%d graph.chunk_count=%d",
+        "run_graph.latency_ms=%.2f match_count=%d entity_state=%s rel_state=%s weight=%.3f status=%s",
         latency_ms,
-        len(results),
         len(graph_chunks),
+        lookup_res.entity_state,
+        lookup_res.relationship_state,
+        calibrated_weight,
+        lookup_res.execution_status,
     )
-    existing = state.get("stage_timings", {})
+
     return {
-        "graph_results": results,
+        "graph_results": list(lookup_res.candidate_chunks),
         "graph_chunks": graph_chunks,
+        "graph_candidate_ids": candidate_ids,
+        "graph_match_count": len(graph_chunks),
+        "graph_latency_ms": lookup_res.latency_ms,
+        "graph_traversed_nodes": lookup_res.traversed_node_count,
+        "graph_matched_edges": lookup_res.edge_match_count,
+        "graph_was_truncated": lookup_res.was_truncated,
+        "graph_truncation_reason": lookup_res.truncation_reason,
+        "graph_entity_state": lookup_res.entity_state,
+        "graph_relationship_state": lookup_res.relationship_state,
+        "graph_execution_status": lookup_res.execution_status,
         "stage_timings": {**existing, "graph_ms": latency_ms},
     }
 
@@ -697,6 +796,7 @@ def run_reranker(state: PipelineState):
     structural = state.get("structural_candidates", [])
     okf_candidates = state.get("okf_candidates", [])
 
+    graph_weight = float(getattr(settings, "GRAPH_FUSION_WEIGHT", 1.10))
     structural_weight = float(getattr(settings, "PAGEINDEX_STRUCTURAL_WEIGHT", 1.1))
     okf_weight = float(getattr(settings, "OKF_FUSION_WEIGHT", 1.15))
     merged = _rrf_merge(
@@ -706,7 +806,7 @@ def run_reranker(state: PipelineState):
         structural_chunks=structural,
         okf_chunks=okf_candidates,
         k=60,
-        graph_weight=1.2,
+        graph_weight=graph_weight,
         structural_weight=structural_weight,
         okf_weight=okf_weight,
     )
@@ -730,6 +830,15 @@ def run_reranker(state: PipelineState):
             "okf_latency_ms": 0.0,
             "okf_entity_state": "none",
             "okf_property_state": "none",
+            "graph_candidate_ids": [],
+            "graph_match_count": 0,
+            "graph_latency_ms": 0.0,
+            "graph_traversed_nodes": 0,
+            "graph_matched_edges": 0,
+            "graph_was_truncated": False,
+            "graph_truncation_reason": None,
+            "graph_entity_state": "none",
+            "graph_relationship_state": "none",
         })
         return {"top_chunks": [], "retrieval_candidates": cands, "reranker_mode": RerankerMode.BYPASSED.value}
 
@@ -761,6 +870,15 @@ def run_reranker(state: PipelineState):
         "okf_latency_ms": state.get("okf_latency_ms", 0.0),
         "okf_entity_state": state.get("okf_entity_state", "none"),
         "okf_property_state": state.get("okf_property_state", "none"),
+        "graph_candidate_ids": state.get("graph_candidate_ids", [str(c.id) for c in graph]),
+        "graph_match_count": state.get("graph_match_count", len(graph)),
+        "graph_latency_ms": state.get("graph_latency_ms", 0.0),
+        "graph_traversed_nodes": state.get("graph_traversed_nodes", 0),
+        "graph_matched_edges": state.get("graph_matched_edges", 0),
+        "graph_was_truncated": state.get("graph_was_truncated", False),
+        "graph_truncation_reason": state.get("graph_truncation_reason", None),
+        "graph_entity_state": state.get("graph_entity_state", "none"),
+        "graph_relationship_state": state.get("graph_relationship_state", "none"),
     }
 
     from services.retrieval.evidence_contract import evidence_item_from_chunk
@@ -1345,8 +1463,11 @@ def route_after_reranker_or_graph(state: PipelineState):
 
 
 def route_after_okf_post(state: PipelineState):
-    plan = state["plan"]
-    if plan and plan.use_graph:
+    plan = state.get("plan")
+    selected = state.get("selected_strategies", {}) or {}
+    primary = selected.get("primary", [])
+    graph_enabled = getattr(settings, "GRAPH_ENABLED", False)
+    if graph_enabled or (plan and getattr(plan, "use_graph", False)) or ("knowledge_graph" in primary):
         return "run_graph"
     return "run_reranker"
 
@@ -1566,6 +1687,16 @@ class Pipeline:
             "okf_entity_state": "none",
             "okf_property_state": "none",
             "okf_execution_status": "none",
+            "graph_candidate_ids": [],
+            "graph_match_count": 0,
+            "graph_latency_ms": 0.0,
+            "graph_traversed_nodes": 0,
+            "graph_matched_edges": 0,
+            "graph_was_truncated": False,
+            "graph_truncation_reason": None,
+            "graph_entity_state": "none",
+            "graph_relationship_state": "none",
+            "graph_execution_status": "none",
         }
 
         final_state = app.invoke(initial_state)
@@ -1622,6 +1753,16 @@ class Pipeline:
                 self.okf_latency_ms = state.get("okf_latency_ms", 0.0)
                 self.okf_entity_state = state.get("okf_entity_state", "none")
                 self.okf_property_state = state.get("okf_property_state", "none")
+                self.graph_candidates = state.get("graph_chunks", [])
+                self.graph_candidate_ids = state.get("graph_candidate_ids", [])
+                self.graph_match_count = state.get("graph_match_count", 0)
+                self.graph_latency_ms = state.get("graph_latency_ms", 0.0)
+                self.graph_traversed_nodes = state.get("graph_traversed_nodes", 0)
+                self.graph_matched_edges = state.get("graph_matched_edges", 0)
+                self.graph_was_truncated = state.get("graph_was_truncated", False)
+                self.graph_truncation_reason = state.get("graph_truncation_reason", None)
+                self.graph_entity_state = state.get("graph_entity_state", "none")
+                self.graph_relationship_state = state.get("graph_relationship_state", "none")
                 self.query_embedding = state.get("query_embedding")
                 self.query_embedding_provenance = state.get("query_embedding_provenance")
 

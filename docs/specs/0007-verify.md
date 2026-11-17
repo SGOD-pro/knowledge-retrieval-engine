@@ -1,14 +1,14 @@
-# Verify: Knowledge Graph enrichment (spec 0007 Slices 1 and 2, updated 2026-11-17)
+# Verify: Knowledge Graph enrichment (spec 0007 Slices 1, 2, and 3, updated 2026-11-17)
 _Steps derived from spec 0007 acceptance criteria. /check verify runs these; /test locks the durable ones._
 
 ## Verification Metadata
-* **Tested Commit**: `6d8bebad7e41cf0ca16cf02563a436740b5218df`
+* **Tested Commit**: Working tree HEAD (with Slice 3 implementation)
 * **Branch**: `re-factor`
 * **Repository**: `SGOD-pro/knowledge-retrieval-engine`
 * **Execution Date**: 2026-11-17
 * **Environment**: Linux x86_64, Python 3.12 via uv (host Python 3.14.7), SQLite 3 with WAL journal mode, DynamoDB Local (port 8000), local FastAPI and Uvicorn server (port 8001)
 * **Provider Modes**: Mocked Bedrock runtime client fixtures for CountTokens and Converse, mocked OpenRouter reranker. Zero paid provider calls made. All local mocks are documented as local test doubles and not mischaracterized as live AWS cloud verification.
-* **Status**: Slice 1 and Slice 2 fully verified and approved. Slice 3 pending. Spec 0007 In Progress. Spec 0003 deferred. GRAPH_ENABLED=false preserved.
+* **Status**: Slice 1, Slice 2, and Slice 3 fully verified. Spec 0007 implementation complete, ready for review. Spec 0003 deferred. GRAPH_ENABLED=false preserved.
 
 ## Exact Test Commands and Results
 
@@ -18,13 +18,15 @@ Command:
 cd backend && uv run pytest \
   tests/test_knowledge_graph_slice1.py \
   tests/test_knowledge_graph_slice2.py \
+  tests/test_knowledge_graph_ablation_slice3.py \
   tests/test_okf_slice3_1.py \
   tests/test_table_store.py -q
 ```
-Result: **192 passed in 19.37s**
+Result: **204 passed in 19.89s**
 Suite breakdown:
 * `tests/test_knowledge_graph_slice1.py`: 65 passed
 * `tests/test_knowledge_graph_slice2.py`: 64 passed
+* `tests/test_knowledge_graph_ablation_slice3.py`: 12 passed
 * `tests/test_okf_slice3_1.py`: 21 passed
 * `tests/test_table_store.py`: 42 passed
 
@@ -34,7 +36,7 @@ Command 1:
 cd backend && uv run python ../verify_0007_live.py
 ```
 Result: **18 passed out of 18 (18/18)**
-* Live workspace creation over HTTP (Alice workspace ws_2f1ab8e9022b) -> 201
+* Live workspace creation over HTTP (Alice workspace ws_ac389367ca17) -> 201
 * Real CSV document ingestion with provenance -> 201
 * DocumentSnapshot graph metadata exposure -> 200
 * Deterministic tabular relationship extraction from foreign keys -> 200 (4 entities, 2 relationships)
@@ -129,10 +131,38 @@ Result: **15 passed out of 15 (15/15)**
 * Enforces 15 second worker leases with monotonic fence tokens, safe lease takeover, crash recovery fail closed semantics, and ready publication preservation across failed new attempts.
 * Storage staging errors trigger conditional lease release across InMemory, SQLite WAL, and DynamoDB Local stores.
 
+## Detailed Slice 3 Coverage Confirmation
+
+### 1. Pipeline Fusion and Fast Path Bypass (AC-10)
+* Wired `run_graph` node in `backend/src/services/langgraph_pipeline.py` after OKF router post and before reranking.
+* Enforces `GRAPH_ENABLED` setting with default `False`. When disabled, bypasses graph retrieval with zero latency and zero model tokens.
+* Supports query plan routing bypass: fast path plans bypass graph lookup entirely with zero overhead.
+* Calibrated reciprocal rank fusion score computation: initial graph weight set to 1.10, halved to 0.55 when entity ambiguity or edge conflicts are detected.
+* Graph candidate chunks pool softly into `_rrf_merge` without displacing baseline retrieval chunks.
+
+### 2. Decoupled Baseline Ingestion and Snapshot Metadata (AC-3, AC-11, AC-12)
+* Wired graph extraction in `backend/src/modules/documents/documents_service.py` as an asynchronous background enrichment pass per ADR-001.
+* Ingestion updates `DocumentSnapshot` with `graph_status`, `graph_entities_count`, and `graph_relations_count`.
+* Extraction failures or timeouts log gracefully and record `graph_status="failed"` without blocking baseline document availability or core query execution.
+
+### 3. Retrieval Candidate Telemetry Trace (AC-12)
+* Exposed graph telemetry fields in `QueryResponse`: `graph_candidate_ids`, `graph_match_count`, `graph_latency_ms`, `graph_traversed_nodes`, `graph_matched_edges`, `graph_was_truncated`, `graph_truncation_reason`, `graph_entity_state`, and `graph_relationship_state`.
+* `query_service.py` maps graph telemetry attributes into query response dictionaries.
+
+### 4. Offline Ablation Comparison Suite and Counterexample Safety (AC-10, AC-13)
+* Implemented comprehensive test suite in `backend/tests/test_knowledge_graph_ablation_slice3.py` (12 tests passing).
+* Evaluates recall, precision, and latency comparisons with graph enabled versus disabled across canonical evaluation documents.
+* Counterexample safety verified: an incorrect graph expansion on Page 2 never displaces a factual answer chunk on Page 18 in reciprocal rank fusion.
+* Validated dynamic source and workspace tombstones fail closed, halting graph retrieval immediately.
+* Validated client deadline and concurrency limits drop graph retrieval cleanly on caller timeout without corrupting query results.
+
+### 5. Benchmark Comparison Precondition Barrier (AC-13)
+* `validate_benchmark_comparison_preconditions` strictly enforces comparison rules: blocks benchmark accuracy claims on non canonical workspaces and requires explicit approval before executing paid benchmarks.
+
 ## Review Records and Status
-* **Original Review**: `docs/reviews/2026-11-17-re-factor-0007-slice2-acceptance.md` preserved as a historical record (Verdict: Changes requested, identifying 3 Major and 4 Minor findings in sentence splitting, calendar modalities, intervening token allowlists, and passive auxiliaries).
-* **Follow Up Review**: `docs/reviews/2026-11-17-re-factor-0007-slice2-review.md` confirmed as the superseding authoritative review (Verdict: Approve, 0 blockers, 0 majors, 0 minors, 0 nits).
-* **Current Status**: Slice 2 is locally verified and reviewed. Spec 0007 remains In Progress.
+* **Original Slice 2 Review**: `docs/reviews/2026-11-17-re-factor-0007-slice2-acceptance.md` preserved as a historical record (Verdict: Changes requested).
+* **Follow Up Slice 2 Review**: `docs/reviews/2026-11-17-re-factor-0007-slice2-review.md` confirmed as the superseding authoritative review (Verdict: Approve).
+* **Current Status**: Slice 1, Slice 2, and Slice 3 are locally verified. Spec 0007 is ready for Slice 3 review. Spec 0007 remains In Progress until merged.
 
 ## Acceptance Criteria Traceability
 * **AC-1**: Grounded Narrative PDF Extraction and tabular extraction.
@@ -144,15 +174,14 @@ Result: **15 passed out of 15 (15/15)**
 * **AC-7**: Dynamic source and workspace tombstone enforcement fail closed.
 * **AC-8**: GraphConcurrencyController deadlines and capacity retention.
 * **AC-9**: Bounded multi hop traversal and targeted chunk hydration.
-* **AC-10**: Deeply immutable PinnedSnapshotContext request local bindings. (Candidate reciprocal rank fusion pooling deferred to Slice 3).
-* **AC-11**: Non destructive legacy cutover and partitioned storage routing.
-* **AC-12**: DocumentSnapshot graph metadata attributes.
-* **AC-13**: Benchmark comparison barrier blocking unverified claims.
+* **AC-10**: Deeply immutable PinnedSnapshotContext request local bindings, fast path bypass, and calibrated reciprocal rank fusion candidate pooling.
+* **AC-11**: Decoupled background enrichment pass, non destructive legacy cutover, and partitioned storage routing.
+* **AC-12**: DocumentSnapshot graph metadata attributes and QueryResponse retrieval candidate telemetry trace.
+* **AC-13**: Offline ablation comparison harness, counterexample discovery safety, and benchmark comparison barrier blocking unverified claims.
 
 ## Remaining Limitations and Invariants
-* Spec 0007 remains In Progress.
-* Slice 3 (Pipeline reciprocal rank fusion, snapshot metadata wiring, candidate telemetry trace, and offline ablation) remains pending and was not implemented during this task.
+* Spec 0007 implementation is complete and ready for code review.
 * Spec 0003 remains proposed and deferred.
-* `GRAPH_ENABLED=false` remains preserved.
+* `GRAPH_ENABLED=false` remains preserved by default; enabled selectively in isolated test suites via configuration overrides.
 * Zero paid provider calls made, zero benchmarks run, canonical corpus and historical benchmark workspaces preserved untouched.
 * Storage conditions exercised across DynamoDB Local and independent SQLite WAL connections; live AWS Bedrock and DynamoDB cloud services remain unverified in local development.
