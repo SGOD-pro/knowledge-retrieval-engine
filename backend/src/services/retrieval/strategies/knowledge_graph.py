@@ -50,6 +50,7 @@ class KnowledgeGraphStrategy:
         repository: Any | None = None,
         boundary_repo: Any | None = None,
         documents_repo: DocumentsRepository | None = None,
+        table_store: Any | None = None,
     ) -> None:
         # Backward compatibility for legacy callers passing CloudRepository as repository
         if repository is not None and not hasattr(repository, "resolve_mentions"):
@@ -60,10 +61,22 @@ class KnowledgeGraphStrategy:
         self.repository = repository or get_shared_knowledge_graph_repository()
         self.boundary_repo = boundary_repo or get_workspace_boundary_repo()
         self.documents_repo = documents_repo or DocumentsRepository()
+        self.table_store = table_store
+        if self.table_store is None:
+            try:
+                from db.table_store import get_shared_table_store
+                self.table_store = get_shared_table_store()
+            except Exception:
+                self.table_store = None
+
+        if retriever is not None and getattr(retriever, "table_store", None) is None and self.table_store is not None:
+            retriever.table_store = self.table_store
+
         self.retriever = retriever or KnowledgeGraphRetriever(
             repository=self.repository,
             boundary_repo=self.boundary_repo,
             documents_repo=self.documents_repo,
+            table_store=self.table_store,
         )
 
     async def retrieve(

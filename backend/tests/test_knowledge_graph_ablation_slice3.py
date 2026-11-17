@@ -926,11 +926,30 @@ def test_documents_service_csv_ingestion_with_authoritative_schema_relations():
     assert manifest.relationship_count == 2
 
     # 3. Assert grounded retrieval through KnowledgeGraphRetriever
-    retriever = KnowledgeGraphRetriever(repository=kg_repo, boundary_repo=b_repo)
+    retriever = KnowledgeGraphRetriever(repository=kg_repo, boundary_repo=b_repo, documents_repo=doc_service.repo, table_store=table_store)
     res = retriever.expand(workspace_id=ws_id, query="Engineering")
     assert res.edge_match_count >= 1
     assert len(res.matched_chunk_ids) >= 1
     assert f"{doc_id}:csv:row2" in res.matched_chunk_ids
+
+    # 4. Prove hydrated evidence through candidate_chunks
+    assert len(res.candidate_chunks) >= 1
+    cand = res.candidate_chunks[0]
+    assert cand.document_id == doc_id
+    assert cand.workspace_id == ws_id
+    assert cand.source_format == "csv"
+    assert "Engineering" in cand.text
+    assert cand.metadata.get("document_version") == doc_ver or cand.metadata.get("version") == doc_ver
+
+    # 5. Assert valid candidates survive conversion to EvidenceItem in KnowledgeGraphStrategy
+    import asyncio
+    from services.retrieval.strategies.knowledge_graph import KnowledgeGraphStrategy
+    strat = KnowledgeGraphStrategy(retriever=retriever, repository=kg_repo, boundary_repo=b_repo, documents_repo=doc_service.repo, table_store=table_store)
+    strat_res = asyncio.run(strat.retrieve("Engineering", ws_id))
+    assert len(strat_res.items) >= 1
+    assert strat_res.items[0].document_id == doc_id
+    assert strat_res.items[0].workspace_id == ws_id
+    assert "Engineering" in strat_res.items[0].text
 
 
 def test_documents_service_csv_absent_schema_relations_yields_empty_manifest():
@@ -1165,10 +1184,31 @@ def test_documents_service_pdf_ingestion_with_mocked_bedrock_provider():
     assert snapshot.graph_relations_count == 1
 
     # Assert graph retrieval returns grounded chunk
-    retriever = KnowledgeGraphRetriever(repository=kg_repo, boundary_repo=b_repo)
+    retriever = KnowledgeGraphRetriever(repository=kg_repo, boundary_repo=b_repo, documents_repo=doc_service.repo)
     res = retriever.expand(workspace_id=ws_id, query="Acme Corp")
     assert res.edge_match_count >= 1
     assert f"{doc_id}:c1" in res.matched_chunk_ids
+
+    # Assert nonempty candidate_chunks and actual source evidence
+    assert len(res.candidate_chunks) >= 1
+    cand = res.candidate_chunks[0]
+    assert cand.id == f"{doc_id}:c1"
+    assert cand.document_id == doc_id
+    assert cand.workspace_id == ws_id
+    assert cand.text == ch_text
+    assert cand.page_number == 1
+    assert cand.metadata.get("document_version") == doc_ver
+
+    # Assert valid candidates survive conversion to EvidenceItem in KnowledgeGraphStrategy
+    import asyncio
+    from services.retrieval.strategies.knowledge_graph import KnowledgeGraphStrategy
+    strat = KnowledgeGraphStrategy(retriever=retriever, repository=kg_repo, boundary_repo=b_repo, documents_repo=doc_service.repo)
+    strat_res = asyncio.run(strat.retrieve("Acme Corp", ws_id))
+    assert len(strat_res.items) >= 1
+    assert strat_res.items[0].document_id == doc_id
+    assert strat_res.items[0].workspace_id == ws_id
+    assert strat_res.items[0].text == ch_text
+    assert strat_res.items[0].locator.get("page_number") == 1
 
 
 def test_documents_service_pdf_missing_provider_returns_unavailable_baseline_ready():
@@ -1469,8 +1509,8 @@ def test_bounded_recovery_from_stub_empty_manifest():
             }
 
     auth_client = AuthoritativeBedrockClient()
-    # Now execute with authoritative client - should bypass stub manifest and recover
-    recovered_man = builder.build_and_persist_pdf_graph(
+    # Now execute with authoritative client - should bypass stub manifest and recover via explicit recovery
+    recovered_man = builder.recover_stub_manifest(
         workspace_id=ws_id,
         document_id=doc_id,
         document_version=doc_ver,
@@ -1569,4 +1609,862 @@ def test_baseline_published_before_enrichment_and_preserved_on_failure():
     snap = b_repo.get_document_snapshot(ws_id, doc_id)
     assert snap is not None
     assert snap.graph_status == "failed"
+
+
+# =============================================================================
+# Section 15: Exact-Version Authority, Historical Stub Recovery, and Grounded Hydration
+# =============================================================================
+
+
+def test_csv_unversioned_and_older_version_schema_relations_not_inherited():
+    """Verify older version v1 schema relations are never inherited by version v2 without verified relations."""
+    import hashlib
+    import tempfile
+    from pathlib import Path
+    from schemas.structured_table import TableSchema, ColumnDefinition, HeaderTopology, InferredDtype
+    from ingestion.graph_builder import DirectionalSchemaRelation
+    from modules.documents.documents_service import DocumentsService
+    from services.retrieval.knowledge_graph_retriever import KnowledgeGraphRetriever
+
+    ws_id = "ws_csv_version_isolation"
+    b_repo = get_workspace_boundary_repo()
+    b_repo.create_workspace(name="CSV Version Isolation WS", owner_principal_id="test_user", workspace_id=ws_id)
+
+    # Document v1 has verified schema relations
+    doc1_id = "doc_inv_v1"
+    csv1_text = "Item,Warehouse,Qty\nWidget,North,100\n"
+    csv1_bytes = csv1_text.encode("utf-8")
+    doc1_ver = hashlib.sha256(csv1_bytes).hexdigest()[:32]
+    table_id = "inventory"
+
+    table_store = get_shared_table_store()
+    table_store.store_schema(
+        table_id=table_id,
+        workspace_id=ws_id,
+        schema=TableSchema(
+            columns=(
+                ColumnDefinition(col_index=0, name="Item", inferred_dtype=InferredDtype.STRING),
+                ColumnDefinition(col_index=1, name="Warehouse", inferred_dtype=InferredDtype.STRING),
+                ColumnDefinition(col_index=2, name="Qty", inferred_dtype=InferredDtype.INTEGER),
+            ),
+            header_rows=(0,),
+            header_topology=HeaderTopology.SINGLE_ROW,
+            confidence=1.0,
+            schema_relations=(
+                DirectionalSchemaRelation(
+                    source_column="Item",
+                    predicate="stored_in",
+                    target_column="Warehouse",
+                ),
+            ),
+            metadata={"document_id": doc1_id, "workspace_id": ws_id, "document_version": doc1_ver, "table_id": table_id},
+        ),
+        document_id=doc1_id,
+        document_version=doc1_ver,
+    )
+
+    doc_service = DocumentsService()
+    with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmp:
+        tmp.write(csv1_bytes)
+        tmp1_path = tmp.name
+    try:
+        doc_service.background_ingest(
+            temp_path_str=tmp1_path,
+            workspace_id=ws_id,
+            doc_id=doc1_id,
+            filename="inventory.csv",
+            content=csv1_bytes,
+            size_str="100 B",
+        )
+    finally:
+        Path(tmp1_path).unlink(missing_ok=True)
+
+    snap1 = b_repo.get_document_snapshot(ws_id, doc1_id)
+    assert snap1 is not None
+    assert snap1.graph_status == "ready"
+    assert snap1.graph_relations_count == 1
+
+    # Now ingest Document v2 of inventory without verified schema relations
+    doc2_id = "doc_inv_v2"
+    csv2_text = "Item,Warehouse,Qty\nGadget,South,200\n"
+    csv2_bytes = csv2_text.encode("utf-8")
+    doc2_ver = hashlib.sha256(csv2_bytes).hexdigest()[:32]
+
+    with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmp:
+        tmp.write(csv2_bytes)
+        tmp2_path = tmp.name
+    try:
+        doc_service.background_ingest(
+            temp_path_str=tmp2_path,
+            workspace_id=ws_id,
+            doc_id=doc2_id,
+            filename="inventory.csv",
+            content=csv2_bytes,
+            size_str="100 B",
+        )
+    finally:
+        Path(tmp2_path).unlink(missing_ok=True)
+
+    # v2 must NOT inherit v1 relations
+    snap2 = b_repo.get_document_snapshot(ws_id, doc2_id)
+    assert snap2 is not None
+    assert snap2.graph_status == "empty"
+    assert snap2.graph_entities_count == 0
+    assert snap2.graph_relations_count == 0
+
+    # Retriever must find 0 relations and 0 candidate chunks for v2
+    kg_repo = get_shared_knowledge_graph_repository()
+    retriever = KnowledgeGraphRetriever(repository=kg_repo, boundary_repo=b_repo, documents_repo=doc_service.repo, table_store=table_store)
+    res = retriever.expand(workspace_id=ws_id, query="Gadget")
+    assert res.edge_match_count == 0
+    assert len(res.candidate_chunks) == 0
+
+
+def test_csv_same_table_name_collision_across_documents_rejected():
+    """Verify same-table-name collisions across documents are rejected and do not bleed relations."""
+    import hashlib
+    import tempfile
+    from pathlib import Path
+    from schemas.structured_table import TableSchema, ColumnDefinition, HeaderTopology, InferredDtype
+    from ingestion.graph_builder import DirectionalSchemaRelation
+    from modules.documents.documents_service import DocumentsService
+    from services.retrieval.knowledge_graph_retriever import KnowledgeGraphRetriever
+
+    ws_id = "ws_csv_collision_isolation"
+    b_repo = get_workspace_boundary_repo()
+    b_repo.create_workspace(name="CSV Collision WS", owner_principal_id="test_user", workspace_id=ws_id)
+
+    # Doc A has table "metrics" with verified relations
+    doc_a_id = "doc_a_metrics"
+    csv_a_text = "Metric,Owner,Target\nLatency,DevOps,50ms\n"
+    csv_a_bytes = csv_a_text.encode("utf-8")
+    doc_a_ver = hashlib.sha256(csv_a_bytes).hexdigest()[:32]
+    table_id = "metrics"
+
+    table_store = get_shared_table_store()
+    table_store.store_schema(
+        table_id=table_id,
+        workspace_id=ws_id,
+        schema=TableSchema(
+            columns=(
+                ColumnDefinition(col_index=0, name="Metric", inferred_dtype=InferredDtype.STRING),
+                ColumnDefinition(col_index=1, name="Owner", inferred_dtype=InferredDtype.STRING),
+                ColumnDefinition(col_index=2, name="Target", inferred_dtype=InferredDtype.STRING),
+            ),
+            header_rows=(0,),
+            header_topology=HeaderTopology.SINGLE_ROW,
+            confidence=1.0,
+            schema_relations=(
+                DirectionalSchemaRelation(
+                    source_column="Metric",
+                    predicate="owned_by",
+                    target_column="Owner",
+                ),
+            ),
+            metadata={"document_id": doc_a_id, "workspace_id": ws_id, "document_version": doc_a_ver, "table_id": table_id},
+        ),
+        document_id=doc_a_id,
+        document_version=doc_a_ver,
+    )
+
+    doc_service = DocumentsService()
+    with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmp:
+        tmp.write(csv_a_bytes)
+        tmp_a_path = tmp.name
+    try:
+        doc_service.background_ingest(
+            temp_path_str=tmp_a_path,
+            workspace_id=ws_id,
+            doc_id=doc_a_id,
+            filename="metrics.csv",
+            content=csv_a_bytes,
+            size_str="100 B",
+        )
+    finally:
+        Path(tmp_a_path).unlink(missing_ok=True)
+
+    snap_a = b_repo.get_document_snapshot(ws_id, doc_a_id)
+    assert snap_a is not None
+    assert snap_a.graph_status == "ready"
+
+    # Doc B has same table name "metrics" but different document_id and no schema relations
+    doc_b_id = "doc_b_metrics"
+    csv_b_text = "Metric,Owner,Target\nThroughput,Platform,10k\n"
+    csv_b_bytes = csv_b_text.encode("utf-8")
+    doc_b_ver = hashlib.sha256(csv_b_bytes).hexdigest()[:32]
+
+    with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmp:
+        tmp.write(csv_b_bytes)
+        tmp_b_path = tmp.name
+    try:
+        doc_service.background_ingest(
+            temp_path_str=tmp_b_path,
+            workspace_id=ws_id,
+            doc_id=doc_b_id,
+            filename="metrics.csv",
+            content=csv_b_bytes,
+            size_str="100 B",
+        )
+    finally:
+        Path(tmp_b_path).unlink(missing_ok=True)
+
+    # Doc B must reject Doc A's schema and publish an empty manifest
+    snap_b = b_repo.get_document_snapshot(ws_id, doc_b_id)
+    assert snap_b is not None
+    assert snap_b.graph_status == "empty"
+    assert snap_b.graph_entities_count == 0
+    assert snap_b.graph_relations_count == 0
+
+    kg_repo = get_shared_knowledge_graph_repository()
+    retriever = KnowledgeGraphRetriever(repository=kg_repo, boundary_repo=b_repo, documents_repo=doc_service.repo, table_store=table_store)
+    res = retriever.expand(workspace_id=ws_id, query="Throughput")
+    assert res.edge_match_count == 0
+    assert len(res.candidate_chunks) == 0
+
+
+def test_recovery_on_historical_stub_with_completed_calls_and_zero_tokens_memory_sqlite_ddb(tmp_path):
+    """Verify historical client=None stubs with completed_calls>=1 and spent_output_tokens=0 recover cleanly."""
+    import hashlib
+    import json
+    import uuid
+    from db.knowledge_graph_repo import (
+        InMemoryKnowledgeGraphRepository,
+        SQLiteKnowledgeGraphRepository,
+        DynamoDBKnowledgeGraphRepository,
+    )
+    from schemas.contracts.knowledge_graph import KnowledgeGraphManifest, KnowledgeGraphBudgetLedger
+    from ingestion.graph_builder import KnowledgeGraphBuilder
+
+    # Repositories to exercise
+    repos: list[tuple[str, Any]] = [
+        ("Memory", InMemoryKnowledgeGraphRepository()),
+        ("SQLite", SQLiteKnowledgeGraphRepository(db_path=str(tmp_path / "kg_recovery.sqlite"))),
+    ]
+
+    # Check if DynamoDB Local is reachable
+    try:
+        import boto3
+        ddb_c = boto3.client("dynamodb", endpoint_url="http://localhost:8000", region_name="us-east-1", aws_access_key_id="test", aws_secret_access_key="test")
+        ddb_c.list_tables()
+        ddb_table = f"kre_kg_recov_{uuid.uuid4().hex[:8]}"
+        ddb_c.create_table(
+            TableName=ddb_table,
+            KeySchema=[{"AttributeName": "PK", "KeyType": "HASH"}, {"AttributeName": "SK", "KeyType": "RANGE"}],
+            AttributeDefinitions=[{"AttributeName": "PK", "AttributeType": "S"}, {"AttributeName": "SK", "AttributeType": "S"}],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        repos.append(("DynamoDB", DynamoDBKnowledgeGraphRepository(table_name=ddb_table, endpoint_url="http://localhost:8000")))
+    except Exception:
+        pass
+
+    class MockBedrockClient:
+        def __init__(self):
+            self.calls = 0
+
+        def count_tokens(self, modelId, input):
+            return {"inputTokens": 140}
+
+        def converse(self, modelId, messages, system=None, inferenceConfig=None, timeout_s=None):
+            self.calls += 1
+            return {
+                "output": {
+                    "message": {
+                        "content": [
+                            {
+                                "text": json.dumps({
+                                    "entities": [
+                                        {"name": "Alpha Corp", "entity_type": "organization"},
+                                        {"name": "Omega Ltd", "entity_type": "organization"},
+                                    ],
+                                    "relationships": [
+                                        {
+                                            "source_entity": "Alpha Corp",
+                                            "predicate": "partnered_with",
+                                            "target_entity": "Omega Ltd",
+                                            "chunk_id": "doc_stub:c1",
+                                            "verbatim_evidence": "Alpha Corp partnered with Omega Ltd in 2024.",
+                                        }
+                                    ],
+                                })
+                            }
+                        ]
+                    }
+                },
+                "usage": {"inputTokens": 140, "outputTokens": 45},
+            }
+
+    for repo_name, repo in repos:
+        ws_id = f"ws_stub_rec_{repo_name.lower()}"
+        doc_id = "doc_stub_1"
+        doc_ver = "v1"
+        stub_pub_id = f"pub_stub_{repo_name.lower()}"
+        idemp = hashlib.sha256(f"{ws_id}:{doc_id}:{doc_ver}:kg".encode("utf-8")).hexdigest()
+
+        # 1. Populate actual historical stub shape: completed_calls=1, spent_output_tokens=0
+        stub_ledger = KnowledgeGraphBudgetLedger(
+            workspace_id=ws_id,
+            document_id=doc_id,
+            document_version=doc_ver,
+            fence_token=1,
+            reserved_calls=1,
+            completed_calls=1,
+            reserved_tokens=2200,
+            reserved_prompt_tokens=1400,
+            reserved_output_tokens=800,
+            spent_tokens=140,
+            spent_prompt_tokens=140,
+            spent_output_tokens=0,  # Synthetic stub signature
+            reconciled_fences=(1,),
+            status="active",
+            updated_at="2026-11-18T00:00:00Z",
+        )
+        repo.save_budget_ledger(stub_ledger)
+
+        stub_manifest = KnowledgeGraphManifest(
+            workspace_id=ws_id,
+            document_id=doc_id,
+            document_version=doc_ver,
+            publication_id=stub_pub_id,
+            status="empty",
+            entity_count=0,
+            relationship_count=0,
+            ingested_at_utc="2026-11-18T00:00:00Z",
+            content_hash=idemp,
+        )
+        repo.commit_manifest(ws_id, stub_manifest)
+
+        client = MockBedrockClient()
+        builder = KnowledgeGraphBuilder(repository=repo)
+
+        chunk = Chunk(
+            id="doc_stub:c1",
+            document_id=doc_id,
+            workspace_id=ws_id,
+            text="Alpha Corp partnered with Omega Ltd in 2024.",
+            source_format="pdf",
+            element_type="paragraph",
+            page_number=1,
+            metadata={"document_version": doc_ver},
+            embedding_fast=embed_fast_local("Alpha Corp partnered with Omega Ltd in 2024."),
+            embedding_full=_deterministic_vector("Alpha Corp partnered with Omega Ltd in 2024.", 1024),
+        )
+
+        # 2. Normal build with allow_stub_recovery=False preserves stub manifest without calling Bedrock
+        man_default = builder.build_and_persist_pdf_graph(
+            workspace_id=ws_id,
+            document_id=doc_id,
+            document_version=doc_ver,
+            chunks=[chunk],
+            client=client,
+            allow_stub_recovery=False,
+        )
+        assert man_default.publication_id == stub_pub_id
+        assert man_default.status == "empty"
+        assert client.calls == 0
+
+        # 3. Explicit recovery via recover_stub_manifest succeeds
+        recovered_man = builder.recover_stub_manifest(
+            workspace_id=ws_id,
+            document_id=doc_id,
+            document_version=doc_ver,
+            chunks=[chunk],
+            client=client,
+        )
+        assert client.calls == 1
+        assert recovered_man.status == "ready"
+        assert recovered_man.entity_count == 2
+        assert recovered_man.relationship_count == 1
+        assert recovered_man.base_publication_id == stub_pub_id
+        assert recovered_man.publication_id != stub_pub_id
+
+        # 4. Verify durable ledger preserved prior spend and incremented completed_calls
+        final_ledger = repo.get_budget_ledger(ws_id, doc_id, doc_ver, consistent_read=True)
+        assert final_ledger is not None
+        assert final_ledger.completed_calls == 2
+        assert final_ledger.spent_prompt_tokens == 280  # 140 prior + 140 new
+        assert final_ledger.spent_output_tokens == 45
+        assert final_ledger.fence_token == 2
+
+
+def test_recovery_preserves_legitimate_empty_publication():
+    """Verify legitimate empty Bedrock responses with spent_output_tokens>0 are preserved and not recovered."""
+    import hashlib
+    from db.knowledge_graph_repo import InMemoryKnowledgeGraphRepository
+    from schemas.contracts.knowledge_graph import KnowledgeGraphManifest, KnowledgeGraphBudgetLedger
+    from ingestion.graph_builder import KnowledgeGraphBuilder
+
+    repo = InMemoryKnowledgeGraphRepository()
+    ws_id = "ws_legit_empty"
+    doc_id = "doc_legit_empty"
+    doc_ver = "v1"
+    pub_id = "pub_legit_empty_123"
+    idemp = hashlib.sha256(f"{ws_id}:{doc_id}:{doc_ver}:kg".encode("utf-8")).hexdigest()
+
+    # Legitimate Bedrock empty result: completed_calls=1, spent_output_tokens=15 (>0)
+    legit_ledger = KnowledgeGraphBudgetLedger(
+        workspace_id=ws_id,
+        document_id=doc_id,
+        document_version=doc_ver,
+        fence_token=1,
+        reserved_calls=1,
+        completed_calls=1,
+        reserved_tokens=2200,
+        reserved_prompt_tokens=1400,
+        reserved_output_tokens=800,
+        spent_tokens=155,
+        spent_prompt_tokens=140,
+        spent_output_tokens=15,  # Legitimate Bedrock spend
+        reconciled_fences=(1,),
+        status="active",
+        updated_at="2026-11-18T00:00:00Z",
+    )
+    repo.save_budget_ledger(legit_ledger)
+
+    legit_manifest = KnowledgeGraphManifest(
+        workspace_id=ws_id,
+        document_id=doc_id,
+        document_version=doc_ver,
+        publication_id=pub_id,
+        status="empty",
+        entity_count=0,
+        relationship_count=0,
+        ingested_at_utc="2026-11-18T00:00:00Z",
+        content_hash=idemp,
+    )
+    repo.commit_manifest(ws_id, legit_manifest)
+
+    class SpyBedrockClient:
+        def __init__(self):
+            self.calls = 0
+
+        def count_tokens(self, modelId, input):
+            return {"inputTokens": 140}
+
+        def converse(self, *args, **kwargs):
+            self.calls += 1
+            return {}
+
+    spy_client = SpyBedrockClient()
+    builder = KnowledgeGraphBuilder(repository=repo)
+
+    chunk = Chunk(
+        id="doc_legit:c1",
+        document_id=doc_id,
+        workspace_id=ws_id,
+        text="No organizational entities mentioned here.",
+        source_format="pdf",
+        element_type="paragraph",
+        page_number=1,
+        metadata={"document_version": doc_ver},
+        embedding_fast=embed_fast_local("No organizational entities mentioned here."),
+        embedding_full=_deterministic_vector("No organizational entities mentioned here.", 1024),
+    )
+
+    # Attempt recovery: must preserve legitimate empty publication
+    res_man = builder.recover_stub_manifest(
+        workspace_id=ws_id,
+        document_id=doc_id,
+        document_version=doc_ver,
+        chunks=[chunk],
+        client=spy_client,
+    )
+
+    assert res_man.publication_id == pub_id
+    assert res_man.status == "empty"
+    assert spy_client.calls == 0  # Bedrock was never called
+
+
+def test_recovery_fails_on_competing_publication_cas_conflict(tmp_path):
+    """Verify recovery raises OptimisticConcurrencyError and preserves competing publication when concurrent publication commits."""
+    import hashlib
+    import json
+    import pytest
+    from db.knowledge_graph_repo import (
+        InMemoryKnowledgeGraphRepository,
+        SQLiteKnowledgeGraphRepository,
+        OptimisticConcurrencyError,
+    )
+    from schemas.contracts.knowledge_graph import KnowledgeGraphManifest, KnowledgeGraphBudgetLedger
+    from ingestion.graph_builder import KnowledgeGraphBuilder
+
+    repos = [
+        ("Memory", InMemoryKnowledgeGraphRepository()),
+        ("SQLite", SQLiteKnowledgeGraphRepository(db_path=str(tmp_path / "kg_cas_recovery.sqlite"))),
+    ]
+
+    class MockBedrockClient:
+        def count_tokens(self, modelId, input):
+            return {"inputTokens": 140}
+
+        def converse(self, *args, **kwargs):
+            return {
+                "output": {
+                    "message": {
+                        "content": [
+                            {
+                                "text": json.dumps({
+                                    "entities": [{"name": "A", "entity_type": "organization"}],
+                                    "relationships": [],
+                                })
+                            }
+                        ]
+                    }
+                },
+                "usage": {"inputTokens": 140, "outputTokens": 20},
+            }
+
+    for name, repo in repos:
+        ws_id = f"ws_cas_{name.lower()}"
+        doc_id = "doc_cas_1"
+        doc_ver = "v1"
+        stub_pub_id = f"pub_stub_{name.lower()}"
+        competing_pub_id = f"pub_competing_{name.lower()}"
+        idemp = hashlib.sha256(f"{ws_id}:{doc_id}:{doc_ver}:kg".encode("utf-8")).hexdigest()
+
+        # 1. Historical stub
+        repo.save_budget_ledger(KnowledgeGraphBudgetLedger(
+            workspace_id=ws_id,
+            document_id=doc_id,
+            document_version=doc_ver,
+            fence_token=1,
+            reserved_calls=1,
+            completed_calls=1,
+            reserved_tokens=2200,
+            reserved_prompt_tokens=1400,
+            reserved_output_tokens=800,
+            spent_tokens=140,
+            spent_prompt_tokens=140,
+            spent_output_tokens=0,
+            reconciled_fences=(1,),
+            status="active",
+            updated_at="2026-11-18T00:00:00Z",
+        ))
+        repo.commit_manifest(ws_id, KnowledgeGraphManifest(
+            workspace_id=ws_id,
+            document_id=doc_id,
+            document_version=doc_ver,
+            publication_id=stub_pub_id,
+            status="empty",
+            entity_count=0,
+            relationship_count=0,
+            ingested_at_utc="2026-11-18T00:00:00Z",
+            content_hash=idemp,
+        ))
+
+        # 2. Simulate competing publication committing DURING recovery
+        builder = KnowledgeGraphBuilder(repository=repo)
+        chunk = Chunk(
+            id="doc_cas:c1",
+            document_id=doc_id,
+            workspace_id=ws_id,
+            text="A entity.",
+            source_format="pdf",
+            element_type="paragraph",
+            page_number=1,
+            metadata={"document_version": doc_ver},
+            embedding_fast=embed_fast_local("A entity."),
+            embedding_full=_deterministic_vector("A entity.", 1024),
+        )
+
+        class RacingBedrockClient:
+            def count_tokens(self, modelId, input):
+                return {"inputTokens": 140}
+
+            def converse(self, *args, **kwargs):
+                # Competing publication commits concurrently while Bedrock is executing
+                repo.commit_manifest(
+                    ws_id,
+                    KnowledgeGraphManifest(
+                        workspace_id=ws_id,
+                        document_id=doc_id,
+                        document_version=doc_ver,
+                        publication_id=competing_pub_id,
+                        base_publication_id=stub_pub_id,
+                        status="ready",
+                        entity_count=1,
+                        relationship_count=0,
+                        ingested_at_utc="2026-11-18T00:00:00Z",
+                        content_hash=idemp,
+                    ),
+                    base_publication_id=stub_pub_id,
+                )
+                return {
+                    "output": {
+                        "message": {
+                            "content": [
+                                {
+                                    "text": json.dumps({
+                                        "entities": [{"name": "A", "entity_type": "organization"}],
+                                        "relationships": [],
+                                    })
+                                }
+                            ]
+                        }
+                    },
+                    "usage": {"inputTokens": 140, "outputTokens": 20},
+                }
+
+        # Recovery attempts CAS with base_publication_id=stub_pub_id -> must raise OptimisticConcurrencyError
+        with pytest.raises(OptimisticConcurrencyError):
+            builder.recover_stub_manifest(
+                workspace_id=ws_id,
+                document_id=doc_id,
+                document_version=doc_ver,
+                chunks=[chunk],
+                client=RacingBedrockClient(),
+            )
+
+        # Assert competing publication was preserved intact
+        current_man = repo.get_manifest(ws_id, doc_id, doc_ver, consistent_read=True)
+        assert current_man is not None
+        assert current_man.publication_id == competing_pub_id
+
+
+def test_hydrated_evidence_negative_controls():
+    """Verify negative controls: deleted chunks, tombstones, absent table rows, and version mismatch produce 0 candidates."""
+    from services.retrieval.knowledge_graph_retriever import KnowledgeGraphRetriever
+    from schemas.contracts.knowledge_graph import KnowledgeGraphEntity, KnowledgeGraphRelationship, KnowledgeGraphManifest
+    from schemas.contracts.location import DocumentLocation, TableLocation
+    from schemas.structured_table import TableSchema
+    from modules.documents.documents_repository import DocumentsRepository
+
+    ws_id = "ws_negative_controls"
+    doc_id = "doc_neg_1"
+    doc_ver = "v1"
+    b_repo = get_workspace_boundary_repo()
+    b_repo.create_workspace(name="Neg Controls WS", owner_principal_id="test_user", workspace_id=ws_id)
+
+    from schemas.contracts.boundary import DocumentSnapshot
+    b_repo.save_document_snapshot(
+        DocumentSnapshot(
+            workspace_id=ws_id,
+            document_id=doc_id,
+            source="doc_neg.pdf",
+            version=doc_ver,
+            format="pdf",
+            incomplete_coverage_flag=False,
+            exclusions=(),
+            persisted_rows=1,
+            total_rows=1,
+            created_at="2026-11-18T00:00:00Z",
+            graph_status="ready",
+        )
+    )
+
+    kg_repo = get_shared_knowledge_graph_repository()
+    doc_repo = DocumentsRepository()
+    table_store = get_shared_table_store()
+
+    pub_id = "pub_neg_1"
+
+    # 1. Missing / deleted source chunk control
+    e1 = KnowledgeGraphEntity(entity_id="E_ALPHA", workspace_id=ws_id, name="Alpha", canonical_name="alpha", entity_type="organization", source_document_id=doc_id)
+    e2 = KnowledgeGraphEntity(entity_id="E_BETA", workspace_id=ws_id, name="Beta", canonical_name="beta", entity_type="organization", source_document_id=doc_id)
+
+    rel_missing_chunk = KnowledgeGraphRelationship(
+        relationship_id="REL_NEG_1",
+        workspace_id=ws_id,
+        source_entity_id="E_ALPHA",
+        source_entity_name="Alpha",
+        predicate="merged_with",
+        canonical_predicate="merged_with",
+        target_entity_id="E_BETA",
+        target_entity_name="Beta",
+        directed=True,
+        confidence=1.0,
+        source_document_id=doc_id,
+        source_document_version=doc_ver,
+        publication_id=pub_id,
+        source_chunk_ids=("non_existent_chunk_id",),
+        location=DocumentLocation(page=1),
+        verbatim_evidence="Alpha merged with Beta.",
+        relationship_state="unique",
+        created_at_utc="2026-11-18T00:00:00Z",
+    )
+    kg_repo.stage_relationships(
+        workspace_id=ws_id,
+        document_id=doc_id,
+        document_version=doc_ver,
+        publication_id=pub_id,
+        entities=[e1, e2],
+        relationships=[rel_missing_chunk],
+    )
+    kg_repo.commit_manifest(
+        ws_id,
+        KnowledgeGraphManifest(
+            workspace_id=ws_id,
+            document_id=doc_id,
+            document_version=doc_ver,
+            publication_id=pub_id,
+            status="ready",
+            entity_count=2,
+            relationship_count=1,
+            ingested_at_utc="2026-11-18T00:00:00Z",
+            content_hash="h1",
+        ),
+    )
+
+    retriever = KnowledgeGraphRetriever(repository=kg_repo, boundary_repo=b_repo, documents_repo=doc_repo, table_store=table_store)
+    res = retriever.expand(workspace_id=ws_id, query="Alpha", caller_deadline_ms=5000.0)
+    assert res.edge_match_count >= 1
+    assert len(res.candidate_chunks) == 0  # Missing chunk produces 0 candidate chunks
+
+    # 2. Tombstoned document control
+    b_repo.create_source(workspace_id=ws_id, title="Doc Neg", source_id=doc_id)
+    b_repo.record_source_tombstone(workspace_id=ws_id, source_id=doc_id, caller_principal_id="usr_alice")
+
+    res_tomb = retriever.expand(workspace_id=ws_id, query="Alpha", caller_deadline_ms=5000.0)
+    assert res_tomb.edge_match_count == 0
+    assert len(res_tomb.candidate_chunks) == 0
+
+    # 3. Absent table row control
+    doc_table_id = "doc_neg_table"
+    pub_table_id = "pub_neg_table"
+    b_repo.save_document_snapshot(
+        DocumentSnapshot(
+            workspace_id=ws_id,
+            document_id=doc_table_id,
+            source="table_neg.csv",
+            version=doc_ver,
+            format="csv",
+            incomplete_coverage_flag=False,
+            exclusions=(),
+            persisted_rows=1,
+            total_rows=1,
+            created_at="2026-11-18T00:00:00Z",
+            graph_status="ready",
+        )
+    )
+
+    e3 = KnowledgeGraphEntity(entity_id="E_GAMMA", workspace_id=ws_id, name="Gamma", canonical_name="gamma", entity_type="organization", source_document_id=doc_table_id)
+    e4 = KnowledgeGraphEntity(entity_id="E_DELTA", workspace_id=ws_id, name="Delta", canonical_name="delta", entity_type="organization", source_document_id=doc_table_id)
+
+    rel_table = KnowledgeGraphRelationship(
+        relationship_id="REL_NEG_TABLE",
+        workspace_id=ws_id,
+        source_entity_id="E_GAMMA",
+        source_entity_name="Gamma",
+        predicate="subsidiary_of",
+        canonical_predicate="subsidiary_of",
+        target_entity_id="E_DELTA",
+        target_entity_name="Delta",
+        directed=True,
+        confidence=1.0,
+        source_document_id=doc_table_id,
+        source_document_version=doc_ver,
+        publication_id=pub_table_id,
+        source_chunk_ids=(),
+        location=TableLocation(table_id="non_existent_table", row_id="row_9999"),
+        verbatim_evidence="Gamma is subsidiary of Delta.",
+        relationship_state="unique",
+        created_at_utc="2026-11-18T00:00:00Z",
+    )
+    kg_repo.stage_relationships(
+        workspace_id=ws_id,
+        document_id=doc_table_id,
+        document_version=doc_ver,
+        publication_id=pub_table_id,
+        entities=[e3, e4],
+        relationships=[rel_table],
+    )
+    kg_repo.commit_manifest(
+        ws_id,
+        KnowledgeGraphManifest(
+            workspace_id=ws_id,
+            document_id=doc_table_id,
+            document_version=doc_ver,
+            publication_id=pub_table_id,
+            status="ready",
+            entity_count=2,
+            relationship_count=1,
+            ingested_at_utc="2026-11-18T00:00:00Z",
+            content_hash="h2",
+        ),
+    )
+
+    res_table = retriever.expand(workspace_id=ws_id, query="Gamma", caller_deadline_ms=5000.0)
+    assert res_table.edge_match_count >= 1
+    assert len(res_table.candidate_chunks) == 0  # Absent table row produces 0 candidate chunks
+
+    # 4. Wrong version mismatch control
+    doc_ver_id = "doc_neg_ver"
+    pub_ver_id = "pub_neg_ver"
+    b_repo.save_document_snapshot(
+        DocumentSnapshot(
+            workspace_id=ws_id,
+            document_id=doc_ver_id,
+            source="table_ver.csv",
+            version="v2",
+            format="csv",
+            incomplete_coverage_flag=False,
+            exclusions=(),
+            persisted_rows=1,
+            total_rows=1,
+            created_at="2026-11-18T00:00:00Z",
+            graph_status="ready",
+        )
+    )
+    from schemas.structured_table import ColumnDefinition, HeaderTopology, TableSchema
+    # Store schema only for v1, while relationship is tagged as v2
+    table_store.store_schema(
+        table_id="tbl_wrong_ver",
+        workspace_id=ws_id,
+        schema=TableSchema(
+            columns=(ColumnDefinition(col_index=0, name="col_a"),),
+            header_rows=(0,),
+            header_topology=HeaderTopology.SINGLE_ROW,
+            confidence=1.0,
+            metadata={"workspace_id": ws_id, "document_id": doc_ver_id, "document_version": "v1", "table_id": "tbl_wrong_ver"},
+        ),
+        document_id=doc_ver_id,
+        document_version="v1",
+    )
+    e5 = KnowledgeGraphEntity(entity_id="E_EPSILON", workspace_id=ws_id, name="Epsilon", canonical_name="epsilon", entity_type="organization", source_document_id=doc_ver_id)
+    e6 = KnowledgeGraphEntity(entity_id="E_ZETA", workspace_id=ws_id, name="Zeta", canonical_name="zeta", entity_type="organization", source_document_id=doc_ver_id)
+    rel_ver = KnowledgeGraphRelationship(
+        relationship_id="REL_NEG_VER",
+        workspace_id=ws_id,
+        source_entity_id="E_EPSILON",
+        source_entity_name="Epsilon",
+        predicate="partner_of",
+        canonical_predicate="partner_of",
+        target_entity_id="E_ZETA",
+        target_entity_name="Zeta",
+        directed=True,
+        confidence=1.0,
+        source_document_id=doc_ver_id,
+        source_document_version="v2",
+        publication_id=pub_ver_id,
+        source_chunk_ids=(),
+        location=TableLocation(table_id="tbl_wrong_ver", row_id=0),
+        verbatim_evidence="Epsilon is partner of Zeta.",
+        relationship_state="unique",
+        created_at_utc="2026-11-18T00:00:00Z",
+    )
+    kg_repo.stage_relationships(
+        workspace_id=ws_id,
+        document_id=doc_ver_id,
+        document_version="v2",
+        publication_id=pub_ver_id,
+        entities=[e5, e6],
+        relationships=[rel_ver],
+    )
+    kg_repo.commit_manifest(
+        ws_id,
+        KnowledgeGraphManifest(
+            workspace_id=ws_id,
+            document_id=doc_ver_id,
+            document_version="v2",
+            publication_id=pub_ver_id,
+            status="ready",
+            entity_count=2,
+            relationship_count=1,
+            ingested_at_utc="2026-11-18T00:00:00Z",
+            content_hash="h3",
+        ),
+    )
+    res_ver = retriever.expand(workspace_id=ws_id, query="Epsilon", caller_deadline_ms=5000.0)
+    assert res_ver.edge_match_count >= 1
+    assert len(res_ver.candidate_chunks) == 0  # Version mismatch rejected by table store authority
+
 

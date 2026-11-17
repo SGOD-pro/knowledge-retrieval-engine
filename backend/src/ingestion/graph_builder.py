@@ -37,6 +37,7 @@ try:
     from src.schemas.contracts.location import DocumentLocation, TableLocation
     from src.db.knowledge_graph_repo import (
         KnowledgeGraphRepositoryBase,
+        OptimisticConcurrencyError,
         disable_client_retries,
         get_knowledge_graph_repository,
         get_shared_knowledge_graph_repository,
@@ -55,6 +56,7 @@ except ImportError:
     from schemas.contracts.location import DocumentLocation, TableLocation
     from db.knowledge_graph_repo import (
         KnowledgeGraphRepositoryBase,
+        OptimisticConcurrencyError,
         disable_client_retries,
         get_knowledge_graph_repository,
         get_shared_knowledge_graph_repository,
@@ -154,12 +156,38 @@ def _resolve_schema_relations_from_table_store(
             if schema is not None:
                 meta = getattr(schema, "metadata", {}) or {}
                 if isinstance(meta, dict):
-                    # Identity check: verify workspace and version if present in metadata
+                    # Identity check: verify workspace, document, version, and table if present in metadata
                     meta_ws = meta.get("workspace_id")
+                    meta_doc = meta.get("document_id")
                     meta_ver = meta.get("document_version") or meta.get("version")
-                    if (meta_ws and meta_ws != workspace_id) or (meta_ver and meta_ver != document_version):
+                    meta_tbl = meta.get("table_id")
+                    if (meta_ws and meta_ws != workspace_id) or (meta_ver and str(meta_ver) != str(document_version)):
                         logger.warning("Rejecting schema relations due to workspace/version conflict in metadata")
                         return []
+                    if meta_doc and str(meta_doc) != str(document_id):
+                        logger.warning("Rejecting schema relations due to document_id conflict in metadata: %s != %s", meta_doc, document_id)
+                        return []
+                    if meta_tbl and str(meta_tbl) != str(t_cand):
+                        logger.warning("Rejecting schema relations due to table_id conflict in metadata: %s != %s", meta_tbl, t_cand)
+                        return []
+
+                    # Validate bindings using storage keys and authoritative metadata
+                    # Missing optional metadata alone must not substitute for proof
+                    if not meta_doc:
+                        is_bound = False
+                        if t_cand == document_id:
+                            is_bound = True
+                        else:
+                            try:
+                                m = table_store.get_ingestion_manifest(document_id, workspace_id, version=document_version)
+                                if m and isinstance(m, dict) and m.get("table_id") == t_cand and m.get("document_id") == document_id:
+                                    is_bound = True
+                            except Exception:
+                                pass
+                        if not is_bound:
+                            logger.warning("Rejecting schema relations for %s: unverifiable binding without document proof", t_cand)
+                            continue
+
                 if getattr(schema, "schema_relations", None):
                     raw_candidates.extend(schema.schema_relations)
                 if getattr(schema, "foreign_keys", None):
@@ -182,41 +210,25 @@ def _resolve_schema_relations_from_table_store(
         if manifest and isinstance(manifest, dict):
             # Strict identity check
             man_ws = manifest.get("workspace_id")
+            man_doc = manifest.get("document_id")
             man_ver = manifest.get("document_version") or manifest.get("version")
-            if (man_ws and man_ws != workspace_id) or (man_ver and man_ver != document_version):
+            man_tbl = manifest.get("table_id")
+            if (man_ws and man_ws != workspace_id) or (man_ver and str(man_ver) != str(document_version)):
                 logger.warning("Rejecting manifest schema relations due to workspace/version conflict")
                 return []
-            else:
-                if manifest.get("schema_relations"):
-                    raw_candidates.extend(manifest["schema_relations"])
-                if manifest.get("foreign_keys"):
-                    raw_candidates.extend(manifest["foreign_keys"])
+            if man_doc and str(man_doc) != str(document_id):
+                logger.warning("Rejecting manifest schema relations due to document_id conflict: %s != %s", man_doc, document_id)
+                return []
+            if table_name and man_tbl and man_tbl != table_name and man_tbl != document_id:
+                logger.warning("Rejecting manifest schema relations due to table_name mismatch: %s != %s", man_tbl, table_name)
+                return []
+
+            if manifest.get("schema_relations"):
+                raw_candidates.extend(manifest["schema_relations"])
+            if manifest.get("foreign_keys"):
+                raw_candidates.extend(manifest["foreign_keys"])
     except Exception as e:
         logger.debug("Could not resolve manifest from table_store: %s", e)
-
-    # 3. StructuredTable lookup
-    if not raw_candidates:
-        try:
-            st = table_store.get_table(tbl, workspace_id)
-            if st and getattr(st, "schema", None):
-                st_schema = st.schema
-                st_doc = getattr(st, "document_id", None)
-                if st_doc and st_doc != document_id:
-                    logger.warning("Rejecting table schema due to document_id mismatch: %s != %s", st_doc, document_id)
-                else:
-                    st_meta = getattr(st_schema, "metadata", {}) or {}
-                    if isinstance(st_meta, dict):
-                        meta_ws = st_meta.get("workspace_id")
-                        meta_ver = st_meta.get("document_version") or st_meta.get("version")
-                        if (meta_ws and meta_ws != workspace_id) or (meta_ver and meta_ver != document_version):
-                            logger.warning("Rejecting table schema relations due to workspace/version conflict in metadata")
-                            return []
-                    if getattr(st_schema, "schema_relations", None):
-                        raw_candidates.extend(st_schema.schema_relations)
-                    if getattr(st_schema, "foreign_keys", None):
-                        raw_candidates.extend(st_schema.foreign_keys)
-        except Exception as e:
-            logger.debug("Could not resolve table from table_store.get_table: %s", e)
 
     results: list[DirectionalSchemaRelation | TableForeignKey] = []
     seen: set[tuple[str, str, str]] = set()
@@ -1231,6 +1243,7 @@ class KnowledgeGraphBuilder:
         lease_duration_s: float = 15.0,
         call_deadline_s: float = 10.0,
         authoritative_disambiguation: dict[str, str] | None = None,
+        allow_stub_recovery: bool = False,
     ) -> KnowledgeGraphManifest:
         """Extract canonical entity relationships from PDF text chunks using Bedrock converse and durable budgeting."""
         if not worker_id or not worker_id.strip():
@@ -1243,16 +1256,37 @@ class KnowledgeGraphBuilder:
         idempotency_key = hashlib.sha256(f"{workspace_id}:{document_id}:{document_version}:kg".encode("utf-8")).hexdigest()
         existing_man = self.repository.get_manifest(workspace_id, document_id, document_version, consistent_read=True)
         if existing_man is not None and existing_man.status in ("ready", "empty") and existing_man.content_hash == idempotency_key:
-            if existing_man.status == "empty" and client is not None:
-                ledger_check = self.repository.get_budget_ledger(workspace_id, document_id, document_version, consistent_read=True)
-                is_stub = (ledger_check is None or (ledger_check.completed_calls == 0 and ledger_check.spent_output_tokens == 0))
-                if not is_stub:
-                    return existing_man
-                logger.info(
-                    "Bypassing stub empty manifest for doc %s ver %s to allow bounded recovery with authoritative client",
-                    document_id, document_version,
+            is_recovery = False
+            if existing_man.status == "empty" and allow_stub_recovery and client is not None:
+                # Explicit, narrowly scoped recovery operation with strict provenance checks
+                prov_ok = (
+                    existing_man.workspace_id == workspace_id
+                    and existing_man.document_id == document_id
+                    and existing_man.document_version == document_version
+                    and existing_man.entity_count == 0
+                    and existing_man.relationship_count == 0
                 )
-            else:
+                if prov_ok:
+                    ledger_check = self.repository.get_budget_ledger(workspace_id, document_id, document_version, consistent_read=True)
+                    # Historical stub state from client=None: synthetic reconciliation incremented completed_calls (>=1),
+                    # but spent_output_tokens == 0. Legitimate Bedrock calls always generate output tokens (>0).
+                    if ledger_check is None or ledger_check.spent_output_tokens == 0:
+                        logger.info(
+                            "Identified historical stub empty manifest for doc %s ver %s (completed_calls=%d, spent_output_tokens=0). Initiating bounded CAS recovery.",
+                            document_id,
+                            document_version,
+                            ledger_check.completed_calls if ledger_check else 0,
+                        )
+                        is_recovery = True
+                        base_publication_id = existing_man.publication_id
+                    else:
+                        logger.info(
+                            "Preserving legitimate empty manifest for doc %s ver %s with spent_output_tokens=%d > 0",
+                            document_id,
+                            document_version,
+                            ledger_check.spent_output_tokens,
+                        )
+            if not is_recovery:
                 return existing_man
 
         if client is None:
@@ -1697,6 +1731,9 @@ class KnowledgeGraphBuilder:
                 fence_token=fence_token,
                 worker_id=worker_id,
             )
+        except OptimisticConcurrencyError as oce:
+            logger.warning("Publication conflict during commit for %s: %s", document_id, oce)
+            raise
         except Exception as commit_err:
             logger.warning("Failed to commit manifest: %s", commit_err)
             try:
@@ -1714,6 +1751,26 @@ class KnowledgeGraphBuilder:
             return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
 
         return manifest
+
+    def recover_stub_manifest(
+        self,
+        workspace_id: str,
+        document_id: str,
+        document_version: str,
+        chunks: Sequence[Any],
+        client: Any | None = None,
+        worker_id: str | None = None,
+    ) -> KnowledgeGraphManifest:
+        """Explicit, narrowly scoped recovery operation for historical client=None stubs with provenance checks."""
+        return self.build_and_persist_pdf_graph(
+            workspace_id=workspace_id,
+            document_id=document_id,
+            document_version=document_version,
+            chunks=chunks,
+            client=client,
+            worker_id=worker_id,
+            allow_stub_recovery=True,
+        )
 
 
 def _clean_json_payload(raw_text: str) -> str:
@@ -1972,6 +2029,7 @@ def extract_and_persist_graph(
     client: Any | None = None,
     repository: KnowledgeGraphRepositoryBase | None = None,
     schema_relations: Sequence[DirectionalSchemaRelation | TableForeignKey] | None = None,
+    allow_stub_recovery: bool = False,
 ) -> KnowledgeGraphManifest | None:
     """Convenience helper extracting and persisting knowledge graph records across formats."""
     repo = repository or get_shared_knowledge_graph_repository()
@@ -2033,6 +2091,7 @@ def extract_and_persist_graph(
             document_version=document_version,
             chunks=chunks or [],
             client=client,
+            allow_stub_recovery=allow_stub_recovery,
         )
     return None
 

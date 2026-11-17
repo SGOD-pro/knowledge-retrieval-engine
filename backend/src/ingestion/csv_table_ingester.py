@@ -123,25 +123,59 @@ def ingest_csv_to_table_store(
 
     schema = infer_schema_from_header(headers, sample_rows)
 
-    # Check if authoritative schema, foreign keys, or schema relations already exist for this table
+    # Check if authoritative schema, foreign keys, or schema relations already exist for this exact table and version
     existing_schema = store.get_schema(table_id, workspace_id, version=document_version)
-    if existing_schema is None:
-        existing_schema = store.get_schema(table_id, workspace_id)
 
-    inherited_fks = getattr(existing_schema, "foreign_keys", ()) or ()
-    inherited_relations = schema_relations or getattr(existing_schema, "schema_relations", ()) or ()
-    inherited_metadata = dict(getattr(existing_schema, "metadata", {}) or {})
+    inherited_fks = ()
+    inherited_relations = schema_relations or ()
+    inherited_metadata = {}
 
-    if inherited_fks or inherited_relations or inherited_metadata:
-        schema = TableSchema(
-            columns=schema.columns,
-            header_rows=schema.header_rows,
-            header_topology=schema.header_topology,
-            confidence=schema.confidence,
-            foreign_keys=tuple(inherited_fks),
-            schema_relations=tuple(inherited_relations),
-            metadata=inherited_metadata,
-        )
+    if existing_schema is not None:
+        existing_meta = dict(getattr(existing_schema, "metadata", {}) or {})
+        meta_ws = existing_meta.get("workspace_id")
+        meta_doc = existing_meta.get("document_id")
+        meta_ver = existing_meta.get("document_version") or existing_meta.get("version")
+        meta_tbl = existing_meta.get("table_id")
+
+        is_binding_verified = False
+        if meta_ws and meta_ws != workspace_id:
+            is_binding_verified = False
+        elif meta_ver and str(meta_ver) != str(document_version):
+            is_binding_verified = False
+        elif meta_doc and str(meta_doc) != str(document_id):
+            is_binding_verified = False
+        elif meta_tbl and str(meta_tbl) != str(table_id):
+            is_binding_verified = False
+        elif meta_doc == document_id and meta_ws == workspace_id:
+            is_binding_verified = True
+        else:
+            # Missing optional metadata alone must not substitute for proof
+            # Validate bindings using storage keys and authoritative metadata
+            man = store.get_ingestion_manifest(document_id, workspace_id, version=document_version)
+            if man and isinstance(man, dict) and man.get("table_id") == table_id and man.get("document_id") == document_id:
+                is_binding_verified = True
+
+        if is_binding_verified:
+            inherited_fks = getattr(existing_schema, "foreign_keys", ()) or ()
+            inherited_relations = schema_relations or getattr(existing_schema, "schema_relations", ()) or ()
+            inherited_metadata = existing_meta
+
+    # Enforce authoritative provenance metadata on the versioned schema
+    final_metadata = dict(inherited_metadata)
+    final_metadata["document_id"] = document_id
+    final_metadata["workspace_id"] = workspace_id
+    final_metadata["document_version"] = document_version
+    final_metadata["table_id"] = table_id
+
+    schema = TableSchema(
+        columns=schema.columns,
+        header_rows=schema.header_rows,
+        header_topology=schema.header_topology,
+        confidence=schema.confidence,
+        foreign_keys=tuple(inherited_fks),
+        schema_relations=tuple(inherited_relations),
+        metadata=final_metadata,
+    )
 
     schema_version = _compute_schema_version(schema)
 
