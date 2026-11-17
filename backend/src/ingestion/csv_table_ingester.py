@@ -12,7 +12,7 @@ import hashlib
 import io
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 import uuid
 
 from db.table_store.base import TableStore
@@ -87,6 +87,7 @@ def ingest_csv_to_table_store(
     allow_rejections: bool = False,
     exclusion_policy: str | None = None,
     table_name: str | None = None,
+    schema_relations: Sequence[Any] | None = None,
 ) -> CsvIngestionResult:
     """Ingest CSV file into TableStore using streaming, checkpoints, and versioned keys."""
     if not workspace_id:
@@ -121,6 +122,27 @@ def ingest_csv_to_table_store(
                     break
 
     schema = infer_schema_from_header(headers, sample_rows)
+
+    # Check if authoritative schema, foreign keys, or schema relations already exist for this table
+    existing_schema = store.get_schema(table_id, workspace_id, version=document_version)
+    if existing_schema is None:
+        existing_schema = store.get_schema(table_id, workspace_id)
+
+    inherited_fks = getattr(existing_schema, "foreign_keys", ()) or ()
+    inherited_relations = schema_relations or getattr(existing_schema, "schema_relations", ()) or ()
+    inherited_metadata = dict(getattr(existing_schema, "metadata", {}) or {})
+
+    if inherited_fks or inherited_relations or inherited_metadata:
+        schema = TableSchema(
+            columns=schema.columns,
+            header_rows=schema.header_rows,
+            header_topology=schema.header_topology,
+            confidence=schema.confidence,
+            foreign_keys=tuple(inherited_fks),
+            schema_relations=tuple(inherited_relations),
+            metadata=inherited_metadata,
+        )
+
     schema_version = _compute_schema_version(schema)
 
     # 3. Check for existing manifest (idempotency check)

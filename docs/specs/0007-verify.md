@@ -22,11 +22,11 @@ cd backend && uv run pytest \
   tests/test_okf_slice3_1.py \
   tests/test_table_store.py -q
 ```
-Result: **205 passed in 20.72s**
+Result: **214 passed in 26.29s**
 Suite breakdown:
 * `tests/test_knowledge_graph_slice1.py`: 65 passed
 * `tests/test_knowledge_graph_slice2.py`: 64 passed
-* `tests/test_knowledge_graph_ablation_slice3.py`: 13 passed
+* `tests/test_knowledge_graph_ablation_slice3.py`: 22 passed
 * `tests/test_okf_slice3_1.py`: 21 passed
 * `tests/test_table_store.py`: 42 passed
 
@@ -159,11 +159,22 @@ Result: **15 passed out of 15 (15/15)**
 ### 5. Benchmark Comparison Precondition Barrier (AC-13)
 * `validate_benchmark_comparison_preconditions` strictly enforces comparison rules: blocks benchmark accuracy claims on non canonical workspaces and requires explicit approval before executing paid benchmarks.
 
+### 6. Production Ingestion Wiring and Provider Resolution (AC-1, AC-3, AC-5, AC-11)
+* Verified CSV schema relationship resolution: `DocumentsService.background_ingest` resolves verified directional relationships from authoritative exact version `TableStore` schema metadata and passes them through to `extract_and_persist_graph`.
+* Reject conflicting schema relations: cross workspace or cross version mismatches in schema metadata, manifests, or table records are rejected fail closed without creating spurious relationships.
+* Ingested TableStore persistence: `ingest_csv_to_table_store` preserves foreign keys, directional schema relations, and metadata on versioned schema entries without overwriting them during header inference.
+* Bedrock provider boundary wiring: `KnowledgeGraphBuilder` resolves configured Bedrock runtime client through `aws.infra.get_client("bedrock-runtime")` with support for explicit injection in tests.
+* Bedrock call governance: enforces mandatory CountTokens validation, durable token budget reservations, retry bounds, deadline fencing, and atomic reconciliation before publication.
+* Missing provider status: documents ingested without provider configuration record status `unavailable` or `failed` in `DocumentSnapshot` (never a successful empty extraction), while baseline document publication remains `Ready` per ADR-001.
+* Valid zero relationships distinction: narrative documents with valid Bedrock responses returning zero entity relationships publish an `empty` manifest with spent tokens accounted for in the budget ledger.
+* Bounded recovery: legacy stub empty manifests created by missing provider runs (zero completed calls and zero spent output tokens) are safely recovered when an authoritative provider is supplied, without re ingesting the corpus or resetting spent budgets.
+
 ## Review Records and Status
 * **Original Slice 2 Review**: `docs/reviews/2026-11-17-re-factor-0007-slice2-acceptance.md` preserved as a historical record (Verdict: Changes requested).
 * **Follow Up Slice 2 Review**: `docs/reviews/2026-11-17-re-factor-0007-slice2-review.md` confirmed as the superseding authoritative review (Verdict: Approve).
 * **Original Slice 3 Review**: `docs/reviews/2026-11-17-re-factor-0007-slice3-review.md` preserved as a historical record (Verdict: Changes requested).
 * **Follow Up Slice 3 Review**: `docs/reviews/2026-11-17-re-factor-0007-slice3-followup-review.md` confirmed as the superseding authoritative review (Verdict: Approve, 0 blockers, 0 majors, 0 minors, 0 nits).
+* **Wiring Blockers Resolution**: Both Slice 3 production ingestion wiring blockers (CSV schema relations from TableStore and Bedrock provider boundary injection) repaired, covered by 9 dedicated application path tests in Section 14, and verified locally.
 * **Current Status**: Slice 1, Slice 2, and Slice 3 are locally verified and approved. Spec 0007 implementation is complete and approved. Spec 0007 remains In Progress until merged.
 
 ## Acceptance Criteria Traceability

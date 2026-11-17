@@ -24,6 +24,16 @@ from schemas.structured_table import (
 logger = logging.getLogger(__name__)
 
 
+def _serialize_relation_item(item: Any) -> Any:
+    if isinstance(item, dict):
+        return item
+    if hasattr(item, "model_dump"):
+        return item.model_dump()
+    if hasattr(item, "__dict__"):
+        return dict(item.__dict__)
+    return item
+
+
 def _schema_to_json(schema: TableSchema) -> str:
     cols = []
     for c in schema.columns:
@@ -36,11 +46,17 @@ def _schema_to_json(schema: TableSchema) -> str:
             "sample_values": list(c.sample_values),
             "null_ratio": c.null_ratio,
         })
+    fk_list = [_serialize_relation_item(fk) for fk in getattr(schema, "foreign_keys", ())] if getattr(schema, "foreign_keys", None) else []
+    sr_list = [_serialize_relation_item(sr) for sr in getattr(schema, "schema_relations", ())] if getattr(schema, "schema_relations", None) else []
+    meta = dict(getattr(schema, "metadata", {}) or {})
     data = {
         "columns": cols,
         "header_rows": list(schema.header_rows),
         "header_topology": schema.header_topology.value,
         "confidence": schema.confidence,
+        "foreign_keys": fk_list,
+        "schema_relations": sr_list,
+        "metadata": meta,
     }
     return json.dumps(data)
 
@@ -65,6 +81,9 @@ def _json_to_schema(s: str) -> TableSchema:
         header_rows=tuple(data.get("header_rows", (0,))),
         header_topology=HeaderTopology(data.get("header_topology", "single_row")),
         confidence=data.get("confidence", 1.0),
+        foreign_keys=tuple(data.get("foreign_keys", ())),
+        schema_relations=tuple(data.get("schema_relations", ())),
+        metadata=dict(data.get("metadata", {}) or {}),
     )
 
 

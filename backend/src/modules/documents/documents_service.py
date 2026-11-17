@@ -32,8 +32,9 @@ def _resolve_media_type(filename: str) -> str:
 class DocumentsService:
     """Service handling multi-format document ingestion, storage, and file streaming."""
 
-    def __init__(self, repo: DocumentsRepository | None = None):
+    def __init__(self, repo: DocumentsRepository | None = None, bedrock_client: Any | None = None):
         self.repo = repo or DocumentsRepository()
+        self.bedrock_client = bedrock_client
 
     @staticmethod
     def _enrich_page_index_snapshot_metadata(
@@ -108,6 +109,8 @@ class DocumentsService:
         chunks: Any,
         table_name: str | None = None,
         table_store: Any | None = None,
+        client: Any | None = None,
+        schema_relations: Any | None = None,
     ) -> tuple[str | None, int, int]:
         """Resolve or extract Knowledge Graph relationships and return (status, entities_count, relations_count)."""
         suffix = Path(filename).suffix.lower()
@@ -125,6 +128,8 @@ class DocumentsService:
                 chunks=chunks,
                 table_name=table_name,
                 table_store=table_store,
+                client=client,
+                schema_relations=schema_relations,
             )
             if manifest:
                 stat = getattr(manifest, "status", None) or (manifest.get("status") if isinstance(manifest, dict) else None)
@@ -334,6 +339,7 @@ class DocumentsService:
                         chunks=document.chunks,
                         table_name=t_name,
                         table_store=store_ref,
+                        client=getattr(self, "bedrock_client", None),
                     )
                 except Exception as kg_err:
                     logger.warning("Knowledge Graph enrichment failed for %s: %s", doc_id, kg_err)
@@ -593,6 +599,7 @@ class DocumentsService:
                             chunks=doc.chunks,
                             table_name=t_name,
                             table_store=store_ref,
+                            client=getattr(self, "bedrock_client", None),
                         )
                     except Exception as kg_err:
                         logger.warning("Knowledge Graph enrichment failed for %s: %s", doc.id, kg_err)

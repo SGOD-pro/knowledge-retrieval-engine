@@ -58,6 +58,9 @@ class TableSchema:
     header_rows: tuple[int, ...]
     header_topology: HeaderTopology
     confidence: float
+    foreign_keys: tuple[Any, ...] = ()
+    schema_relations: tuple[Any, ...] = ()
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

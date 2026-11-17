@@ -212,7 +212,7 @@ class KnowledgeGraphManifest(BaseModel):
     document_version: str = Field(..., max_length=64)
     publication_id: str = Field(..., max_length=128)
     base_publication_id: str | None = Field(default=None, max_length=128)
-    status: Literal["ready", "empty", "failed"] = "ready"
+    status: Literal["ready", "empty", "failed", "unavailable"] = "ready"
     entity_count: int = Field(default=0, ge=0)
     relationship_count: int = Field(default=0, ge=0)
     ingested_at_utc: str

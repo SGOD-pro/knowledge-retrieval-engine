@@ -100,7 +100,12 @@ from src.services.retrieval.okf_retriever import OkfRetriever
 boundary_repo = get_workspace_boundary_repo(require_durable=True)
 okf_repository = get_okf_repo(require_durable=True)
 
-csv_snapshot = boundary_repo.get_document_snapshot(ws_id, csv_doc_id)
+csv_snapshot = None
+for _ in range(30):
+    csv_snapshot = boundary_repo.get_document_snapshot(ws_id, csv_doc_id)
+    if csv_snapshot and csv_snapshot.okf_status is not None:
+        break
+    time.sleep(0.2)
 csv_okf_status = csv_snapshot.okf_status if csv_snapshot else None
 csv_e_count = csv_snapshot.okf_entities_count if csv_snapshot else 0
 csv_p_count = csv_snapshot.okf_properties_count if csv_snapshot else 0

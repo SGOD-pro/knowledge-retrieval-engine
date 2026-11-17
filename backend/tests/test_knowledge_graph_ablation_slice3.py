@@ -834,3 +834,739 @@ def test_shared_repository_reset_and_legacy_strategy_init():
     assert strat.repository is not None
     assert hasattr(strat.repository, "resolve_mentions")
     assert strat.documents_repo is legacy_repo
+
+
+# ===========================================================================
+# 14. Real Application Path Ingestion Wiring (Slice 3 Wiring Blockers)
+# ===========================================================================
+
+def test_documents_service_csv_ingestion_with_authoritative_schema_relations():
+    """Verify CSV ingestion resolves verified schema relations from TableStore and persists grounded graph."""
+    import hashlib
+    import tempfile
+    from pathlib import Path
+    from schemas.structured_table import TableSchema, ColumnDefinition, HeaderTopology, InferredDtype
+    from ingestion.graph_builder import DirectionalSchemaRelation
+    from modules.documents.documents_service import DocumentsService
+    from services.retrieval.knowledge_graph_retriever import KnowledgeGraphRetriever
+
+    ws_id = "ws_csv_app_wiring"
+    doc_id = "doc_depts_app"
+    b_repo = get_workspace_boundary_repo()
+    b_repo.create_workspace(name="CSV App WS", owner_principal_id="test_user", workspace_id=ws_id)
+
+    csv_text = (
+        "Department,Manager,DeptCode\n"
+        "Engineering,Alice Smith,ENG\n"
+        "Research,Bob Jones,RES\n"
+    )
+    csv_bytes = csv_text.encode("utf-8")
+    doc_ver = hashlib.sha256(csv_bytes).hexdigest()[:32]
+    table_id = "departments"
+
+    table_store = get_shared_table_store()
+    # Store authoritative schema relations on TableStore for this exact version
+    table_store.store_schema(
+        table_id=table_id,
+        workspace_id=ws_id,
+        schema=TableSchema(
+            columns=(
+                ColumnDefinition(col_index=0, name="Department", inferred_dtype=InferredDtype.STRING),
+                ColumnDefinition(col_index=1, name="Manager", inferred_dtype=InferredDtype.STRING),
+                ColumnDefinition(col_index=2, name="DeptCode", inferred_dtype=InferredDtype.STRING),
+            ),
+            header_rows=(0,),
+            header_topology=HeaderTopology.SINGLE_ROW,
+            confidence=1.0,
+            schema_relations=(
+                DirectionalSchemaRelation(
+                    source_column="Department",
+                    predicate="managed_by",
+                    target_column="Manager",
+                    source_type="organization",
+                    target_type="person",
+                    disambiguation_column="DeptCode",
+                ),
+            ),
+        ),
+        document_id=doc_id,
+        document_version=doc_ver,
+    )
+
+    doc_service = DocumentsService()
+    with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmp:
+        tmp.write(csv_bytes)
+        tmp_path = tmp.name
+
+    try:
+        doc_service.background_ingest(
+            temp_path_str=tmp_path,
+            workspace_id=ws_id,
+            doc_id=doc_id,
+            filename="departments.csv",
+            content=csv_bytes,
+            size_str="100 B",
+        )
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+    # 1. Assert DocumentSnapshot records ready graph metadata
+    snapshot = b_repo.get_document_snapshot(ws_id, doc_id)
+    assert snapshot is not None
+    assert snapshot.graph_status == "ready"
+    assert snapshot.graph_entities_count == 4
+    assert snapshot.graph_relations_count == 2
+
+    # 2. Assert KnowledgeGraphManifest committed
+    kg_repo = get_shared_knowledge_graph_repository()
+    manifest = kg_repo.get_manifest(ws_id, doc_id, doc_ver, consistent_read=True)
+    assert manifest is not None
+    assert manifest.status == "ready"
+    assert manifest.entity_count == 4
+    assert manifest.relationship_count == 2
+
+    # 3. Assert grounded retrieval through KnowledgeGraphRetriever
+    retriever = KnowledgeGraphRetriever(repository=kg_repo, boundary_repo=b_repo)
+    res = retriever.expand(workspace_id=ws_id, query="Engineering")
+    assert res.edge_match_count >= 1
+    assert len(res.matched_chunk_ids) >= 1
+    assert f"{doc_id}:csv:row2" in res.matched_chunk_ids
+
+
+def test_documents_service_csv_absent_schema_relations_yields_empty_manifest():
+    """Verify CSV ingestion without schema relations publishes empty graph manifest while preserving Ready status."""
+    import hashlib
+    import tempfile
+    from pathlib import Path
+    from modules.documents.documents_service import DocumentsService
+
+    ws_id = "ws_csv_empty_wiring"
+    doc_id = "doc_items_empty"
+    b_repo = get_workspace_boundary_repo()
+    b_repo.create_workspace(name="CSV Empty WS", owner_principal_id="test_user", workspace_id=ws_id)
+
+    csv_text = (
+        "Item,Category,Price\n"
+        "Widget,Hardware,10\n"
+        "Gadget,Electronics,20\n"
+    )
+    csv_bytes = csv_text.encode("utf-8")
+    doc_ver = hashlib.sha256(csv_bytes).hexdigest()[:32]
+
+    doc_service = DocumentsService()
+    with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmp:
+        tmp.write(csv_bytes)
+        tmp_path = tmp.name
+
+    try:
+        doc_service.background_ingest(
+            temp_path_str=tmp_path,
+            workspace_id=ws_id,
+            doc_id=doc_id,
+            filename="items.csv",
+            content=csv_bytes,
+            size_str="100 B",
+        )
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+    snapshot = b_repo.get_document_snapshot(ws_id, doc_id)
+    assert snapshot is not None
+    assert snapshot.graph_status == "empty"
+    assert snapshot.graph_entities_count == 0
+    assert snapshot.graph_relations_count == 0
+
+    from modules.documents.documents_repository import _WORKSPACE_DOCS
+    doc_record = doc_service.repo.get(doc_id)
+    assert doc_record is not None
+    doc_entry = next((d for d in _WORKSPACE_DOCS.get(ws_id, []) if str(d.get("id")) == str(doc_id)), None)
+    assert doc_entry is not None
+    assert doc_entry["status"] == "Ready"
+
+
+def test_documents_service_csv_cross_workspace_version_conflict_rejected():
+    """Verify schema relations referencing another workspace or version are strictly rejected."""
+    import hashlib
+    import tempfile
+    from pathlib import Path
+    from schemas.structured_table import TableSchema, ColumnDefinition, HeaderTopology, InferredDtype
+    from ingestion.graph_builder import DirectionalSchemaRelation
+    from modules.documents.documents_service import DocumentsService
+
+    ws_id = "ws_csv_active"
+    doc_id = "doc_conflict_csv"
+    b_repo = get_workspace_boundary_repo()
+    b_repo.create_workspace(name="CSV Active", owner_principal_id="test_user", workspace_id=ws_id)
+
+    csv_text = "ColA,ColB\nValA,ValB\n"
+    csv_bytes = csv_text.encode("utf-8")
+    doc_ver = hashlib.sha256(csv_bytes).hexdigest()[:32]
+    table_id = "conflicttbl"
+
+    table_store = get_shared_table_store()
+    # Schema metadata points to a conflicting foreign workspace and version
+    table_store.store_schema(
+        table_id=table_id,
+        workspace_id=ws_id,
+        schema=TableSchema(
+            columns=(
+                ColumnDefinition(col_index=0, name="ColA", inferred_dtype=InferredDtype.STRING),
+                ColumnDefinition(col_index=1, name="ColB", inferred_dtype=InferredDtype.STRING),
+            ),
+            header_rows=(0,),
+            header_topology=HeaderTopology.SINGLE_ROW,
+            confidence=1.0,
+            schema_relations=(
+                DirectionalSchemaRelation(
+                    source_column="ColA",
+                    predicate="relates_to",
+                    target_column="ColB",
+                ),
+            ),
+            metadata={"workspace_id": "ws_FOREIGN", "document_version": "v_DIFFERENT"},
+        ),
+        document_id=doc_id,
+        document_version=doc_ver,
+    )
+
+    doc_service = DocumentsService()
+    with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmp:
+        tmp.write(csv_bytes)
+        tmp_path = tmp.name
+
+    try:
+        doc_service.background_ingest(
+            temp_path_str=tmp_path,
+            workspace_id=ws_id,
+            doc_id=doc_id,
+            filename="conflicttbl.csv",
+            content=csv_bytes,
+            size_str="100 B",
+        )
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+    snapshot = b_repo.get_document_snapshot(ws_id, doc_id)
+    assert snapshot is not None
+    # Conflicting schema relations are rejected, resulting in empty graph status
+    assert snapshot.graph_status == "empty"
+    assert snapshot.graph_entities_count == 0
+
+
+def test_documents_service_pdf_ingestion_with_mocked_bedrock_provider():
+    """Verify PDF ingestion calls CountTokens and Converse, reconciles spend, and publishes retrievable graph."""
+    import hashlib
+    import json
+    import tempfile
+    from pathlib import Path
+    from unittest.mock import patch
+    from modules.documents.documents_service import DocumentsService
+    from services.retrieval.knowledge_graph_retriever import KnowledgeGraphRetriever
+
+    ws_id = "ws_pdf_app_wiring"
+    doc_id = "doc_pdf_acme"
+    b_repo = get_workspace_boundary_repo()
+    b_repo.create_workspace(name="PDF App WS", owner_principal_id="test_user", workspace_id=ws_id)
+
+    pdf_bytes = b"%PDF-1.4 sample pdf content for knowledge graph extraction."
+    doc_ver = hashlib.sha256(pdf_bytes).hexdigest()[:32]
+
+    ch_text = "Acme Corp acquired Beta Tech in 2024."
+    chunk = Chunk(
+        id=f"{doc_id}:c1",
+        document_id=doc_id,
+        workspace_id=ws_id,
+        text=ch_text,
+        source_format="pdf",
+        element_type="paragraph",
+        page_number=1,
+        metadata={"document_version": doc_ver},
+        embedding_fast=embed_fast_local(ch_text),
+        embedding_full=_deterministic_vector(ch_text, 1024),
+    )
+    parsed_doc = Document(id=doc_id, filename="acme.pdf", source_format="pdf", chunks=[chunk], workspace_id=ws_id)
+
+    class MockBedrockClient:
+        def __init__(self):
+            self.count_tokens_calls = 0
+            self.converse_calls = 0
+
+        def count_tokens(self, modelId, input):
+            self.count_tokens_calls += 1
+            return {"inputTokens": 140}
+
+        def converse(self, modelId, messages, system=None, inferenceConfig=None, timeout_s=None):
+            self.converse_calls += 1
+            return {
+                "output": {
+                    "message": {
+                        "content": [
+                            {
+                                "text": json.dumps({
+                                    "entities": [
+                                        {"name": "Acme Corp", "entity_type": "organization"},
+                                        {"name": "Beta Tech", "entity_type": "organization"},
+                                    ],
+                                    "relationships": [
+                                        {
+                                            "source_entity": "Acme Corp",
+                                            "predicate": "acquired",
+                                            "target_entity": "Beta Tech",
+                                            "chunk_id": f"{doc_id}:c1",
+                                            "verbatim_evidence": "Acme Corp acquired Beta Tech in 2024.",
+                                        }
+                                    ],
+                                })
+                            }
+                        ]
+                    }
+                },
+                "usage": {"inputTokens": 140, "outputTokens": 50},
+            }
+
+    mock_bedrock = MockBedrockClient()
+    doc_service = DocumentsService(bedrock_client=mock_bedrock)
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+        tmp.write(pdf_bytes)
+        tmp_path = tmp.name
+
+    try:
+        with patch("api.routes.ingest_document", return_value=parsed_doc), \
+             patch("modules.documents.documents_service.ingest_document", return_value=parsed_doc):
+            doc_service.background_ingest(
+                temp_path_str=tmp_path,
+                workspace_id=ws_id,
+                doc_id=doc_id,
+                filename="acme.pdf",
+                content=pdf_bytes,
+                size_str="100 B",
+            )
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+    # Assert CountTokens and Converse executed
+    assert mock_bedrock.count_tokens_calls == 1
+    assert mock_bedrock.converse_calls == 1
+
+    # Assert durable ledger reconciled spend
+    kg_repo = get_shared_knowledge_graph_repository()
+    ledger = kg_repo.get_budget_ledger(ws_id, doc_id, doc_ver, consistent_read=True)
+    assert ledger is not None
+    assert ledger.spent_prompt_tokens == 140
+    assert ledger.spent_output_tokens == 50
+    assert ledger.completed_calls == 1
+
+    # Assert DocumentSnapshot records ready graph status
+    snapshot = b_repo.get_document_snapshot(ws_id, doc_id)
+    assert snapshot is not None
+    assert snapshot.graph_status == "ready"
+    assert snapshot.graph_entities_count == 2
+    assert snapshot.graph_relations_count == 1
+
+    # Assert graph retrieval returns grounded chunk
+    retriever = KnowledgeGraphRetriever(repository=kg_repo, boundary_repo=b_repo)
+    res = retriever.expand(workspace_id=ws_id, query="Acme Corp")
+    assert res.edge_match_count >= 1
+    assert f"{doc_id}:c1" in res.matched_chunk_ids
+
+
+def test_documents_service_pdf_missing_provider_returns_unavailable_baseline_ready():
+    """Verify PDF ingestion with missing provider returns unavailable/failed and preserves baseline Ready status."""
+    import hashlib
+    import tempfile
+    from pathlib import Path
+    from unittest.mock import patch
+    from modules.documents.documents_service import DocumentsService
+
+    ws_id = "ws_pdf_missing_prov"
+    doc_id = "doc_missing_prov"
+    b_repo = get_workspace_boundary_repo()
+    b_repo.create_workspace(name="PDF Missing Prov", owner_principal_id="test_user", workspace_id=ws_id)
+
+    pdf_bytes = b"%PDF-1.4 test document without client."
+    doc_ver = hashlib.sha256(pdf_bytes).hexdigest()[:32]
+
+    ch_text = "Some text."
+    chunk = Chunk(
+        id=f"{doc_id}:c1",
+        document_id=doc_id,
+        workspace_id=ws_id,
+        text=ch_text,
+        source_format="pdf",
+        element_type="paragraph",
+        page_number=1,
+        metadata={"document_version": doc_ver},
+        embedding_fast=embed_fast_local(ch_text),
+        embedding_full=_deterministic_vector(ch_text, 1024),
+    )
+    parsed_doc = Document(id=doc_id, filename="missing.pdf", source_format="pdf", chunks=[chunk], workspace_id=ws_id)
+
+    # DocumentsService without injected client in test environment (missing provider configuration)
+    doc_service = DocumentsService(bedrock_client=None)
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+        tmp.write(pdf_bytes)
+        tmp_path = tmp.name
+
+    try:
+        with patch("api.routes.ingest_document", return_value=parsed_doc), \
+             patch("modules.documents.documents_service.ingest_document", return_value=parsed_doc):
+            doc_service.background_ingest(
+                temp_path_str=tmp_path,
+                workspace_id=ws_id,
+                doc_id=doc_id,
+                filename="missing.pdf",
+                content=pdf_bytes,
+                size_str="100 B",
+            )
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+    snapshot = b_repo.get_document_snapshot(ws_id, doc_id)
+    assert snapshot is not None
+    # Missing provider must NEVER return a successful empty extraction ("empty") or "ready"
+    assert snapshot.graph_status in ("unavailable", "failed")
+    assert snapshot.graph_status != "ready"
+    assert snapshot.graph_status != "empty"
+
+    # Baseline publication remains Ready per ADR-001
+    from modules.documents.documents_repository import _WORKSPACE_DOCS
+    doc_record = doc_service.repo.get(doc_id)
+    assert doc_record is not None
+    doc_entry = next((d for d in _WORKSPACE_DOCS.get(ws_id, []) if str(d.get("id")) == str(doc_id)), None)
+    assert doc_entry is not None
+    assert doc_entry["status"] == "Ready"
+
+
+def test_documents_service_pdf_provider_failure_reconciles_fail_closed():
+    """Verify PDF provider call failure reconciles fail closed and preserves baseline Ready status."""
+    import hashlib
+    import tempfile
+    from pathlib import Path
+    from unittest.mock import patch
+    from modules.documents.documents_service import DocumentsService
+
+    ws_id = "ws_pdf_prov_fail"
+    doc_id = "doc_prov_fail"
+    b_repo = get_workspace_boundary_repo()
+    b_repo.create_workspace(name="PDF Prov Fail", owner_principal_id="test_user", workspace_id=ws_id)
+
+    pdf_bytes = b"%PDF-1.4 failure test document."
+    doc_ver = hashlib.sha256(pdf_bytes).hexdigest()[:32]
+
+    ch_text = "Acme acquired Beta."
+    chunk = Chunk(
+        id=f"{doc_id}:c1",
+        document_id=doc_id,
+        workspace_id=ws_id,
+        text=ch_text,
+        source_format="pdf",
+        element_type="paragraph",
+        page_number=1,
+        metadata={"document_version": doc_ver},
+        embedding_fast=embed_fast_local(ch_text),
+        embedding_full=_deterministic_vector(ch_text, 1024),
+    )
+    parsed_doc = Document(id=doc_id, filename="fail.pdf", source_format="pdf", chunks=[chunk], workspace_id=ws_id)
+
+    class FailingBedrockClient:
+        def count_tokens(self, modelId, input):
+            return {"inputTokens": 100}
+
+        def converse(self, *args, **kwargs):
+            raise RuntimeError("Bedrock Converse network timeout")
+
+    doc_service = DocumentsService(bedrock_client=FailingBedrockClient())
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+        tmp.write(pdf_bytes)
+        tmp_path = tmp.name
+
+    try:
+        with patch("api.routes.ingest_document", return_value=parsed_doc), \
+             patch("modules.documents.documents_service.ingest_document", return_value=parsed_doc):
+            doc_service.background_ingest(
+                temp_path_str=tmp_path,
+                workspace_id=ws_id,
+                doc_id=doc_id,
+                filename="fail.pdf",
+                content=pdf_bytes,
+                size_str="100 B",
+            )
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+    snapshot = b_repo.get_document_snapshot(ws_id, doc_id)
+    assert snapshot is not None
+    assert snapshot.graph_status == "failed"
+
+    from modules.documents.documents_repository import _WORKSPACE_DOCS
+    doc_record = doc_service.repo.get(doc_id)
+    assert doc_record is not None
+    doc_entry = next((d for d in _WORKSPACE_DOCS.get(ws_id, []) if str(d.get("id")) == str(doc_id)), None)
+    assert doc_entry is not None
+    assert doc_entry["status"] == "Ready"
+
+
+def test_documents_service_pdf_valid_zero_relationships_yields_empty():
+    """Verify that a valid provider call returning zero relationships produces status='empty' with recorded spend."""
+    import hashlib
+    import json
+    import tempfile
+    from pathlib import Path
+    from unittest.mock import patch
+    from modules.documents.documents_service import DocumentsService
+
+    ws_id = "ws_pdf_valid_empty"
+    doc_id = "doc_pdf_empty_valid"
+    b_repo = get_workspace_boundary_repo()
+    b_repo.create_workspace(name="PDF Valid Empty", owner_principal_id="test_user", workspace_id=ws_id)
+
+    pdf_bytes = b"%PDF-1.4 document with narrative having zero entity relationships."
+    doc_ver = hashlib.sha256(pdf_bytes).hexdigest()[:32]
+
+    ch_text = "The weather was sunny in May."
+    chunk = Chunk(
+        id=f"{doc_id}:c1",
+        document_id=doc_id,
+        workspace_id=ws_id,
+        text=ch_text,
+        source_format="pdf",
+        element_type="paragraph",
+        page_number=1,
+        metadata={"document_version": doc_ver},
+        embedding_fast=embed_fast_local(ch_text),
+        embedding_full=_deterministic_vector(ch_text, 1024),
+    )
+    parsed_doc = Document(id=doc_id, filename="empty_rel.pdf", source_format="pdf", chunks=[chunk], workspace_id=ws_id)
+
+    class ZeroRelBedrockClient:
+        def count_tokens(self, modelId, input):
+            return {"inputTokens": 110}
+
+        def converse(self, *args, **kwargs):
+            return {
+                "output": {
+                    "message": {
+                        "content": [{"text": json.dumps({"entities": [], "relationships": []})}]
+                    }
+                },
+                "usage": {"inputTokens": 110, "outputTokens": 20},
+            }
+
+    doc_service = DocumentsService(bedrock_client=ZeroRelBedrockClient())
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+        tmp.write(pdf_bytes)
+        tmp_path = tmp.name
+
+    try:
+        with patch("api.routes.ingest_document", return_value=parsed_doc), \
+             patch("modules.documents.documents_service.ingest_document", return_value=parsed_doc):
+            doc_service.background_ingest(
+                temp_path_str=tmp_path,
+                workspace_id=ws_id,
+                doc_id=doc_id,
+                filename="empty_rel.pdf",
+                content=pdf_bytes,
+                size_str="100 B",
+            )
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+    snapshot = b_repo.get_document_snapshot(ws_id, doc_id)
+    assert snapshot is not None
+    assert snapshot.graph_status == "empty"
+    assert snapshot.graph_entities_count == 0
+    assert snapshot.graph_relations_count == 0
+
+    kg_repo = get_shared_knowledge_graph_repository()
+    ledger = kg_repo.get_budget_ledger(ws_id, doc_id, doc_ver, consistent_read=True)
+    assert ledger is not None
+    assert ledger.spent_prompt_tokens == 110
+    assert ledger.spent_output_tokens == 20
+    assert ledger.completed_calls == 1
+
+
+def test_bounded_recovery_from_stub_empty_manifest():
+    """Verify that a stub empty manifest from missing provider can be recovered when valid client is provided."""
+    import hashlib
+    import json
+    from ingestion.graph_builder import KnowledgeGraphBuilder
+    from schemas.contracts.knowledge_graph import KnowledgeGraphManifest
+
+    ws_id = "ws_stub_recovery"
+    doc_id = "doc_stub_rec"
+    doc_ver = "v_rec_1"
+    kg_repo = get_shared_knowledge_graph_repository()
+    builder = KnowledgeGraphBuilder(repository=kg_repo)
+
+    idempotency_key = hashlib.sha256(f"{ws_id}:{doc_id}:{doc_ver}:kg".encode("utf-8")).hexdigest()
+
+    # Commit an old stub empty manifest with zero completed calls in ledger
+    stub_man = KnowledgeGraphManifest(
+        workspace_id=ws_id,
+        document_id=doc_id,
+        document_version=doc_ver,
+        publication_id="pub_stub",
+        status="empty",
+        entity_count=0,
+        relationship_count=0,
+        ingested_at_utc="2026-11-17T00:00:00Z",
+        content_hash=idempotency_key,
+    )
+    kg_repo.commit_manifest(ws_id, stub_man)
+
+    ch_text = "Acme Corp acquired Beta Tech in 2024."
+    chunk = Chunk(
+        id=f"{doc_id}:c1",
+        document_id=doc_id,
+        workspace_id=ws_id,
+        text=ch_text,
+        source_format="pdf",
+        element_type="paragraph",
+        page_number=1,
+        metadata={"document_version": doc_ver},
+        embedding_fast=embed_fast_local(ch_text),
+        embedding_full=_deterministic_vector(ch_text, 1024),
+    )
+
+    class AuthoritativeBedrockClient:
+        def __init__(self):
+            self.calls = 0
+
+        def count_tokens(self, modelId, input):
+            return {"inputTokens": 120}
+
+        def converse(self, *args, **kwargs):
+            self.calls += 1
+            return {
+                "output": {
+                    "message": {
+                        "content": [
+                            {
+                                "text": json.dumps({
+                                    "entities": [
+                                        {"name": "Acme Corp", "entity_type": "organization"},
+                                        {"name": "Beta Tech", "entity_type": "organization"},
+                                    ],
+                                    "relationships": [
+                                        {
+                                            "source_entity": "Acme Corp",
+                                            "predicate": "acquired",
+                                            "target_entity": "Beta Tech",
+                                            "chunk_id": f"{doc_id}:c1",
+                                            "verbatim_evidence": "Acme Corp acquired Beta Tech in 2024.",
+                                        }
+                                    ],
+                                })
+                            }
+                        ]
+                    }
+                },
+                "usage": {"inputTokens": 120, "outputTokens": 45},
+            }
+
+    auth_client = AuthoritativeBedrockClient()
+    # Now execute with authoritative client - should bypass stub manifest and recover
+    recovered_man = builder.build_and_persist_pdf_graph(
+        workspace_id=ws_id,
+        document_id=doc_id,
+        document_version=doc_ver,
+        chunks=[chunk],
+        client=auth_client,
+    )
+    assert recovered_man.status == "ready"
+    assert recovered_man.entity_count == 2
+    assert recovered_man.relationship_count == 1
+    assert auth_client.calls == 1
+
+    # Replay should now perform idempotent skip
+    replay_man = builder.build_and_persist_pdf_graph(
+        workspace_id=ws_id,
+        document_id=doc_id,
+        document_version=doc_ver,
+        chunks=[chunk],
+        client=auth_client,
+    )
+    assert replay_man.status == "ready"
+    assert auth_client.calls == 1  # 0 extra calls!
+
+
+def test_baseline_published_before_enrichment_and_preserved_on_failure():
+    """Verify baseline DocumentSnapshot is published before enrichment begins and remains Ready on failure."""
+    import hashlib
+    import tempfile
+    from pathlib import Path
+    from unittest.mock import patch
+    from modules.documents.documents_service import DocumentsService
+
+    ws_id = "ws_baseline_decoupled"
+    doc_id = "doc_base_decoupled"
+    b_repo = get_workspace_boundary_repo()
+    b_repo.create_workspace(name="Baseline Decoupled", owner_principal_id="test_user", workspace_id=ws_id)
+
+    pdf_bytes = b"%PDF-1.4 baseline decoupling verification document."
+    doc_ver = hashlib.sha256(pdf_bytes).hexdigest()[:32]
+
+    ch_text = "Some text."
+    chunk = Chunk(
+        id=f"{doc_id}:c1",
+        document_id=doc_id,
+        workspace_id=ws_id,
+        text=ch_text,
+        source_format="pdf",
+        element_type="paragraph",
+        page_number=1,
+        metadata={"document_version": doc_ver},
+        embedding_fast=embed_fast_local(ch_text),
+        embedding_full=_deterministic_vector(ch_text, 1024),
+    )
+    parsed_doc = Document(id=doc_id, filename="base.pdf", source_format="pdf", chunks=[chunk], workspace_id=ws_id)
+
+    doc_service = DocumentsService()
+    baseline_seen = False
+
+    orig_enrich = doc_service._enrich_graph_snapshot_metadata
+
+    def inspect_and_fail(*args, **kwargs):
+        nonlocal baseline_seen
+        # Check that baseline DocumentSnapshot already exists before enrichment returns
+        snap = b_repo.get_document_snapshot(ws_id, doc_id)
+        if snap is not None and snap.version == doc_ver:
+            baseline_seen = True
+        raise RuntimeError("Simulated graph builder crash")
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+        tmp.write(pdf_bytes)
+        tmp_path = tmp.name
+
+    try:
+        with patch("api.routes.ingest_document", return_value=parsed_doc), \
+             patch("modules.documents.documents_service.ingest_document", return_value=parsed_doc), \
+             patch.object(doc_service, "_enrich_graph_snapshot_metadata", side_effect=inspect_and_fail):
+            doc_service.background_ingest(
+                temp_path_str=tmp_path,
+                workspace_id=ws_id,
+                doc_id=doc_id,
+                filename="base.pdf",
+                content=pdf_bytes,
+                size_str="100 B",
+            )
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+    assert baseline_seen is True
+    # Baseline document is Ready in repo despite graph failure
+    from modules.documents.documents_repository import _WORKSPACE_DOCS
+    doc_record = doc_service.repo.get(doc_id)
+    assert doc_record is not None
+    doc_entry = next((d for d in _WORKSPACE_DOCS.get(ws_id, []) if str(d.get("id")) == str(doc_id)), None)
+    assert doc_entry is not None
+    assert doc_entry["status"] == "Ready"
+    # Final snapshot records graph_status='failed'
+    snap = b_repo.get_document_snapshot(ws_id, doc_id)
+    assert snap is not None
+    assert snap.graph_status == "failed"
+

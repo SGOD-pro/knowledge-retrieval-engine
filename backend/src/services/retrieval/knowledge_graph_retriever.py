@@ -439,8 +439,15 @@ class KnowledgeGraphRetriever:
         concurrency_controller: GraphConcurrencyController | None = None,
         table_store: Any | None = None,
     ) -> None:
-        self.repository = repository or get_knowledge_graph_repository()
-        self.boundary_repo = boundary_repo
+        self.repository = repository or get_shared_knowledge_graph_repository()
+        if boundary_repo is None:
+            try:
+                from db.workspace_boundary_repo import get_workspace_boundary_repo
+                self.boundary_repo = get_workspace_boundary_repo()
+            except Exception:
+                self.boundary_repo = None
+        else:
+            self.boundary_repo = boundary_repo
         self.documents_repo = documents_repo or DocumentsRepository()
         self.concurrency_controller = concurrency_controller or GraphConcurrencyController()
         self.table_store = table_store

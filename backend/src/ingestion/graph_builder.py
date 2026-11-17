@@ -39,6 +39,7 @@ try:
         KnowledgeGraphRepositoryBase,
         disable_client_retries,
         get_knowledge_graph_repository,
+        get_shared_knowledge_graph_repository,
     )
 except ImportError:
     from schemas.contracts.knowledge_graph import (
@@ -56,6 +57,7 @@ except ImportError:
         KnowledgeGraphRepositoryBase,
         disable_client_retries,
         get_knowledge_graph_repository,
+        get_shared_knowledge_graph_repository,
     )
 
 logger = logging.getLogger(__name__)
@@ -88,6 +90,147 @@ class TableForeignKey(BaseModel):
     source_type: Literal["organization", "person", "location", "product", "concept", "table", "other"] = "organization"
     target_type: Literal["organization", "person", "location", "product", "concept", "table", "other"] = "organization"
     disambiguation_column: str | None = Field(default=None, max_length=128)
+
+
+def _parse_schema_relation(raw: Any) -> DirectionalSchemaRelation | TableForeignKey | None:
+    if isinstance(raw, (DirectionalSchemaRelation, TableForeignKey)):
+        return raw
+    if isinstance(raw, dict):
+        src_col = raw.get("source_column")
+        tgt_col = raw.get("target_column")
+        if not src_col or not tgt_col:
+            return None
+        if "foreign_table" in raw and raw["foreign_table"]:
+            return TableForeignKey(
+                source_column=str(src_col),
+                foreign_table=str(raw["foreign_table"]),
+                target_column=str(tgt_col),
+                predicate=str(raw.get("predicate") or "PARENT_OF"),
+                source_type=raw.get("source_type", "organization"),
+                target_type=raw.get("target_type", "organization"),
+                disambiguation_column=raw.get("disambiguation_column"),
+            )
+        pred = raw.get("predicate")
+        if not pred:
+            return None
+        return DirectionalSchemaRelation(
+            source_column=str(src_col),
+            predicate=str(pred),
+            target_column=str(tgt_col),
+            source_type=raw.get("source_type", "organization"),
+            target_type=raw.get("target_type", "organization"),
+            disambiguation_column=raw.get("disambiguation_column"),
+        )
+    return None
+
+
+def _resolve_schema_relations_from_table_store(
+    table_store: Any,
+    table_name: str | None,
+    workspace_id: str,
+    document_version: str,
+    document_id: str,
+) -> list[DirectionalSchemaRelation | TableForeignKey]:
+    """Resolve verified directional schema relations from authoritative exact-version TableStore metadata.
+
+    Preserves workspace/table/document/version identity checks and rejects unverified or conflicting relations.
+    Does not invent relationships from row co-occurrence or speculative column-name matching.
+    """
+    if not table_store or not workspace_id:
+        return []
+
+    tbl = table_name or document_id
+    raw_candidates: list[Any] = []
+    candidates_to_try = [tbl]
+    if tbl.lower() not in candidates_to_try:
+        candidates_to_try.append(tbl.lower())
+    if document_id not in candidates_to_try:
+        candidates_to_try.append(document_id)
+
+    # 1. Exact-version TableSchema from TableStore
+    for t_cand in candidates_to_try:
+        try:
+            schema = table_store.get_schema(t_cand, workspace_id, version=document_version)
+            if schema is not None:
+                meta = getattr(schema, "metadata", {}) or {}
+                if isinstance(meta, dict):
+                    # Identity check: verify workspace and version if present in metadata
+                    meta_ws = meta.get("workspace_id")
+                    meta_ver = meta.get("document_version") or meta.get("version")
+                    if (meta_ws and meta_ws != workspace_id) or (meta_ver and meta_ver != document_version):
+                        logger.warning("Rejecting schema relations due to workspace/version conflict in metadata")
+                        return []
+                if getattr(schema, "schema_relations", None):
+                    raw_candidates.extend(schema.schema_relations)
+                if getattr(schema, "foreign_keys", None):
+                    raw_candidates.extend(schema.foreign_keys)
+                if isinstance(meta, dict):
+                    if meta.get("schema_relations"):
+                        raw_candidates.extend(meta["schema_relations"])
+                    if meta.get("foreign_keys"):
+                        raw_candidates.extend(meta["foreign_keys"])
+                    if meta.get("relationships"):
+                        raw_candidates.extend(meta["relationships"])
+                if raw_candidates:
+                    break
+        except Exception as e:
+            logger.debug("Could not resolve schema from table_store.get_schema: %s", e)
+
+    # 2. Ingestion manifest for document and exact version
+    try:
+        manifest = table_store.get_ingestion_manifest(document_id, workspace_id, version=document_version)
+        if manifest and isinstance(manifest, dict):
+            # Strict identity check
+            man_ws = manifest.get("workspace_id")
+            man_ver = manifest.get("document_version") or manifest.get("version")
+            if (man_ws and man_ws != workspace_id) or (man_ver and man_ver != document_version):
+                logger.warning("Rejecting manifest schema relations due to workspace/version conflict")
+                return []
+            else:
+                if manifest.get("schema_relations"):
+                    raw_candidates.extend(manifest["schema_relations"])
+                if manifest.get("foreign_keys"):
+                    raw_candidates.extend(manifest["foreign_keys"])
+    except Exception as e:
+        logger.debug("Could not resolve manifest from table_store: %s", e)
+
+    # 3. StructuredTable lookup
+    if not raw_candidates:
+        try:
+            st = table_store.get_table(tbl, workspace_id)
+            if st and getattr(st, "schema", None):
+                st_schema = st.schema
+                st_doc = getattr(st, "document_id", None)
+                if st_doc and st_doc != document_id:
+                    logger.warning("Rejecting table schema due to document_id mismatch: %s != %s", st_doc, document_id)
+                else:
+                    st_meta = getattr(st_schema, "metadata", {}) or {}
+                    if isinstance(st_meta, dict):
+                        meta_ws = st_meta.get("workspace_id")
+                        meta_ver = st_meta.get("document_version") or st_meta.get("version")
+                        if (meta_ws and meta_ws != workspace_id) or (meta_ver and meta_ver != document_version):
+                            logger.warning("Rejecting table schema relations due to workspace/version conflict in metadata")
+                            return []
+                    if getattr(st_schema, "schema_relations", None):
+                        raw_candidates.extend(st_schema.schema_relations)
+                    if getattr(st_schema, "foreign_keys", None):
+                        raw_candidates.extend(st_schema.foreign_keys)
+        except Exception as e:
+            logger.debug("Could not resolve table from table_store.get_table: %s", e)
+
+    results: list[DirectionalSchemaRelation | TableForeignKey] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    for item in raw_candidates:
+        parsed = _parse_schema_relation(item)
+        if parsed is not None:
+            pred_key = getattr(parsed, "foreign_table", None) or parsed.predicate
+            key = (parsed.source_column, pred_key, parsed.target_column)
+            if key not in seen:
+                seen.add(key)
+                results.append(parsed)
+
+    return results
 
 
 _NEGATION_WORDS = {
@@ -929,8 +1072,43 @@ def reset_kg_provider_controller() -> None:
 class KnowledgeGraphBuilder:
     """Builder service extracting and persisting deterministic Knowledge Graph representations."""
 
-    def __init__(self, repository: KnowledgeGraphRepositoryBase | None = None) -> None:
-        self.repository = repository or get_knowledge_graph_repository()
+    def __init__(
+        self,
+        repository: KnowledgeGraphRepositoryBase | None = None,
+        bedrock_client: Any | None = None,
+        worker_id: str | None = None,
+    ) -> None:
+        self.repository = repository or get_shared_knowledge_graph_repository()
+        self._bedrock_client = bedrock_client
+        self.worker_id = worker_id
+
+    def _get_bedrock_client(self) -> Any:
+        if getattr(self, "_bedrock_client", None) is not None:
+            return self._bedrock_client
+
+        env = getattr(settings, "ENVIRONMENT", "dev").lower()
+        provider = getattr(settings, "MODEL_PROVIDER", "dev").lower()
+        if env == "test" or provider == "test":
+            return None
+
+        import boto3
+        from aws.infra import get_client
+
+        cfg = create_dedicated_storage_config(connect_timeout=3.0, read_timeout=7.0)
+        try:
+            client = get_client("bedrock-runtime", config=cfg)
+        except Exception:
+            profile = getattr(settings, "AWS_PROFILE", None) or os.getenv("AWS_PROFILE") or "aws"
+            region = getattr(settings, "AWS_REGION", None) or os.getenv("AWS_REGION") or "ap-south-1"
+            session = boto3.Session(profile_name=profile, region_name=region)
+            client = session.client(
+                "bedrock-runtime",
+                region_name=region,
+                config=cfg,
+            )
+        disable_client_retries(client)
+        self._bedrock_client = client
+        return self._bedrock_client
 
     def build_and_persist_tabular_graph(
         self,
@@ -1015,6 +1193,7 @@ class KnowledgeGraphBuilder:
         base_publication_id: str | None,
         existing_manifest: KnowledgeGraphManifest | None,
         content_hash: str,
+        status: str = "failed",
     ) -> KnowledgeGraphManifest:
         if existing_manifest is not None and existing_manifest.status == "ready":
             return existing_manifest
@@ -1024,7 +1203,7 @@ class KnowledgeGraphBuilder:
             document_version=document_version,
             publication_id=existing_manifest.publication_id if existing_manifest else generate_publication_id(),
             base_publication_id=base_publication_id,
-            status="failed",
+            status=status if status in ("failed", "unavailable") else "failed",
             entity_count=0,
             relationship_count=0,
             ingested_at_utc=_now_utc(),
@@ -1058,10 +1237,35 @@ class KnowledgeGraphBuilder:
             worker_id = getattr(self, "worker_id", None) or f"kg_worker_{os.getpid()}"
         worker_id = worker_id.strip()
 
+        if client is None:
+            client = self._get_bedrock_client()
+
         idempotency_key = hashlib.sha256(f"{workspace_id}:{document_id}:{document_version}:kg".encode("utf-8")).hexdigest()
         existing_man = self.repository.get_manifest(workspace_id, document_id, document_version, consistent_read=True)
         if existing_man is not None and existing_man.status in ("ready", "empty") and existing_man.content_hash == idempotency_key:
-            return existing_man
+            if existing_man.status == "empty" and client is not None:
+                ledger_check = self.repository.get_budget_ledger(workspace_id, document_id, document_version, consistent_read=True)
+                is_stub = (ledger_check is None or (ledger_check.completed_calls == 0 and ledger_check.spent_output_tokens == 0))
+                if not is_stub:
+                    return existing_man
+                logger.info(
+                    "Bypassing stub empty manifest for doc %s ver %s to allow bounded recovery with authoritative client",
+                    document_id, document_version,
+                )
+            else:
+                return existing_man
+
+        if client is None:
+            logger.warning("Bedrock client unavailable for PDF graph extraction on doc %s", document_id)
+            return self._fail_closed_manifest(
+                workspace_id=workspace_id,
+                document_id=document_id,
+                document_version=document_version,
+                base_publication_id=base_publication_id,
+                existing_manifest=existing_man,
+                content_hash=idempotency_key,
+                status="unavailable",
+            )
 
         ledger = self.repository.get_budget_ledger(workspace_id, document_id, document_version, consistent_read=True)
         if ledger is not None:
@@ -1141,26 +1345,23 @@ class KnowledgeGraphBuilder:
         system = [{"text": BEDROCK_GRAPH_SYSTEM_PROMPT}]
         model_id = getattr(settings, "GRAPH_BEDROCK_MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0")
 
-        if client is not None:
-            disable_client_retries(client)
-            if not hasattr(client, "count_tokens"):
-                logger.error("Bedrock client missing mandatory count_tokens capability (AC-5)")
+        disable_client_retries(client)
+        if not hasattr(client, "count_tokens"):
+            logger.error("Bedrock client missing mandatory count_tokens capability (AC-5)")
+            return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
+        try:
+            count_resp = client.count_tokens(
+                modelId=model_id,
+                input={"converse": {"messages": messages, "system": system}},
+            )
+            raw_tokens = count_resp.get("inputTokens", 0) if isinstance(count_resp, dict) else None
+            if not isinstance(raw_tokens, int) or raw_tokens <= 0:
+                logger.error("Bedrock count_tokens returned non-positive tokens: %s", count_resp)
                 return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
-            try:
-                count_resp = client.count_tokens(
-                    modelId=model_id,
-                    input={"converse": {"messages": messages, "system": system}},
-                )
-                raw_tokens = count_resp.get("inputTokens", 0) if isinstance(count_resp, dict) else None
-                if not isinstance(raw_tokens, int) or raw_tokens <= 0:
-                    logger.error("Bedrock count_tokens returned non-positive tokens: %s", count_resp)
-                    return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
-                estimated_prompt_tokens = raw_tokens
-            except Exception as count_err:
-                logger.error("Bedrock count_tokens failed: %s", count_err)
-                return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
-        else:
-            estimated_prompt_tokens = max(1, len(user_prompt) // 4 + len(BEDROCK_GRAPH_SYSTEM_PROMPT) // 4)
+            estimated_prompt_tokens = raw_tokens
+        except Exception as count_err:
+            logger.error("Bedrock count_tokens failed: %s", count_err)
+            return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
 
         if estimated_prompt_tokens > 2000:
             logger.error("Estimated prompt tokens %d exceed 2000 per-call limit", estimated_prompt_tokens)
@@ -1188,225 +1389,220 @@ class KnowledgeGraphBuilder:
         usage: dict[str, int] = {}
         dispatch_success = False
 
-        if client is None:
-            output_text = "{}"
-            usage = {"inputTokens": estimated_prompt_tokens, "outputTokens": 0}
-            dispatch_success = True
-        else:
-            controller = get_kg_provider_controller()
-            max_attempts = 2
-            start_time = time.perf_counter()
+        controller = get_kg_provider_controller()
+        max_attempts = 2
+        start_time = time.perf_counter()
 
-            for attempt in range(max_attempts):
-                rem_deadline = max(0.001, call_deadline_s - (time.perf_counter() - start_time))
-                if rem_deadline <= 0.001 and attempt > 0:
-                    logger.warning("Provider call deadline expired before retry attempt %d", attempt)
-                    self.repository.fail_extraction_budget(
-                        workspace_id=workspace_id,
-                        document_id=document_id,
-                        document_version=document_version,
-                        worker_id=worker_id,
-                        fence_token=fence_token,
-                        error_reason="caller_timeout",
-                        prompt_tokens_spent=estimated_prompt_tokens,
-                    )
-                    return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
-
-                if attempt > 0:
-                    retry_res = self.repository.reserve_extraction_budget(
-                        workspace_id=workspace_id,
-                        document_id=document_id,
-                        document_version=document_version,
-                        worker_id=worker_id,
-                        estimated_prompt_tokens=estimated_prompt_tokens,
-                        max_output_tokens=max_output_tokens,
-                        max_calls=max_calls,
-                        max_total_tokens=max_total_tokens,
-                        lease_duration_s=lease_duration_s,
-                        max_input_tokens=max_input_tokens,
-                        max_output_ceiling=1600,
-                    )
-                    if not retry_res.granted:
-                        logger.warning("Retry budget reservation denied: %s", retry_res.reason)
-                        self.repository.fail_extraction_budget(
-                            workspace_id=workspace_id,
-                            document_id=document_id,
-                            document_version=document_version,
-                            worker_id=worker_id,
-                            fence_token=fence_token,
-                            error_reason="retry_reservation_denied",
-                            prompt_tokens_spent=estimated_prompt_tokens,
-                        )
-                        return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
-                    fence_token = retry_res.fence_token
-
-                res_obj, status = controller.run_provider_call(
-                    client.converse,
-                    modelId=model_id,
-                    messages=messages,
-                    system=system,
-                    inferenceConfig={"temperature": 0.0, "maxTokens": max_output_tokens},
-                    timeout_s=rem_deadline,
+        for attempt in range(max_attempts):
+            rem_deadline = max(0.001, call_deadline_s - (time.perf_counter() - start_time))
+            if rem_deadline <= 0.001 and attempt > 0:
+                logger.warning("Provider call deadline expired before retry attempt %d", attempt)
+                self.repository.fail_extraction_budget(
+                    workspace_id=workspace_id,
+                    document_id=document_id,
+                    document_version=document_version,
+                    worker_id=worker_id,
+                    fence_token=fence_token,
+                    error_reason="caller_timeout",
+                    prompt_tokens_spent=estimated_prompt_tokens,
                 )
+                return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
 
-                if status == "caller_timeout":
-                    logger.warning("Bedrock converse caller timeout exceeded call_deadline_s=%.2f", call_deadline_s)
+            if attempt > 0:
+                retry_res = self.repository.reserve_extraction_budget(
+                    workspace_id=workspace_id,
+                    document_id=document_id,
+                    document_version=document_version,
+                    worker_id=worker_id,
+                    estimated_prompt_tokens=estimated_prompt_tokens,
+                    max_output_tokens=max_output_tokens,
+                    max_calls=max_calls,
+                    max_total_tokens=max_total_tokens,
+                    lease_duration_s=lease_duration_s,
+                    max_input_tokens=max_input_tokens,
+                    max_output_ceiling=1600,
+                )
+                if not retry_res.granted:
+                    logger.warning("Retry budget reservation denied: %s", retry_res.reason)
                     self.repository.fail_extraction_budget(
                         workspace_id=workspace_id,
                         document_id=document_id,
                         document_version=document_version,
                         worker_id=worker_id,
                         fence_token=fence_token,
-                        error_reason="caller_timeout",
+                        error_reason="retry_reservation_denied",
+                        prompt_tokens_spent=estimated_prompt_tokens,
+                    )
+                    return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
+                fence_token = retry_res.fence_token
+
+            res_obj, status = controller.run_provider_call(
+                client.converse,
+                modelId=model_id,
+                messages=messages,
+                system=system,
+                inferenceConfig={"temperature": 0.0, "maxTokens": max_output_tokens},
+                timeout_s=rem_deadline,
+            )
+
+            if status == "caller_timeout":
+                logger.warning("Bedrock converse caller timeout exceeded call_deadline_s=%.2f", call_deadline_s)
+                self.repository.fail_extraction_budget(
+                    workspace_id=workspace_id,
+                    document_id=document_id,
+                    document_version=document_version,
+                    worker_id=worker_id,
+                    fence_token=fence_token,
+                    error_reason="caller_timeout",
+                    prompt_tokens_spent=estimated_prompt_tokens,
+                )
+                return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
+
+            if status == "admission_rejected":
+                logger.warning("Bedrock converse admission rejected due to queue saturation")
+                self.repository.fail_extraction_budget(
+                    workspace_id=workspace_id,
+                    document_id=document_id,
+                    document_version=document_version,
+                    worker_id=worker_id,
+                    fence_token=fence_token,
+                    error_reason="admission_rejected",
+                    prompt_tokens_spent=0,
+                )
+                return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
+
+            if status == "call_failed":
+                exc = res_obj
+                err_str = str(exc)
+                if ("ThrottlingException" in err_str or "429" in err_str) and attempt < max_attempts - 1:
+                    logger.warning("Bedrock throttled, retrying once...")
+                    time.sleep(1.0)
+                    continue
+                else:
+                    logger.error("Bedrock converse failed: %s", exc)
+                    self.repository.fail_extraction_budget(
+                        workspace_id=workspace_id,
+                        document_id=document_id,
+                        document_version=document_version,
+                        worker_id=worker_id,
+                        fence_token=fence_token,
+                        error_reason=str(exc),
                         prompt_tokens_spent=estimated_prompt_tokens,
                     )
                     return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
 
-                if status == "admission_rejected":
-                    logger.warning("Bedrock converse admission rejected due to queue saturation")
-                    self.repository.fail_extraction_budget(
-                        workspace_id=workspace_id,
-                        document_id=document_id,
-                        document_version=document_version,
-                        worker_id=worker_id,
-                        fence_token=fence_token,
-                        error_reason="admission_rejected",
-                        prompt_tokens_spent=0,
-                    )
-                    return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
+            resp = res_obj
+            raw_usage = resp.get("usage") if isinstance(resp, dict) else None
+            if not isinstance(raw_usage, dict):
+                logger.error("Bedrock converse response missing or invalid usage dict: %r", raw_usage)
+                self.repository.fail_extraction_budget(
+                    workspace_id=workspace_id,
+                    document_id=document_id,
+                    document_version=document_version,
+                    worker_id=worker_id,
+                    fence_token=fence_token,
+                    error_reason="missing_provider_usage",
+                    prompt_tokens_spent=estimated_prompt_tokens,
+                )
+                return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
 
-                if status == "call_failed":
-                    exc = res_obj
-                    err_str = str(exc)
-                    if ("ThrottlingException" in err_str or "429" in err_str) and attempt < max_attempts - 1:
-                        logger.warning("Bedrock throttled, retrying once...")
-                        time.sleep(1.0)
-                        continue
-                    else:
-                        logger.error("Bedrock converse failed: %s", exc)
-                        self.repository.fail_extraction_budget(
-                            workspace_id=workspace_id,
-                            document_id=document_id,
-                            document_version=document_version,
-                            worker_id=worker_id,
-                            fence_token=fence_token,
-                            error_reason=str(exc),
-                            prompt_tokens_spent=estimated_prompt_tokens,
-                        )
-                        return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
+            in_tok = raw_usage.get("inputTokens")
+            out_tok = raw_usage.get("outputTokens")
 
-                resp = res_obj
-                raw_usage = resp.get("usage") if isinstance(resp, dict) else None
-                if not isinstance(raw_usage, dict):
-                    logger.error("Bedrock converse response missing or invalid usage dict: %r", raw_usage)
-                    self.repository.fail_extraction_budget(
-                        workspace_id=workspace_id,
-                        document_id=document_id,
-                        document_version=document_version,
-                        worker_id=worker_id,
-                        fence_token=fence_token,
-                        error_reason="missing_provider_usage",
-                        prompt_tokens_spent=estimated_prompt_tokens,
-                    )
-                    return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
+            def _is_valid_token_int(val: Any) -> bool:
+                return not isinstance(val, bool) and isinstance(val, int)
 
-                in_tok = raw_usage.get("inputTokens")
-                out_tok = raw_usage.get("outputTokens")
+            if not _is_valid_token_int(in_tok) or in_tok <= 0:
+                logger.error("Bedrock converse returned invalid inputTokens: %r", in_tok)
+                self.repository.fail_extraction_budget(
+                    workspace_id=workspace_id,
+                    document_id=document_id,
+                    document_version=document_version,
+                    worker_id=worker_id,
+                    fence_token=fence_token,
+                    error_reason="invalid_provider_usage",
+                    prompt_tokens_spent=estimated_prompt_tokens,
+                )
+                return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
 
-                def _is_valid_token_int(val: Any) -> bool:
-                    return not isinstance(val, bool) and isinstance(val, int)
+            if not _is_valid_token_int(out_tok) or out_tok < 0:
+                logger.error("Bedrock converse returned invalid outputTokens: %r", out_tok)
+                self.repository.fail_extraction_budget(
+                    workspace_id=workspace_id,
+                    document_id=document_id,
+                    document_version=document_version,
+                    worker_id=worker_id,
+                    fence_token=fence_token,
+                    error_reason="invalid_provider_usage",
+                    prompt_tokens_spent=in_tok,
+                )
+                return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
 
-                if not _is_valid_token_int(in_tok) or in_tok <= 0:
-                    logger.error("Bedrock converse returned invalid inputTokens: %r", in_tok)
-                    self.repository.fail_extraction_budget(
-                        workspace_id=workspace_id,
-                        document_id=document_id,
-                        document_version=document_version,
-                        worker_id=worker_id,
-                        fence_token=fence_token,
-                        error_reason="invalid_provider_usage",
-                        prompt_tokens_spent=estimated_prompt_tokens,
-                    )
-                    return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
+            # 1. Per-call output token limit (e.g. reject outputTokens=801 when maxTokens=800)
+            if out_tok > max_output_tokens:
+                logger.error("Bedrock converse outputTokens %d exceeds per-call limit %d", out_tok, max_output_tokens)
+                self.repository.fail_extraction_budget(
+                    workspace_id=workspace_id,
+                    document_id=document_id,
+                    document_version=document_version,
+                    worker_id=worker_id,
+                    fence_token=fence_token,
+                    error_reason="output_tokens_exceeded_limit",
+                    prompt_tokens_spent=in_tok,
+                    output_tokens_spent=out_tok,
+                )
+                return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
 
-                if not _is_valid_token_int(out_tok) or out_tok < 0:
-                    logger.error("Bedrock converse returned invalid outputTokens: %r", out_tok)
-                    self.repository.fail_extraction_budget(
-                        workspace_id=workspace_id,
-                        document_id=document_id,
-                        document_version=document_version,
-                        worker_id=worker_id,
-                        fence_token=fence_token,
-                        error_reason="invalid_provider_usage",
-                        prompt_tokens_spent=in_tok,
-                    )
-                    return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
+            # 2. Per-call input token limit: cannot exceed reserved allowance or configured ceiling (2000)
+            if in_tok > estimated_prompt_tokens or in_tok > 2000:
+                logger.error("Bedrock converse inputTokens %d exceeds reservation %d or cap 2000", in_tok, estimated_prompt_tokens)
+                self.repository.fail_extraction_budget(
+                    workspace_id=workspace_id,
+                    document_id=document_id,
+                    document_version=document_version,
+                    worker_id=worker_id,
+                    fence_token=fence_token,
+                    error_reason="input_tokens_exceeded_reservation",
+                    prompt_tokens_spent=in_tok,
+                    output_tokens_spent=out_tok,
+                )
+                return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
 
-                # 1. Per-call output token limit (e.g. reject outputTokens=801 when maxTokens=800)
-                if out_tok > max_output_tokens:
-                    logger.error("Bedrock converse outputTokens %d exceeds per-call limit %d", out_tok, max_output_tokens)
-                    self.repository.fail_extraction_budget(
-                        workspace_id=workspace_id,
-                        document_id=document_id,
-                        document_version=document_version,
-                        worker_id=worker_id,
-                        fence_token=fence_token,
-                        error_reason="output_tokens_exceeded_limit",
-                        prompt_tokens_spent=in_tok,
-                        output_tokens_spent=out_tok,
-                    )
-                    return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
+            # 3. Aggregate document token limits across attempts and retries
+            curr_ledger = self.repository.get_budget_ledger(workspace_id, document_id, document_version, consistent_read=True)
+            prior_spt = curr_ledger.spent_prompt_tokens if curr_ledger else 0
+            prior_sot = curr_ledger.spent_output_tokens if curr_ledger else 0
+            prior_tot = curr_ledger.spent_tokens if curr_ledger else 0
 
-                # 2. Per-call input token limit: cannot exceed reserved allowance or configured ceiling (2000)
-                if in_tok > estimated_prompt_tokens or in_tok > 2000:
-                    logger.error("Bedrock converse inputTokens %d exceeds reservation %d or cap 2000", in_tok, estimated_prompt_tokens)
-                    self.repository.fail_extraction_budget(
-                        workspace_id=workspace_id,
-                        document_id=document_id,
-                        document_version=document_version,
-                        worker_id=worker_id,
-                        fence_token=fence_token,
-                        error_reason="input_tokens_exceeded_reservation",
-                        prompt_tokens_spent=in_tok,
-                        output_tokens_spent=out_tok,
-                    )
-                    return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
+            if (
+                prior_spt + in_tok > max_input_tokens
+                or prior_sot + out_tok > 1600
+                or prior_tot + in_tok + out_tok > max_total_tokens
+            ):
+                logger.error(
+                    "Aggregate tokens overrun document budget: prompt=%d/%d, output=%d/1600, total=%d/%d",
+                    prior_spt + in_tok,
+                    max_input_tokens,
+                    prior_sot + out_tok,
+                    prior_tot + in_tok + out_tok,
+                    max_total_tokens,
+                )
+                self.repository.fail_extraction_budget(
+                    workspace_id=workspace_id,
+                    document_id=document_id,
+                    document_version=document_version,
+                    worker_id=worker_id,
+                    fence_token=fence_token,
+                    error_reason="aggregate_budget_overrun",
+                    prompt_tokens_spent=in_tok,
+                    output_tokens_spent=out_tok,
+                )
+                return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
 
-                # 3. Aggregate document token limits across attempts and retries
-                curr_ledger = self.repository.get_budget_ledger(workspace_id, document_id, document_version, consistent_read=True)
-                prior_spt = curr_ledger.spent_prompt_tokens if curr_ledger else 0
-                prior_sot = curr_ledger.spent_output_tokens if curr_ledger else 0
-                prior_tot = curr_ledger.spent_tokens if curr_ledger else 0
-
-                if (
-                    prior_spt + in_tok > max_input_tokens
-                    or prior_sot + out_tok > 1600
-                    or prior_tot + in_tok + out_tok > max_total_tokens
-                ):
-                    logger.error(
-                        "Aggregate tokens overrun document budget: prompt=%d/%d, output=%d/1600, total=%d/%d",
-                        prior_spt + in_tok,
-                        max_input_tokens,
-                        prior_sot + out_tok,
-                        prior_tot + in_tok + out_tok,
-                        max_total_tokens,
-                    )
-                    self.repository.fail_extraction_budget(
-                        workspace_id=workspace_id,
-                        document_id=document_id,
-                        document_version=document_version,
-                        worker_id=worker_id,
-                        fence_token=fence_token,
-                        error_reason="aggregate_budget_overrun",
-                        prompt_tokens_spent=in_tok,
-                        output_tokens_spent=out_tok,
-                    )
-                    return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
-
-                output_text = resp.get("output", {}).get("message", {}).get("content", [{}])[0].get("text", "")
-                usage = {"inputTokens": in_tok, "outputTokens": out_tok}
-                dispatch_success = True
-                break
+            output_text = resp.get("output", {}).get("message", {}).get("content", [{}])[0].get("text", "")
+            usage = {"inputTokens": in_tok, "outputTokens": out_tok}
+            dispatch_success = True
+            break
 
         if not dispatch_success:
             return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
@@ -1775,23 +1971,59 @@ def extract_and_persist_graph(
     table_store: Any | None = None,
     client: Any | None = None,
     repository: KnowledgeGraphRepositoryBase | None = None,
+    schema_relations: Sequence[DirectionalSchemaRelation | TableForeignKey] | None = None,
 ) -> KnowledgeGraphManifest | None:
     """Convenience helper extracting and persisting knowledge graph records across formats."""
-    builder = KnowledgeGraphBuilder(repository=repository)
+    repo = repository or get_shared_knowledge_graph_repository()
+    builder = KnowledgeGraphBuilder(repository=repo, bedrock_client=client)
     fmt = format.lower().replace(".", "")
     if fmt == "csv":
         rows: list[dict[str, Any]] = []
-        if table_store and table_name:
-            try:
-                rows = list(table_store.query_rows(table_name, workspace_id, version=document_version))
-            except Exception as e:
-                logger.warning("Failed to query rows from table_store for kg: %s", e)
+        resolved_relations = list(schema_relations) if schema_relations is not None else None
+        if resolved_relations is None and table_store:
+            resolved_relations = _resolve_schema_relations_from_table_store(
+                table_store=table_store,
+                table_name=table_name,
+                workspace_id=workspace_id,
+                document_version=document_version,
+                document_id=document_id,
+            )
+
+        if table_store and (table_name or document_id):
+            t_id = table_name or document_id
+            candidates_to_try = [t_id]
+            if t_id.lower() not in candidates_to_try:
+                candidates_to_try.append(t_id.lower())
+            if document_id not in candidates_to_try:
+                candidates_to_try.append(document_id)
+
+            for cand_id in candidates_to_try:
+                try:
+                    raw_rows = list(table_store.query_rows(cand_id, workspace_id, version=document_version))
+                    if raw_rows:
+                        schema = table_store.get_schema(cand_id, workspace_id, version=document_version)
+                        col_map = {c.col_index: c.name for c in schema.columns} if schema and schema.columns else {}
+                        for r in raw_rows:
+                            if isinstance(r, dict):
+                                rows.append(r)
+                            elif hasattr(r, "cells"):
+                                row_dict = {}
+                                for cell in r.cells:
+                                    cname = col_map.get(cell.col_index, f"Col_{cell.col_index}")
+                                    val = cell.raw_value if cell.raw_value is not None else cell.normalized_value
+                                    row_dict[cname] = val
+                                rows.append(row_dict)
+                        break
+                except Exception as e:
+                    logger.warning("Failed to query rows from table_store for kg: %s", e)
+
         return builder.build_and_persist_tabular_graph(
             workspace_id=workspace_id,
             document_id=document_id,
             document_version=document_version,
             table_name=table_name or document_id,
             rows=rows,
+            schema_relations=resolved_relations,
             source_chunks=chunks,
         )
     elif fmt == "pdf":
