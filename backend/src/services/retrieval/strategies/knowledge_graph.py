@@ -51,6 +51,12 @@ class KnowledgeGraphStrategy:
         boundary_repo: Any | None = None,
         documents_repo: DocumentsRepository | None = None,
     ) -> None:
+        # Backward compatibility for legacy callers passing CloudRepository as repository
+        if repository is not None and not hasattr(repository, "resolve_mentions"):
+            if documents_repo is None and hasattr(repository, "get_chunks_by_ids"):
+                documents_repo = repository
+            repository = None
+
         self.repository = repository or get_shared_knowledge_graph_repository()
         self.boundary_repo = boundary_repo or get_workspace_boundary_repo()
         self.documents_repo = documents_repo or DocumentsRepository()

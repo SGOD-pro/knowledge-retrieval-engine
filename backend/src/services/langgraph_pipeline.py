@@ -740,6 +740,7 @@ def run_graph(state: PipelineState):
         query=query,
         max_hops=max_hops,
         caller_deadline_ms=timeout_ms,
+        snapshot_context=state.get("snapshot_context"),
     )
 
     # 4. Calibrate RRF weight (AC-10)
@@ -752,7 +753,9 @@ def run_graph(state: PipelineState):
     calibrated_weight = ambiguous_weight if is_ambiguous_or_conflicting else base_weight
 
     graph_chunks = [
-        dataclasses.replace(c, graph_weight=calibrated_weight) if hasattr(c, "graph_weight") else c
+        dataclasses.replace(c, graph_weight=calibrated_weight)
+        if dataclasses.is_dataclass(c) and hasattr(c, "graph_weight")
+        else c
         for c in lookup_res.candidate_chunks
     ]
 

@@ -725,6 +725,43 @@ def test_documents_service_snapshot_metadata_ac12():
         assert e_f == 0
         assert r_f == 0
 
+    # 3. Empty extraction sets graph_status='empty' and builds valid DocumentSnapshot (Major finding fix)
+    with patch("ingestion.graph_builder.extract_and_persist_graph") as mock_extract:
+        mock_extract.return_value = {
+            "status": "empty",
+            "entities_count": 0,
+            "relations_count": 0,
+        }
+
+        status_e, e_e, r_e = DocumentsService._enrich_graph_snapshot_metadata(
+            workspace_id=ws_id,
+            doc_id=doc_id,
+            doc_ver="v3",
+            filename="empty.csv",
+            chunks=[],
+        )
+
+        assert status_e == "empty"
+        assert e_e == 0
+        assert r_e == 0
+
+        # Verify DocumentSnapshot instantiates without validation error
+        from schemas.contracts.boundary import DocumentSnapshot
+        snapshot = DocumentSnapshot(
+            workspace_id=ws_id,
+            document_id=doc_id,
+            source="empty.csv",
+            version="v3",
+            format="csv",
+            created_at="2026-11-17T12:00:00Z",
+            graph_status=status_e,
+            graph_entities_count=e_e,
+            graph_relations_count=r_e,
+        )
+        assert snapshot.graph_status == "empty"
+        assert snapshot.graph_entities_count == 0
+        assert snapshot.graph_relations_count == 0
+
 
 # ===========================================================================
 # 11. KnowledgeGraphStrategy Direct Retrieval Contract (AC-11)
@@ -774,3 +811,26 @@ def test_dynamic_tombstone_during_pipeline_traversal_ac7():
     assert res["graph_chunks"] == []
     assert res["graph_candidate_ids"] == []
     assert res["graph_match_count"] == 0
+
+
+# ===========================================================================
+# 13. Shared Repository Reset and Legacy Strategy Init (Review Minor Findings)
+# ===========================================================================
+
+def test_shared_repository_reset_and_legacy_strategy_init():
+    """Verify shared repository reset returns a fresh instance and strategy gracefully accepts legacy repository."""
+    # 1. Reset returns fresh non-None instance
+    repo = get_shared_knowledge_graph_repository(reset=True)
+    assert repo is not None
+    assert hasattr(repo, "resolve_mentions")
+
+    # 2. Legacy caller passing CloudRepository or mock lacking resolve_mentions
+    class MockLegacyRepository:
+        def get_chunks_by_ids(self, workspace_id, keys):
+            return []
+
+    legacy_repo = MockLegacyRepository()
+    strat = KnowledgeGraphStrategy(repository=legacy_repo)
+    assert strat.repository is not None
+    assert hasattr(strat.repository, "resolve_mentions")
+    assert strat.documents_repo is legacy_repo

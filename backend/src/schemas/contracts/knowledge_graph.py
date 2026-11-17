@@ -122,6 +122,7 @@ class GraphStatus(StrEnum):
     PENDING = "pending"
     PROCESSING = "processing"
     READY = "ready"
+    EMPTY = "empty"
     FAILED = "failed"
     UNAVAILABLE = "unavailable"
 

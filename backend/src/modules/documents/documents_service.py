@@ -130,7 +130,9 @@ class DocumentsService:
                 stat = getattr(manifest, "status", None) or (manifest.get("status") if isinstance(manifest, dict) else None)
                 ecnt = getattr(manifest, "entity_count", None) or (manifest.get("entities_count") if isinstance(manifest, dict) else 0) or 0
                 rcnt = getattr(manifest, "relationship_count", None) or (manifest.get("relations_count") if isinstance(manifest, dict) else 0) or 0
-                return stat or "ready", int(ecnt), int(rcnt)
+                if stat not in ("pending", "processing", "ready", "empty", "failed", "unavailable"):
+                    stat = "ready" if (int(ecnt) > 0 or int(rcnt) > 0) else "empty"
+                return stat, int(ecnt), int(rcnt)
             return "failed", 0, 0
         except Exception as kg_err:
             logger.warning("Could not persist Knowledge Graph for %s: %s", doc_id, kg_err)

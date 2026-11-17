@@ -2769,10 +2769,7 @@ def get_shared_knowledge_graph_repository(
     """Resolve and return singleton Knowledge Graph repository matching configured environment."""
     global _SHARED_KG_REPO
     with _KG_REPO_LOCK:
-        if reset:
-            _SHARED_KG_REPO = None
-            return None
-        if _SHARED_KG_REPO is None:
+        if reset or _SHARED_KG_REPO is None:
             _SHARED_KG_REPO = get_knowledge_graph_repository(
                 backend=backend, db_path=db_path, table_name=table_name
             )
