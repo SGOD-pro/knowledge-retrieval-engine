@@ -61,8 +61,11 @@ uv run pytest tests/test_contracts_and_identity.py
 * Dynamic source and workspace tombstones halt graph traversal and chunk hydration immediately fail closed.
 * Targeted chunk hydration uses point lookups by chunk identifier with zero calls to get_all_chunks.
 * Grounded narrative PDF extraction enforces verbatim directional syntax grounding, rejecting reversed voice, sentence negation, disjoint clauses, and co occurrence without directional predicate.
+* Grounding preserves source context by locating candidate evidence within enclosing sentences, rejecting evidence that removes conditional, negated, hypothetical, or reported speech framing.
 * Entity identity defaults strictly to document scoped identity; cross document entity joins require verified disambiguation tokens.
+* Chunk provenance validation checks document version and identity across attributes and metadata, rejecting stale versions and conflicting fields before Bedrock dispatch.
 * Ingestion extraction Bedrock Converse dispatch requires authoritative count_tokens pre validation and atomic budget ledger reservations with 15 second worker leases and monotonic fencing, preserving ready publications on failed attempts.
+* Bedrock token limits enforce per call caps (inputTokens <= 2000, outputTokens <= 800) and cumulative document ceilings (4000 prompt, 1600 output, 5600 total), failing closed and retaining spend durably in the budget ledger on overruns.
 * TableStore evidence hydration enforces an inner deadline check halting table row hydration immediately on deadline overrun.
 
 ## Gotchas
