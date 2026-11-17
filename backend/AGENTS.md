@@ -62,6 +62,7 @@ uv run pytest tests/test_contracts_and_identity.py
 * Targeted chunk hydration uses point lookups by chunk identifier with zero calls to get_all_chunks.
 * Grounded narrative PDF extraction enforces verbatim directional syntax grounding, rejecting reversed voice, sentence negation, disjoint clauses, and co occurrence without directional predicate.
 * Grounding preserves source context by locating candidate evidence within enclosing sentences, rejecting evidence that removes conditional, negated, hypothetical, or reported speech framing.
+* Sentence boundary splitting respects corporate abbreviations (Inc., Corp., Ltd.) and numeric decimals, distinguishes calendar month May from modal auxiliary may, accommodates descriptive business role nouns and temporal qualifiers between entities and predicates, and detects modal passive constructions with auxiliary be.
 * Entity identity defaults strictly to document scoped identity; cross document entity joins require verified disambiguation tokens.
 * Chunk provenance validation checks document version and identity across attributes and metadata, rejecting stale versions and conflicting fields before Bedrock dispatch.
 * Ingestion extraction Bedrock Converse dispatch requires authoritative count_tokens pre validation and atomic budget ledger reservations with 15 second worker leases and monotonic fencing, preserving ready publications on failed attempts.

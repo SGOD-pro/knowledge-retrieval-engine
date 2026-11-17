@@ -2252,3 +2252,343 @@ def test_durable_token_limit_accounting_across_sqlite_and_dynamodb_local():
     )
     assert res_ddb.granted is False
     assert res_ddb.reason == "tokens_exhausted"
+
+
+def test_grounding_corporate_abbreviations_and_decimals():
+    """covers: Major 1 Grounding robustness on corporate suffixes (Inc., Corp., Ltd.) and decimals (51.5%, $3.5M)."""
+    # 1. Corporate suffixes in entity names and text
+    text1 = "Acme Inc. acquired Beta Corp. in an all cash transaction."
+    valid1, reason1 = validate_relationship_grounding(
+        chunk_text=text1,
+        source_entity_name="Acme Inc.",
+        predicate="acquired",
+        target_entity_name="Beta Corp.",
+    )
+    assert valid1 is True, f"Failed with reason: {reason1}"
+    assert reason1 is None
+
+    # Also test matching when entity name in model output omits period
+    valid1b, _ = validate_relationship_grounding(
+        chunk_text=text1,
+        source_entity_name="Acme Inc",
+        predicate="acquired",
+        target_entity_name="Beta Corp",
+    )
+    assert valid1b is True
+
+    # 2. Decimal metrics and financial percentages
+    text2 = "Acme acquired 51.5% of Beta for $3.5M."
+    valid2, reason2 = validate_relationship_grounding(
+        chunk_text=text2,
+        source_entity_name="Acme",
+        predicate="acquired",
+        target_entity_name="Beta",
+    )
+    assert valid2 is True, f"Failed with reason: {reason2}"
+
+    # 3. Honorifics and multiple corporate entities in end-to-end extraction
+    text3 = "According to Dr. Smith, Acme Corp. acquired Beta Ltd. for $50M. The deal completed yesterday."
+    chunk = make_chunk(
+        id="ch_abbr_1",
+        text=text3,
+        workspace_id="ws_abbr",
+        document_id="doc_abbr",
+        document_version="v1",
+        page_number=1,
+    )
+    model_json = json.dumps({
+        "entities": [
+            {"name": "Acme Corp.", "entity_type": "organization"},
+            {"name": "Beta Ltd.", "entity_type": "organization"},
+        ],
+        "relationships": [
+            {
+                "source": "Acme Corp.",
+                "predicate": "acquired",
+                "target": "Beta Ltd.",
+                "verbatim_evidence": "Acme Corp. acquired Beta Ltd.",
+                "chunk_id": "ch_abbr_1",
+            }
+        ],
+    })
+    entities, rels = extract_pdf_relationships(
+        workspace_id="ws_abbr",
+        document_id="doc_abbr",
+        document_version="v1",
+        chunks=[chunk],
+        model_output_json=model_json,
+        publication_id="pub_abbr",
+    )
+    assert len(rels) == 1
+    assert rels[0].source_entity_name == "Acme Corp."
+    assert rels[0].target_entity_name == "Beta Ltd."
+    assert rels[0].predicate == "acquired"
+
+
+def test_grounding_calendar_month_may_vs_epistemic_modality():
+    """covers: Major 2 Calendar month May preserved as factual while epistemic modal 'may' is rejected."""
+    # 1. Factual statement in May 2023
+    text_may_factual = "In May 2023, Acme acquired Beta."
+    v_fact, r_fact = validate_relationship_grounding(
+        chunk_text=text_may_factual,
+        source_entity_name="Acme",
+        predicate="acquired",
+        target_entity_name="Beta",
+    )
+    assert v_fact is True, f"Factual May statement was falsely rejected: {r_fact}"
+    assert r_fact is None
+
+    # 2. Factual statement with calendar date
+    text_may_date = "On May 15, Acme completed the purchase of Beta."
+    v_date, r_date = validate_relationship_grounding(
+        chunk_text=text_may_date,
+        source_entity_name="Acme",
+        predicate="completed the purchase of",
+        target_entity_name="Beta",
+    )
+    assert v_date is True, f"Calendar date May was rejected: {r_date}"
+
+    # 3. Modal verb 'may acquire' must be rejected as hypothetical
+    text_modal_may = "Acme may acquire Beta pending shareholder vote."
+    v_mod, r_mod = validate_relationship_grounding(
+        chunk_text=text_modal_may,
+        source_entity_name="Acme",
+        predicate="acquired",
+        target_entity_name="Beta",
+    )
+    assert v_mod is False
+    assert r_mod == "hypothetical_or_unsupported_claim"
+
+    # 4. Modal auxiliary 'may have acquired' must be rejected
+    text_modal_have = "Acme may have acquired Beta according to reports."
+    v_have, r_have = validate_relationship_grounding(
+        chunk_text=text_modal_have,
+        source_entity_name="Acme",
+        predicate="acquired",
+        target_entity_name="Beta",
+    )
+    assert v_have is False
+    assert r_have == "hypothetical_or_unsupported_claim"
+
+
+def test_grounding_intervening_business_nouns_and_temporal_adverbs():
+    """covers: Major 3 Descriptive business nouns (competitor, supplier, startup) and temporal adverbs (today, in 2023)."""
+    # 1. Descriptive nouns between predicate and target entity
+    cases = [
+        ("Acme acquired competitor Beta in a landmark deal.", "competitor"),
+        ("Acme partnered with supplier Beta to scale production.", "supplier"),
+        ("Acme invested in startup Beta during Series A.", "startup"),
+        ("Acme acquired developer Beta.", "developer"),
+        ("Acme acquired vendor Beta.", "vendor"),
+        ("Acme acquired rival Beta.", "rival"),
+    ]
+    for text, noun in cases:
+        valid, reason = validate_relationship_grounding(
+            chunk_text=text,
+            source_entity_name="Acme",
+            predicate="acquired" if "acquired" in text else ("partnered_with" if "partnered" in text else "invested_in"),
+            target_entity_name="Beta",
+        )
+        assert valid is True, f"Failed on descriptive noun '{noun}': {reason}"
+
+    # 2. Temporal adverbs and prepositional phrases between subject and predicate
+    temporal_cases = [
+        "Acme today acquired Beta.",
+        "Acme yesterday acquired Beta.",
+        "Acme in 2023 acquired Beta.",
+        "Acme recently acquired Beta.",
+    ]
+    for text in temporal_cases:
+        valid, reason = validate_relationship_grounding(
+            chunk_text=text,
+            source_entity_name="Acme",
+            predicate="acquired",
+            target_entity_name="Beta",
+        )
+        assert valid is True, f"Failed on temporal adverb in '{text}': {reason}"
+
+
+def test_grounding_passive_voice_with_modal_auxiliary_be():
+    """covers: Minor 1 Passive voice detection with infinitive and modal auxiliary 'be'."""
+    text1 = "Beta will be acquired by Acme."
+    v1, r1 = validate_relationship_grounding(
+        chunk_text=text1,
+        source_entity_name="Acme",
+        predicate="acquired",
+        target_entity_name="Beta",
+    )
+    assert v1 is True, f"Failed on 'will be acquired by': {r1}"
+
+    text2 = "Beta is to be acquired by Acme in the third quarter."
+    v2, r2 = validate_relationship_grounding(
+        chunk_text=text2,
+        source_entity_name="Acme",
+        predicate="acquired",
+        target_entity_name="Beta",
+    )
+    assert v2 is True, f"Failed on 'to be acquired by': {r2}"
+
+
+def test_extract_pdf_relationships_page_zero_clamping():
+    """covers: Minor 2 Page number 0 clamped to 1 preventing DocumentLocation ValidationError."""
+    text = "Acme acquired Beta."
+    chunk = make_chunk(
+        id="ch_p0",
+        text=text,
+        workspace_id="ws_p0",
+        document_id="doc_p0",
+        document_version="v1",
+        page_number=0,
+    )
+    # Explicitly verify chunk has page_number=0
+    assert chunk.page_number == 0
+
+    model_json = json.dumps({
+        "entities": [
+            {"name": "Acme", "entity_type": "organization"},
+            {"name": "Beta", "entity_type": "organization"},
+        ],
+        "relationships": [
+            {
+                "source": "Acme",
+                "predicate": "acquired",
+                "target": "Beta",
+                "verbatim_evidence": "Acme acquired Beta",
+                "chunk_id": "ch_p0",
+            }
+        ],
+    })
+
+    # Should not raise pydantic ValidationError on DocumentLocation(page=0)
+    entities, rels = extract_pdf_relationships(
+        workspace_id="ws_p0",
+        document_id="doc_p0",
+        document_version="v1",
+        chunks=[chunk],
+        model_output_json=model_json,
+        publication_id="pub_p0",
+    )
+    assert len(rels) == 1
+    assert rels[0].location.page == 1
+
+
+def test_build_pdf_graph_handles_staging_failure_gracefully():
+    """covers: Minor 3 Unhandled exception during stage_relationships fails closed into budget ledger."""
+    repo = InMemoryKnowledgeGraphRepository()
+    mock_bedrock = MagicMock()
+    mock_bedrock.converse.return_value = {
+        "output": {
+            "message": {
+                "content": [
+                    {
+                        "text": json.dumps({
+                            "entities": [
+                                {"name": "Acme", "entity_type": "organization"},
+                                {"name": "Beta", "entity_type": "organization"},
+                            ],
+                            "relationships": [
+                                {
+                                    "source": "Acme",
+                                    "predicate": "acquired",
+                                    "target": "Beta",
+                                    "verbatim_evidence": "Acme acquired Beta",
+                                    "chunk_id": "ch_stg",
+                                }
+                            ],
+                        })
+                    }
+                ]
+            }
+        },
+        "usage": {"inputTokens": 100, "outputTokens": 50},
+    }
+
+    # Simulate staging failure
+    repo.stage_relationships = MagicMock(side_effect=RuntimeError("Storage staging error"))
+
+    builder = KnowledgeGraphBuilder(repository=repo)
+    chunk = make_chunk(
+        id="ch_stg",
+        text="Acme acquired Beta.",
+        workspace_id="ws_stg",
+        document_id="doc_stg",
+        document_version="v1",
+        page_number=1,
+    )
+
+    # Initialize count_tokens on mock bedrock
+    mock_bedrock.count_tokens = MagicMock(return_value={"inputTokens": 100})
+
+    manifest = builder.build_and_persist_pdf_graph(
+        workspace_id="ws_stg",
+        document_id="doc_stg",
+        document_version="v1",
+        chunks=[chunk],
+        client=mock_bedrock,
+        worker_id="worker_stg",
+    )
+
+    assert manifest.status == "failed"
+    ledger = repo.get_budget_ledger("ws_stg", "doc_stg", "v1")
+    assert ledger is not None
+    assert ledger.lease_owner_id is None
+    assert ledger.lease_expires_at == 0.0
+
+
+def test_grounding_non_negating_prepositional_phrases():
+    """covers: Minor 4 Non-negating prepositional phrases (with no debt, without objections) accepted."""
+    # 1. Non-negating prepositional phrase with 'no'
+    text1 = "Acme acquired Beta with no regulatory objections."
+    v1, r1 = validate_relationship_grounding(
+        chunk_text=text1,
+        source_entity_name="Acme",
+        predicate="acquired",
+        target_entity_name="Beta",
+    )
+    assert v1 is True, f"Falsely rejected non-negating preposition: {r1}"
+
+    # 2. Non-negating prepositional phrase with 'without'
+    text2 = "Acme acquired Beta without debt."
+    v2, r2 = validate_relationship_grounding(
+        chunk_text=text2,
+        source_entity_name="Acme",
+        predicate="acquired",
+        target_entity_name="Beta",
+    )
+    assert v2 is True, f"Falsely rejected 'without debt': {r2}"
+
+    # 3. Direct verbal negation must still be rejected
+    text3 = "Acme did not acquire Beta."
+    v3, r3 = validate_relationship_grounding(
+        chunk_text=text3,
+        source_entity_name="Acme",
+        predicate="acquired",
+        target_entity_name="Beta",
+    )
+    assert v3 is False
+    assert r3 == "negated_relationship"
+
+
+def test_chunk_provenance_validation_supports_dictionary_chunks():
+    """covers: Nit 3 Chunk provenance validation supports dictionary chunk objects."""
+    dict_chunk = {
+        "id": "ch_dict_1",
+        "document_id": "doc_dict",
+        "workspace_id": "ws_dict",
+        "document_version": "v1",
+        "text": "Acme acquired Beta.",
+        "metadata": {
+            "page": 1,
+            "document_id": "doc_dict",
+            "workspace_id": "ws_dict",
+            "version": "v1",
+        },
+    }
+    is_valid, reason = validate_chunk_provenance(
+        chunk=dict_chunk,
+        workspace_id="ws_dict",
+        document_id="doc_dict",
+        document_version="v1",
+    )
+    assert is_valid is True, f"Dictionary chunk rejected: {reason}"
+    assert reason is None

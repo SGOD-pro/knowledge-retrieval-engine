@@ -1,52 +1,17 @@
 # Review, re-factor, 2026-11-17
 
-**Reviewed by**: Gemini Pro (author on Gemini Pro)
-**Scope**: 8 files, re-factor vs af02997
-**Verdict**: Qualified acceptance following verified resolution of 6 correctness findings
+**Reviewed by**: gemini-2.5-pro (author on claude-3-5-sonnet)
+**Scope**: 11 files, branch vs af02997 (plus working tree changes)
+**Verdict**: Approve
 
 ## Summary
+This follow-up review evaluates the resolution of 3 Major and 4 Minor findings previously identified in the Spec 0007 Slice 2 implementation (`re-factor` branch vs `af02997`). The revisions systematically eliminate grounding brittleness by introducing boundary-aware sentence segmentation that respects corporate abbreviations (`Inc.`, `Corp.`, `Ltd.`) and numeric decimals (`51.5%`, `$3.5M`), disambiguating the calendar month May from epistemic modality, expanding active syntactic binding allowlists to accommodate descriptive role nouns and temporal adverbs, and localizing negation detection to prevent false rejections on non-negating prepositional phrases. Distributed budget fencing, lease releases on storage errors, and page number boundary safety have also been verified, and the comprehensive 64-test suite in `test_knowledge_graph_slice2.py` fully validates the entire extraction and persistence surface.
 
-This review evaluated the complete implementation of Spec 0007 Slice 2 (Grounded narrative PDF extraction and durable Bedrock budgeting) alongside carried forward Slice 1 nits. The initial implementation provided foundational extraction prompts, JSON parsing, basic syntax grounding, document scoped entity identity, CountTokens pre-validation, atomic budget reservations, and publication staging.
-
-During pre-acceptance evaluation, 6 correctness issues were identified and repaired. The repaired implementation was verified with targeted tests across live DynamoDB Local transactions and independent SQLite connections.
-
-## Correctness findings and disposition
-
-### 1. DynamoDB lease cleanup races
-- **Issue**: Manifest publication and failure cleanup used separate or unconditioned updates that could clear another worker's lease if worker B took over after worker A expired.
-- **Disposition**: Resolved. DynamoDB `commit_manifest` now combines manifest creation and lease release into a single atomic `transact_write_items` call conditioned on `fence_token = :ft AND lease_owner_id = :owner AND lease_expires_at >= :now_ts`. In `fail_extraction_budget`, late workers record spend without clearing newer worker leases.
-- **Verification**: Verified via `test_dynamodb_local_publication_cleanup_never_clears_another_workers_lease` and `test_dynamodb_local_failure_cleanup_never_clears_another_workers_lease`.
-
-### 2. Reconciliation atomicity and idempotency
-- **Issue**: Reading and updating `reconciled_fences` in python application memory allowed duplicate reconciliation of the same attempt and risked overwriting concurrent worker markers.
-- **Disposition**: Resolved. DynamoDB reconciliation now uses native `list_append(if_not_exists(#rf, :empty_list), :this_fence)` guarded by `attribute_not_exists(#rf) OR NOT contains(#rf, :exp_fence)`. Duplicate reconciliation is idempotent and cumulative spend is protected.
-- **Verification**: Verified via `test_dynamodb_local_atomic_idempotent_reconciliation`.
-
-### 3. PDF evidence, provenance, and identity
-- **Issue**: Model output could fabricate evidence, cite mismatched source documents, lose chunk page numbers, or fabricate cross document disambiguation tokens.
-- **Disposition**: Resolved. Extraction enforces verbatim evidence presence in the cited chunk, rejects chunks with mismatched workspace, document, or version IDs, preserves chunk `page_number`, and strips model supplied disambiguation tokens unless verified against an authoritative source mapping.
-- **Verification**: Verified via `test_extract_pdf_relationships_rejects_empty_or_fabricated_evidence`, `test_extract_pdf_relationships_rejects_wrong_source_bindings`, `test_extract_pdf_relationships_preserves_actual_page_number`, and `test_extract_pdf_relationships_rejects_unverified_model_disambiguation_token`.
-
-### 4. Sentence grounding across unrelated clauses and modalities
-- **Issue**: Word order matching in a single sentence accepted unrelated clauses (such as "Acme acquired Gamma, while Beta opened an office") as well as hypothetical or reported claims.
-- **Disposition**: Resolved. Grounding validation partitions sentences by punctuation and conjunction clauses, validates syntactic direct object attachments, and rejects unsupported modalities including conditional and reported speech.
-- **Verification**: Verified via `test_grounding_rejects_unrelated_clauses_in_one_sentence` and `test_grounding_rejects_hypothetical_and_reported_claims`.
-
-### 5. Missing or invalid provider usage
-- **Issue**: Non numeric, missing, or zero provider usage could be accepted or substituted with estimates.
-- **Disposition**: Resolved. Authoritative `inputTokens` and `outputTokens` are required. Missing, boolean, negative, zero inputTokens, or out of range counts fail closed without publishing extracted relationships, while preserving existing ready publications.
-- **Verification**: Verified via `test_build_pdf_graph_fails_closed_on_invalid_usage`.
-
-### 6. Provider deadline and capacity bounds
-- **Issue**: Provider calls lacked bounded execution deadlines and capacity retention, while boto3 hidden retries could mask spend.
-- **Disposition**: Resolved. `KnowledgeGraphProviderConcurrencyController` enforces caller deadlines with bounded queue capacity, retains semaphore slots until underlying provider calls complete, and disables client retries.
-- **Verification**: Verified via `test_provider_call_deadline_and_capacity_retention` and `test_disable_client_retries_unregisters_boto3_handlers`.
-
-## Nits
-
-- `backend/src/ingestion/graph_builder.py`: Slicing raw text bytes at 2000 and decoding with `errors="ignore"` safely prevents UTF-8 decoding exceptions, but character-aware slicing could be adopted if exact boundary preservation is needed.
-- `backend/src/ingestion/graph_builder.py`: Fallback heuristic prompt token estimation applies only when no Bedrock client is configured; restricted to offline test doubles.
+## Strengths
+- **Robust Boundary-Aware Sentence Segmentation**: `split_sentences_with_spans` elegantly handles decimal numbers and honorifics while disambiguating corporate suffixes based on clause verb presence and capitalized boundary tokens, cleanly resolving abbreviation-induced grounding dropouts.
+- **Accurate Calendar Month vs Modal Auxiliary Disambiguation**: `_has_unsupported_modality` cleanly distinguishes temporal and date context (prepositional frames like "in/during/since" and date numbers like "2023", "May 15") from epistemic modal constructions ("may acquire", "may have acquired"), preserving factual historical claims without relaxing modality guards.
+- **Localized Negation & Syntax Flexibility**: Replacing sentence-wide negation checks with `_has_predicate_negation` and expanding intervening token sets allows natural business expressions ("with no regulatory objections", "competitor", "supplier", "in 2023") to ground accurately while continuing to strictly reject reversed voice and verbal negation.
+- **Fail-Closed Staging Resilience & Monotonic Lease Release**: Wrapping relationship staging in try/except blocks and enabling monotonic worker lease releases in `fail_extraction_budget` across InMemory, SQLite WAL, and DynamoDB ensures lease capacity is immediately recovered without risking race conditions against newer workers.
 
 ## Test coverage
-
-TESTS = configured. All 38 tests in `backend/tests/test_knowledge_graph_slice2.py` pass cleanly in 7.84s. In addition, Slice 1 regressions (65 tests), OKF Slice 3.1 regressions (57 tests), and TableStore regressions (6 tests) all pass cleanly (166 total passing tests).
+Test coverage is comprehensive and robust. The 64 tests in `backend/tests/test_knowledge_graph_slice2.py` pass without failures, including targeted regression tests for corporate abbreviations (`Inc.`, `Corp.`, `Ltd.`), financial percentages, calendar month May vs modal verbs, descriptive business nouns, temporal adverbs, modal passive voice with auxiliary `be`, page number 0 clamping on `DocumentLocation`, staging error recovery in the budget ledger, non-negating prepositional phrases, and dictionary chunk provenance.

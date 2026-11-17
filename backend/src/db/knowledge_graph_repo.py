@@ -884,6 +884,13 @@ class InMemoryKnowledgeGraphRepository:
                 return
             ledger = KnowledgeGraphBudgetLedger(**item["data"])
             if fence_token in ledger.reconciled_fences:
+                if ledger.fence_token == fence_token and ledger.lease_owner_id == worker_id:
+                    updated = ledger.model_copy(update={
+                        "lease_owner_id": None,
+                        "lease_expires_at": 0.0,
+                        "updated_at": _now_utc(),
+                    })
+                    self.save_budget_ledger(updated)
                 return
 
             actual_total = prompt_tokens_spent + output_tokens_spent
@@ -1736,7 +1743,19 @@ class SQLiteKnowledgeGraphRepository:
                 ledger = KnowledgeGraphBudgetLedger(**json.loads(row["data_json"]))
 
                 if fence_token in ledger.reconciled_fences:
-                    self._conn.execute("COMMIT")
+                    if ledger.fence_token == fence_token and ledger.lease_owner_id == worker_id:
+                        updated = ledger.model_copy(update={
+                            "lease_owner_id": None,
+                            "lease_expires_at": 0.0,
+                            "updated_at": _now_utc(),
+                        })
+                        self._conn.execute(
+                            "UPDATE kre_knowledge_graph SET data_json = ? WHERE pk = ? AND sk = ?",
+                            (json.dumps(updated.model_dump()), pk, sk),
+                        )
+                        self._conn.execute("COMMIT")
+                    else:
+                        self._conn.execute("COMMIT")
                     return
 
                 actual_total = prompt_tokens_spent + output_tokens_spent
@@ -2623,7 +2642,25 @@ class DynamoDBKnowledgeGraphRepository:
         sk = "BUDGET#LEDGER"
 
         curr = self.get_budget_ledger(workspace_id, document_id, document_version, consistent_read=True)
-        if curr is None or fence_token in curr.reconciled_fences:
+        if curr is None:
+            return
+        if fence_token in curr.reconciled_fences:
+            if curr.fence_token == fence_token and curr.lease_owner_id == worker_id:
+                try:
+                    self._table.update_item(
+                        Key={"PK": pk, "SK": sk},
+                        UpdateExpression="SET lease_owner_id = :none, lease_expires_at = :zero_dec, updated_at = :now_iso",
+                        ConditionExpression="attribute_exists(PK) AND fence_token = :exp_fence AND lease_owner_id = :wid",
+                        ExpressionAttributeValues={
+                            ":none": None,
+                            ":zero_dec": Decimal(0),
+                            ":now_iso": _now_utc(),
+                            ":exp_fence": fence_token,
+                            ":wid": worker_id,
+                        },
+                    )
+                except Exception:
+                    pass
             return
 
         actual_total = prompt_tokens_spent + output_tokens_spent

@@ -98,7 +98,7 @@ _NEGATION_WORDS = {
 }
 
 _UNSUPPORTED_MODALITY_REGEX = re.compile(
-    r"\b(?:might|could|would|may|if|whether|rumored|rumor|alleged|allegedly|supposedly|purportedly|"
+    r"\b(?:might|could|would|if|whether|rumored|rumor|alleged|allegedly|supposedly|purportedly|"
     r"speculated|speculation|hypothetically|hypothetical|assuming|suppose|supposing|considering|"
     r"proposed|reported\s+that|claimed\s+that|claims\s+that|said\s+that|stated\s+that|"
     r"disputed|unconfirmed|said|says|stated|states|claimed|claims|reported|reports|believed|believes)\b",
@@ -114,23 +114,37 @@ _ALLOWED_PRE_PREDICATE_WORDS = {
     "has", "had", "have", "having", "is", "was", "were", "are", "been", "being",
     "will", "would", "shall", "should", "can", "could", "may", "might", "must",
     "did", "does", "do",
-    "recently", "officially", "formally", "successfully", "directly", "indirectly",
-    "mutually", "jointly", "also", "already", "now", "then", "soon", "currently",
-    "previously", "ultimately", "finally", "subsequently", "unanimously", "proudly",
-    "further", "actively", "to",
+    "today", "yesterday", "recently", "officially", "formally", "successfully",
+    "directly", "indirectly", "mutually", "jointly", "also", "already", "now",
+    "then", "soon", "currently", "previously", "ultimately", "finally",
+    "subsequently", "unanimously", "proudly", "further", "actively", "earlier",
+    "initially", "primarily", "reportedly", "in", "on", "at", "during", "after",
+    "before", "since", "to", "for",
 }
 
 _ALLOWED_ACTIVE_INTERVENING_WORDS = {
-    "the", "a", "an", "its", "their", "both", "all", "several", "each",
+    "the", "a", "an", "its", "their", "his", "her", "both", "all", "several", "each",
+    "this", "that", "these", "those", "such",
     "with", "in", "to", "into", "for", "of", "on", "from", "over", "by", "as", "at",
-    "subsidiary", "majority", "stake", "shares", "equity", "assets", "firm", "company",
-    "technologies", "corp", "inc", "ltd", "new", "key", "strategic", "global", "local",
-    "primary", "recently", "successfully", "fully", "directly", "indirectly", "partner",
-    "division", "business", "unit", "interest", "entire",
+    "about", "against", "through", "under", "via",
+    "competitor", "supplier", "vendor", "provider", "startup", "developer", "rival",
+    "partner", "manufacturer", "operator", "distributor", "specialist", "maker",
+    "builder", "firm", "company", "technologies", "corp", "inc", "ltd", "agency",
+    "subsidiary", "division", "business", "unit", "arm", "entity", "enterprise",
+    "peer", "counterpart", "target", "consultancy", "group", "stake", "shares",
+    "equity", "assets", "interest", "majority", "minority", "portion", "holding",
+    "holdings", "percent", "percentage", "pct",
+    "purchase", "acquisition", "merger", "sale", "takeover", "buyout", "agreement", "contract",
+    "new", "key", "strategic", "global", "local", "primary", "leading", "fellow",
+    "longtime", "major", "minor", "controlling", "wholly", "owned", "private",
+    "public", "independent", "foreign", "domestic", "entire", "full", "joint",
+    "mutual", "critical", "direct", "indirect", "sole",
+    "recently", "successfully", "fully", "directly", "indirectly", "officially",
+    "formally", "substantially",
 }
 
 _ALLOWED_PASSIVE_AUXILIARIES = {
-    "was", "were", "is", "are", "been", "being", "has", "have", "had",
+    "was", "were", "is", "are", "been", "being", "be", "has", "have", "had",
     "will", "would", "shall", "should", "can", "could", "may", "might", "must",
     "recently", "officially", "formally", "successfully", "directly", "indirectly",
     "jointly", "also", "already", "now", "then", "soon", "currently", "previously",
@@ -141,29 +155,202 @@ _ALLOWED_PASSIVE_BY_WORDS = {
     "by", "the", "its", "their", "a", "an", "new", "strategic", "global",
     "local", "subsidiary", "firm", "company", "division", "partner", "wholly",
     "owned", "directly", "indirectly", "jointly", "majority", "stake",
+    "sole", "longtime", "leading", "primary", "foreign", "domestic",
 }
+
+_HONORIFICS = {"dr", "mr", "mrs", "ms", "prof", "sr", "jr", "vs", "eg", "ie", "etc", "approx", "est"}
+_CORP_SUFFIXES = {"inc", "corp", "ltd", "co", "llc", "plc", "gmbh"}
 
 
 def _clean_text_tokens(text: str) -> list[str]:
     return [t.lower() for t in re.findall(r"\b\w+\b", text)]
 
 
+def _entity_pattern(name: str) -> str:
+    lead_b = r"\b" if name and name[0].isalnum() else r"(?<!\w)"
+    trail_b = r"\b" if name and name[-1].isalnum() else r"(?!\w)"
+    return lead_b + re.escape(name) + trail_b
+
+
+def _has_unsupported_modality(sentence: str) -> bool:
+    if _UNSUPPORTED_MODALITY_REGEX.search(sentence):
+        return True
+
+    # Detect modal auxiliary 'may' without falsely rejecting calendar month 'May'
+    for m in re.finditer(r"\bmay\b", sentence, re.IGNORECASE):
+        start, end = m.start(), m.end()
+        raw_word = sentence[start:end]
+
+        pre_text = sentence[:start].rstrip()
+        is_preceded_by_date_prep = bool(
+            re.search(
+                r"\b(?:in|during|since|until|by|of|from|between|through|for|on)\b$",
+                pre_text,
+                re.IGNORECASE,
+            )
+        )
+
+        post_text = sentence[end:].lstrip()
+        is_followed_by_date = bool(
+            re.match(
+                r"^(?:(?:\d{1,2}(?:st|nd|rd|th)?,?\s+)?\d{4}|\d{1,2}(?:st|nd|rd|th)?\b)",
+                post_text,
+            )
+        )
+
+        if is_preceded_by_date_prep or is_followed_by_date:
+            continue
+
+        if raw_word == "may":
+            return True
+
+        if start == 0 or pre_text.endswith((".", "!", "?", ";", ":")):
+            if sentence.strip().endswith("?") or re.match(r"^[A-Z][a-z]+\s+[a-z]+", post_text):
+                return True
+
+        is_modal_syntax = bool(
+            re.match(
+                r"^(?:(?:not|also|potentially|possibly|have|be)\s+)*[a-z]+",
+                post_text,
+            )
+        )
+        if is_modal_syntax:
+            return True
+
+    return False
+
+
+def _has_predicate_negation(clause: str, source_lower: str, target_lower: str, pred_stem: str) -> bool:
+    """Check whether a clause or sentence contains localized negation on subject or predicate."""
+    clause_lower = clause.lower()
+    if re.search(r"\b(?:neither|nor|no)\s+(?:\w+\s+){0,3}" + _entity_pattern(source_lower), clause_lower):
+        return True
+    if re.search(r"\b(?:neither|nor)\s+(?:\w+\s+){0,3}" + _entity_pattern(target_lower), clause_lower):
+        return True
+
+    p_matches = list(re.finditer(r"\b" + re.escape(pred_stem) + r"\w*\b", clause_lower))
+    for pm in p_matches:
+        p_start = pm.start()
+        pre_text = clause_lower[max(0, p_start - 35) : p_start].strip()
+        pre_words = _clean_text_tokens(pre_text)
+        if any(w in _NEGATION_WORDS for w in pre_words):
+            return True
+
+    if re.search(
+        r"\b(?:was|were|is|are|been|being|be)\s+(?:not|never)\s+(?:\w+\s+){0,2}" + re.escape(pred_stem),
+        clause_lower,
+    ):
+        return True
+
+    return False
+
+
+def split_sentences_with_spans(text: str) -> list[tuple[str, int, int]]:
+    """Split text into sentences while respecting corporate abbreviations, decimals, and honorifics."""
+    if not text.strip():
+        return []
+
+    sentences: list[tuple[str, int, int]] = []
+    start = 0
+    n = len(text)
+    i = 0
+
+    while i < n:
+        ch = text[i]
+        is_term = False
+        term_len = 1
+
+        if ch in ("\n", "\r"):
+            is_term = True
+            while i + term_len < n and text[i + term_len] in ("\n", "\r"):
+                term_len += 1
+        elif ch in ("!", "?"):
+            after = text[i + 1 :].lstrip(" \"'\t")
+            if not after or after[0].isupper() or text[i + 1 : i + 2] in ("\n", " ", ""):
+                is_term = True
+        elif ch == ".":
+            prev_char = text[i - 1] if i > 0 else ""
+            next_char = text[i + 1] if i + 1 < n else ""
+            if prev_char.isdigit() and next_char.isdigit():
+                i += 1
+                continue
+
+            match_word = re.search(r"([A-Za-z]+)\.$", text[: i + 1])
+            prev_word = match_word.group(1).lower() if match_word else ""
+
+            if prev_word in _HONORIFICS:
+                i += 1
+                continue
+
+            j = i + 1
+            while j < n and text[j] in (" ", "\t", '"', "'", ")", "]"):
+                j += 1
+
+            if j >= n:
+                is_term = True
+                term_len = j - i
+            elif text[j] in ("\n", "\r"):
+                is_term = True
+                term_len = j - i
+            elif text[j].isupper() or text[j].isdigit():
+                if prev_word in _CORP_SUFFIXES:
+                    buffer_words = [w.lower() for w in re.findall(r"\b\w+\b", text[start : i + 1])]
+                    has_verb = any(
+                        w.endswith("ed")
+                        or w.endswith("ing")
+                        or w in (
+                            "is", "was", "were", "are", "has", "had", "have",
+                            "acquired", "sold", "bought", "merged", "partnered",
+                            "invested", "agreed", "signs", "signed",
+                        )
+                        for w in buffer_words
+                    )
+                    if has_verb:
+                        is_term = True
+                        term_len = j - i
+                else:
+                    is_term = True
+                    term_len = j - i
+
+        if is_term:
+            end_pos = i + term_len
+            sent = text[start:end_pos].strip()
+            if sent:
+                sentences.append((sent, start, end_pos))
+            start = end_pos
+            i = end_pos
+        else:
+            i += 1
+
+    if start < n:
+        sent = text[start:].strip()
+        if sent:
+            sentences.append((sent, start, n))
+
+    return sentences
+
+
 def _find_enclosing_sentence(text: str, start_idx: int, end_idx: int) -> str:
     """Locate the enclosing sentence surrounding a verbatim evidence span in source text."""
-    prev_text = text[:start_idx]
-    last_term = -1
-    for m in re.finditer(r"[.!?\n]", prev_text):
-        last_term = m.end()
-    sent_start = last_term if last_term != -1 else 0
+    sents = split_sentences_with_spans(text)
+    if not sents:
+        return text[start_idx:end_idx].strip()
 
-    after_text = text[end_idx:]
-    term_match = re.search(r"[.!?\n]", after_text)
-    if term_match:
-        sent_end = end_idx + term_match.end()
-    else:
-        sent_end = len(text)
+    for sent_text, s_start, s_end in sents:
+        if s_start <= start_idx and s_end >= end_idx:
+            return sent_text
 
-    return text[sent_start:sent_end].strip()
+    overlapping = [
+        (sent_text, s_start, s_end)
+        for sent_text, s_start, s_end in sents
+        if not (s_end < start_idx or s_start > end_idx)
+    ]
+    if overlapping:
+        min_start = overlapping[0][1]
+        max_end = overlapping[-1][2]
+        return text[min_start:max_end].strip()
+
+    return text.strip()
 
 
 def validate_chunk_provenance(
@@ -180,16 +367,26 @@ def validate_chunk_provenance(
     - Stale metadata versions not matching the requested document_version.
     - Workspace or document boundaries not matching the request.
     """
-    cid = str(getattr(chunk, "id", None) or getattr(chunk, "chunk_id", None) or "").strip()
+    if isinstance(chunk, dict):
+        cid = str(chunk.get("id") or chunk.get("chunk_id") or "").strip()
+        meta = chunk.get("metadata")
+        ch_doc = chunk.get("document_id")
+        ch_ws = chunk.get("workspace_id")
+        ch_ver = chunk.get("document_version") or chunk.get("version")
+    else:
+        cid = str(getattr(chunk, "id", None) or getattr(chunk, "chunk_id", None) or "").strip()
+        meta = getattr(chunk, "metadata", None)
+        ch_doc = getattr(chunk, "document_id", None)
+        ch_ws = getattr(chunk, "workspace_id", None)
+        ch_ver = getattr(chunk, "document_version", None) or getattr(chunk, "version", None)
+
     if not cid:
         return False, "missing_chunk_id"
 
-    meta = getattr(chunk, "metadata", None)
     if not isinstance(meta, dict):
         meta = {}
 
     # 1. Document ID validation
-    ch_doc = getattr(chunk, "document_id", None)
     ch_doc_str = str(ch_doc).strip() if (ch_doc is not None and str(ch_doc).strip()) else None
     meta_doc = meta.get("document_id")
     meta_doc_str = str(meta_doc).strip() if (meta_doc is not None and str(meta_doc).strip()) else None
@@ -204,7 +401,6 @@ def validate_chunk_provenance(
         return False, f"mismatched_document_id: resolved '{resolved_doc}' != expected '{document_id}'"
 
     # 2. Workspace ID validation
-    ch_ws = getattr(chunk, "workspace_id", None)
     ch_ws_str = str(ch_ws).strip() if (ch_ws is not None and str(ch_ws).strip()) else None
     meta_ws = meta.get("workspace_id")
     meta_ws_str = str(meta_ws).strip() if (meta_ws is not None and str(meta_ws).strip()) else None
@@ -219,7 +415,6 @@ def validate_chunk_provenance(
         return False, f"mismatched_workspace_id: resolved '{resolved_ws}' != expected '{workspace_id}'"
 
     # 3. Document Version validation
-    ch_ver = getattr(chunk, "document_version", None)
     ch_ver_str = str(ch_ver).strip() if (ch_ver is not None and str(ch_ver).strip()) else None
     meta_ver = meta.get("document_version")
     meta_ver_str = str(meta_ver).strip() if (meta_ver is not None and str(meta_ver).strip()) else None
@@ -277,9 +472,20 @@ def validate_relationship_grounding(
 
     # 1. Verbatim presence checks
     if source_lower not in text_lower:
-        return False, f"source_entity_not_found: '{source_entity_name}'"
+        if source_lower.endswith(".") and source_lower[:-1] in text_lower:
+            source_lower = source_lower[:-1]
+        elif (source_lower + ".") in text_lower:
+            source_lower = source_lower + "."
+        else:
+            return False, f"source_entity_not_found: '{source_entity_name}'"
+
     if target_lower not in text_lower:
-        return False, f"target_entity_not_found: '{target_entity_name}'"
+        if target_lower.endswith(".") and target_lower[:-1] in text_lower:
+            target_lower = target_lower[:-1]
+        elif (target_lower + ".") in text_lower:
+            target_lower = target_lower + "."
+        else:
+            return False, f"target_entity_not_found: '{target_entity_name}'"
 
     # Search for predicate or stem
     pred_tokens = pred_lower.split()
@@ -299,6 +505,9 @@ def validate_relationship_grounding(
     if primary_pred_word not in text_lower and pred_stem not in text_lower:
         return False, f"predicate_not_grounded: '{predicate}' (co-occurrence alone rejected)"
 
+    if primary_pred_word in _NEGATION_WORDS or pred_stem in _NEGATION_WORDS:
+        return False, "negated_relationship"
+
     if evidence_span:
         ev_lower = evidence_span.strip().lower()
         if source_lower not in ev_lower or target_lower not in ev_lower:
@@ -307,43 +516,48 @@ def validate_relationship_grounding(
             return False, "evidence_span_missing_predicate"
 
     # 2. Sentence-level analysis
-    sentences = re.split(r"[.!?\n]+", text_lower)
+    sentence_spans = split_sentences_with_spans(chunk_text)
     matched_sentences = [
-        s for s in sentences
-        if source_lower in s and target_lower in s and (primary_pred_word in s or pred_stem in s)
+        sent for sent, _, _ in sentence_spans
+        if source_lower in sent.lower() and target_lower in sent.lower() and (primary_pred_word in sent.lower() or pred_stem in sent.lower())
     ]
 
     if not matched_sentences:
         return False, "co_occurrence_across_disjoint_sentences"
 
     for sentence in matched_sentences:
-        tokens = _clean_text_tokens(sentence)
-        if any(w in _NEGATION_WORDS for w in tokens):
+        if _has_predicate_negation(sentence, source_lower, target_lower, pred_stem):
             return False, "negated_relationship"
 
-        if _UNSUPPORTED_MODALITY_REGEX.search(sentence):
+        if _has_unsupported_modality(sentence):
             return False, "hypothetical_or_unsupported_claim"
 
         # Split sentence into clauses to prevent cross-clause false relationships
         clauses = _CLAUSE_DELIMITER_REGEX.split(sentence)
         matching_clauses = [
             c for c in clauses
-            if source_lower in c and target_lower in c and (primary_pred_word in c or pred_stem in c)
+            if source_lower in c.lower() and target_lower in c.lower() and (primary_pred_word in c.lower() or pred_stem in c.lower())
         ]
         if not matching_clauses:
             return False, "unrelated_clauses"
 
         for clause in matching_clauses:
-            s_matches = [m.start() for m in re.finditer(r"\b" + re.escape(source_lower) + r"\b", clause)]
-            t_matches = [m.start() for m in re.finditer(r"\b" + re.escape(target_lower) + r"\b", clause)]
+            clause_lower = clause.lower()
+            s_matches = [m.start() for m in re.finditer(_entity_pattern(source_lower), clause_lower)]
+            t_matches = [m.start() for m in re.finditer(_entity_pattern(target_lower), clause_lower)]
             if not s_matches or not t_matches:
                 continue
 
-            p_matches = list(re.finditer(r"\b" + re.escape(pred_stem) + r"\w*\b", clause))
+            p_matches = list(re.finditer(r"\b" + re.escape(pred_stem) + r"\w*\b", clause_lower))
             if not p_matches:
                 continue
 
-            is_passive = bool(re.search(r"\b(?:was|is|been|were|are)\b(?:\s+\w+){0,2}\s+" + re.escape(pred_stem) + r"\w*\s+by\b", clause))
+            is_passive = bool(
+                re.search(
+                    r"\b(?:was|is|been|were|are|be)\b(?:\s+\w+){0,2}\s+" + re.escape(pred_stem) + r"\w*\s+by\b",
+                    clause_lower,
+                )
+            )
 
             has_reversed = False
             for p_match in p_matches:
@@ -357,13 +571,13 @@ def validate_relationship_grounding(
                         if is_passive:
                             # Passive voice: Target was <pred> by Source
                             if t_idx < p_idx < s_idx:
-                                # Validate passive auxiliaries between target and predicate
-                                aux_span = clause[t_end:p_idx].strip()
+                                aux_span = clause_lower[t_end:p_idx].strip()
                                 aux_tokens = _clean_text_tokens(aux_span)
+                                if any(tok in _NEGATION_WORDS for tok in aux_tokens):
+                                    return False, "negated_relationship"
                                 if not all(tok in _ALLOWED_PASSIVE_AUXILIARIES or tok.endswith("ly") or tok.isdigit() for tok in aux_tokens):
                                     continue
-                                # Validate passive by-phrase between predicate and source
-                                by_span = clause[p_end:s_idx].strip()
+                                by_span = clause_lower[p_end:s_idx].strip()
                                 by_tokens = _clean_text_tokens(by_span)
                                 if "by" not in by_tokens:
                                     continue
@@ -375,20 +589,31 @@ def validate_relationship_grounding(
                         else:
                             # Active voice: Source <pred> Target
                             if s_idx < p_idx < t_idx:
+                                # Check for negation preceding source entity in clause
+                                pre_source_span = clause_lower[:s_idx].rstrip()
+                                if re.search(r"\b(?:no|neither|nor)\b(?:\s+\w+){0,2}$", pre_source_span):
+                                    return False, "negated_relationship"
+
                                 # Validate actor-predicate binding: tokens between source and predicate
-                                pre_span = clause[s_end:p_idx].strip()
+                                pre_span = clause_lower[s_end:p_idx].strip()
                                 pre_tokens = _clean_text_tokens(pre_span)
+                                if any(tok in _NEGATION_WORDS for tok in pre_tokens):
+                                    return False, "negated_relationship"
                                 if not all(tok in _ALLOWED_PRE_PREDICATE_WORDS or tok.endswith("ly") or tok.isdigit() for tok in pre_tokens):
                                     continue
-                                if len(pre_tokens) > 5:
+                                if len(pre_tokens) > 6:
                                     continue
 
-                                intervening_span = clause[p_end:t_idx].strip()
+                                intervening_span = clause_lower[p_end:t_idx].strip()
                                 inter_tokens = _clean_text_tokens(intervening_span)
-                                if all(tok in _ALLOWED_ACTIVE_INTERVENING_WORDS or tok.isdigit() for tok in inter_tokens) and len(inter_tokens) <= 6:
+                                if any(tok in _NEGATION_WORDS for tok in inter_tokens):
+                                    return False, "negated_relationship"
+                                if all(tok in _ALLOWED_ACTIVE_INTERVENING_WORDS or tok.isdigit() for tok in inter_tokens) and len(inter_tokens) <= 7:
                                     return True, None
                                 else:
-                                    return False, "unsupported_syntactic_binding"
+                                    continue
+                            elif t_idx < p_idx < s_idx:
+                                has_reversed = True
                             elif t_idx < p_idx < s_idx:
                                 has_reversed = True
 
@@ -1218,14 +1443,30 @@ class KnowledgeGraphBuilder:
         )
 
         if relationships:
-            self.repository.stage_relationships(
-                workspace_id=workspace_id,
-                document_id=document_id,
-                document_version=document_version,
-                publication_id=pub_id,
-                entities=entities,
-                relationships=relationships,
-            )
+            try:
+                self.repository.stage_relationships(
+                    workspace_id=workspace_id,
+                    document_id=document_id,
+                    document_version=document_version,
+                    publication_id=pub_id,
+                    entities=entities,
+                    relationships=relationships,
+                )
+            except Exception as stage_err:
+                logger.warning("Failed to stage relationships: %s", stage_err)
+                try:
+                    self.repository.fail_extraction_budget(
+                        workspace_id=workspace_id,
+                        document_id=document_id,
+                        document_version=document_version,
+                        worker_id=worker_id,
+                        fence_token=fence_token,
+                        error_reason=f"staging_failure: {stage_err}",
+                        prompt_tokens_spent=estimated_prompt_tokens,
+                    )
+                except Exception:
+                    pass
+                return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
             manifest = KnowledgeGraphManifest(
                 workspace_id=workspace_id,
                 document_id=document_id,
@@ -1262,6 +1503,18 @@ class KnowledgeGraphBuilder:
             )
         except Exception as commit_err:
             logger.warning("Failed to commit manifest: %s", commit_err)
+            try:
+                self.repository.fail_extraction_budget(
+                    workspace_id=workspace_id,
+                    document_id=document_id,
+                    document_version=document_version,
+                    worker_id=worker_id,
+                    fence_token=fence_token,
+                    error_reason=f"commit_failure: {commit_err}",
+                    prompt_tokens_spent=estimated_prompt_tokens,
+                )
+            except Exception:
+                pass
             return self._fail_closed_manifest(workspace_id, document_id, document_version, base_publication_id, existing_man, idempotency_key)
 
         return manifest
@@ -1343,7 +1596,7 @@ def extract_pdf_relationships(
         if page_val is None:
             page_val = (getattr(ch, "metadata", {}) or {}).get("page", 1)
         try:
-            page = int(page_val)
+            page = max(1, int(page_val))
         except (ValueError, TypeError):
             page = 1
         chunks_map[cid] = (ch, text, page)
@@ -1377,9 +1630,9 @@ def extract_pdf_relationships(
     for rel in raw_relationships:
         if not isinstance(rel, dict):
             continue
-        src_name = str(rel.get("source_entity", "")).strip()
+        src_name = str(rel.get("source_entity") or rel.get("source") or "").strip()
         pred = str(rel.get("predicate", "")).strip()
-        tgt_name = str(rel.get("target_entity", "")).strip()
+        tgt_name = str(rel.get("target_entity") or rel.get("target") or "").strip()
         chunk_id = str(rel.get("chunk_id", "")).strip()
         verbatim_ev = str(rel.get("verbatim_evidence", "")).strip()
 
@@ -1486,7 +1739,7 @@ def extract_pdf_relationships(
                 disambiguation_token=tgt_disambig,
             )
 
-        location = DocumentLocation(page=ch_page)
+        location = DocumentLocation(page=max(1, ch_page))
         rel_model = KnowledgeGraphRelationship(
             relationship_id=rel_id,
             workspace_id=workspace_id,
