@@ -1,7 +1,7 @@
 # 0007. Bounded Knowledge Graph Enrichment and Multi Hop Relationship Traversal
 
 **Date**: 2026-11-14
-**Status**: In Progress
+**Status**: Accepted
 
 ## Summary
 
@@ -35,7 +35,7 @@ Knowledge Graph enrichment reuses and builds upon these proven contracts without
 
 ## Scope Reconciliation (Feature 7)
 
-In `docs/scope/scope.md`, Feature 7 represents `Knowledge graph enrichment` (Slice 4). Baseline discovery retrieval, lexical search, vector indexing, and TableStore aggregation were already established and verified in specification 0004 (Feature 4). Slice 4 builds upon that verified baseline by introducing bounded inter entity graph traversal. Specification 0007 remains `Proposed` until approved and built under `/develop`.
+In `docs/scope/scope.md`, Feature 7 represents `Knowledge graph enrichment` (Slice 4). Baseline discovery retrieval, lexical search, vector indexing, and TableStore aggregation were already established and verified in specification 0004 (Feature 4). Slice 4 builds upon that verified baseline by introducing bounded inter entity graph traversal. Specification 0007 Slices 1, 2, and 3 are locally accepted and verified.
 
 ## Overlap Analysis with OKF (Spec 0006)
 

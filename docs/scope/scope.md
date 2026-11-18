@@ -22,8 +22,8 @@ _These are recommendations to keep your build orderly, not requirements. Skip an
 | 4 | Core walking skeleton | Slice 1 | done |
 | 5 | PageIndex structural retrieval | Slice 2 | done |
 | 6 | OKF integration | Slice 3 | done |
-| 7 | Knowledge graph enrichment | Slice 4 | in progress |
-| 8 | Knowledge Map and requirement router | Slice 5 | planned |
+| 7 | Knowledge graph enrichment | Slice 4 | done |
+| 8 | LAYA bounded escalation | Slice 5 | planned |
 | 9 | Evidence verification and answer assembly | Slice 6 | planned |
 | 10 | End to end interface integration | Slice 7 | planned |
 | 11 | Production authentication, workspace membership, and session persistence | Slice 8 | planned |
@@ -147,7 +147,7 @@ Spec [0006](../specs/0006-okf-integration.md) · code in `backend/src/`
 
 ## Slice 4: Knowledge graph enrichment
 
-### 7. Knowledge graph enrichment · in progress
+### 7. Knowledge graph enrichment · done
 Extract typed entity relationships, enforce verbatim grounding and durable budget fencing, run bounded multi hop traversal with targeted chunk hydration, and pool candidates softly into reciprocal rank fusion.
 **Done when:** typed knowledge graph entities and directed relationships are extracted from active chunks with verbatim grounding and durable budget fencing, partitioned storage supports bounded multi hop traversal and targeted chunk hydration without table scans, and candidates pool softly into reciprocal rank fusion without displacing baseline retrieval.
 - [x] Design it (spec): `/architect knowledge graph enrichment`
@@ -162,10 +162,17 @@ Spec [0007](../specs/0007-knowledge-graph-enrichment.md) · code in `backend/src
 
 ## Slice 5: LAYA bounded escalation
 
-### 8. LAYA bounded escalation · needs a decision
+### 8. LAYA bounded escalation · planned
 Plan LAYA integration for bounded heuristic and query expansion escalation when discovery finds no support.
 **Done when:** LAYA is integrated as a subsequent, independently verifiable slice.
-- [ ] Design it (spec): `/architect LAYA bounded escalation`
+- [x] Design it (spec): `/architect LAYA bounded escalation`
+- [ ] Build it: `/develop LAYA bounded escalation`
+   - [ ] Slice 5.1: Typed contracts, pre invocation budget gate, decision state machine, and fallback missing requirement policy (AC-1, AC-2, AC-3, AC-4)
+   - [ ] Slice 5.2: Bounded expansion execution, targeted lexical and dense dispatch, single generation preservation, and refusal telemetry (AC-5, AC-6, AC-7, AC-8)
+- [ ] Verify it: `/check verify LAYA bounded escalation`
+- [ ] Test it: `/test LAYA bounded escalation`
+- [ ] Review it (fresh model): `/check review LAYA bounded escalation`
+Spec [0008](../specs/0008-laya-bounded-escalation.md) · code in `backend/src/`
 
 ## Slice 6: End to end interface integration
 
