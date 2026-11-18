@@ -242,12 +242,53 @@ This milestone completes and hardens Slice 1 of specification 0007 (Bounded Know
 3. Unimplemented Slices: Slice 2 (LLM entity and relationship extraction, Bedrock budgeting ledger, and verbatim grounding validation) and Slice 3 (Pipeline reciprocal rank fusion, snapshot metadata, telemetry trace, and offline ablation) remain unimplemented.
 4. Deferred specifications: Specification 0003 (Snapshot registry, publication, and atomic deletion) remains Proposed and deferred. Specification 0007 remains In Progress.
 
-### Project Status and Bounded Next Slice 2 Task
+### Project Status and Subsequent Slices Completion
 
-* Specification 0007: Slice 1 is complete and verified. Specification 0007 as a whole remains In Progress.
-* Specification 0003: Snapshot registry, publication, and atomic deletion remains Proposed and deferred.
-* Invariant reminder: Zero paid benchmarks run, zero re ingestion, zero re embedding, and historical benchmark artifacts preserved.
-* Bounded Next Slice 2 Task:
-  1. Implement Bedrock Claude 3 Haiku converse prompt templates and output parsers in `KnowledgeGraphBuilder`, extracting canonical entity relationship triples from PDF text chunks with verbatim directional syntax validation (AC-1, AC-2, AC-3).
-  2. Implement durable budget accounting, fencing, and mandatory Bedrock `count_tokens` validation on `BUDGET#LEDGER`, with 15 second lease expiries, monotonic fence tokens, mandatory non empty worker identity (`worker_id`), and stale worker fencing (AC-3, AC-4, AC-5).
-  3. Implement Slice 2 unit and regression test suite in `backend/tests/test_knowledge_graph_slice2.py` verifying PDF extraction, verbatim grounding, Bedrock count_tokens validation, budget ledger leasing, stale worker fencing, crash recovery, and throttling retry ceilings (AC-2, AC-3, AC-4, AC-5).
+* Specification 0007: Slice 1 is complete and verified.
+
+## Bounded Knowledge Graph Enrichment (0007 Final Acceptance and Reconciliation)
+
+* **Date**: November 18 2026
+* **Branch**: `re-factor`
+* **Final implementation commit**: `029ff20c789fb4aea24e80592efcb04f1c2dd103`
+* **Status**: Specification 0007 Slices 1, 2, and 3 fully completed, verified, and approved. Implementation is complete. Specification 0003 remains Proposed and deferred. `GRAPH_ENABLED=false` preserved by default.
+
+### Overview
+
+This milestone records the full completion and acceptance of specification 0007 (Bounded Knowledge Graph Enrichment and Multi Hop Relationship Traversal) across all three slices:
+1. **Slice 1 (Deterministic Tabular Graph and Traversal)**: Partitioned persistence across Memory, SQLite WAL, and DynamoDB Local stores. Deterministic CSV relationship extraction from foreign keys and primary keys. Deeply immutable PinnedSnapshotContext request local document bindings. Bounded 2 hop multi hop traversal with 25 node ceiling. Targeted chunk hydration with zero calls to get_all_chunks. Dynamic source and workspace deletion tombstones failing closed. GraphConcurrencyController with 4 workers and 8 queue slots.
+2. **Slice 2 (Narrative PDF Extraction and Token Budgeting)**: Verbatim directional syntax grounding, rejecting reversed voice, sentence negation, disjoint clauses, and co occurrence alone. Source context preservation rejecting stripped conditional, negated, or reported speech framing. Syntactic binding respecting corporate abbreviations, numeric decimals, modal auxiliary verbs, and modal passive constructions. Bedrock token budgeting on BUDGET#LEDGER with 15 second worker leases, monotonic fencing, CountTokens validation, per call caps (2000 prompt tokens, 800 output tokens), and cumulative document ceilings (4000 prompt tokens, 1600 output tokens, 5600 total tokens).
+3. **Slice 3 (Query Pipeline Fusion, TableStore Wiring, and Ablation Harness)**:
+   * Query pipeline integration: `run_graph` node wired into `langgraph_pipeline.py` after OKF and before reranking. Soft candidate pooling into reciprocal rank fusion with calibrated weights (1.10, halved to 0.55 on ambiguity or conflict). Fast path query bypass.
+   * Decoupled baseline ingestion: Asynchronous background enrichment pass per ADR-001 with DocumentSnapshot graph metadata. Baseline documents remain available and retrievable if graph enrichment fails or times out.
+   * Production ingestion wiring: Exact version CSV schema authority resolving relations only from authoritative TableStore schema records. Missing provider status recording `unavailable` or `failed` (never a false empty). Distinguishes legitimate empty publications from historical stubs, providing bounded safe recovery via `recover_stub_manifest`.
+   * Pipeline TableStore wiring: `run_graph` resolves shared TableStore via `get_shared_table_store()` and injects it into KnowledgeGraphRetriever, hydrating stored table cells into Chunk objects that survive into retained evidence items with strategy `knowledge_graph`.
+   * Exception fallback contract enforcement: `run_graph` catches expand exceptions cleanly and sets valid `storage_failed` status without raising Pydantic validation errors.
+   * Offline ablation comparison harness: 34 tests in `test_knowledge_graph_ablation_slice3.py` verifying recall, precision, latency, and counterexample safety (an incorrect graph expansion never displaces factual baseline chunks).
+
+### Reconciled Verification Evidence
+
+* Newly Executed Runs (DynamoDB Local Active on Port 8000):
+  * Slice 1 (`tests/test_knowledge_graph_slice1.py`): 65 passed, 0 skipped in 4.57s
+  * Slice 2 (`tests/test_knowledge_graph_slice2.py`): 64 passed, 0 skipped in 4.96s
+  * Slice 3 (`tests/test_knowledge_graph_ablation_slice3.py`): 34 passed, 0 skipped in 12.44s
+  * Boundary & CSV (`tests/test_workspace_boundary_isolation.py` & `tests/test_csv_ingestion_complete.py`): 32 passed, 0 skipped in 11.49s
+  * OKF & TableStore (`tests/test_okf_slice3_1.py` & `tests/test_table_store.py`): 63 passed, 0 skipped in 11.14s
+  * Total newly executed across KG + Boundary/CSV: **195 passed, 0 skipped** (65 + 64 + 34 + 32).
+  * Total combined: **258 passed, 0 skipped** (195 + 63).
+* Historical Runs (DynamoDB Local Daemon Offline):
+  * Combined regression total: 186 passed, 34 skipped (with 28 Slice 3 tests) or 192 passed, 34 skipped (with 34 Slice 3 tests).
+  * 8 tests skipped in Slices 1 and 2 when daemon was offline (producing 62 passed in Slice 1 and 59 passed in Slice 2; 62 + 59 = 121 passed, 8 skipped).
+* Live HTTP Verification:
+  * 18 passed live over HTTP in `verify_0007_live.py` (18 of 18).
+
+### Operational Boundaries and Limitations
+
+1. **Implementation Acceptance versus Live Deployment and Benchmark Readiness**:
+   * Implementation is complete and locally accepted.
+   * Live AWS deployment and production cloud readiness remain unverified; local verification ran on SQLite WAL, in memory stores, and containerized DynamoDB Local (port 8000). Zero calls were made to live AWS Bedrock or live AWS DynamoDB.
+   * Benchmark accuracy readiness is guarded by `validate_benchmark_comparison_preconditions`, blocking claims on non canonical workspaces. Paid benchmark execution on `ws_canonical_comparison_0004` was not run and requires explicit authorization.
+2. **Configuration Invariant**: `GRAPH_ENABLED=false` remains preserved by default.
+3. **Deferred Specifications**: Specification 0003 (Snapshot registry, publication, and atomic deletion) remains Proposed and deferred.
+4. **Preserved Artifacts**: Historical benchmark workspaces (`ws_fresh_benchmark`), ground truth, and comparison artifacts preserved untouched. Zero paid provider calls, zero corpus re ingestion, zero re embedding.
+
