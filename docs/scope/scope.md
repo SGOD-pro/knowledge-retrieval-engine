@@ -167,8 +167,8 @@ Plan LAYA integration for bounded heuristic and query expansion escalation when 
 **Done when:** LAYA is integrated as a subsequent, independently verifiable slice.
 - [x] Design it (spec): `/architect LAYA bounded escalation`
 - [ ] Build it: `/develop LAYA bounded escalation`
-   - [ ] Slice 5.1: Typed contracts, pre invocation budget gate, decision state machine, and fallback missing requirement policy (AC-1, AC-2, AC-3, AC-4)
-   - [ ] Slice 5.2: Bounded expansion execution, targeted lexical and dense dispatch, single generation preservation, and refusal telemetry (AC-5, AC-6, AC-7, AC-8)
+   - [ ] Slice 5.1: Thin executable path with typed contracts, pre reservation gate, decision state machine, fallback policy, lexical expansion, and single synthesis limit (unsupported routes explicitly unavailable)
+   - [ ] Slice 5.2: Multi route expansion thickening (dense, structural, structured non RRF, graph), admission queue concurrency, and ablation suite
 - [ ] Verify it: `/check verify LAYA bounded escalation`
 - [ ] Test it: `/test LAYA bounded escalation`
 - [ ] Review it (fresh model): `/check review LAYA bounded escalation`
