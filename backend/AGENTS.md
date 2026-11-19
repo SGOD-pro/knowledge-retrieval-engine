@@ -106,6 +106,7 @@ uv run pytest tests/test_contracts_and_identity.py
 * Concurrency controller bounds workers (4 active, 8 queue slots) with worker capacity retention on caller timeout and late spend reconciliation.
 * Single synthesis call invariant (MAX_SYNTHESIS_CALLS = 1) under ADR-004 is strictly enforced across baseline and escalation paths.
 * Final delivery gate blocks free-form answer delivery if semantic verifier is unconfigured or returns contradicted, and validates fallback replacement excerpts against boundary repository tombstones.
+* Snapshot context resolves baseline ready authorized documents independently of KG manifests; missing or failed snapshot authority halts escalation immediately fail closed with zero expansion.
 
 ## Related specs
 * [docs/specs/0001-contracts-and-identity-envelope.md](../docs/specs/0001-contracts-and-identity-envelope.md)
