@@ -1433,6 +1433,7 @@ def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
     elif "table" in err_str or "operand" in err_str or "calc" in err_str:
         missing_dimension = "tabular_operand"
     else:
+        # Slice 5.1 default fallback; Slice 5.2 thickens routing across dense, structural, structured, and graph gap dimensions
         missing_dimension = "exact_term"
 
     from services.retrieval.response_builder import build_citation
@@ -1636,8 +1637,8 @@ def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
                     updated_state["error"] = "Caller deadline exceeded before synthesis"
                     updated_state["laya_status"] = "timeout"
                 else:
-                    ledger.synthesis_calls += 1
-                    updated_state["synthesis_calls"] = ledger.synthesis_calls
+                    synth_calls = ledger.record_synthesis_call() if hasattr(ledger, "record_synthesis_call") else (ledger.synthesis_calls + 1)
+                    updated_state["synthesis_calls"] = synth_calls
                     llm_res = run_llm(current_state)
                     updated_state.update(llm_res)
             else:

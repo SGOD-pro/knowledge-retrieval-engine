@@ -83,6 +83,9 @@ class LayaBudgetLedger(BaseModel):
             if self.expansion_steps >= MAX_EXPANSION_STEPS:
                 return False, f"Expansion steps exhausted ({self.expansion_steps}/{MAX_EXPANSION_STEPS})"
 
+            if self.tool_attempts >= MAX_TOOL_ATTEMPTS:
+                return False, f"Tool attempts exhausted ({self.tool_attempts}/{MAX_TOOL_ATTEMPTS})"
+
             if estimated_input_tokens > MAX_INPUT_TOKENS_CAP:
                 return False, f"Estimated input tokens ({estimated_input_tokens}) exceeds cap ({MAX_INPUT_TOKENS_CAP})"
 
@@ -95,11 +98,22 @@ class LayaBudgetLedger(BaseModel):
             self.tool_attempts += 1
             return True, "reserved"
 
+    def can_attempt(self) -> bool:
+        """Check whether additional tool attempts remain under MAX_TOOL_ATTEMPTS."""
+        with self._lock:
+            return self.tool_attempts < MAX_TOOL_ATTEMPTS
+
     def record_attempt(self) -> int:
         """Charge an additional tool attempt for retries within the same bounded operation."""
         with self._lock:
             self.tool_attempts += 1
             return self.tool_attempts
+
+    def record_synthesis_call(self) -> int:
+        """Atomically increment and return the synthesis call count."""
+        with self._lock:
+            self.synthesis_calls += 1
+            return self.synthesis_calls
 
     def settle_spend(
         self,

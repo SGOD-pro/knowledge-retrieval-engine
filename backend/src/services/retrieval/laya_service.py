@@ -176,7 +176,7 @@ class LayaDecisionService:
         def _spend_reconcile_cb(usage: dict[str, Any], latency_ms: float, status: str) -> None:
             in_tok = usage.get("inputTokens", 0) if isinstance(usage, dict) else 0
             out_tok = usage.get("outputTokens", 0) if isinstance(usage, dict) else 0
-            is_late = status in ("late_completion", "timeout", "caller_timeout") or status != "completed"
+            is_late = status != "completed"
             ledger.settle_spend(in_tok, out_tok, latency_ms, is_late=is_late, status=status)
 
         raw_response, status = self._invoke_with_retry(
@@ -264,6 +264,13 @@ class LayaDecisionService:
                 is_429 = True
 
         if is_429:
+            if hasattr(ledger, "can_attempt") and not ledger.can_attempt():
+                logger.warning(
+                    "laya.max_tool_attempts_reached attempts=%d",
+                    getattr(ledger, "tool_attempts", 0),
+                )
+                return resp, status
+
             ledger.record_attempt()
             rem_s = escalation_deadline_t - time.perf_counter()
             if rem_s >= 0.5:

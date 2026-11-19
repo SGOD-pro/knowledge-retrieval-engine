@@ -16,7 +16,7 @@ _Steps derived from spec 0008 acceptance criteria. /check verify runs these; /te
 ```bash
 cd backend && uv run pytest tests/test_laya_escalation_slice5_1.py -v
 ```
-Result: **34 passed, 0 skipped in 5.47s**
+Result: **35 passed, 0 skipped in 4.90s**
 Breakdown:
 * `test_laya_contracts_strict_discriminator_and_bounds`: PASSED (frozen contract immutability, extra field rejection, strict discriminator agreement, opaque version bounds)
 * `test_baseline_evidence_summary_normalized_bbox`: PASSED (normalized bounding box coordinate order x0 < x1, y0 < y1 between 0.0 and 1.0)
@@ -28,6 +28,7 @@ Breakdown:
 * `test_concurrency_queue_saturation_load_shedding`: PASSED (concurrency controller 4 workers, 8 queue slots, immediate admission_rejected load shedding)
 * `test_caller_timeout_capacity_retention_and_late_settlement`: PASSED (caller timeout retains worker slot until completion, late completion discarded, late spend reconciled)
 * `test_429_throttling_retries_charged_as_attempts`: PASSED (HTTP 429 retries charged as physical attempts within same bounded operation)
+* `test_max_tool_attempts_ceiling_blocks_further_retries`: PASSED (MAX_TOOL_ATTEMPTS ceiling blocks pre reservation and retry attempts)
 * `test_happy_path_lexical_expansion_success`: PASSED (end to end pipeline lexical expansion on coverage gap, stale refusal clearing, rerank, single synthesis call)
 * `test_empty_context_triggers_escalation`: PASSED (empty context triggers LAYA escalation rather than immediate crash)
 * `test_code_rejection_of_unavailable_routes_in_slice5_1`: PASSED (code validation rejects unavailable routes in Slice 5.1 and falls back to lexical)

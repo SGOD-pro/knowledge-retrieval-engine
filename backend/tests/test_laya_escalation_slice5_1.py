@@ -570,6 +570,39 @@ def test_429_throttling_retries_charged_as_attempts():
     assert ledger.tool_attempts == 2
 
 
+def test_max_tool_attempts_ceiling_blocks_further_retries():
+    """Verify that reaching MAX_TOOL_ATTEMPTS prevents additional retry attempts and fails safely."""
+    from src.services.retrieval.laya_gate import MAX_TOOL_ATTEMPTS
+
+    # Case 1: Pre-reservation fails when tool_attempts is already at ceiling
+    ledger_full = LayaBudgetLedger()
+    ledger_full.tool_attempts = MAX_TOOL_ATTEMPTS
+    assert ledger_full.can_attempt() is False
+    res, msg = ledger_full.pre_reserve(2500.0, 100, 50)
+    assert res is False
+    assert "Tool attempts exhausted" in msg
+
+    # Case 2: When tool_attempts reaches ceiling after initial attempt, 429 retry is blocked
+    ledger = LayaBudgetLedger()
+    ledger.tool_attempts = MAX_TOOL_ATTEMPTS - 1  # 2 attempts already used
+
+    mock_client = MagicMock()
+    err_429 = RuntimeError("HTTP 429: Too Many Requests / ThrottlingException")
+    mock_client.converse.side_effect = err_429
+    mock_client.count_tokens.return_value = {"inputTokens": 150}
+
+    service = LayaDecisionService(client=mock_client)
+    req = _make_sample_request()
+
+    decision = service.decide(req, deadline_remaining_ms=2500.0, ledger=ledger)
+    assert decision.route == "lexical_expansion"
+    assert decision.execution_status == "rejected_by_code"
+    # Initial reservation incremented from 2 to 3, but retry was blocked
+    assert ledger.tool_attempts == MAX_TOOL_ATTEMPTS
+    # Only single initial call was made, retry was blocked
+    assert mock_client.converse.call_count == 1
+
+
 # ===========================================================================
 # 9. Bounded Lexical Expansion Success (AC-1, AC-5, AC-7)
 # ===========================================================================

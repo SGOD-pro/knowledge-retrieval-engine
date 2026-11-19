@@ -15,9 +15,14 @@ import dataclasses
 import logging
 from typing import Any
 
-from schemas.models import Chunk
-from src.schemas.contracts.laya import LayaEscalationDecision
-from services.retrieval.bm25_retriever import BM25Retriever, get_cached_chunks
+try:
+    from schemas.models import Chunk
+    from schemas.contracts.laya import LayaEscalationDecision
+    from services.retrieval.bm25_retriever import BM25Retriever, get_cached_chunks
+except ImportError:
+    from src.schemas.models import Chunk
+    from src.schemas.contracts.laya import LayaEscalationDecision
+    from src.services.retrieval.bm25_retriever import BM25Retriever, get_cached_chunks
 
 logger = logging.getLogger(__name__)
 
