@@ -630,41 +630,46 @@ def test_happy_path_lexical_expansion_success():
         "usage": {"input_tokens": 120, "output_tokens": 25},
     }
 
+    def _mock_rerank_fn(q, chunks, top_k=6, return_mode=False):
+        top = list(chunks)[:top_k]
+        return (top, "mocked") if return_mode else top
+
     # Patch call_llm so run_llm produces the answer
     with patch("services.langgraph_pipeline.call_llm", return_value=mock_llm_response):
         with patch("services.langgraph_pipeline._get_repo", return_value=repo):
-            # Patch initial fidelity to fail with CoverageError on initial baseline pass
-            original_check_fidelity = None
-            from services.retrieval import fidelity_check
-            original_check_fidelity = fidelity_check.check_fidelity
+            with patch("services.langgraph_pipeline.rerank", side_effect=_mock_rerank_fn):
+                # Patch initial fidelity to fail with CoverageError on initial baseline pass
+                original_check_fidelity = None
+                from services.retrieval import fidelity_check
+                original_check_fidelity = fidelity_check.check_fidelity
 
-            fidelity_calls = 0
+                fidelity_calls = 0
 
-            def _mock_check_fidelity(q, contexts, **kw):
-                nonlocal fidelity_calls
-                fidelity_calls += 1
-                if fidelity_calls == 1:
-                    # Initial baseline pass fails coverage
-                    from services.retrieval.fidelity_check import CoverageError
-                    raise CoverageError("No coverage for 'turnover'")
-                return 1.0
+                def _mock_check_fidelity(q, contexts, **kw):
+                    nonlocal fidelity_calls
+                    fidelity_calls += 1
+                    if fidelity_calls == 1:
+                        # Initial baseline pass fails coverage
+                        from services.retrieval.fidelity_check import CoverageError
+                        raise CoverageError("No coverage for 'turnover'")
+                    return 1.0
 
-            with patch("services.langgraph_pipeline.check_fidelity", side_effect=_mock_check_fidelity):
-                response = pipeline.run(
-                    query=query,
-                    workspace_id=ws_id,
-                    laya_enabled=True,
-                    laya_client=mock_client,
-                    verifier=mock_verifier,
-                    require_delivery_gate=True,
-                )
+                with patch("services.langgraph_pipeline.check_fidelity", side_effect=_mock_check_fidelity):
+                    response = pipeline.run(
+                        query=query,
+                        workspace_id=ws_id,
+                        laya_enabled=True,
+                        laya_client=mock_client,
+                        verifier=mock_verifier,
+                        require_delivery_gate=True,
+                    )
 
-                assert response.laya_calls == 1
-                assert response.expansion_steps == 1
-                assert response.synthesis_calls == 1
-                assert "$450 million" in response.answer
-                assert len(response.citations) > 0
-                assert mock_verifier.verify_call_count == 1
+                    assert response.laya_calls == 1
+                    assert response.expansion_steps == 1
+                    assert response.synthesis_calls == 1
+                    assert "$450 million" in response.answer
+                    assert len(response.citations) > 0
+                    assert mock_verifier.verify_call_count == 1
 
 
 # ===========================================================================
@@ -721,31 +726,36 @@ def test_empty_context_triggers_escalation():
 
     mock_verifier = MockVerifier(support_status="ASSERTED")
 
+    def _mock_rerank_fn(q, chunks, top_k=6, return_mode=False):
+        top = list(chunks)[:top_k]
+        return (top, "mocked") if return_mode else top
+
     with patch("services.langgraph_pipeline.call_llm", return_value=mock_llm_resp):
         with patch("services.langgraph_pipeline._get_repo", return_value=repo):
-            # Simulate initial compressor returning empty context, secondary returning text
-            comp_calls = 0
+            with patch("services.langgraph_pipeline.rerank", side_effect=_mock_rerank_fn):
+                # Simulate initial compressor returning empty context, secondary returning text
+                comp_calls = 0
 
-            def _mock_compress(q, chunks):
-                nonlocal comp_calls
-                comp_calls += 1
-                if comp_calls == 1:
-                    return ""
-                return f"[{doc_chunk.id}] Target acquired in sector 7."
+                def _mock_compress(q, chunks):
+                    nonlocal comp_calls
+                    comp_calls += 1
+                    if comp_calls == 1:
+                        return ""
+                    return f"[{doc_chunk.id}] Target acquired in sector 7."
 
-            with patch("services.langgraph_pipeline.compress_chunks", side_effect=_mock_compress):
-                with patch("services.langgraph_pipeline.check_fidelity", return_value=1.0):
-                    response = pipeline.run(
-                        query="Where was target acquired?",
-                        workspace_id=ws_id,
-                        laya_enabled=True,
-                        laya_client=mock_client,
-                        verifier=mock_verifier,
-                    )
+                with patch("services.langgraph_pipeline.compress_chunks", side_effect=_mock_compress):
+                    with patch("services.langgraph_pipeline.check_fidelity", return_value=1.0):
+                        response = pipeline.run(
+                            query="Where was target acquired?",
+                            workspace_id=ws_id,
+                            laya_enabled=True,
+                            laya_client=mock_client,
+                            verifier=mock_verifier,
+                        )
 
-                    assert response.laya_calls == 1
-                    assert response.expansion_steps == 1
-                    assert "sector 7" in response.answer
+                        assert response.laya_calls == 1
+                        assert response.expansion_steps == 1
+                        assert "sector 7" in response.answer
 
 
 # ===========================================================================
@@ -1061,10 +1071,26 @@ def test_no_progress_clean_refusal():
         text="Known data chunk.",
         element_type="narrative_block",
         workspace_id="ws_test_no_prog",
+        metadata={"document_version": "v1"},
     )
 
     mock_repo = MagicMock()
     mock_repo.get_all_chunks.return_value = [chunk_existing]
+
+    from datetime import datetime, timezone
+    now_str = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    snap_ctx = PinnedSnapshotContext(
+        workspace_id="ws_test_no_prog",
+        captured_at_utc=now_str,
+        active_documents=(
+            PinnedDocumentVersion(
+                document_id="doc_known",
+                document_version="v1",
+                publication_id="pub_known",
+                is_tombstoned=False,
+            ),
+        ),
+    )
 
     executor = LayaExpansionExecutor()
     decision = LayaEscalationDecision(
@@ -1083,6 +1109,7 @@ def test_no_progress_clean_refusal():
         workspace_id="ws_test_no_prog",
         baseline_chunks=[chunk_existing],
         chunk_repo=mock_repo,
+        snapshot_context=snap_ctx,
     )
 
     assert no_prog is True
@@ -1570,5 +1597,343 @@ def test_strict_usage_validation_zero_slack():
     # Multi-byte UTF-8 symbols have byte length strictly >= char length
     unicode_sample = "KRE 知识 🔍 2026"
     assert proven_token_upper_bound(unicode_sample) >= len(unicode_sample)
+
+
+# ===========================================================================
+# 28. Compiled Pipeline Production Snapshot and Execution Deadlines (AC-1, AC-4, AC-5)
+# ===========================================================================
+
+def test_compiled_pipeline_production_snapshot_no_kg_manifest():
+    """Verify production application path resolves baseline-ready document without KG manifest when snapshot is not caller-injected."""
+    ws_id = "ws_prod_snapshot_no_kg"
+    from db.database import CloudRepository
+    from src.db.workspace_boundary_repo import get_workspace_boundary_repo
+    from src.schemas.contracts.boundary import DocumentSnapshot
+    from datetime import datetime, timezone
+
+    repo = CloudRepository()
+    boundary_repo = get_workspace_boundary_repo()
+
+    doc_chunk = Chunk(
+        id="chunk_prod_snap_1",
+        document_id="doc_snap_plain",
+        source_format="pdf",
+        text="The verified quarterly revenue was $120 million for plain docs.",
+        element_type="narrative_block",
+        workspace_id=ws_id,
+        metadata={"document_version": "v1"},
+        embedding_fast=[0.1] * 384,
+        embedding_full=[0.1] * 1024,
+    )
+    doc = Document(
+        id="doc_snap_plain",
+        filename="doc_snap_plain.pdf",
+        source_format="pdf",
+        chunks=(doc_chunk,),
+        workspace_id=ws_id,
+    )
+    repo.save(doc)
+    repo.add_document_to_workspace(ws_id, doc)
+    invalidate_chunk_cache(ws_id)
+
+    # Ensure boundary snapshot exists, but NO KG manifest is present (GRAPH_ENABLED=False default)
+    boundary_repo.save_document_snapshot(
+        DocumentSnapshot(
+            workspace_id=ws_id,
+            document_id="doc_snap_plain",
+            source="doc_snap_plain.pdf",
+            version="v1",
+            format="pdf",
+            created_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        )
+    )
+
+    mock_client = MockBedrockConverseClient(
+        response_payload={
+            "decision_id": "dec_prod_snap_1",
+            "route": "lexical_expansion",
+            "parameters": {
+                "route_type": "lexical_expansion",
+                "query_terms": ["quarterly", "revenue", "plain"],
+                "document_ids": ["doc_snap_plain"],
+            },
+            "confidence": 0.95,
+            "rationale": "Lexical match on quarterly revenue",
+        }
+    )
+
+    mock_llm_response = {
+        "answer": "The verified quarterly revenue was $120 million for plain docs.",
+        "citations": ["chunk_prod_snap_1"],
+        "usage": {"input_tokens": 100, "output_tokens": 20},
+    }
+    mock_verifier = MockVerifier(support_status="ASSERTED")
+
+    def _mock_rerank(q, chunks, top_k=6, return_mode=False):
+        top = list(chunks)[:top_k]
+        return (top, "mocked") if return_mode else top
+
+    with patch("services.langgraph_pipeline.call_llm", return_value=mock_llm_response):
+        with patch("services.langgraph_pipeline._get_repo", return_value=repo):
+            with patch("services.langgraph_pipeline.rerank", side_effect=_mock_rerank):
+                fidelity_calls = 0
+                def _mock_fidelity(q, contexts, **kw):
+                    nonlocal fidelity_calls
+                    fidelity_calls += 1
+                    if fidelity_calls == 1:
+                        from services.retrieval.fidelity_check import CoverageError
+                        raise CoverageError("Initial fidelity gap")
+                    return 1.0
+
+                with patch("services.langgraph_pipeline.check_fidelity", side_effect=_mock_fidelity):
+                    # Production path: NO caller-injected snapshot_context
+                    response = pipeline.run(
+                        query="What was quarterly revenue for plain docs?",
+                        workspace_id=ws_id,
+                        laya_enabled=True,
+                        laya_client=mock_client,
+                        verifier=mock_verifier,
+                        require_delivery_gate=True,
+                    )
+
+                    assert response.laya_calls == 1
+                    assert response.expansion_steps == 1
+                    assert response.synthesis_calls == 1
+                    assert "$120 million" in response.answer
+                    assert len(response.citations) > 0
+
+
+def test_compiled_pipeline_snapshot_resolution_failure_stops_expansion():
+    """Verify that failure in snapshot authority resolution halts expansion immediately fail-closed."""
+    ws_id = "ws_snapshot_failure"
+    from db.database import CloudRepository
+    from src.db.workspace_boundary_repo import get_workspace_boundary_repo
+    from services.retrieval.fidelity_check import CoverageError
+
+    repo = CloudRepository()
+    boundary_repo = get_workspace_boundary_repo()
+
+    mock_client = MockBedrockConverseClient()
+    mock_executor = MagicMock()
+
+    # Boundary repo snapshot listing raises an unexpected storage exception
+    with patch.object(boundary_repo, "list_document_snapshots", side_effect=RuntimeError("Storage unavailable for snapshots")):
+        with patch("services.langgraph_pipeline._get_repo", return_value=repo):
+            with patch("services.langgraph_pipeline.check_fidelity", side_effect=CoverageError("Initial fidelity gap")):
+                response = pipeline.run(
+                    query="What is the revenue?",
+                    workspace_id=ws_id,
+                    laya_enabled=True,
+                    laya_client=mock_client,
+                    laya_expansion_executor=mock_executor,
+                    boundary_repo=boundary_repo,
+                )
+
+                # Expansion executor was never called
+                mock_executor.execute.assert_not_called()
+                assert response.expansion_steps == 0
+                assert response.answer == "NOT_FOUND"
+                assert response.retrieval_incomplete is True
+
+
+def test_compiled_pipeline_slow_retrieval_deadline_retains_capacity():
+    """Verify slow expansion retrieval exceeding caller deadline retains capacity and discards late candidates."""
+    ws_id = "ws_slow_retrieval"
+    ctrl = LayaProviderConcurrencyController(max_concurrency=1, max_queue=2)
+    from db.database import CloudRepository
+    from src.db.workspace_boundary_repo import get_workspace_boundary_repo
+    from src.schemas.contracts.boundary import DocumentSnapshot
+    from services.retrieval.fidelity_check import CoverageError
+    from datetime import datetime, timezone
+
+    repo = CloudRepository()
+    boundary_repo = get_workspace_boundary_repo()
+
+    doc_chunk = Chunk(
+        id="chunk_late_exp_1",
+        document_id="doc_slow",
+        source_format="pdf",
+        text="Late arrived text chunk that must never be published.",
+        element_type="narrative_block",
+        workspace_id=ws_id,
+        metadata={"document_version": "v1"},
+        embedding_fast=[0.1] * 384,
+        embedding_full=[0.1] * 1024,
+    )
+    doc = Document(
+        id="doc_slow",
+        filename="doc_slow.pdf",
+        source_format="pdf",
+        chunks=(doc_chunk,),
+        workspace_id=ws_id,
+    )
+    repo.save(doc)
+    repo.add_document_to_workspace(ws_id, doc)
+    boundary_repo.save_document_snapshot(
+        DocumentSnapshot(
+            workspace_id=ws_id,
+            document_id="doc_slow",
+            source="doc_slow.pdf",
+            version="v1",
+            format="pdf",
+            created_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        )
+    )
+
+    started = threading.Event()
+    finish = threading.Event()
+
+    def slow_execute(**kw):
+        started.set()
+        finish.wait(timeout=10.0)
+        return [doc_chunk], False, "completed"
+
+    mock_slow_executor = MagicMock()
+    mock_slow_executor.execute.side_effect = slow_execute
+
+    mock_client = MockBedrockConverseClient(
+        response_payload={
+            "decision_id": "dec_slow_retrieval",
+            "route": "lexical_expansion",
+            "parameters": {
+                "route_type": "lexical_expansion",
+                "query_terms": ["late", "arrived"],
+                "document_ids": ["doc_slow"],
+            },
+            "confidence": 0.9,
+            "rationale": "Lexical expansion for slow retrieval test",
+        }
+    )
+
+    def _mock_rerank_baseline(q, chunks, top_k=6, return_mode=False):
+        top = list(chunks)[:top_k]
+        return (top, "mocked") if return_mode else top
+
+    with patch("services.langgraph_pipeline._get_repo", return_value=repo):
+        with patch("services.langgraph_pipeline.rerank", side_effect=_mock_rerank_baseline):
+            with patch("services.langgraph_pipeline.check_fidelity", side_effect=CoverageError("Gap")):
+                # Set viable escalation deadline sufficient for decide but tight for retrieval
+                response = pipeline.run(
+                    query="Find late arrived chunk",
+                    workspace_id=ws_id,
+                    laya_enabled=True,
+                    laya_client=mock_client,
+                    laya_expansion_executor=mock_slow_executor,
+                    laya_concurrency_controller=ctrl,
+                    caller_deadline_ms=600.0,
+                )
+
+            # Caller must time out and abort with NOT_FOUND
+            assert response.answer == "NOT_FOUND"
+            assert response.retrieval_incomplete is True
+            assert started.is_set() is True, "slow_execute was never started!"
+            # Underlying worker slot MUST remain retained while slow_execute is still running!
+            assert ctrl.active_count == 1
+
+    # Now release slow worker task
+    finish.set()
+    time.sleep(0.1)
+    # Capacity must now be cleanly released
+    assert ctrl.active_count == 0
+    ctrl.shutdown(wait=False)
+
+
+def test_compiled_pipeline_slow_reranking_deadline_retains_capacity():
+    """Verify slow post-expansion reranking exceeding caller deadline retains capacity and discards late candidates."""
+    ws_id = "ws_slow_reranking"
+    ctrl = LayaProviderConcurrencyController(max_concurrency=1, max_queue=2)
+    from db.database import CloudRepository
+    from src.db.workspace_boundary_repo import get_workspace_boundary_repo
+    from src.schemas.contracts.boundary import DocumentSnapshot
+    from services.retrieval.fidelity_check import CoverageError
+    from datetime import datetime, timezone
+
+    repo = CloudRepository()
+    boundary_repo = get_workspace_boundary_repo()
+
+    doc_chunk = Chunk(
+        id="chunk_slow_rerank_1",
+        document_id="doc_slow_rerank",
+        source_format="pdf",
+        text="Novel chunk before slow rerank.",
+        element_type="narrative_block",
+        workspace_id=ws_id,
+        metadata={"document_version": "v1"},
+        embedding_fast=[0.1] * 384,
+        embedding_full=[0.1] * 1024,
+    )
+    doc = Document(
+        id="doc_slow_rerank",
+        filename="doc_slow_rerank.pdf",
+        source_format="pdf",
+        chunks=(doc_chunk,),
+        workspace_id=ws_id,
+    )
+    repo.save(doc)
+    repo.add_document_to_workspace(ws_id, doc)
+    boundary_repo.save_document_snapshot(
+        DocumentSnapshot(
+            workspace_id=ws_id,
+            document_id="doc_slow_rerank",
+            source="doc_slow_rerank.pdf",
+            version="v1",
+            format="pdf",
+            created_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        )
+    )
+
+    started = threading.Event()
+    finish = threading.Event()
+
+    def slow_reranker(st):
+        if st.get("laya_decision") is not None:
+            started.set()
+            finish.wait(timeout=10.0)
+        return {"top_chunks": [doc_chunk], "reranked_chunks": [doc_chunk]}
+
+    mock_client = MockBedrockConverseClient(
+        response_payload={
+            "decision_id": "dec_slow_rerank",
+            "route": "lexical_expansion",
+            "parameters": {
+                "route_type": "lexical_expansion",
+                "query_terms": ["novel", "chunk"],
+                "document_ids": ["doc_slow_rerank"],
+            },
+            "confidence": 0.9,
+            "rationale": "Lexical expansion for slow rerank test",
+        }
+    )
+
+    def _mock_rerank_baseline(q, chunks, top_k=6, return_mode=False):
+        top = list(chunks)[:top_k]
+        return (top, "mocked") if return_mode else top
+
+    with patch("services.langgraph_pipeline.call_llm", return_value={"answer": "Late text", "citations": []}):
+        with patch("services.langgraph_pipeline._get_repo", return_value=repo):
+            with patch("services.langgraph_pipeline.rerank", side_effect=_mock_rerank_baseline):
+                with patch("services.langgraph_pipeline.run_reranker", side_effect=slow_reranker):
+                    with patch("services.langgraph_pipeline.check_fidelity", side_effect=CoverageError("Gap")):
+                        response = pipeline.run(
+                            query="Find novel chunk",
+                            workspace_id=ws_id,
+                            laya_enabled=True,
+                            laya_client=mock_client,
+                            laya_concurrency_controller=ctrl,
+                            caller_deadline_ms=600.0,
+                        )
+
+                        # Caller must time out and abort with NOT_FOUND refusal
+                        assert response.answer == "NOT_FOUND"
+                        assert response.retrieval_incomplete is True
+                        # Underlying worker slot MUST remain retained while slow_reranker is still executing!
+                        assert ctrl.active_count == 1
+
+    # Release slow worker and confirm clean release
+    finish.set()
+    time.sleep(0.1)
+    assert ctrl.active_count == 0
+    ctrl.shutdown(wait=False)
+
 
 

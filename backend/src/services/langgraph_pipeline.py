@@ -157,6 +157,8 @@ class PipelineState(TypedDict):
     laya_decision_service: Any | None
     laya_expansion_executor: Any | None
     laya_budget_ledger: Any | None
+    laya_concurrency_controller: Any | None
+    caller_deadline_ms: float | None
     snapshot_context: Any | None
     _pipeline_start_time: float
 
@@ -1313,8 +1315,18 @@ def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
     pipe_start = state.get("_pipeline_start_time", time.perf_counter())
     elapsed_ms = (time.perf_counter() - pipe_start) * 1000.0
     remaining_ms = max(0.0, 15000.0 - elapsed_ms)
-    phase_deadline_ms = min(remaining_ms, 2500.0)
+    caller_spec_deadline = state.get("caller_deadline_ms") or state.get("phase_deadline_ms")
+    if caller_spec_deadline is not None:
+        phase_deadline_ms = float(caller_spec_deadline)
+    else:
+        phase_deadline_ms = min(remaining_ms, 2500.0)
     escalation_deadline_t = time.perf_counter() + (phase_deadline_ms / 1000.0)
+
+    try:
+        from services.retrieval.laya_concurrency import get_laya_concurrency_controller
+    except ImportError:
+        from src.services.retrieval.laya_concurrency import get_laya_concurrency_controller
+    ctrl = state.get("laya_concurrency_controller") or get_laya_concurrency_controller()
 
     ws_id = state.get("workspace_id", "ws_default")
 
@@ -1363,12 +1375,32 @@ def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
     snapshot_context = state.get("snapshot_context")
     if snapshot_context is None:
         try:
-            from db.knowledge_graph_repo import get_knowledge_graph_repo, build_pinned_snapshot_context
-            kg_repo = state.get("knowledge_graph_repo") or get_knowledge_graph_repo()
-            snapshot_context = build_pinned_snapshot_context(ws_id, boundary_repo, kg_repo)
+            from db.knowledge_graph_repo import get_knowledge_graph_repository, build_pinned_snapshot_context
+            kg_repo = state.get("knowledge_graph_repo")
+            if kg_repo is None and getattr(settings, "GRAPH_ENABLED", False):
+                try:
+                    kg_repo = get_knowledge_graph_repository()
+                except Exception:
+                    kg_repo = None
+            snapshot_context = build_pinned_snapshot_context(
+                workspace_id=ws_id,
+                boundary_repo=boundary_repo,
+                kg_repo=kg_repo,
+                require_kg_manifest=False,
+            )
         except Exception as ske:
-            logger.info("laya.snapshot_context_build_failed: %s", ske)
+            logger.error("laya.snapshot_context_build_failed: %s (failing closed)", ske)
             snapshot_context = None
+
+    if snapshot_context is None or not hasattr(snapshot_context, "get_document"):
+        logger.error("laya.missing_snapshot_authority: failing closed")
+        return {
+            "final_answer": "NOT_FOUND",
+            "citations": [],
+            "confidence_score": 0.0,
+            "retrieval_incomplete": True,
+            "error": "Missing or failed snapshot authority",
+        }
 
     err = state.get("error") or "Context insufficient"
     compressed = state.get("compressed_text", "")
@@ -1464,6 +1496,7 @@ def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
     service = state.get("laya_decision_service") or LayaDecisionService(
         client=state.get("laya_client"),
         model_id=state.get("laya_model_id"),
+        concurrency_controller=ctrl,
     )
     decision = service.decide(escalation_req, phase_deadline_ms, ledger)
     l_lat_ms = (time.perf_counter() - t0) * 1000.0
@@ -1476,20 +1509,33 @@ def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
     no_progress = True
     status = decision.execution_status
 
-    rem_ms_after_decide = (escalation_deadline_t - time.perf_counter()) * 1000.0
-    if rem_ms_after_decide < 100.0:
+    rem_s_expansion = max(0.0, escalation_deadline_t - time.perf_counter())
+    if rem_s_expansion < 0.050:
         no_progress = True
         status = "timeout"
     elif decision.route == "lexical_expansion":
         executor = state.get("laya_expansion_executor") or LayaExpansionExecutor()
-        novel_chunks, no_progress, status = executor.execute(
-            decision=decision,
-            workspace_id=ws_id,
-            baseline_chunks=state.get("candidate_chunks", []),
-            boundary_repo=boundary_repo,
-            chunk_repo=state.get("doc_repo"),
-            snapshot_context=snapshot_context,
-        )
+
+        def _do_expansion() -> tuple[list[Chunk], bool, str]:
+            return executor.execute(
+                decision=decision,
+                workspace_id=ws_id,
+                baseline_chunks=state.get("candidate_chunks", []),
+                boundary_repo=boundary_repo,
+                chunk_repo=state.get("doc_repo"),
+                snapshot_context=snapshot_context,
+                timeout_s=rem_s_expansion,
+            )
+
+        exp_res, exp_status = ctrl.run_provider_call(_do_expansion, timeout_s=rem_s_expansion)
+        if exp_status == "completed" and exp_res is not None:
+            novel_chunks, no_progress, status = exp_res
+        elif exp_status == "caller_timeout":
+            novel_chunks, no_progress, status = [], True, "timeout"
+        elif exp_status == "admission_rejected":
+            novel_chunks, no_progress, status = [], True, "admission_rejected"
+        else:
+            novel_chunks, no_progress, status = [], True, "error"
 
     cands["laya_novel_chunks"] = [str(c.id) for c in novel_chunks]
     cands["laya_no_progress"] = no_progress
@@ -1509,10 +1555,11 @@ def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
         "stage_timings": {**existing_timings, "laya_ms": l_lat_ms},
     }
 
-    rem_ms_after_exp = (escalation_deadline_t - time.perf_counter()) * 1000.0
-    if rem_ms_after_exp < 100.0 and novel_chunks:
+    rem_s_post = max(0.0, escalation_deadline_t - time.perf_counter())
+    if rem_s_post < 0.050 and novel_chunks:
         no_progress = True
         status = "timeout"
+        novel_chunks = []
         updated_state["laya_status"] = "timeout"
 
     if novel_chunks and not no_progress:
@@ -1526,8 +1573,34 @@ def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
         merged_candidates = list(state.get("candidate_chunks", [])) + novel_chunks
         current_state = {**state, **updated_state, "candidate_chunks": merged_candidates}
 
-        # 2. Rerank updated candidate pool (consuming second allowed rerank batch under ADR-004)
-        rerank_res = run_reranker(current_state)
+        # 2. Rerank updated candidate pool under deadline protection
+        def _do_rerank() -> dict[str, Any]:
+            return run_reranker(current_state)
+
+        rerank_res, rerank_status = ctrl.run_provider_call(_do_rerank, timeout_s=rem_s_post)
+        if rerank_status == "caller_timeout":
+            logger.warning("laya.rerank_caller_timeout failing closed with timeout refusal")
+            return {
+                "final_answer": "NOT_FOUND",
+                "citations": [],
+                "confidence_score": 0.0,
+                "retrieval_incomplete": True,
+                "laya_status": "timeout",
+                "error": "Caller deadline exceeded during post-expansion reranking",
+                "stage_timings": {**existing_timings, "laya_ms": (time.perf_counter() - t0) * 1000.0},
+            }
+        elif rerank_status != "completed" or rerank_res is None:
+            logger.warning("laya.rerank_failed failing closed with error refusal")
+            return {
+                "final_answer": "NOT_FOUND",
+                "citations": [],
+                "confidence_score": 0.0,
+                "retrieval_incomplete": True,
+                "laya_status": "error",
+                "error": "Post-expansion reranking failed",
+                "stage_timings": {**existing_timings, "laya_ms": (time.perf_counter() - t0) * 1000.0},
+            }
+
         current_state.update(rerank_res)
 
         # 3. Recompress top chunks
@@ -1553,11 +1626,20 @@ def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
             updated_state["error"] = None
             verifier = state.get("verifier") or state.get("semantic_verifier")
             if verifier is not None and (not hasattr(verifier, "is_ready") or verifier.is_ready()):
-                # Run single synthesis call
-                ledger.synthesis_calls += 1
-                updated_state["synthesis_calls"] = ledger.synthesis_calls
-                llm_res = run_llm(current_state)
-                updated_state.update(llm_res)
+                # Run single synthesis call under deadline protection
+                rem_s_synthesis = max(0.0, escalation_deadline_t - time.perf_counter())
+                if rem_s_synthesis < 0.050:
+                    updated_state["final_answer"] = "NOT_FOUND"
+                    updated_state["citations"] = []
+                    updated_state["confidence_score"] = 0.0
+                    updated_state["retrieval_incomplete"] = True
+                    updated_state["error"] = "Caller deadline exceeded before synthesis"
+                    updated_state["laya_status"] = "timeout"
+                else:
+                    ledger.synthesis_calls += 1
+                    updated_state["synthesis_calls"] = ledger.synthesis_calls
+                    llm_res = run_llm(current_state)
+                    updated_state.update(llm_res)
             else:
                 # Verifier is unconfigured / unavailable -> free form delivery blocked!
                 from services.retrieval.extractor import extract_verified_fact
@@ -2336,6 +2418,8 @@ class Pipeline:
             "laya_decision_service": kwargs.get("laya_decision_service"),
             "laya_expansion_executor": kwargs.get("laya_expansion_executor"),
             "laya_budget_ledger": kwargs.get("laya_budget_ledger"),
+            "laya_concurrency_controller": kwargs.get("laya_concurrency_controller"),
+            "caller_deadline_ms": kwargs.get("caller_deadline_ms"),
             "snapshot_context": kwargs.get("snapshot_context"),
             "_pipeline_start_time": time.perf_counter(),
         }

@@ -36,14 +36,18 @@ class LayaExpansionExecutor:
         boundary_repo: Any | None = None,
         chunk_repo: Any | None = None,
         snapshot_context: Any | None = None,
+        timeout_s: float | None = None,
     ) -> tuple[list[Chunk], bool, str]:
         """Execute validated expansion decision and return (novel_chunks, no_progress, status).
 
         Returns:
         - novel_chunks: chunks retrieved that are not already present in baseline_chunks
         - no_progress: True if expansion produced zero novel chunks
-        - status: "completed", "tombstoned", "no_progress", "unavailable_route", or "error"
+        - status: "completed", "tombstoned", "no_progress", "unavailable_route", "missing_authority", or "error"
         """
+        if timeout_s is not None and timeout_s <= 0.0:
+            return [], True, "timeout"
+
         # Dynamic tombstone check on workspace BEFORE retrieval
         if boundary_repo is not None and hasattr(boundary_repo, "has_tombstone"):
             try:
@@ -60,6 +64,11 @@ class LayaExpansionExecutor:
         if decision.route != "lexical_expansion":
             logger.warning("laya.executor_route_unavailable route=%s in Slice 5.1", decision.route)
             return [], True, "unavailable_route"
+
+        # Strict snapshot authority validation: fail closed if missing or invalid
+        if snapshot_context is None or not hasattr(snapshot_context, "get_document"):
+            logger.warning("laya.executor_missing_snapshot_context failing closed")
+            return [], True, "missing_authority"
 
         # Lexical expansion path
         params = decision.parameters
@@ -89,11 +98,15 @@ class LayaExpansionExecutor:
         target_docs_arg: list[str] | None = None
         if active_target_docs:
             target_docs_arg = list(active_target_docs)
-        elif snapshot_context is not None and hasattr(snapshot_context, "active_documents"):
+        elif hasattr(snapshot_context, "active_documents"):
             target_docs_arg = [
                 d.document_id for d in snapshot_context.active_documents
                 if not getattr(d, "is_tombstoned", False)
             ]
+
+        if not target_docs_arg:
+            logger.info("laya.no_active_documents_in_snapshot for workspace_id=%s", workspace_id)
+            return [], True, "no_progress"
 
         # Hydrate active candidate chunks
         try:
@@ -151,17 +164,16 @@ class LayaExpansionExecutor:
             c_ver = str(c_ver)
 
             # Strict PinnedSnapshotContext bindings
-            if snapshot_context is not None and hasattr(snapshot_context, "get_document"):
-                pinned_doc = snapshot_context.get_document(c_doc)
-                if pinned_doc is None:
-                    # Absent from pinned bindings -> reject!
-                    continue
-                if getattr(pinned_doc, "is_tombstoned", False):
-                    # Tombstoned in snapshot -> reject!
-                    continue
-                if c_ver != str(pinned_doc.document_version):
-                    # Conflicting version metadata -> reject!
-                    continue
+            pinned_doc = snapshot_context.get_document(c_doc)
+            if pinned_doc is None:
+                # Absent from pinned bindings -> reject!
+                continue
+            if getattr(pinned_doc, "is_tombstoned", False):
+                # Tombstoned in snapshot -> reject!
+                continue
+            if c_ver != str(pinned_doc.document_version):
+                # Conflicting version metadata -> reject!
+                continue
 
             filtered_chunks.append(c)
 

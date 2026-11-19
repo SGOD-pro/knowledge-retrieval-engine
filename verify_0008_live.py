@@ -772,6 +772,7 @@ novel_tomb, no_prog_tomb, st_tomb = executor.execute(
     baseline_chunks=[],
     boundary_repo=mock_boundary,
     chunk_repo=mock_chunk_repo,
+    snapshot_context=snap_context_match,
 )
 tombstone_retrieval_ok = (len(novel_tomb) == 0 and st_tomb == "tombstoned")
 record(

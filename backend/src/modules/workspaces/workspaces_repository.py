@@ -368,3 +368,33 @@ class WorkspacesRepository:
                 else "application/octet-stream"
             )
             _DOCUMENT_FILES[doc_id_str] = (raw_bytes, document.filename, mime)
+
+        # Ensure DocumentSnapshot is registered in boundary repo for baseline snapshot authority
+        try:
+            from datetime import datetime, timezone
+            from src.schemas.contracts.boundary import DocumentSnapshot
+            from src.db.workspace_boundary_repo import get_workspace_boundary_repo
+            b_repo = get_workspace_boundary_repo()
+            doc_ver = getattr(document, "version", None) or "v1"
+            if hasattr(document, "chunks") and document.chunks:
+                first_c = document.chunks[0]
+                c_meta = getattr(first_c, "metadata", None) or {}
+                doc_ver = getattr(first_c, "document_version", None) or getattr(first_c, "version", None) or c_meta.get("document_version") or c_meta.get("version") or doc_ver
+            if hasattr(b_repo, "create_source"):
+                try:
+                    b_repo.create_source(workspace_id=workspace_id, title=document.filename, source_id=doc_id_str)
+                except Exception:
+                    pass
+            if hasattr(b_repo, "save_document_snapshot"):
+                b_repo.save_document_snapshot(
+                    DocumentSnapshot(
+                        workspace_id=workspace_id,
+                        document_id=doc_id_str,
+                        source=document.filename or doc_id_str,
+                        version=str(doc_ver),
+                        format=getattr(document, "source_format", "pdf").lower().replace(".", "") or "pdf",
+                        created_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    )
+                )
+        except Exception as be:
+            logger.debug("boundary_repo document snapshot registration skipped: %s", be)

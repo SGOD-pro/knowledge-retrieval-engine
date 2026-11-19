@@ -2793,18 +2793,23 @@ def get_shared_knowledge_graph_repository(
 def build_pinned_snapshot_context(
     workspace_id: str,
     boundary_repo: Any,
-    kg_repo: KnowledgeGraphRepositoryBase,
+    kg_repo: Any | None = None,
+    require_kg_manifest: bool = False,
 ) -> PinnedSnapshotContext:
     """Acquire deeply immutable request-local snapshot context pinned at query start.
     
     Evaluates dynamic workspace tombstone. Invokes boundary_repo.list_document_snapshots.
-    Queries kg_repo.get_manifest using strongly consistent reads.
+    If kg_repo is provided, queries kg_repo.get_manifest using strongly consistent reads.
     Evaluates dynamic source tombstones via boundary_repo.has_tombstone(workspace_id, "source", doc_id).
-    Filters for manifests with status == "ready".
+    When require_kg_manifest is True, filters for manifests with status == "ready".
+    When require_kg_manifest is False, retains baseline-ready document snapshots even without KG manifests.
     Returns deeply immutable PinnedSnapshotContext.
     """
     now_utc = _now_utc()
-    if boundary_repo and hasattr(boundary_repo, "has_tombstone"):
+    if boundary_repo is None:
+        raise ValueError("boundary_repo is required to build pinned snapshot context")
+
+    if hasattr(boundary_repo, "has_tombstone"):
         if boundary_repo.has_tombstone(workspace_id, "workspace", workspace_id):
             return PinnedSnapshotContext(
                 workspace_id=workspace_id,
@@ -2812,13 +2817,10 @@ def build_pinned_snapshot_context(
                 active_documents=(),
             )
 
-    snapshots = []
-    if boundary_repo and hasattr(boundary_repo, "list_document_snapshots"):
-        try:
-            snapshots = boundary_repo.list_document_snapshots(workspace_id)
-        except Exception as e:
-            logger.warning("Failed to list document snapshots for workspace %s: %s", workspace_id, e)
-            snapshots = []
+    if not hasattr(boundary_repo, "list_document_snapshots"):
+        raise AttributeError("boundary_repo missing list_document_snapshots")
+
+    snapshots = boundary_repo.list_document_snapshots(workspace_id)
 
     pinned_docs: list[PinnedDocumentVersion] = []
     for s in snapshots:
@@ -2831,22 +2833,38 @@ def build_pinned_snapshot_context(
         if boundary_repo and hasattr(boundary_repo, "has_tombstone"):
             is_tomb = boundary_repo.has_tombstone(workspace_id, "source", str(did))
 
-        manifest = kg_repo.get_manifest(workspace_id, str(did), str(ver), consistent_read=True)
-        if manifest is not None and manifest.status == "ready":
-            pinned_docs.append(
-                PinnedDocumentVersion(
-                    document_id=str(did),
-                    document_version=str(ver),
-                    publication_id=manifest.publication_id,
-                    is_tombstoned=is_tomb,
-                )
+        manifest = None
+        if kg_repo is not None and hasattr(kg_repo, "get_manifest"):
+            try:
+                manifest = kg_repo.get_manifest(workspace_id, str(did), str(ver), consistent_read=True)
+            except Exception as me:
+                logger.debug("kg_repo.get_manifest error for doc %s: %s", did, me)
+                manifest = None
+
+        if manifest is not None and getattr(manifest, "status", None) == "ready":
+            pub_id = manifest.publication_id
+        elif require_kg_manifest:
+            continue
+        else:
+            pub_id = getattr(s, "publication_id", None) or (s.get("publication_id") if isinstance(s, dict) else None) or f"pub_{did}_{ver}"
+
+        pinned_docs.append(
+            PinnedDocumentVersion(
+                document_id=str(did),
+                document_version=str(ver),
+                publication_id=str(pub_id),
+                is_tombstoned=is_tomb,
             )
+        )
 
     return PinnedSnapshotContext(
         workspace_id=workspace_id,
         captured_at_utc=now_utc,
         active_documents=tuple(pinned_docs),
     )
+
+
+get_knowledge_graph_repo = get_knowledge_graph_repository
 
 
 import sys
