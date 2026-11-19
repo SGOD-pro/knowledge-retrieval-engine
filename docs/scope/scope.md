@@ -170,7 +170,7 @@ Plan LAYA integration for bounded heuristic and query expansion escalation when 
    - [x] Slice 5.1: Thin executable path with typed contracts, pre reservation gate, bounded admission concurrency, decision state machine, fallback policy, lexical expansion, delivery gate, and single synthesis limit (unsupported routes explicitly unavailable)
    - [ ] Slice 5.2: Multi route expansion thickening (dense, structural, structured non RRF, graph), structured math entry wiring, and ablation suite
 - [x] Verify it: `/check verify LAYA bounded escalation` (Slice 5.1)
-- [ ] Test it: `/test LAYA bounded escalation`
+- [x] Test it: `/test LAYA bounded escalation` (Slice 5.1)
 - [x] Review it (fresh model): `/check review LAYA bounded escalation` (Slice 5.1)
 Spec [0008](../specs/0008-laya-bounded-escalation.md) · code in `backend/src/`
 
