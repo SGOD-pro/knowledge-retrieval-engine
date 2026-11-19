@@ -23,7 +23,7 @@ This update evaluates the implementation and the resolutions to previous finding
 ## Nits
 
 - ⚪ `backend/src/services/retrieval/laya_gate.py:66`, the `_lock` attribute uses `PrivateAttr(default_factory=threading.Lock)` on a Pydantic model where a regular class initialization attribute would be cleaner.
-- ⚪ `backend/src/services/retrieval/laya_concurrency.py:47-55`, reading integer counters under the lock in property accessors adds small overhead on CPython where single word reads are atomic.
+- ⚪ `backend/src/services/retrieval/laya_concurrency.py:47-55`, reading integer counters under the lock in property accessors resolved in commit `7fa305c` by returning attributes directly without locking.
 
 ## Strengths
 
