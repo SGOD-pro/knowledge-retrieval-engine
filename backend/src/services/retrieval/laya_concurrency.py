@@ -45,13 +45,11 @@ class LayaProviderConcurrencyController:
 
     @property
     def active_count(self) -> int:
-        with self._lock:
-            return self._active_workers
+        return self._active_workers
 
     @property
     def queued_count(self) -> int:
-        with self._lock:
-            return self._queued_callers
+        return self._queued_callers
 
     def shutdown(self, wait: bool = False) -> None:
         """Shutdown underlying thread pool executor."""
