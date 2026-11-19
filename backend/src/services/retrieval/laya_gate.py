@@ -23,7 +23,7 @@ import json
 import logging
 import threading
 from typing import Any
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
 from src.schemas.contracts.laya import BaselineEvidenceSummary, LayaEscalationRequest
 
@@ -58,10 +58,7 @@ class LayaBudgetLedger(BaseModel):
     tool_attempts: int = 0
     late_settled_calls: int = 0
     settled_history: list[dict[str, Any]] = Field(default_factory=list)
-
-    def __init__(self, **data: Any) -> None:
-        super().__init__(**data)
-        self._lock = threading.Lock()
+    _lock: threading.Lock = PrivateAttr(default_factory=threading.Lock)
 
     def pre_reserve(
         self,
@@ -114,6 +111,8 @@ class LayaBudgetLedger(BaseModel):
             self.total_latency_ms += max(0.0, latency_ms)
             if is_late:
                 self.late_settled_calls += 1
+            if len(self.settled_history) >= 20:
+                self.settled_history.pop(0)
             self.settled_history.append(
                 {
                     "input_tokens": input_tokens,
@@ -123,6 +122,24 @@ class LayaBudgetLedger(BaseModel):
                     "status": status,
                 }
             )
+
+    def record_invalid_usage(self) -> None:
+        """Mark last settlement or record invalid usage event without double counting spend."""
+        with self._lock:
+            if self.settled_history:
+                self.settled_history[-1]["status"] = "invalid_usage"
+            else:
+                if len(self.settled_history) >= 20:
+                    self.settled_history.pop(0)
+                self.settled_history.append(
+                    {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "latency_ms": 0.0,
+                        "is_late": False,
+                        "status": "invalid_usage",
+                    }
+                )
 
 
 def calculate_phase_deadline(remaining_query_ms: float) -> float:
@@ -233,7 +250,7 @@ def validate_provider_usage(usage: Any, estimated_prompt_tokens: int) -> tuple[i
     - Must be a dictionary.
     - inputTokens must be a positive integer.
     - outputTokens must be a non negative integer <= 250.
-    - inputTokens must not exceed estimated_prompt_tokens + 50 slack for tokenization variance.
+    - inputTokens must not exceed estimated_prompt_tokens + 100 slack for tokenization variance.
     """
     if not isinstance(usage, dict):
         raise InvalidUsageError(f"Usage must be a dictionary, got {type(usage).__name__}")

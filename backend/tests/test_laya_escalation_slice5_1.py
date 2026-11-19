@@ -1086,3 +1086,152 @@ def test_no_progress_clean_refusal():
     assert no_prog is True
     assert len(novel) == 0
     assert st == "no_progress"
+
+
+def test_invalid_usage_fallback_through_decision_service():
+    """Verify InvalidUsageError in decide() falls back to Section 35 policy without TypeError or double settlement."""
+    req = _make_sample_request()
+    ledger = LayaBudgetLedger()
+
+    # Provider response returns out of bound input tokens (2000 > est_prompt_tokens + 100)
+    mock_client = MagicMock()
+    mock_client.converse.return_value = {
+        "output": {
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "toolUse": {
+                            "name": "propose_escalation_route",
+                            "input": {
+                                "route": "lexical_expansion",
+                                "parameters": {"route_type": "lexical_expansion", "query_terms": ["revenue"]},
+                                "confidence": 0.9,
+                                "rationale": "Targeted lexical query",
+                            },
+                        }
+                    }
+                ],
+            }
+        },
+        "usage": {"inputTokens": 2000, "outputTokens": 50},
+    }
+
+    ctrl = LayaProviderConcurrencyController()
+    service = LayaDecisionService(client=mock_client, concurrency_controller=ctrl)
+    try:
+        decision = service.decide(request=req, deadline_remaining_ms=2500.0, ledger=ledger)
+
+        # Must fall back gracefully to deterministic policy with rejected_by_code
+        assert decision.route == "lexical_expansion"
+        assert decision.execution_status == "rejected_by_code"
+        assert "Invalid provider usage" in decision.rationale
+
+        # Must not double settle spend: concurrency callback settled 2000/50 once
+        assert ledger.total_input_tokens == 2000
+        assert ledger.total_output_tokens == 50
+        assert len(ledger.settled_history) == 1
+        assert ledger.settled_history[-1]["status"] == "invalid_usage"
+    finally:
+        ctrl.shutdown(wait=False)
+
+
+def test_missing_usage_dict_fallback_through_decision_service():
+    """Verify missing usage dictionary in provider response falls back to Section 35 policy cleanly."""
+    req = _make_sample_request()
+    ledger = LayaBudgetLedger()
+
+    mock_client = MagicMock()
+    mock_client.converse.return_value = {
+        "output": {
+            "message": {
+                "role": "assistant",
+                "content": [{"text": "Unexpected free-form text without usage"}],
+            }
+        }
+    }
+
+    ctrl = LayaProviderConcurrencyController()
+    service = LayaDecisionService(client=mock_client, concurrency_controller=ctrl)
+    try:
+        decision = service.decide(request=req, deadline_remaining_ms=2500.0, ledger=ledger)
+
+        assert decision.route == "lexical_expansion"
+        assert decision.execution_status == "rejected_by_code"
+        assert "Invalid provider usage" in decision.rationale
+        assert ledger.total_input_tokens == 0
+        assert ledger.total_output_tokens == 0
+        assert len(ledger.settled_history) == 1
+        assert ledger.settled_history[-1]["status"] == "invalid_usage"
+    finally:
+        ctrl.shutdown(wait=False)
+
+
+def test_dynamic_missing_dimension_derivation_in_pipeline():
+    """Verify run_laya_escalation maps various failure modes to proper missing dimensions."""
+    mock_client = MagicMock()
+    captured_requests: list[LayaEscalationRequest] = []
+
+    class MockService(LayaDecisionService):
+        def decide(self, request: LayaEscalationRequest, deadline_remaining_ms: float, ledger: LayaBudgetLedger) -> LayaEscalationDecision:
+            captured_requests.append(request)
+            return get_deterministic_fallback_decision(request)
+
+    scenarios = [
+        # (compressed_text, err, recorded_stage, expected_stage, expected_dim)
+        ("", "Empty context", None, "run_fidelity_empty_context", "semantic_concept"),
+        ("Some text", "Math operands missing for EBITDA calculation", None, "run_deterministic_math_operands", "tabular_operand"),
+        ("Some text", "Missing location page 4 breakdown", None, "run_fidelity_coverage", "location"),
+        ("Some text", "Missing relationship between entity A and entity B", None, "run_fidelity_coverage", "relationship"),
+        ("Some text", "Missing exact term Q3_guidance_target", None, "run_fidelity_coverage", "exact_term"),
+    ]
+
+    for comp, err_msg, rec_stage, exp_stage, exp_dim in scenarios:
+        captured_requests.clear()
+        state = {
+            "query": "Where is the specific metric?",
+            "workspace_id": "ws_test_dims",
+            "error": err_msg,
+            "failed_stage": rec_stage,
+            "compressed_text": comp,
+            "candidate_chunks": [],
+            "top_chunks": [],
+            "laya_decision_service": MockService(client=mock_client),
+            "laya_expansion_executor": MagicMock(),
+            "stage_timings": {},
+            "_pipeline_start_time": time.perf_counter(),
+        }
+
+        # Mock expansion executor to report no novel chunks so it completes quickly
+        state["laya_expansion_executor"].execute.return_value = ([], True, "no_progress")
+
+        run_laya_escalation(state)
+
+        assert len(captured_requests) == 1
+        req = captured_requests[0]
+        assert req.missing_requirement.failed_stage == exp_stage
+        assert req.missing_requirement.missing_dimension == exp_dim
+
+
+def test_laya_policy_empty_terms_routes_to_none():
+    """Verify that when no alphanumeric terms can be extracted, deterministic fallback routes to none."""
+    req = LayaEscalationRequest(
+        query_id="q_no_terms",
+        workspace_id="ws_test",
+        query="??? !!! @@@",
+        missing_requirement=MissingRequirementDescription(
+            requirement_id="req_empty_terms",
+            missing_dimension="exact_term",
+            description="Empty evidence",
+            failed_stage="run_fidelity_coverage",
+            detected_gap="??? !!!",
+        ),
+        available_routes=("lexical_expansion", "none"),
+        retrieved_summary=(),
+    )
+
+    decision = get_deterministic_fallback_decision(req)
+    assert decision.route == "none"
+    assert decision.confidence == 0.0
+    assert "No viable terms" in decision.parameters.reason
+

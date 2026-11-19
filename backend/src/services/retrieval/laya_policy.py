@@ -56,7 +56,7 @@ def extract_fallback_query_terms(text: str, max_terms: int = 5) -> tuple[str, ..
     if not terms and words:
         # If all were stop words, pick the first word truncated
         terms.append(words[0][:64])
-    return tuple(terms) if terms else ("query",)
+    return tuple(terms)
 
 
 def get_deterministic_fallback_decision(

@@ -53,6 +53,10 @@ class LayaProviderConcurrencyController:
         with self._lock:
             return self._queued_callers
 
+    def shutdown(self, wait: bool = False) -> None:
+        """Shutdown underlying thread pool executor."""
+        self._executor.shutdown(wait=wait)
+
     def run_provider_call(
         self,
         func: Callable[..., Any],

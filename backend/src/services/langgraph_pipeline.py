@@ -4,6 +4,7 @@ import logging
 import re
 import time
 from typing import Any, TypedDict
+import uuid
 
 from langgraph.graph import END, START, StateGraph
 
@@ -19,19 +20,32 @@ from services.retrieval.page_index_retriever import PageIndexRetriever
 from services.retrieval.planner import Plan, planner
 from services.retrieval.reranker import rerank
 from services.retrieval.vector_retriever import VectorRetriever
-import uuid
-from src.schemas.contracts.laya import (
-    BaselineEvidenceSummary,
-    LayaEscalationDecision,
-    LayaEscalationRequest,
-    MissingRequirementDescription,
-)
-from src.services.retrieval.laya_executor import LayaExpansionExecutor
-from src.services.retrieval.laya_gate import (
-    LayaBudgetLedger,
-    calculate_phase_deadline,
-)
-from src.services.retrieval.laya_service import LayaDecisionService
+try:
+    from schemas.contracts.laya import (
+        BaselineEvidenceSummary,
+        LayaEscalationDecision,
+        LayaEscalationRequest,
+        MissingRequirementDescription,
+    )
+    from services.retrieval.laya_executor import LayaExpansionExecutor
+    from services.retrieval.laya_gate import (
+        LayaBudgetLedger,
+        calculate_phase_deadline,
+    )
+    from services.retrieval.laya_service import LayaDecisionService
+except ImportError:
+    from src.schemas.contracts.laya import (
+        BaselineEvidenceSummary,
+        LayaEscalationDecision,
+        LayaEscalationRequest,
+        MissingRequirementDescription,
+    )
+    from src.services.retrieval.laya_executor import LayaExpansionExecutor
+    from src.services.retrieval.laya_gate import (
+        LayaBudgetLedger,
+        calculate_phase_deadline,
+    )
+    from src.services.retrieval.laya_service import LayaDecisionService
 
 logger = logging.getLogger(__name__)
 
@@ -923,6 +937,7 @@ def run_reranker(state: PipelineState):
     if isinstance(rerank_res, tuple) and len(rerank_res) == 2:
         top_chunks, reranker_mode = rerank_res
     else:
+        # Accommodate test doubles in legacy phase tests returning bare chunk list
         top_chunks = rerank_res
         reranker_mode = getattr(rerank_res, "reranker_mode", RerankerMode.BYPASSED.value)
     latency_ms = (time.perf_counter() - t0) * 1000.0
@@ -1299,13 +1314,42 @@ def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
 
     err = state.get("error") or "Context insufficient"
     compressed = state.get("compressed_text", "")
-    failed_stage = "run_fidelity_empty_context" if not compressed else "run_fidelity_coverage"
+
+    # Derive failed stage from state or context failure mode
+    failed_stage_recorded = state.get("failed_stage")
+    if failed_stage_recorded in (
+        "run_fidelity_coverage",
+        "run_fidelity_empty_context",
+        "run_deterministic_math_operands",
+    ):
+        failed_stage = failed_stage_recorded
+    elif not compressed:
+        failed_stage = "run_fidelity_empty_context"
+    elif "math" in str(err).lower() or "operand" in str(err).lower():
+        failed_stage = "run_deterministic_math_operands"
+    else:
+        failed_stage = "run_fidelity_coverage"
+
+    # Derive missing dimension from failed stage and error indicators
+    err_str = str(err).lower()
+    if failed_stage == "run_fidelity_empty_context":
+        missing_dimension = "semantic_concept"
+    elif failed_stage == "run_deterministic_math_operands":
+        missing_dimension = "tabular_operand"
+    elif "location" in err_str or "page" in err_str or "section" in err_str:
+        missing_dimension = "location"
+    elif "relationship" in err_str or "entity" in err_str or "connect" in err_str:
+        missing_dimension = "relationship"
+    elif "table" in err_str or "operand" in err_str or "calc" in err_str:
+        missing_dimension = "tabular_operand"
+    else:
+        missing_dimension = "exact_term"
 
     from services.retrieval.response_builder import build_citation
 
     req_desc = MissingRequirementDescription(
         requirement_id=f"req_{uuid.uuid4().hex[:8]}",
-        missing_dimension="exact_term",
+        missing_dimension=missing_dimension,
         description=f"Evidence gap detected during {failed_stage}",
         failed_stage=failed_stage,
         detected_gap=str(err)[:300],
@@ -1386,6 +1430,12 @@ def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
     }
 
     if novel_chunks and not no_progress:
+        # Note on design choice for Slice 5.1:
+        # Post expansion reranking, recompression, fidelity rechecking, and single synthesis
+        # are executed as an inline sequence of pure state transformer calls within this node.
+        # This matches the bounded specification requirement for immediate deterministic resolution.
+        # Slice 5.2 may restructure this flow as an explicit LangGraph subgraph.
+
         # 1. Pool novel chunks with baseline candidates
         merged_candidates = list(state.get("candidate_chunks", [])) + novel_chunks
         current_state = {**state, **updated_state, "candidate_chunks": merged_candidates}

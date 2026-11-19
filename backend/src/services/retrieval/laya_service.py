@@ -162,14 +162,8 @@ class LayaDecisionService:
             in_tok, out_tok = validate_provider_usage(usage, est_prompt_tokens)
         except InvalidUsageError as e:
             logger.error("laya.invalid_usage error=%s usage=%s", e, usage)
-            # Settle known spent tokens fail closed
-            ledger.settle_spend(
-                in_tok=usage.get("inputTokens", 0) if isinstance(usage, dict) and isinstance(usage.get("inputTokens"), int) else 0,
-                out_tok=usage.get("outputTokens", 0) if isinstance(usage, dict) and isinstance(usage.get("outputTokens"), int) else 0,
-                latency_ms=0.0,
-                is_late=False,
-                status="invalid_usage",
-            )
+            # Record invalid usage status without double counting already settled spend
+            ledger.record_invalid_usage()
             fallback = get_deterministic_fallback_decision(request, f"Invalid provider usage: {e}")
             return fallback.model_copy(update={"execution_status": "rejected_by_code"})
 

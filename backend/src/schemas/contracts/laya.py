@@ -222,6 +222,7 @@ class LayaEscalationDecision(BaseModel):
         if isinstance(v, bool):
             raise ValueError("confidence must not be a boolean")
         return v
+
     execution_status: Literal[
         "proposed",
         "approved",
