@@ -23,7 +23,7 @@ _These are recommendations to keep your build orderly, not requirements. Skip an
 | 5 | PageIndex structural retrieval | Slice 2 | done |
 | 6 | OKF integration | Slice 3 | done |
 | 7 | Knowledge graph enrichment | Slice 4 | done |
-| 8 | LAYA bounded escalation | Slice 5 | planned |
+| 8 | LAYA bounded escalation | Slice 5 | in-progress |
 | 9 | Evidence verification and answer assembly | Slice 6 | planned |
 | 10 | End to end interface integration | Slice 7 | planned |
 | 11 | Production authentication, workspace membership, and session persistence | Slice 8 | planned |
