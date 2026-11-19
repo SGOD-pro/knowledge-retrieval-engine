@@ -16,9 +16,7 @@ This update evaluates the implementation and the resolutions to previous finding
 **Suggested fix**: In Slice 5.2, call the expansion executor directly with an isolated thread pool or deadline guard rather than sharing the provider concurrency controller.
 
 ### 🟡 Module aliasing at import time, `backend/src/schemas/contracts/laya.py:16-18`
-**Problem**: The module registers itself in sys.modules under an alternate name to reconcile schemas.contracts.laya and src.schemas.contracts.laya.
-**Why it matters**: Modifying sys.modules at import time can create subtle object identity mismatches in debuggers or serialization tools.
-**Suggested fix**: Standardize project import paths across pyproject.toml configuration so runtime module aliasing is unnecessary.
+Resolved in commit `6cd3ebc` by standardizing all imports across test suites and services to use `schemas.contracts.laya` with fallback, eliminating `sys.modules` manipulation entirely.
 
 ## Nits
 
