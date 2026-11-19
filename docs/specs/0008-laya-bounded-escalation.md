@@ -5,7 +5,7 @@
 
 ## Summary
 
-This specification defines bounded LAYA escalation for the query execution pipeline. When initial baseline discovery fails to retrieve sufficient supporting evidence, leaves request coverage incomplete, or encounters missing calculation operands, LAYA activates as a bounded decision model. It never writes user facing answer prose. Instead, it inspects a structured description of missing requirements and proposes one targeted expansion route, such as lexical, dense, structural, graph, or tabular execution. Code strictly validates the proposed route against active permissions, readiness, and budget limits before executing. The pipeline preserves baseline evidence, enforces authoritative resource budgets, guarantees at most one answer synthesis call per query while preserving the final verification reserve, and returns a structured refusal if evidence remains unsupported.
+This specification defines bounded LAYA escalation for the query execution pipeline. When initial baseline discovery fails to retrieve sufficient supporting evidence, leaves request coverage incomplete, or encounters missing calculation operands, LAYA activates as a bounded decision model. It never writes user facing answer prose. Instead, it inspects a structured description of missing requirements and proposes one targeted expansion route, such as lexical, dense, structural, graph, or tabular execution. Code strictly validates the proposed route against active permissions, readiness, and budget limits before executing. The pipeline preserves baseline evidence, enforces authoritative resource budgets, guarantees at most one answer synthesis call per query while preserving the final verification reserve, and returns a structured refusal if evidence remains unsupported. Furthermore, free form generated text is never emitted without passing an authoritative final answer delivery gate.
 
 ## Context
 
@@ -25,19 +25,19 @@ Architecture Decision Record [ADR-004-model-budget-ledger.md](file:///home/swyra
 
 **User stories**:
 - As a retrieval engineer, I want queries with vocabulary mismatch or missing section context to trigger one targeted expansion so that factual answers are retrieved without infinite search loops.
-- As a system operator, I want escalation to enforce strict call, token, and deadline budgets so that complex queries never overrun latency targets or deplete worker capacity.
-- As an enterprise tenant, I want escalation decisions and expanded retrievals to remain strictly isolated within my authorized workspace and active document snapshots, honoring deletion tombstones fail closed.
+- As a system operator, I want escalation to enforce strict call, token, admission, and deadline budgets so that complex queries never overrun latency targets or deplete worker capacity.
+- As an enterprise tenant, I want escalation decisions and expanded retrievals to remain strictly isolated within my authorized workspace and active document snapshots, honoring opaque document versions and deletion tombstones fail closed.
 - As an API consumer, I want queries that remain unsupported after escalation to produce an explicit, structured refusal with zero citations, rather than speculative or unverified hallucinations.
 
 **Acceptance criteria**:
 - **AC-1**: Bounded escalation triggers if and only if initial baseline discovery lacks sufficient evidence support (such as coverage error in fidelity verification, empty compressed context, or missing required tabular operands) and the query budget retains an unused expansion slot (`expansion_steps == 0` and `laya_calls < MAX_QUERY_LAYA_CALLS`). Escalation does not activate when baseline evidence is sufficient, when deterministic math answered the query, or when remaining deadline is below the minimum viable threshold.
-- **AC-2**: LAYA operates strictly as a typed decision model and never emits user facing answer prose. It accepts a typed `LayaEscalationRequest` containing query identity, authorized workspace identity, a structured `MissingRequirementDescription`, and summarized baseline evidence locators. It returns a typed `LayaEscalationDecision` specifying one chosen route (`lexical_expansion`, `dense_expansion`, `structural_expansion`, `graph_expansion`, `structured_expansion`, or `none`) alongside bounded route parameters and an explicit numeric decision confidence. Missing, null, or out of bounds confidence is rejected, and routing confidence is never used to certify evidence sufficiency.
+- **AC-2**: LAYA operates strictly as a typed decision model and never emits user facing answer prose. It accepts a typed `LayaEscalationRequest` containing query identity, authorized workspace identity, a structured `MissingRequirementDescription`, and bounded baseline evidence locators with opaque string versions. It returns a typed `LayaEscalationDecision` specifying one chosen route (`lexical_expansion`, `dense_expansion`, `structural_expansion`, `graph_expansion`, `structured_expansion`, or `none`) alongside bounded route parameters and an explicit numeric decision confidence. The model enforces strict discriminator agreement between `route` and `parameters.route_type`. Missing, null, or out of bounds confidence is rejected, and routing confidence is never used to certify evidence sufficiency.
 - **AC-3**: Code validates the proposed decision before execution through a deterministic state machine. If LAYA proposes an unauthorized route, an inactive feature (such as `graph_expansion` while `GRAPH_ENABLED=false`), an unknown document, or malformed parameters, or if LAYA times out or encounters a provider error, code routes to the deterministic missing requirement policy defined in Architecture Bible section 35. If that fallback route is also unavailable, code transitions to clean refusal. All fallback and alternative paths share the single expansion allowance.
-- **AC-4**: Authoritative resource budgets govern escalation under ADR-004. ADR-004 establishes the global policy limit `MAX_QUERY_LLM_CALLS = 2` across the query lifecycle (reserving 1 synthesis call and 1 final semantic verifier call for free form narrative generation). Slice 5 enforces tighter slice specific limits without redefining global policy: exactly one answer synthesis call (`MAX_SYNTHESIS_CALLS = 1`), at most 1 LAYA decision call per query (`MAX_QUERY_LAYA_CALLS = 1` for escalation), at most 1 targeted expansion step (`MAX_EXPANSION_STEPS = 1`), at most 1000 input prompt tokens, at most 250 output decision tokens, and a phase deadline derived as `min(query_remaining_ms, 2500.0)`. Pre reservation atomically checks slots and token estimates before dispatch, 429 throttling retries are charged as attempts, and worker concurrency is capped at 4 with capacity retention.
-- **AC-5**: Workspace, document version, and tombstone isolation are enforced across escalation. LAYA receives only metadata and evidence bound to the active workspace and pinned snapshot context. Any expanded retrieval executes strictly within the authorized workspace. Active source or workspace tombstones in `WorkspaceBoundaryRepository` are checked dynamically before and after expansion, returning zero candidates immediately fail closed on tombstone detection.
-- **AC-6**: Exactly one answer synthesis call is permitted per query. Answer synthesis (`run_llm`) executes only after all retrieval and verification stages have settled. LAYA decision tokens do not count toward or consume answer generation slots. If evidence remains unsupported after expansion, the pipeline bypasses answer synthesis entirely, returning a deterministic refusal with zero generation calls.
+- **AC-4**: Authoritative resource budgets govern escalation under ADR-004. ADR-004 establishes the global policy limit `MAX_QUERY_LLM_CALLS = 2` across the query lifecycle (reserving 1 synthesis call and 1 final semantic verifier call for free form narrative generation). Slice 5 enforces tighter slice specific limits without redefining global policy: exactly one answer synthesis call (`MAX_SYNTHESIS_CALLS = 1`), at most 1 LAYA decision call per query (`MAX_QUERY_LAYA_CALLS = 1` for escalation), at most 1 targeted expansion step (`MAX_EXPANSION_STEPS = 1`), at most 1000 input prompt tokens, at most 250 output decision tokens, and a phase deadline derived as `min(query_remaining_ms, 2500.0)`. Pre reservation atomically checks slots and token estimates before dispatch, 429 throttling retries are charged as attempts, and worker concurrency is capped at 4 with capacity retention in Slice 5.1.
+- **AC-5**: Workspace, document version, and tombstone isolation are enforced across escalation. LAYA receives only metadata and evidence bound to the active workspace and pinned snapshot context. Document identifiers are strings up to 128 characters, and document versions are opaque strings up to 64 characters, matching [boundary.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/schemas/contracts/boundary.py) and [knowledge_graph.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/schemas/contracts/knowledge_graph.py). Any expanded retrieval executes strictly within the authorized workspace. Active source or workspace tombstones in `WorkspaceBoundaryRepository` are checked dynamically before and after expansion, returning zero candidates immediately fail closed on tombstone detection.
+- **AC-6**: Exactly one answer synthesis call is permitted per query. Answer synthesis (`run_llm`) executes only after all retrieval and verification stages have settled. LAYA decision tokens do not count toward or consume answer generation slots. If evidence remains unsupported after expansion, the pipeline bypasses answer synthesis entirely, returning a deterministic refusal with zero generation calls. Furthermore, free form generated wording cannot be delivered without passing the authoritative final answer delivery gate. If the semantic verifier is unconfigured or unavailable, free form delivery is explicitly blocked, falling back strictly to approved deterministic output or explicit refusal.
 - **AC-7**: Expanded retrieval candidates pool into evidence collection alongside baseline candidates. For narrative routes, candidates are reranked (consuming the second rerank batch allowed under ADR-004) and recompressed. Structured expansion executes outside reciprocal rank fusion directly through TableStore into mandatory execution evidence. Stale refusal state is cleared before rechecking support. If secondary verification succeeds, answer synthesis proceeds; if verification fails, the engine emits a structured refusal (`final_answer="NOT_FOUND"`, `citations=[]`, `confidence_score=0.0`, `retrieval_incomplete=True`). Telemetry records execution details in `QueryResponse.retrieval_candidates`.
-- **AC-8**: Comprehensive offline ablation test harness verifies escalation behavior without paid provider calls. Offline tests use mocked LAYA decision doubles, verifying successful expansion, fallback on provider failure, code rejection of invalid routes, tenant isolation, tombstone halting, no progress suppression, and strict enforcement of the single answer synthesis invariant. Slice 5.1 implements one thin executable vertical path through lexical expansion with unsupported routes explicitly unavailable.
+- **AC-8**: Comprehensive offline ablation test harness verifies escalation behavior without paid provider calls. Offline tests use mocked LAYA decision doubles, verifying successful expansion, fallback on provider failure, code rejection of invalid routes, tenant isolation, tombstone halting, no progress suppression, queue saturation, caller timeout with capacity retention, and strict enforcement of the single answer synthesis invariant. Slice 5.1 implements one thin executable vertical path through lexical expansion with unsupported routes explicitly unavailable.
 
 ## Options considered
 
@@ -52,6 +52,7 @@ Integrate LAYA as a specialized decision node in the LangGraph query pipeline be
 - Code validation acts as an authoritative verification gate, rejecting unauthorized or disabled features.
 - Preserves baseline discovery chunks when expansion fails or produces zero additional evidence.
 - Guarantees at most one answer synthesis call per query while preserving the global verification reserve under ADR-004.
+- Enforces the final delivery gate so that unverified free form text is never emitted.
 
 **Cons**:
 - Does not solve highly exploratory multi question research tasks requiring three or more iterative search hops (accepted, as multi hop exploratory research belongs to offline agent workflows, not low latency query serving).
@@ -100,18 +101,18 @@ Furthermore, gating escalation on verified evidence insufficiency ensures that t
 
 ### Typed Contracts
 
-The contracts are defined as frozen Pydantic models with strict extra field forbidding. All generic Any fields are replaced with bounded, typed models carrying authoritative document and version bindings:
+The contracts are defined as frozen Pydantic models with strict extra field forbidding. All generic Any fields are replaced with bounded, typed models carrying authoritative document, version, and location bindings:
 
 ```python
 from typing import Annotated, Literal, Union
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class MissingRequirementDescription(BaseModel):
     """Structured characterization of missing evidence causing escalation."""
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    requirement_id: str = Field(..., max_length=64)
+    requirement_id: str = Field(..., min_length=1, max_length=64)
     missing_dimension: Literal[
         "location",
         "exact_term",
@@ -119,26 +120,46 @@ class MissingRequirementDescription(BaseModel):
         "relationship",
         "tabular_operand",
     ]
-    description: str = Field(..., max_length=300)
+    description: str = Field(..., min_length=1, max_length=300)
     failed_stage: Literal[
         "run_fidelity_coverage",
         "run_fidelity_empty_context",
         "run_deterministic_math_operands",
     ]
-    detected_gap: str = Field(..., max_length=300)
+    detected_gap: str = Field(..., min_length=1, max_length=300)
 
 
 class BaselineEvidenceSummary(BaseModel):
-    """Authoritative summary of evidence retrieved during baseline discovery."""
+    """Authoritative summary of evidence retrieved during baseline discovery.
+    
+    Document identifiers are strings up to 128 characters.
+    Document versions are opaque strings up to 64 characters, never integers.
+    Coordinates enforce 1 indexed pages and normalized bounding boxes.
+    """
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    chunk_id: str = Field(..., max_length=64)
-    document_id: str = Field(..., max_length=64)
-    document_version: int = Field(..., ge=1)
-    workspace_id: str = Field(..., max_length=64)
-    snippet: str = Field(..., max_length=300)
-    score: float = Field(..., ge=0.0)
+    chunk_id: str = Field(..., min_length=1, max_length=64)
+    document_id: str = Field(..., min_length=1, max_length=128)
+    document_version: str = Field(..., min_length=1, max_length=64)
+    workspace_id: str = Field(..., min_length=1, max_length=64, pattern=r"^ws_[a-zA-Z0-9_-]+$")
+    snippet: str = Field(..., min_length=1, max_length=300)
+    score: float = Field(..., ge=0.0, le=100.0)
     source_kind: Literal["text", "pdf_page", "table_cell", "graph_node"]
+    page_number: int | None = Field(default=None, ge=1, le=10000)
+    bbox: tuple[float, float, float, float] | None = None
+
+    @model_validator(mode="after")
+    def validate_normalized_bbox(self) -> "BaselineEvidenceSummary":
+        if self.bbox is not None:
+            if len(self.bbox) != 4:
+                raise ValueError("bbox must contain exactly 4 coordinates")
+            x0, y0, x1, y1 = self.bbox
+            for coord in (x0, y0, x1, y1):
+                if coord < 0.0 or coord > 1.0:
+                    raise ValueError("bbox coordinates must be between 0.0 and 1.0")
+            if x0 >= x1 or y0 >= y1:
+                raise ValueError("bbox coordinates must satisfy x0 < x1 and y0 < y1")
+        return self
 
 
 class LexicalExpansionParams(BaseModel):
@@ -146,8 +167,18 @@ class LexicalExpansionParams(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
     route_type: Literal["lexical_expansion"] = "lexical_expansion"
 
-    query_terms: tuple[str, ...] = Field(..., min_length=1, max_length=10)
+    query_terms: tuple[str, ...] = Field(..., min_length=1, max_length=5)
     document_ids: tuple[str, ...] = Field(default_factory=tuple, max_length=5)
+
+    @model_validator(mode="after")
+    def validate_item_bounds(self) -> "LexicalExpansionParams":
+        for term in self.query_terms:
+            if not (1 <= len(term) <= 64):
+                raise ValueError("query_terms items must be between 1 and 64 characters")
+        for doc_id in self.document_ids:
+            if not (1 <= len(doc_id) <= 128):
+                raise ValueError("document_ids items must be between 1 and 128 characters")
+        return self
 
 
 class DenseExpansionParams(BaseModel):
@@ -155,8 +186,15 @@ class DenseExpansionParams(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
     route_type: Literal["dense_expansion"] = "dense_expansion"
 
-    concept_query: str = Field(..., min_length=3, max_length=500)
+    concept_query: str = Field(..., min_length=3, max_length=200)
     document_ids: tuple[str, ...] = Field(default_factory=tuple, max_length=5)
+
+    @model_validator(mode="after")
+    def validate_item_bounds(self) -> "DenseExpansionParams":
+        for doc_id in self.document_ids:
+            if not (1 <= len(doc_id) <= 128):
+                raise ValueError("document_ids items must be between 1 and 128 characters")
+        return self
 
 
 class StructuralExpansionParams(BaseModel):
@@ -164,9 +202,16 @@ class StructuralExpansionParams(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
     route_type: Literal["structural_expansion"] = "structural_expansion"
 
-    document_id: str = Field(..., max_length=64)
+    document_id: str = Field(..., min_length=1, max_length=128)
     section_heading: str | None = Field(default=None, max_length=128)
     target_pages: tuple[int, ...] = Field(default_factory=tuple, max_length=5)
+
+    @model_validator(mode="after")
+    def validate_page_bounds(self) -> "StructuralExpansionParams":
+        for page in self.target_pages:
+            if not (1 <= page <= 10000):
+                raise ValueError("target_pages items must be between 1 and 10000")
+        return self
 
 
 class GraphExpansionParams(BaseModel):
@@ -174,9 +219,16 @@ class GraphExpansionParams(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
     route_type: Literal["graph_expansion"] = "graph_expansion"
 
-    seed_entity_id: str = Field(..., max_length=64)
+    seed_entity_id: str = Field(..., min_length=1, max_length=64)
     relation_types: tuple[str, ...] = Field(default_factory=tuple, max_length=5)
     max_hops: int = Field(default=1, ge=1, le=2)
+
+    @model_validator(mode="after")
+    def validate_item_bounds(self) -> "GraphExpansionParams":
+        for rel in self.relation_types:
+            if not (1 <= len(rel) <= 64):
+                raise ValueError("relation_types items must be between 1 and 64 characters")
+        return self
 
 
 class StructuredExpansionParams(BaseModel):
@@ -184,9 +236,19 @@ class StructuredExpansionParams(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
     route_type: Literal["structured_expansion"] = "structured_expansion"
 
-    table_name: str = Field(..., max_length=64)
+    table_name: str = Field(..., min_length=1, max_length=128)
     required_columns: tuple[str, ...] = Field(..., min_length=1, max_length=10)
     filter_predicates: tuple[str, ...] = Field(default_factory=tuple, max_length=5)
+
+    @model_validator(mode="after")
+    def validate_item_bounds(self) -> "StructuredExpansionParams":
+        for col in self.required_columns:
+            if not (1 <= len(col) <= 64):
+                raise ValueError("required_columns items must be between 1 and 64 characters")
+        for pred in self.filter_predicates:
+            if not (1 <= len(pred) <= 128):
+                raise ValueError("filter_predicates items must be between 1 and 128 characters")
+        return self
 
 
 class NoneExpansionParams(BaseModel):
@@ -214,12 +276,12 @@ class LayaEscalationRequest(BaseModel):
     """Input payload provided to the LAYA decision model."""
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    query_id: str = Field(..., max_length=64)
-    workspace_id: str = Field(..., max_length=64)
-    query: str = Field(..., max_length=1000)
+    query_id: str = Field(..., min_length=1, max_length=64)
+    workspace_id: str = Field(..., min_length=1, max_length=64, pattern=r"^ws_[a-zA-Z0-9_-]+$")
+    query: str = Field(..., min_length=1, max_length=1000)
     missing_requirement: MissingRequirementDescription
-    available_routes: tuple[str, ...] = Field(default_factory=tuple)
-    retrieved_summary: tuple[BaselineEvidenceSummary, ...] = Field(default_factory=tuple)
+    available_routes: tuple[str, ...] = Field(default_factory=tuple, max_length=6)
+    retrieved_summary: tuple[BaselineEvidenceSummary, ...] = Field(default_factory=tuple, max_length=10)
     caller_deadline_ms: float = Field(default=2500.0, ge=0.0)
 
 
@@ -227,7 +289,7 @@ class LayaEscalationDecision(BaseModel):
     """Typed decision output produced by LAYA and validated by code."""
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    decision_id: str = Field(..., max_length=64)
+    decision_id: str = Field(..., min_length=1, max_length=64)
     route: Literal[
         "lexical_expansion",
         "dense_expansion",
@@ -247,6 +309,16 @@ class LayaEscalationDecision(BaseModel):
         "timeout",
         "storage_failed",
     ] = "proposed"
+
+    @model_validator(mode="after")
+    def validate_route_parameter_agreement(self) -> "LayaEscalationDecision":
+        """Enforce strict agreement between route discriminator and parameters.route_type."""
+        if self.route != self.parameters.route_type:
+            raise ValueError(
+                f"Route discriminator mismatch: route '{self.route}' does not match "
+                f"parameters.route_type '{self.parameters.route_type}'"
+            )
+        return self
 ```
 
 ### Confidence Semantics
@@ -276,7 +348,7 @@ In `langgraph_pipeline.py`, LAYA is integrated via conditional routing after ini
       |
 [run_fidelity (evidence check)]
       |
-      +---> (evidence sufficient) ------------> [run_llm (single synthesis)] ---> [END]
+      +---> (evidence sufficient) ------------> [final_answer_delivery_gate] ---> [run_llm] ---> [END]
       |
       +---> (coverage error or empty context)
                  |
@@ -319,10 +391,32 @@ When `SelectedExpansion` executes and finishes:
    - The top reranked chunks pass to `run_compressor` to construct an updated `compressed_text`.
 3. **Clearing Stale Refusal State**:
    - Stale refusal attributes recorded during the initial failure (`state["error"] = None`, `state["final_answer"] = None`, `state["citations"] = []`) are cleared before rechecking support.
-4. **Secondary Support Verification**:
+4. **Secondary Support Verification and Final Delivery Gate**:
    - The pipeline invokes `run_fidelity` on the updated context.
-   - If fidelity succeeds (`error is None`), the pipeline transitions to `run_llm` for single answer synthesis.
+   - If fidelity succeeds (`error is None`), the pipeline evaluates the final answer delivery gate:
+     - If the required final semantic verifier is configured, the pipeline invokes `run_llm` for single answer synthesis, followed by the verifier check.
+     - If the semantic verifier is unconfigured or unavailable, free form delivery is explicitly blocked, and the engine emits approved deterministic excerpts or refusal.
    - If fidelity fails (`error` raised again) or if expansion produced no progress, the pipeline transitions to clean refusal (`final_answer = "NOT_FOUND"`, `citations = []`, `confidence_score = 0.0`, `retrieval_incomplete = True`), bypassing `run_llm` completely.
+
+### Final Answer Delivery Gate (ADR-004)
+
+Under ADR-004, reserving a finishing capacity slot (1 synthesis call + 1 final semantic verifier call) is a necessary budget precondition, but **reserving a slot alone is insufficient to permit delivery of free form generated prose to the caller**.
+
+The final answer delivery gate enforces the following operational rules:
+1. **Verifier Interface and Ownership**:
+   - The authoritative verification contract is [verification.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/schemas/contracts/verification.py) via `VerificationRecord`.
+   - Ownership of final verification belongs to Slice 6 (Feature 9, Evidence verification and answer assembly), which runs the final verifier.
+   - In Slice 5 (LAYA escalation), the pipeline guarantees at most one answer synthesis call (`MAX_SYNTHESIS_CALLS = 1`), preserving the remaining generation slot for this verifier under the ADR-004 global limit `MAX_QUERY_LLM_CALLS = 2`.
+2. **Delivery Blocking Rule**:
+   - Before free form synthesized prose can be emitted in `QueryResponse`, the output must pass either:
+     (a) The configured final generative semantic verifier (`verifier_type="generative"` consuming the second generation call slot), or
+     (b) An evaluated encoder verifier (`verifier_type="encoder"` under `MAX_QUERY_ENCODER_VERIFY_CALLS = 1`), alongside mandatory mechanical citation checks.
+   - If the required semantic verifier is unconfigured, disabled, or unavailable in the environment, **free form generated delivery is explicitly blocked**.
+   - In that event, the engine falls back strictly to approved deterministic outputs:
+     (a) Deterministic verified factual excerpts (`verified_answer` from `extract_verified_fact`),
+     (b) Deterministic table calculation templates from TableStore math, or
+     (c) Explicit structured refusal (`final_answer="NOT_FOUND"`, `citations=[]`, `retrieval_incomplete=True`).
+   - Unverified free form synthesized prose is never delivered to the caller.
 
 ### Resource Budget Accounting and Invocations
 
@@ -343,15 +437,25 @@ Escalation adheres strictly to the budget governance model established in ADR-00
    - Provider retries are counted and charged against query budgets.
    - If an HTTP 429 rate limit is encountered, the attempt is charged against `MAX_TOOL_ATTEMPTS = 3`.
    - At most 1 retry is permitted for HTTP 429 if the remaining phase deadline permits. If the retry fails or times out, execution transitions to the deterministic fallback policy.
-5. **Authoritative Token Preflight**:
-   - Before making a network call, prompt text is evaluated using local tokenizer `count_tokens`.
-   - If input exceeds 1000 tokens, baseline evidence snippets are truncated deterministically to fit within 1000 tokens. If compliant prompt length cannot be achieved, the call is rejected before any billable provider call is made.
+5. **Authoritative Token Preflight and Usage Handling**:
+   - Token preflight is bound to the configured provider model (`settings.LAYA_BEDROCK_MODEL_ID` or active Bedrock client) and the complete serialized request payload (system prompt plus user message with serialized `LayaEscalationRequest` JSON).
+   - Preflight invokes supported authoritative counting: `client.count_tokens(modelId=model_id, input={"converse": {"messages": messages, "system": system}})`.
+   - If `count_tokens` is unsupported on the client or provider, the pipeline evaluates a defensible token upper bound. If no defensible bound is available, the gate **fails closed** immediately without dispatching a network call.
+   - Estimated prompt tokens must not exceed 1000 (`estimated_prompt_tokens <= 1000`). If exceeded, baseline evidence snippets are truncated deterministically to fit within 1000 tokens. If compliant prompt length cannot be achieved, the call is rejected before any billable provider call is made.
+   - The provider request explicitly sets `inferenceConfig={"maxTokens": 250, "temperature": 0.0}`.
+   - Per call output token cap is strictly 250 tokens (`max_output_tokens = 250`).
+   - Upon provider response, `response.get("usage")` is inspected. Usage must be a dictionary containing valid positive integer `inputTokens` and non negative integer `outputTokens`.
+   - If usage is missing, non integer, negative, or if `outputTokens > 250`, or if `inputTokens > estimated_prompt_tokens`: the pipeline treats the response as invalid provider usage, fails closed, settles known spent tokens in the ledger, and transitions immediately to `DefaultPolicy` without leaking unmetered usage.
 6. **Dynamic Deadline Calculation**:
    - The escalation phase deadline is calculated as `phase_deadline_ms = min(query_remaining_ms, 2500.0)`.
    - If `phase_deadline_ms < 500.0` ms, escalation is aborted immediately, failing closed to refusal without calling the provider.
-7. **Admission Queue and Worker Capacity Retention**:
-   - An in process admission queue caps active concurrent LAYA escalation workers at 4, with a bounded wait queue of 8 slots.
-   - When the admission queue is full, incoming escalation requests do not block worker threads; they shed immediately, retaining core engine capacity, and fall back to the deterministic section 35 policy or clean refusal.
+7. **Bounded Admission and Worker Capacity Retention (Slice 5.1)**:
+   - Implemented in Slice 5.1 as `LayaProviderConcurrencyController` alongside the first provider invocation:
+     - Global process admission queue caps active concurrent LAYA escalation workers at 4 (`max_concurrency = 4`).
+     - Bounded wait queue caps waiting callers at 8 (`max_queue = 8`).
+     - Load shedding: when the wait queue is full (8 callers queued), incoming escalation requests are rejected immediately with admission rejection, falling back to deterministic section 35 policy without blocking worker threads.
+     - Capacity retention: when a caller deadline expires while waiting or during invocation (caller timeout), the underlying worker slot in the semaphore and thread pool is retained until the underlying provider call completes, preventing caller timeouts from flooding the provider.
+     - Late completion discarding: if an underlying provider completion returns after caller timeout or cancellation, its result is discarded and does not mutate finished query state.
 
 ### Value sourcing
 
@@ -360,9 +464,10 @@ Escalation adheres strictly to the budget governance model established in ADR-00
 | Trigger escalation | Escalation trigger decision | Derived in `run_fidelity` or `run_deterministic_math` when evidence is missing and `expansion_steps < 1` |
 | Formulate missing requirement | `MissingRequirementDescription` | Derived from fidelity verification gap analysis or missing structured column operands |
 | Decide expansion route | `LayaEscalationDecision` | Computed by LAYA model or fallback deterministic missing requirement policy |
-| Validate route | Route approval / rejection | Computed by code validation against active settings, workspace permissions, and tombstones |
+| Validate route | Route approval / rejection | Computed by code validation against active settings, workspace permissions, discriminator agreement, and tombstones |
 | Execute expansion | Expanded candidate chunks | Retrieved from existing BM25, Vector, PageIndex, OKF, or TableStore adapters |
-| Answer synthesis | Final synthesis text | Synthesized in `run_llm` if and only if secondary evidence verification passes |
+| Verify delivery gate | Gate approval / block | Evaluated against verifier readiness; blocks free form prose if semantic verifier is unavailable |
+| Answer synthesis | Final synthesis text | Synthesized in `run_llm` if and only if secondary evidence verification and delivery gate pass |
 | Answer refusal | `final_answer = "NOT_FOUND"` | Emitted deterministically with empty citations when evidence remains insufficient |
 | Telemetry logging | `laya_*` debug trace | Recorded in `QueryResponse.retrieval_candidates` from LAYA execution timings and tokens |
 
@@ -370,16 +475,17 @@ Escalation adheres strictly to the budget governance model established in ADR-00
 
 1. **Strict Decision Boundary**: LAYA returns only routing decisions; it never generates answer text or user facing responses.
 2. **At Most One Answer Synthesis**: Exactly one answer synthesis call can execute per query (`MAX_SYNTHESIS_CALLS = 1`). This respects ADR-004 by keeping total generation calls within `MAX_QUERY_LLM_CALLS = 2` while preserving the final semantic verification reserve.
-3. **Shared Single Expansion Allowance**: `MAX_EXPANSION_STEPS = 1`. All escalation paths (whether LAYA proposed or deterministic fallback, whether first choice or baseline alternative) share this single allowance. Escalation never chains into secondary or tertiary expansion loops.
-4. **Code Validation Primacy**: Model proposed routes are untrusted suggestions. Code validates permissions, feature flags, version bindings, and budgets before executing any expansion.
-5. **Fail Closed Baseline Preservation**: Any error, timeout, or invalid proposal during escalation leaves baseline evidence intact and fails closed without throwing unhandled exceptions.
-6. **No Progress Suppression**: If an expansion retrieves chunks that are already present in the candidate pool, escalation terminates immediately without further attempts.
-7. **Structured Execution Independence**: Structured expansions execute directly through the approved TableStore executor outside reciprocal rank fusion, rejoining mandatory execution evidence.
+3. **Final Delivery Gate Primacy**: Reserving a slot is not sufficient for delivery. Free form generated text is never emitted without passing final verification; if the verifier is unavailable, delivery is blocked in favor of approved deterministic output or refusal.
+4. **Shared Single Expansion Allowance**: `MAX_EXPANSION_STEPS = 1`. All escalation paths (whether LAYA proposed or deterministic fallback, whether first choice or baseline alternative) share this single allowance. Escalation never chains into secondary or tertiary expansion loops.
+5. **Code Validation Primacy**: Model proposed routes are untrusted suggestions. Code validates permissions, discriminator agreement, feature flags, opaque version bindings, and budgets before executing any expansion.
+6. **Fail Closed Baseline Preservation**: Any error, timeout, or invalid proposal during escalation leaves baseline evidence intact and fails closed without throwing unhandled exceptions.
+7. **No Progress Suppression**: If an expansion retrieves chunks that are already present in the candidate pool, escalation terminates immediately without further attempts.
+8. **Structured Execution Independence**: Structured expansions execute directly through the approved TableStore executor outside reciprocal rank fusion, rejoining mandatory execution evidence.
 
 ### Security and Isolation Model
 
 - Tenant boundary: All LAYA invocations pass explicit `workspace_id`. Prompt context contains only documents authorized in the current workspace.
-- Version binding: Expansion lookups target only active document versions pinned in `PinnedSnapshotContext`.
+- Version binding: Expansion lookups target only active document versions pinned in `PinnedSnapshotContext`. Document versions are preserved as opaque strings (max 64 chars) and are never converted to integers.
 - Dynamic tombstone check: `WorkspaceBoundaryRepository.has_tombstone` is re verified before dispatching any expanded retrieval. If a source was deleted during query execution, the expansion returns zero candidates immediately fail closed.
 
 ### Critical test scenarios
@@ -389,32 +495,38 @@ Escalation adheres strictly to the budget governance model established in ADR-00
 - **Scenario 3 (Code Rejection of Disabled Route and Deterministic Fallback)**: LAYA proposes `graph_expansion` while `GRAPH_ENABLED=false`. Code validation rejects the proposal, falls back to deterministic section 35 lexical expansion, consumes the single expansion step, and succeeds or terminates cleanly without graph access. Baseline retrieval is preserved. (AC-3, AC-5)
 - **Scenario 4 (Provider Timeout and Deterministic Policy)**: LAYA provider call times out. Pipeline catches the timeout fail closed, executes the deterministic section 35 route within remaining deadline, or emits clean refusal if time is exhausted. (AC-3, AC-4)
 - **Scenario 5 (HTTP 429 Attempt Charging and Termination)**: LAYA encounters an HTTP 429 response. Attempt is charged to budget. Single allowed retry succeeds within deadline, or fails and falls back to deterministic policy without budget leak. (AC-4)
-- **Scenario 6 (Token Preflight Truncation)**: Request with oversized evidence summary is truncated deterministically by token preflight to stay within 1000 input tokens before billable provider invocation. (AC-4)
+- **Scenario 6 (Authoritative Token Preflight and Truncation)**: Preflight evaluates the complete request via `count_tokens`. An oversized evidence summary is truncated deterministically to stay within 1000 input tokens before billable provider invocation. If unavailable, defensible bound or fail closed logic is exercised. (AC-4)
 - **Scenario 7 (Deadline Bounding and Early Abort)**: Query has only 300 ms remaining when fidelity fails. Escalation calculates `phase_deadline_ms = 300 < 500` ms, aborts immediately without calling LAYA, and emits clean refusal. (AC-1, AC-4)
 - **Scenario 8 (Missing Structured Operands Entry and Non RRF Execution)**: Structured math query misses required columns. Entry path routes to LAYA, proposing `structured_expansion`. TableStore fetches columns directly outside reciprocal rank fusion, math evaluates deterministically to final answer, and `run_llm` is not invoked. (AC-1, AC-6, AC-7)
 - **Scenario 9 (Empty Context Entry Path)**: Discovery retrieves zero chunks (`compressed_text=""`). Fidelity detects empty context and triggers escalation rather than immediate failure. Lexical expansion finds chunks, secondary fidelity passes, and single synthesis executes. (AC-1, AC-7)
 - **Scenario 10 (Invalid Confidence Rejection)**: LAYA returns decision with missing confidence or confidence equal to 1.5. Code validation rejects decision, executes deterministic fallback, and asserts routing confidence is not treated as evidence sufficiency. (AC-2, AC-3)
 - **Scenario 11 (Tombstoned Source Rejection)**: LAYA proposes structural expansion on a document that has an active deletion tombstone. Code detects tombstone, suppresses expansion, and returns zero additional candidates. (AC-5)
 - **Scenario 12 (No Progress Refusal)**: LAYA expansion returns chunks identical to those already retrieved. No progress detector halts escalation. Pipeline refuses cleanly with `NOT_FOUND` and zero answer generation calls. (AC-6, AC-7)
+- **Scenario 13 (Route Discriminator Mismatch Rejection)**: Decision specifies `route="lexical_expansion"` but passes `DenseExpansionParams`. Schema validation rejects decision with discriminator mismatch error, routing to deterministic fallback. (AC-2, AC-3)
+- **Scenario 14 (Oversized Payload Rejection)**: Request payload passes `retrieved_summary` with 11 items, `query_terms` with 6 items, term length > 64, or page number 0. Pydantic validation rejects the malformed payload fail closed. (AC-2, AC-5)
+- **Scenario 15 (Queue Saturation and Load Shedding)**: Concurrency controller receives 9th queued escalation request when 8 slots are already occupied. Admission is rejected immediately with load shedding, falling back to deterministic policy without thread blocking. (AC-4)
+- **Scenario 16 (Caller Timeout with Capacity Retention and Late Completion Discarding)**: Caller deadline expires after 1.0s while underlying Bedrock call takes 1.8s. Controller retains worker slot until completion, preventing thread leak or provider stampede. Late completion arriving after caller exit is discarded without mutating state. (AC-4)
+- **Scenario 17 (Final Delivery Gate Blocks Free Form Delivery)**: Expansion and secondary fidelity pass, but generative semantic verifier is unconfigured in the environment. Delivery gate blocks free form synthesis, falling back to verified deterministic excerpt or refusal, proving that reserving a slot alone does not emit unverified text. (AC-6)
+- **Scenario 18 (Missing or Invalid Provider Usage Handling)**: Bedrock response returns missing usage dict, negative input tokens, or output tokens exceeding 250. Gate catches invalid usage, fails closed, settles spent tokens, and executes deterministic fallback. (AC-4)
 
 ## Build plan (Tracer Bullet Approach)
 
 The build plan follows a vertical Tracer Bullet slice, implementing the thinnest end to end path through the layers first:
 
-### Slice 5.1: Thin Executable Path (Lexical Expansion and Safety Gate)
-1. **Contracts and Error Envelopes**: Implement frozen Pydantic models `MissingRequirementDescription`, `BaselineEvidenceSummary`, `LayaEscalationRequest`, `LayaEscalationDecision`, and typed route parameter models in `backend/src/schemas/contracts/laya.py`. Satisfies **AC-2**.
+### Slice 5.1: Thin Executable Path (Lexical Expansion, Safety Gate, and Bounded Admission)
+1. **Contracts and Error Envelopes**: Implement frozen Pydantic models `MissingRequirementDescription`, `BaselineEvidenceSummary`, `LayaEscalationRequest`, `LayaEscalationDecision`, and typed route parameter models with discriminator agreement and bounded payload lengths in `backend/src/schemas/contracts/laya.py`. Opaque string versions (max 64 chars) and document IDs (max 128 chars) match existing contracts. Satisfies **AC-2**, **AC-5**.
 2. **Deterministic Missing Requirement Policy**: Implement Architecture Bible section 35 deterministic fallback rules in `backend/src/services/retrieval/laya_policy.py`, mapping missing dimensions to approved expansion routes. Satisfies **AC-3**.
-3. **Pre Reservation and Preflight Gate**: Implement pre reservation checks, token preflight estimation, and deadline calculation `min(query_remaining_ms, 2500.0)` in `backend/src/services/retrieval/laya_gate.py`. Satisfies **AC-4**.
-4. **LAYA Decision Provider Boundary**: Implement `LayaDecisionService` in `backend/src/services/retrieval/laya_service.py` with Bedrock Converse structured output parsing and offline test double injection. In Slice 5.1, unsupported routes (`structural_expansion`, `dense_expansion`, `graph_expansion`, `structured_expansion`) are explicitly registered as unavailable, causing code validation to reject them or fall back. Satisfies **AC-2**, **AC-3**, **AC-4**.
-5. **Targeted Lexical Expansion Handler**: Wire targeted single pass BM25 retrieval handler in `LayaExpansionExecutor`. Satisfies **AC-1**, **AC-5**.
-6. **LangGraph Pipeline Integration**: Wire `run_laya_escalation` node into `backend/src/services/langgraph_pipeline.py` between `run_fidelity` and `run_llm`, clearing stale refusal state upon expansion, reranking, recompressing, and enforcing the single synthesis call limit. Satisfies **AC-1**, **AC-6**, **AC-7**.
-7. **Offline Slice 5.1 Test Suite**: Implement offline regression suite in `backend/tests/test_laya_escalation_slice5_1.py` exercising lexical expansion, code rejection of unavailable routes, deterministic fallback, token preflight, and single synthesis limit with mocked providers. Satisfies **AC-8**.
+3. **Pre Reservation and Preflight Gate**: Implement atomic pre reservation checks, authoritative `count_tokens` preflight estimation with defensible bound fallback, and deadline calculation `min(query_remaining_ms, 2500.0)` in `backend/src/services/retrieval/laya_gate.py`. Satisfies **AC-4**.
+4. **Bounded Admission and Capacity Retention**: Implement `LayaProviderConcurrencyController` in `backend/src/services/retrieval/laya_concurrency.py` capping active workers at 4, queuing at 8, enforcing immediate load shedding on saturation, capacity retention on caller timeout, and late completion discarding. Satisfies **AC-4**.
+5. **LAYA Decision Provider Boundary**: Implement `LayaDecisionService` in `backend/src/services/retrieval/laya_service.py` with Bedrock Converse structured output parsing (`inferenceConfig` maxTokens 250, temperature 0.0), usage dictionary validation, output cap enforcement, and offline test double injection. In Slice 5.1, unsupported routes (`structural_expansion`, `dense_expansion`, `graph_expansion`, `structured_expansion`) are explicitly registered as unavailable, causing code validation to reject them or fall back. Satisfies **AC-2**, **AC-3**, **AC-4**.
+6. **Targeted Lexical Expansion Handler**: Wire targeted single pass BM25 retrieval handler in `LayaExpansionExecutor`. Satisfies **AC-1**, **AC-5**.
+7. **LangGraph Pipeline Integration and Final Delivery Gate**: Wire `run_laya_escalation` node into `backend/src/services/langgraph_pipeline.py` between `run_fidelity` and `run_llm`, clearing stale refusal state upon expansion, reranking, recompressing, enforcing the single synthesis call limit, and gating free form delivery against verifier availability. Satisfies **AC-1**, **AC-6**, **AC-7**.
+8. **Offline Slice 5.1 Test Suite**: Implement offline regression suite in `backend/tests/test_laya_escalation_slice5_1.py` exercising lexical expansion, code rejection of unavailable routes, deterministic fallback, token preflight, discriminator validation, queue saturation, caller timeout with capacity retention, late completion discarding, delivery gate blocking, and single synthesis limit with mocked providers. Satisfies **AC-8**.
 
-### Slice 5.2: Bounded Multi Route Thickening and Concurrency
+### Slice 5.2: Bounded Multi Route Thickening
 1. **Remaining Expansion Handlers**: Wire targeted handlers for `dense_expansion` (vector search), `structural_expansion` (PageIndex), `structured_expansion` (TableStore non RRF execution), and optional `graph_expansion` when `GRAPH_ENABLED=true`.
-2. **Admission Queue Concurrency Guard**: Implement 4 worker admission queue with bounded wait slots and capacity retention in `LayaAdmissionQueue`.
-3. **Structured Math Entry Wiring**: Wire missing operand detection in `run_deterministic_math` to trigger escalation into `structured_expansion`.
-4. **Comprehensive Offline Ablation Suite**: Implement `backend/tests/test_laya_escalation_slice5_2.py` covering multi route dispatch, admission queue shedding, 429 retry charging, and full telemetry reporting.
+2. **Structured Math Entry Wiring**: Wire missing operand detection in `run_deterministic_math` to trigger escalation into `structured_expansion`.
+3. **Comprehensive Offline Ablation Suite**: Implement `backend/tests/test_laya_escalation_slice5_2.py` covering multi route dispatch, 429 retry charging, and full telemetry reporting across all expanded paths.
 
 ## Consequences
 
@@ -423,9 +535,11 @@ The build plan follows a vertical Tracer Bullet slice, implementing the thinnest
 - Eliminates the risk of runaway agent loops by bounding escalation to exactly one decision call and one expansion step.
 - Prevents LAYA from inventing answer claims by restricting it strictly to routing decisions and keeping it out of answer prose generation.
 - Preserves predictable query latency and strictly enforces the single answer synthesis invariant while respecting global model budget policy and verification reserves.
+- Protects free form answer delivery so that unverified model prose is never emitted to users without passing an authoritative semantic verifier gate.
+- Protects system capacity through bounded admission, immediate load shedding, and capacity retention during caller timeouts.
 
 **Negative / tradeoffs**:
-- Slightly increases pipeline graph complexity by adding an escalation branch.
+- Slightly increases pipeline graph complexity by adding an escalation branch and final delivery check.
 - Queries requiring more than one expansion step to resolve complex multi document research chains will terminate with partial answers or refusals.
 
 **Neutral**:
