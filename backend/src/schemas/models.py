@@ -204,6 +204,14 @@ class QueryResponse(BaseModel):
     graph_entity_state: str = "none"
     graph_relationship_state: str = "none"
     reranker_mode: str = "bypassed"
+    retrieval_incomplete: bool = False
+    laya_calls: int = 0
+    expansion_steps: int = 0
+    synthesis_calls: int = 0
+    laya_decision: dict[str, Any] | None = None
+    laya_status: str = "none"
+    laya_latency_ms: float = 0.0
+    laya_tokens: dict[str, int] = Field(default_factory=dict)
 
 
 # --- System Benchmark Models ---

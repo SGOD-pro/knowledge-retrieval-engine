@@ -111,6 +111,16 @@ class Settings(BaseSettings):
     GRAPH_REPO_BACKEND: str | None = None
     GRAPH_SQLITE_PATH: str | None = None
 
+    # LAYA Bounded Escalation Settings (Slice 5.1)
+    LAYA_ENABLED: bool = False
+    LAYA_TIMEOUT_MS: int = 2500
+    LAYA_MIN_DEADLINE_MS: int = 500
+    LAYA_MAX_INPUT_TOKENS: int = 1000
+    LAYA_MAX_OUTPUT_TOKENS: int = 250
+    LAYA_MAX_CONCURRENCY: int = 4
+    LAYA_MAX_QUEUE: int = 8
+    LAYA_BEDROCK_MODEL_ID: str = "anthropic.claude-3-haiku-20240307-v1:0"
+
     model_config = {"env_file": _ENV_FILES, "extra": "ignore"}
 
 

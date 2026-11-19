@@ -162,12 +162,12 @@ Spec [0007](../specs/0007-knowledge-graph-enrichment.md) · code in `backend/src
 
 ## Slice 5: LAYA bounded escalation
 
-### 8. LAYA bounded escalation · planned
+### 8. LAYA bounded escalation · in-progress
 Plan LAYA integration for bounded heuristic and query expansion escalation when discovery finds no support.
 **Done when:** LAYA is integrated as a subsequent, independently verifiable slice.
 - [x] Design it (spec): `/architect LAYA bounded escalation`
 - [ ] Build it: `/develop LAYA bounded escalation`
-   - [ ] Slice 5.1: Thin executable path with typed contracts, pre reservation gate, bounded admission concurrency, decision state machine, fallback policy, lexical expansion, delivery gate, and single synthesis limit (unsupported routes explicitly unavailable)
+   - [x] Slice 5.1: Thin executable path with typed contracts, pre reservation gate, bounded admission concurrency, decision state machine, fallback policy, lexical expansion, delivery gate, and single synthesis limit (unsupported routes explicitly unavailable)
    - [ ] Slice 5.2: Multi route expansion thickening (dense, structural, structured non RRF, graph), structured math entry wiring, and ablation suite
 - [ ] Verify it: `/check verify LAYA bounded escalation`
 - [ ] Test it: `/test LAYA bounded escalation`

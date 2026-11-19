@@ -1,7 +1,7 @@
 # 0008. Bounded LAYA Escalation and Query Expansion
 
 **Date**: 2026-11-18
-**Status**: Proposed
+**Status**: In Progress
 
 ## Summary
 
@@ -348,7 +348,11 @@ In `langgraph_pipeline.py`, LAYA is integrated via conditional routing after ini
       |
 [run_fidelity (evidence check)]
       |
-      +---> (evidence sufficient) ------------> [final_answer_delivery_gate] ---> [run_llm] ---> [END]
+      +---> (evidence sufficient)
+      |          |
+      |          +---> (verifier unready or disabled) ---> [delivery_fallback_or_refusal] ---> [END]
+      |          |
+      |          +---> (verifier ready) --------------> [run_llm] ---> [final_answer_delivery_gate] ---> [END]
       |
       +---> (coverage error or empty context)
                  |

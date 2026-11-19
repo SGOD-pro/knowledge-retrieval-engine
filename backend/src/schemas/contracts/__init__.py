@@ -121,6 +121,19 @@ from src.schemas.contracts.knowledge_graph import (
     canonicalize_predicate,
     normalize_mention,
 )
+from src.schemas.contracts.laya import (
+    BaselineEvidenceSummary,
+    DenseExpansionParams,
+    GraphExpansionParams,
+    LayaEscalationDecision,
+    LayaEscalationRequest,
+    LayaRouteParameters,
+    LexicalExpansionParams,
+    MissingRequirementDescription,
+    NoneExpansionParams,
+    StructuralExpansionParams,
+    StructuredExpansionParams,
+)
 
 __all__ = [
     # Envelope
@@ -227,4 +240,16 @@ __all__ = [
     "PinnedSnapshotContext",
     "canonicalize_predicate",
     "normalize_mention",
+    # LAYA Contracts
+    "BaselineEvidenceSummary",
+    "DenseExpansionParams",
+    "GraphExpansionParams",
+    "LayaEscalationDecision",
+    "LayaEscalationRequest",
+    "LayaRouteParameters",
+    "LexicalExpansionParams",
+    "MissingRequirementDescription",
+    "NoneExpansionParams",
+    "StructuralExpansionParams",
+    "StructuredExpansionParams",
 ]

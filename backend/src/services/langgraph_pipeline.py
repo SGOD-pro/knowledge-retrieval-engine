@@ -19,6 +19,19 @@ from services.retrieval.page_index_retriever import PageIndexRetriever
 from services.retrieval.planner import Plan, planner
 from services.retrieval.reranker import rerank
 from services.retrieval.vector_retriever import VectorRetriever
+import uuid
+from src.schemas.contracts.laya import (
+    BaselineEvidenceSummary,
+    LayaEscalationDecision,
+    LayaEscalationRequest,
+    MissingRequirementDescription,
+)
+from src.services.retrieval.laya_executor import LayaExpansionExecutor
+from src.services.retrieval.laya_gate import (
+    LayaBudgetLedger,
+    calculate_phase_deadline,
+)
+from src.services.retrieval.laya_service import LayaDecisionService
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +125,26 @@ class PipelineState(TypedDict):
     doc_repo: Any | None
     kg_retriever: Any | None
     retriever: Any | None
+    laya_enabled: bool
+    laya_calls: int
+    expansion_steps: int
+    synthesis_calls: int
+    laya_decision: dict[str, Any] | None
+    laya_status: str
+    laya_latency_ms: float
+    laya_tokens: dict[str, int]
+    require_delivery_gate: bool
+    escalation_executed: bool
+    retrieval_incomplete: bool
+    verifier: Any | None
+    semantic_verifier: Any | None
+    laya_client: Any | None
+    laya_model_id: str | None
+    laya_decision_service: Any | None
+    laya_expansion_executor: Any | None
+    laya_budget_ledger: Any | None
+    snapshot_context: Any | None
+    _pipeline_start_time: float
 
 
 # ---------------------------------------------------------------------------
@@ -886,7 +919,12 @@ def run_reranker(state: PipelineState):
         })
         return {"top_chunks": [], "retrieval_candidates": cands, "reranker_mode": RerankerMode.BYPASSED.value}
 
-    top_chunks, reranker_mode = rerank(state["query"], merged, top_k=6, return_mode=True)
+    rerank_res = rerank(state["query"], merged, top_k=6, return_mode=True)
+    if isinstance(rerank_res, tuple) and len(rerank_res) == 2:
+        top_chunks, reranker_mode = rerank_res
+    else:
+        top_chunks = rerank_res
+        reranker_mode = getattr(rerank_res, "reranker_mode", RerankerMode.BYPASSED.value)
     latency_ms = (time.perf_counter() - t0) * 1000.0
     logger.info(
         "reranker.latency_ms=%.2f reranker.input_count=%d reranker.output_count=%d mode=%s",
@@ -1109,6 +1147,11 @@ def run_llm(state: PipelineState):
     if state.get("error"):
         return {}
 
+    calls = state.get("synthesis_calls", 0)
+    if calls >= 1:
+        logger.warning("run_llm.single_synthesis_limit_reached calls=%d, skipping call", calls)
+        return {}
+
     t0 = time.perf_counter()
     compressed = state.get("compressed_text", "").strip()
 
@@ -1194,8 +1237,315 @@ def run_llm(state: PipelineState):
         "executed_path": "full",
         "status": "success",
         "retrieval_candidates": cands,
+        "synthesis_calls": calls + 1,
         "stage_timings": {**existing, "llm_ms": latency_ms},
     }
+
+
+def route_after_fidelity(state: PipelineState) -> str:
+    """Conditional routing after evidence fidelity evaluation.
+
+    - If fidelity failed (error or empty context) and escalation budget is available:
+      routes to run_laya_escalation.
+    - If fidelity failed and escalation is unavailable/exhausted:
+      routes to delivery_gate (refusal).
+    - If fidelity passed:
+      evaluates verifier readiness if delivery gate is required. If unready, routes to delivery_gate;
+      otherwise routes to run_llm for single answer synthesis.
+    """
+    err = state.get("error")
+    if err:
+        laya_enabled = state.get("laya_enabled", getattr(settings, "LAYA_ENABLED", False))
+        expansion_steps = state.get("expansion_steps", 0)
+        laya_calls = state.get("laya_calls", 0)
+        pipe_start = state.get("_pipeline_start_time", time.perf_counter())
+        elapsed_ms = (time.perf_counter() - pipe_start) * 1000.0
+        remaining_ms = max(0.0, 15000.0 - elapsed_ms)
+        if laya_enabled and expansion_steps < 1 and laya_calls < 1 and remaining_ms >= 500.0:
+            return "run_laya_escalation"
+        return "delivery_gate"
+
+    if state.get("escalation_executed") or state.get("require_delivery_gate"):
+        verifier = state.get("verifier") or state.get("semantic_verifier")
+        if verifier is None:
+            return "delivery_gate"
+        if hasattr(verifier, "is_ready") and not verifier.is_ready():
+            return "delivery_gate"
+
+    return "run_llm"
+
+
+def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
+    """Execute bounded LAYA decision model and targeted lexical expansion.
+
+    Enforces:
+    - Atomic pre reservation in request local budget ledger.
+    - Token preflight with deterministic evidence truncation (<= 1000 tokens).
+    - Single pass BM25 lexical expansion (other routes explicitly unavailable).
+    - Merging novel chunks with baseline candidates.
+    - Re reranking and recompression.
+    - Clearing stale refusal state before secondary fidelity recheck.
+    - Single synthesis call enforcement.
+    - Delivery gate evaluation before free form prose delivery.
+    """
+    t0 = time.perf_counter()
+    existing_timings = state.get("stage_timings", {})
+    cands = dict(state.get("retrieval_candidates", {}))
+    ledger = state.get("laya_budget_ledger") or LayaBudgetLedger()
+
+    pipe_start = state.get("_pipeline_start_time", time.perf_counter())
+    elapsed_ms = (time.perf_counter() - pipe_start) * 1000.0
+    remaining_ms = max(0.0, 15000.0 - elapsed_ms)
+
+    err = state.get("error") or "Context insufficient"
+    compressed = state.get("compressed_text", "")
+    failed_stage = "run_fidelity_empty_context" if not compressed else "run_fidelity_coverage"
+
+    from services.retrieval.response_builder import build_citation
+
+    req_desc = MissingRequirementDescription(
+        requirement_id=f"req_{uuid.uuid4().hex[:8]}",
+        missing_dimension="exact_term",
+        description=f"Evidence gap detected during {failed_stage}",
+        failed_stage=failed_stage,
+        detected_gap=str(err)[:300],
+    )
+
+    baseline_chunks = list(state.get("top_chunks") or state.get("candidate_chunks", []))
+    summaries: list[BaselineEvidenceSummary] = []
+    ws_id = state.get("workspace_id", "ws_default")
+    for c in baseline_chunks[:10]:
+        c_ver = str(getattr(c, "document_version", "") or getattr(c, "version", "") or "v1")
+        c_score = float(min(100.0, max(0.0, getattr(c, "similarity_score", 0.0) or getattr(c, "reranker_score", 0.0) or 1.0)))
+        summaries.append(
+            BaselineEvidenceSummary(
+                chunk_id=str(c.id)[:64],
+                document_id=str(getattr(c, "document_id", "doc_unknown"))[:128],
+                document_version=c_ver[:64],
+                workspace_id=ws_id,
+                snippet=str(getattr(c, "text", ""))[:300],
+                score=c_score,
+                source_kind="text",
+                page_number=getattr(c, "page_number", None) if (isinstance(getattr(c, "page_number", None), int) and 1 <= getattr(c, "page_number", None) <= 10000) else None,
+                bbox=getattr(c, "bounding_box", None) if (getattr(c, "bounding_box", None) and len(getattr(c, "bounding_box", None)) == 4) else None,
+            )
+        )
+
+    escalation_req = LayaEscalationRequest(
+        query_id=f"q_{uuid.uuid4().hex[:12]}",
+        workspace_id=ws_id,
+        query=state.get("query", ""),
+        missing_requirement=req_desc,
+        available_routes=("lexical_expansion", "none"),
+        retrieved_summary=tuple(summaries),
+        caller_deadline_ms=remaining_ms,
+    )
+
+    service = state.get("laya_decision_service") or LayaDecisionService(
+        client=state.get("laya_client"),
+        model_id=state.get("laya_model_id"),
+    )
+    decision = service.decide(escalation_req, remaining_ms, ledger)
+    l_lat_ms = (time.perf_counter() - t0) * 1000.0
+
+    cands["laya_decision_id"] = decision.decision_id
+    cands["laya_route"] = decision.route
+    cands["laya_confidence"] = decision.confidence
+
+    novel_chunks: list[Chunk] = []
+    no_progress = True
+    status = decision.execution_status
+
+    if decision.route == "lexical_expansion":
+        executor = state.get("laya_expansion_executor") or LayaExpansionExecutor()
+        novel_chunks, no_progress, status = executor.execute(
+            decision=decision,
+            workspace_id=ws_id,
+            baseline_chunks=state.get("candidate_chunks", []),
+            boundary_repo=state.get("boundary_repo"),
+            chunk_repo=state.get("doc_repo"),
+            snapshot_context=state.get("snapshot_context"),
+        )
+
+    cands["laya_novel_chunks"] = [str(c.id) for c in novel_chunks]
+    cands["laya_no_progress"] = no_progress
+
+    updated_state: dict[str, Any] = {
+        "laya_calls": ledger.laya_calls,
+        "expansion_steps": ledger.expansion_steps,
+        "synthesis_calls": ledger.synthesis_calls,
+        "laya_decision": decision.model_dump(),
+        "laya_status": status,
+        "laya_latency_ms": l_lat_ms,
+        "laya_tokens": {
+            "input_tokens": ledger.total_input_tokens,
+            "output_tokens": ledger.total_output_tokens,
+        },
+        "retrieval_candidates": cands,
+        "stage_timings": {**existing_timings, "laya_ms": l_lat_ms},
+    }
+
+    if novel_chunks and not no_progress:
+        # 1. Pool novel chunks with baseline candidates
+        merged_candidates = list(state.get("candidate_chunks", [])) + novel_chunks
+        current_state = {**state, **updated_state, "candidate_chunks": merged_candidates}
+
+        # 2. Rerank updated candidate pool (consuming second allowed rerank batch under ADR-004)
+        rerank_res = run_reranker(current_state)
+        current_state.update(rerank_res)
+
+        # 3. Recompress top chunks
+        comp_res = run_compressor(current_state)
+        current_state.update(comp_res)
+
+        # 4. Clear stale refusal state before secondary check
+        current_state["error"] = None
+        current_state["final_answer"] = None
+        current_state["citations"] = []
+
+        # 5. Secondary fidelity check
+        fid_res = run_fidelity(current_state)
+        current_state.update(fid_res)
+
+        updated_state.update(rerank_res)
+        updated_state.update(comp_res)
+        updated_state["candidate_chunks"] = merged_candidates
+        updated_state["escalation_executed"] = True
+
+        if current_state.get("error") is None:
+            # Secondary fidelity succeeded!
+            updated_state["error"] = None
+            verifier = state.get("verifier") or state.get("semantic_verifier")
+            if verifier is not None and (not hasattr(verifier, "is_ready") or verifier.is_ready()):
+                # Run single synthesis call
+                ledger.synthesis_calls += 1
+                updated_state["synthesis_calls"] = ledger.synthesis_calls
+                llm_res = run_llm(current_state)
+                updated_state.update(llm_res)
+            else:
+                # Verifier is unconfigured / unavailable -> free form delivery blocked!
+                from services.retrieval.extractor import extract_verified_fact
+                v_ans, v_chunk = extract_verified_fact(current_state["query"], current_state.get("top_chunks", []))
+                if v_ans and v_chunk:
+                    updated_state["final_answer"] = v_ans
+                    updated_state["citations"] = [build_citation(v_chunk).to_dict()]
+                    updated_state["executed_path"] = "deterministic_excerpt"
+                    updated_state["confidence_score"] = 0.8
+                else:
+                    updated_state["final_answer"] = "NOT_FOUND"
+                    updated_state["citations"] = []
+                    updated_state["confidence_score"] = 0.0
+                    updated_state["retrieval_incomplete"] = True
+        else:
+            # Secondary fidelity failed again
+            updated_state["final_answer"] = "NOT_FOUND"
+            updated_state["citations"] = []
+            updated_state["confidence_score"] = 0.0
+            updated_state["retrieval_incomplete"] = True
+    else:
+        # No progress, route unavailable, or none
+        updated_state["final_answer"] = "NOT_FOUND"
+        updated_state["citations"] = []
+        updated_state["confidence_score"] = 0.0
+        updated_state["retrieval_incomplete"] = True
+
+    return updated_state
+
+
+def delivery_gate(state: PipelineState) -> dict[str, Any]:
+    """Authoritative final answer delivery gate.
+
+    Enforces:
+    - Re checks dynamic workspace and document tombstones before delivery (fail closed).
+    - Free form synthesized prose is never delivered without passing an authoritative semantic verifier.
+    - If verifier is unconfigured or unavailable, delivery is blocked in favor of
+      approved deterministic output or structured refusal.
+    """
+    ws_id = state.get("workspace_id", "")
+    boundary_repo = state.get("boundary_repo")
+
+    # 1. Dynamic tombstone check before delivery
+    if boundary_repo is not None and hasattr(boundary_repo, "has_tombstone"):
+        if boundary_repo.has_tombstone(ws_id, "workspace", ws_id):
+            logger.warning("delivery_gate.workspace_tombstoned ws_id=%s (delivery blocked)", ws_id)
+            return {
+                "final_answer": "NOT_FOUND",
+                "citations": [],
+                "confidence_score": 0.0,
+                "retrieval_incomplete": True,
+            }
+        for cit in state.get("citations", []):
+            doc_id = cit.get("document_id") if isinstance(cit, dict) else getattr(cit, "document_id", None)
+            if doc_id and boundary_repo.has_tombstone(ws_id, "source", str(doc_id)):
+                logger.warning("delivery_gate.source_tombstoned doc_id=%s (delivery blocked)", doc_id)
+                return {
+                    "final_answer": "NOT_FOUND",
+                    "citations": [],
+                    "confidence_score": 0.0,
+                    "retrieval_incomplete": True,
+                }
+
+    # 2. Delivery gate blocking rule under ADR-004
+    if state.get("escalation_executed") or state.get("require_delivery_gate"):
+        verifier = state.get("verifier") or state.get("semantic_verifier")
+        ans = state.get("final_answer", "")
+        if ans and ans != "NOT_FOUND":
+            if verifier is None:
+                # No compatible verifier exists -> block free form delivery
+                logger.warning("delivery_gate.blocked_no_verifier (falling back to deterministic output)")
+                from services.retrieval.extractor import extract_verified_fact
+                from services.retrieval.response_builder import build_citation
+
+                v_ans, v_chunk = extract_verified_fact(state["query"], state.get("top_chunks", []))
+                if v_ans and v_chunk:
+                    return {
+                        "final_answer": v_ans,
+                        "citations": [build_citation(v_chunk).to_dict()],
+                        "executed_path": "deterministic_excerpt",
+                        "confidence_score": 0.8,
+                    }
+                return {
+                    "final_answer": "NOT_FOUND",
+                    "citations": [],
+                    "confidence_score": 0.0,
+                    "retrieval_incomplete": True,
+                }
+            else:
+                # Verifier is present -> verify actual synthesized text
+                comp_text = state.get("compressed_text", "")
+                cits = state.get("citations", [])
+                try:
+                    v_rec = verifier.verify(text=ans, context=comp_text, citations=cits)
+                    status = getattr(v_rec, "support_status", None)
+                    if status != "ASSERTED":
+                        logger.warning("delivery_gate.verifier_rejected status=%s", status)
+                        from services.retrieval.extractor import extract_verified_fact
+                        from services.retrieval.response_builder import build_citation
+
+                        v_ans, v_chunk = extract_verified_fact(state["query"], state.get("top_chunks", []))
+                        if v_ans and v_chunk:
+                            return {
+                                "final_answer": v_ans,
+                                "citations": [build_citation(v_chunk).to_dict()],
+                                "executed_path": "deterministic_excerpt",
+                                "confidence_score": 0.8,
+                            }
+                        return {
+                            "final_answer": "NOT_FOUND",
+                            "citations": [],
+                            "confidence_score": 0.0,
+                            "retrieval_incomplete": True,
+                        }
+                except Exception as e:
+                    logger.error("delivery_gate.verifier_exception error=%s", e)
+                    return {
+                        "final_answer": "NOT_FOUND",
+                        "citations": [],
+                        "confidence_score": 0.0,
+                        "retrieval_incomplete": True,
+                    }
+
+    return {}
 
 
 def end_fast_path(state: PipelineState):
@@ -1590,6 +1940,8 @@ workflow.add_node("run_deterministic_math", run_deterministic_math)
 workflow.add_node("run_compressor", run_compressor)
 workflow.add_node("run_fidelity", run_fidelity)
 workflow.add_node("run_llm", run_llm)
+workflow.add_node("run_laya_escalation", run_laya_escalation)
+workflow.add_node("delivery_gate", delivery_gate)
 workflow.add_node("end_fast_path", end_fast_path)
 workflow.add_node("escalate_to_full_retrieval", escalate_to_full_retrieval)
 
@@ -1653,8 +2005,18 @@ workflow.add_conditional_edges(
     },
 )
 workflow.add_edge("run_compressor", "run_fidelity")
-workflow.add_edge("run_fidelity", "run_llm")
-workflow.add_edge("run_llm", END)
+workflow.add_conditional_edges(
+    "run_fidelity",
+    route_after_fidelity,
+    {
+        "run_llm": "run_llm",
+        "run_laya_escalation": "run_laya_escalation",
+        "delivery_gate": "delivery_gate",
+    },
+)
+workflow.add_edge("run_laya_escalation", "delivery_gate")
+workflow.add_edge("run_llm", "delivery_gate")
+workflow.add_edge("delivery_gate", END)
 workflow.add_conditional_edges(
     "end_fast_path",
     route_after_fast_path,
@@ -1754,6 +2116,26 @@ class Pipeline:
             "graph_entity_state": "none",
             "graph_relationship_state": "none",
             "graph_execution_status": "none",
+            "laya_enabled": kwargs.get("laya_enabled", getattr(settings, "LAYA_ENABLED", False)),
+            "laya_calls": 0,
+            "expansion_steps": 0,
+            "synthesis_calls": 0,
+            "laya_decision": None,
+            "laya_status": "none",
+            "laya_latency_ms": 0.0,
+            "laya_tokens": {"input_tokens": 0, "output_tokens": 0},
+            "require_delivery_gate": kwargs.get("require_delivery_gate", False),
+            "escalation_executed": False,
+            "retrieval_incomplete": False,
+            "verifier": kwargs.get("verifier"),
+            "semantic_verifier": kwargs.get("semantic_verifier"),
+            "laya_client": kwargs.get("laya_client"),
+            "laya_model_id": kwargs.get("laya_model_id"),
+            "laya_decision_service": kwargs.get("laya_decision_service"),
+            "laya_expansion_executor": kwargs.get("laya_expansion_executor"),
+            "laya_budget_ledger": kwargs.get("laya_budget_ledger"),
+            "snapshot_context": kwargs.get("snapshot_context"),
+            "_pipeline_start_time": time.perf_counter(),
         }
 
         if table_store is not None:
@@ -1836,6 +2218,14 @@ class Pipeline:
                 self.graph_relationship_state = state.get("graph_relationship_state", "none")
                 self.query_embedding = state.get("query_embedding")
                 self.query_embedding_provenance = state.get("query_embedding_provenance")
+                self.retrieval_incomplete = state.get("retrieval_incomplete", False)
+                self.laya_calls = state.get("laya_calls", 0)
+                self.expansion_steps = state.get("expansion_steps", 0)
+                self.synthesis_calls = state.get("synthesis_calls", 0)
+                self.laya_decision = state.get("laya_decision")
+                self.laya_status = state.get("laya_status", "none")
+                self.laya_latency_ms = state.get("laya_latency_ms", 0.0)
+                self.laya_tokens = state.get("laya_tokens", {"input_tokens": 0, "output_tokens": 0})
 
                 # Expose internal state for tests
                 class LLMInput:
