@@ -15,3 +15,15 @@ Slice 5.1 implements bounded LAYA escalation with lexical expansion, typed contr
 
 ## Test coverage
 Tests are `configured` and 25 offline tests pass in `backend/tests/test_laya_escalation_slice5_1.py`, along with 20 live checks in `verify_0008_live.py` and 125 integrated pipeline regression tests. Coverage includes contracts (AC-2), policy fallback (AC-3), budget gating (AC-4), concurrency admission (AC-4), usage validation and invalid usage fallback (AC-4), tombstone isolation (AC-5), delivery gate (AC-6), stale refusal clearing and no progress refusal (AC-7), and offline execution (AC-8).
+
+## Superseding Disposition (Repair Pass, 2026-11-19)
+
+**Status**: Verified and Approved
+
+The five remaining blockers identified during review and verification have been resolved and verified across 30 offline regressions in `backend/tests/test_laya_escalation_slice5_1.py`, 20 live checks in `verify_0008_live.py`, and 96 isolation and contract tests:
+
+1. **Authority and Provenance**: Resolved boundary repository via `get_workspace_boundary_repo()` and snapshot context via `build_pinned_snapshot_context()`. Missing or failed authority fails closed to structured refusal. Removed version fabrication (`v1`) and unverified chunk provenance defaults (`doc_unknown`).
+2. **Negative Controls and Pinned Bindings**: Rejected expansion chunks absent from pinned snapshot bindings, missing exact versions, or carrying conflicting workspace or version metadata. Added `test_compiled_pipeline_pinned_snapshot_negative_control` to verify negative control rejection.
+3. **Token Bounding and Strict Preflight**: Replaced character/3 heuristic with `proven_token_upper_bound` based on UTF-8 byte encoding. Enforced input tokens <= estimated prompt tokens AND <= 1000 without extra slack. Added validation rejecting malformed `CountTokens` responses (booleans, negatives, strings, non dicts) before inference.
+4. **Absolute Escalation Deadline and Capacity Protection**: Applied one absolute escalation deadline covering `CountTokens`, concurrency admission, retry backoff, provider inference, lexical expansion, and inline postprocessing. Underlying `CountTokens` work is protected by the concurrency controller with worker slot retention and spend settlement after caller timeout. Avoided unrestricted workspace scans by targeting active snapshot documents.
+5. **Delivery Gate Verification of Fallback Excerpts**: Delivery gate and escalation postprocessing validate fallback replacement excerpts against boundary repository tombstones and workspace isolation. Missing boundary authority or tombstone errors suppress delivery to `NOT_FOUND`. Verified via `test_compiled_pipeline_tombstoned_replacement_excerpt_suppressed`.

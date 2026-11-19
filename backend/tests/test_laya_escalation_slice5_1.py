@@ -52,11 +52,13 @@ from src.services.retrieval.laya_policy import (
     get_deterministic_fallback_decision,
 )
 from src.services.retrieval.laya_gate import (
+    InvalidCountTokensError,
     InvalidUsageError,
     LayaBudgetLedger,
     calculate_phase_deadline,
     estimate_tokens_defensible_bound,
     preflight_token_count,
+    proven_token_upper_bound,
     truncate_evidence_summary_for_preflight,
     validate_provider_usage,
 )
@@ -1093,8 +1095,9 @@ def test_invalid_usage_fallback_through_decision_service():
     req = _make_sample_request()
     ledger = LayaBudgetLedger()
 
-    # Provider response returns out of bound input tokens (2000 > est_prompt_tokens + 100)
+    # Provider response returns out of bound input tokens (2000 > est_prompt_tokens)
     mock_client = MagicMock()
+    mock_client.count_tokens.return_value = {"inputTokens": 100}
     mock_client.converse.return_value = {
         "output": {
             "message": {
@@ -1142,6 +1145,7 @@ def test_missing_usage_dict_fallback_through_decision_service():
     ledger = LayaBudgetLedger()
 
     mock_client = MagicMock()
+    mock_client.count_tokens.return_value = {"inputTokens": 100}
     mock_client.converse.return_value = {
         "output": {
             "message": {
@@ -1234,4 +1238,337 @@ def test_laya_policy_empty_terms_routes_to_none():
     assert decision.route == "none"
     assert decision.confidence == 0.0
     assert "No viable terms" in decision.parameters.reason
+
+
+# ===========================================================================
+# 11. Production Application Path Regressions for Slice 5.1 Repair
+# ===========================================================================
+
+
+def test_compiled_pipeline_tombstoned_replacement_excerpt_suppressed():
+    """Verify delivery gate rechecks fallback replacement excerpts against boundary repository tombstones."""
+    from db.database import CloudRepository
+    from src.db.workspace_boundary_repo import get_workspace_boundary_repo
+
+    ws_id = "ws_test_tomb_suppress"
+    b_repo = get_workspace_boundary_repo(reset=True)
+    b_repo.create_workspace(name="Tombstone Suppress Project", owner_principal_id="usr_admin", workspace_id=ws_id)
+
+    repo = CloudRepository()
+    doc_chunk = Chunk(
+        id="chunk_secret_1",
+        document_id="doc_classified",
+        source_format="pdf",
+        text="The project budget is $12 million for fiscal year 2026.",
+        element_type="narrative_block",
+        workspace_id=ws_id,
+        metadata={"document_version": "v1"},
+        embedding_fast=[0.1] * 384,
+        embedding_full=[0.1] * 1024,
+    )
+    doc = Document(
+        id="doc_classified",
+        filename="classified.pdf",
+        source_format="pdf",
+        chunks=(doc_chunk,),
+        workspace_id=ws_id,
+    )
+    repo.save(doc)
+    repo.add_document_to_workspace(ws_id, doc)
+    invalidate_chunk_cache(ws_id)
+
+    # Tombstone the source document in boundary repository
+    b_repo.record_source_tombstone(ws_id, "doc_classified", caller_principal_id="usr_admin")
+    assert b_repo.has_tombstone(ws_id, "source", "doc_classified") is True
+
+    # Initial query
+    query = "What is the project budget for fiscal year 2026?"
+
+    mock_client = MockBedrockConverseClient(
+        response_payload={
+            "decision_id": "dec_tomb_1",
+            "route": "lexical_expansion",
+            "parameters": {
+                "route_type": "lexical_expansion",
+                "query_terms": ["budget", "project"],
+                "document_ids": ["doc_classified"],
+            },
+            "confidence": 0.85,
+            "rationale": "Lexical keyword match for budget",
+        }
+    )
+
+    with patch("services.langgraph_pipeline._get_repo", return_value=repo):
+        # Initial fidelity fails coverage to trigger escalation
+        fidelity_calls = 0
+
+        def _mock_check_fidelity(q, contexts, **kw):
+            nonlocal fidelity_calls
+            fidelity_calls += 1
+            if fidelity_calls == 1:
+                from services.retrieval.fidelity_check import CoverageError
+                raise CoverageError("Initial coverage gap")
+            return 1.0
+
+        with patch("services.langgraph_pipeline.check_fidelity", side_effect=_mock_check_fidelity):
+            # No verifier provided -> delivery gate must evaluate fallback replacement excerpt
+            # Since doc_classified is tombstoned, delivery must be suppressed to NOT_FOUND
+            response = pipeline.run(
+                query=query,
+                workspace_id=ws_id,
+                boundary_repo=b_repo,
+                laya_enabled=True,
+                laya_client=mock_client,
+                verifier=None,
+                require_delivery_gate=True,
+            )
+
+    assert response["final_answer"] == "NOT_FOUND"
+    assert response["citations"] == []
+    assert response["retrieval_incomplete"] is True
+
+
+def test_compiled_pipeline_missing_boundary_authority_fails_closed():
+    """Verify missing boundary authority causes escalation and delivery gate to fail closed."""
+    ws_id = "ws_test_missing_boundary"
+    query = "What is the project schedule?"
+
+    mock_client = MockBedrockConverseClient()
+
+    with patch("db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=None):
+        fidelity_calls = 0
+
+        def _mock_check_fidelity(q, contexts, **kw):
+            nonlocal fidelity_calls
+            fidelity_calls += 1
+            if fidelity_calls == 1:
+                from services.retrieval.fidelity_check import CoverageError
+                raise CoverageError("Initial coverage gap")
+            return 1.0
+
+        with patch("services.langgraph_pipeline.check_fidelity", side_effect=_mock_check_fidelity):
+            response = pipeline.run(
+                query=query,
+                workspace_id=ws_id,
+                boundary_repo=None,
+                laya_enabled=True,
+                laya_client=mock_client,
+                verifier=None,
+                require_delivery_gate=True,
+            )
+
+    assert response["final_answer"] == "NOT_FOUND"
+    assert response["citations"] == []
+    assert response["retrieval_incomplete"] is True
+
+
+def test_compiled_pipeline_pinned_snapshot_negative_control():
+    """Verify expansion chunks absent from pinned bindings, missing exact versions, or carrying conflicting versions are rejected."""
+    ws_id = "ws_test_negative_control"
+
+    # Pinned snapshot with only doc_allowed at version v2
+    pinned_doc = PinnedDocumentVersion(
+        document_id="doc_allowed",
+        document_version="v2",
+        publication_id="pub_allowed_1",
+        is_tombstoned=False,
+    )
+    pinned_snapshot = PinnedSnapshotContext(
+        workspace_id=ws_id,
+        captured_at_utc="2026-11-19T00:00:00Z",
+        active_documents=(pinned_doc,),
+    )
+
+    chunk_valid = Chunk(
+        id="chunk_valid",
+        document_id="doc_allowed",
+        source_format="pdf",
+        text="Valid chunk revenue growth target is 20%.",
+        element_type="narrative_block",
+        workspace_id=ws_id,
+        metadata={"document_version": "v2"},
+    )
+    chunk_absent = Chunk(
+        id="chunk_absent",
+        document_id="doc_forbidden",
+        source_format="pdf",
+        text="Absent doc revenue growth target is 20%.",
+        element_type="narrative_block",
+        workspace_id=ws_id,
+        metadata={"document_version": "v2"},
+    )
+    chunk_conflict_version = Chunk(
+        id="chunk_conflict_ver",
+        document_id="doc_allowed",
+        source_format="pdf",
+        text="Conflict version revenue growth target is 20%.",
+        element_type="narrative_block",
+        workspace_id=ws_id,
+        metadata={"document_version": "v1"},
+    )
+    chunk_missing_version = Chunk(
+        id="chunk_missing_ver",
+        document_id="doc_allowed",
+        source_format="pdf",
+        text="Missing version revenue growth target is 20%.",
+        element_type="narrative_block",
+        workspace_id=ws_id,
+        metadata={},
+    )
+    chunk_wrong_workspace = Chunk(
+        id="chunk_wrong_ws",
+        document_id="doc_allowed",
+        source_format="pdf",
+        text="Wrong workspace revenue growth target is 20%.",
+        element_type="narrative_block",
+        workspace_id="ws_other",
+        metadata={"document_version": "v2"},
+    )
+
+    mock_repo = MagicMock()
+    mock_repo.get_all_chunks.return_value = [
+        chunk_valid,
+        chunk_absent,
+        chunk_conflict_version,
+        chunk_missing_version,
+        chunk_wrong_workspace,
+    ]
+
+    executor = LayaExpansionExecutor()
+    decision = LayaEscalationDecision(
+        decision_id="dec_neg_ctrl",
+        route="lexical_expansion",
+        parameters=LexicalExpansionParams(
+            route_type="lexical_expansion",
+            query_terms=("revenue", "growth"),
+        ),
+        confidence=0.88,
+        rationale="Negative control test",
+    )
+
+    novel, no_prog, st = executor.execute(
+        decision=decision,
+        workspace_id=ws_id,
+        baseline_chunks=[],
+        chunk_repo=mock_repo,
+        snapshot_context=pinned_snapshot,
+    )
+
+    # Only chunk_valid should pass negative controls
+    assert no_prog is False
+    assert len(novel) == 1
+    assert novel[0].id == "chunk_valid"
+    assert st == "completed"
+
+
+def test_count_tokens_capacity_retention_and_malformed_rejection():
+    """Verify malformed CountTokens responses fail closed and capacity is retained on caller timeout."""
+    ctrl = LayaProviderConcurrencyController(max_concurrency=1, max_queue=2)
+    req = _make_sample_request()
+    ledger = LayaBudgetLedger()
+
+    # 1. Malformed responses to preflight_token_count
+    mock_bad_client = MagicMock()
+    for bad_resp in [
+        {"inputTokens": True},   # boolean rejected
+        {"inputTokens": -10},    # negative rejected
+        {"inputTokens": "50"},   # string rejected
+        {"wrongKey": 100},       # missing inputTokens
+        [],                      # not a dict
+    ]:
+        mock_bad_client.count_tokens.return_value = bad_resp
+        with pytest.raises(InvalidCountTokensError):
+            preflight_token_count(
+                client=mock_bad_client,
+                model_id="test-model",
+                system_prompt="sys",
+                user_content="user content",
+                concurrency_controller=ctrl,
+                timeout_s=1.0,
+            )
+
+    # 2. Decision service falls closed to Section 35 fallback on malformed count_tokens
+    mock_client = MagicMock()
+    mock_client.count_tokens.return_value = {"inputTokens": True}
+    service = LayaDecisionService(client=mock_client, concurrency_controller=ctrl)
+    decision = service.decide(request=req, deadline_remaining_ms=2500.0, ledger=ledger)
+    assert decision.route == "lexical_expansion"
+    assert decision.execution_status == "rejected_by_code"
+    assert "CountTokens rejected" in decision.rationale
+
+    # 3. Capacity retention on CountTokens caller timeout
+    started = threading.Event()
+    finish = threading.Event()
+
+    def slow_count(**kw):
+        started.set()
+        finish.wait(timeout=2.0)
+        return {"inputTokens": 100}
+
+    mock_slow_client = MagicMock()
+    mock_slow_client.count_tokens.side_effect = slow_count
+
+    # Run slow count_tokens with tiny timeout
+    with pytest.raises(InvalidCountTokensError):
+        preflight_token_count(
+            client=mock_slow_client,
+            model_id="test-model",
+            system_prompt="sys",
+            user_content="user content",
+            concurrency_controller=ctrl,
+            timeout_s=0.05,
+        )
+
+    # Worker slot must remain retained while slow_count is still running
+    assert ctrl.active_count == 1
+
+    # Release slow worker and verify clean cleanup
+    finish.set()
+    time.sleep(0.1)
+    assert ctrl.active_count == 0
+    ctrl.shutdown(wait=False)
+
+
+def test_strict_usage_validation_zero_slack():
+    """Verify validate_provider_usage enforces input <= estimated AND <= 1000 without extra slack."""
+    # inputTokens > estimated_prompt_tokens (even by 1 token) must raise InvalidUsageError
+    with pytest.raises(InvalidUsageError) as exc_est:
+        validate_provider_usage({"inputTokens": 501, "outputTokens": 50}, estimated_prompt_tokens=500)
+    assert "exceeds preflight estimate of 500" in str(exc_est.value)
+
+    # outputTokens > 250 must raise InvalidUsageError
+    with pytest.raises(InvalidUsageError) as exc_out:
+        validate_provider_usage({"inputTokens": 500, "outputTokens": 251}, estimated_prompt_tokens=500)
+    assert "exceeds strict cap of 250" in str(exc_out.value)
+
+    # inputTokens > 1000 strict cap
+    with pytest.raises(InvalidUsageError) as exc_cap:
+        validate_provider_usage(
+            {"inputTokens": 1001, "outputTokens": 50},
+            estimated_prompt_tokens=1500,
+            reserved_input_tokens=1500,
+        )
+    assert "exceeds strict cap of 1000" in str(exc_cap.value)
+
+    # Non positive inputTokens
+    with pytest.raises(InvalidUsageError) as exc_pos:
+        validate_provider_usage({"inputTokens": 0, "outputTokens": 50}, estimated_prompt_tokens=500)
+    assert "strictly positive" in str(exc_pos.value)
+
+    # Boolean token counts rejected
+    with pytest.raises(InvalidUsageError):
+        validate_provider_usage({"inputTokens": True, "outputTokens": 50}, estimated_prompt_tokens=500)
+
+    # Exact equality passes
+    in_t, out_t = validate_provider_usage({"inputTokens": 500, "outputTokens": 250}, estimated_prompt_tokens=500)
+    assert in_t == 500
+    assert out_t == 250
+
+    # Proven token upper bound UTF-8 byte length test
+    assert proven_token_upper_bound("") == 0
+    assert proven_token_upper_bound("Hello World") == 11
+    # Multi-byte UTF-8 symbols have byte length strictly >= char length
+    unicode_sample = "KRE 知识 🔍 2026"
+    assert proven_token_upper_bound(unicode_sample) >= len(unicode_sample)
+
 

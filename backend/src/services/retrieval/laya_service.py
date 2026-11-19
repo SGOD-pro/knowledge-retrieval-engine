@@ -28,6 +28,7 @@ from src.services.retrieval.laya_concurrency import (
     get_laya_concurrency_controller,
 )
 from src.services.retrieval.laya_gate import (
+    InvalidCountTokensError,
     InvalidUsageError,
     LayaBudgetLedger,
     calculate_phase_deadline,
@@ -64,9 +65,27 @@ class LayaDecisionService:
         model_id: str | None = None,
         concurrency_controller: LayaProviderConcurrencyController | None = None,
     ) -> None:
+        if client is None:
+            client = self._get_production_bedrock_client()
         self.client = client
         self.model_id = model_id or getattr(settings, "LAYA_BEDROCK_MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0")
         self.concurrency_controller = concurrency_controller or get_laya_concurrency_controller()
+
+    @staticmethod
+    def _get_production_bedrock_client() -> Any | None:
+        """Resolve production Bedrock runtime client through standard infrastructure factory."""
+        env = getattr(settings, "ENVIRONMENT", "dev").lower()
+        provider = getattr(settings, "MODEL_PROVIDER", "dev").lower()
+        if env == "test" or provider == "test":
+            return None
+        try:
+            from aws.infra import get_client
+            from botocore.config import Config
+            cfg = Config(connect_timeout=3.0, read_timeout=7.0, retries={"max_attempts": 0})
+            return get_client("bedrock-runtime", config=cfg)
+        except Exception as e:
+            logger.info("laya.bedrock_client_init_failed: %s", e)
+            return None
 
     def decide(
         self,
@@ -77,12 +96,13 @@ class LayaDecisionService:
         """Evaluate missing evidence requirement and return validated escalation decision.
 
         Enforces:
-        1. Phase deadline bounds (min(query_remaining_ms, 2500.0) >= 500.0ms).
+        1. Single absolute escalation deadline covering pre-reservation, CountTokens,
+           admission, inference, retry backoff, and decision validation.
         2. Atomic pre reservation in budget ledger.
-        3. Token preflight with deterministic evidence truncation if input > 1000 tokens.
+        3. Authoritative token preflight with capacity retention and malformed response rejection.
         4. Bounded concurrency admission and capacity retention.
-        5. 429 throttling charged as attempts with at most 1 retry.
-        6. Strict provider usage validation.
+        5. 429 throttling charged as attempts with at most 1 retry within deadline.
+        6. Strict provider usage validation without extra slack.
         7. Code validation of proposed route (rejecting unavailable routes in Slice 5.1).
         8. Deterministic fallback on any failure.
         """
@@ -94,9 +114,17 @@ class LayaDecisionService:
             fallback = get_deterministic_fallback_decision(request, "Deadline expired before escalation")
             return fallback.model_copy(update={"execution_status": "timeout"})
 
+        # Absolute escalation deadline covering all operations
+        escalation_deadline_t = time.perf_counter() + (phase_deadline_ms / 1000.0)
+
         # Step 1: Pre-reservation check
+        rem_ms = (escalation_deadline_t - time.perf_counter()) * 1000.0
+        if rem_ms < 500.0:
+            fallback = get_deterministic_fallback_decision(request, "Deadline expired before pre-reservation")
+            return fallback.model_copy(update={"execution_status": "timeout"})
+
         reserved, reason = ledger.pre_reserve(
-            deadline_remaining_ms=phase_deadline_ms,
+            deadline_remaining_ms=rem_ms,
             estimated_input_tokens=1000,
             estimated_output_tokens=250,
         )
@@ -105,18 +133,32 @@ class LayaDecisionService:
             fallback = get_deterministic_fallback_decision(request, f"Pre-reservation failed: {reason}")
             return fallback.model_copy(update={"execution_status": "budget_exhausted"})
 
-        # Step 2: Token preflight and deterministic truncation
+        # Step 2: Token preflight with deterministic evidence truncation
         truncated_req = truncate_evidence_summary_for_preflight(
             request, target_max_tokens=1000, system_prompt=SYSTEM_PROMPT
         )
         req_json = truncated_req.model_dump_json()
 
-        est_prompt_tokens = preflight_token_count(
-            client=self.client,
-            model_id=self.model_id,
-            system_prompt=SYSTEM_PROMPT,
-            user_content=req_json,
-        )
+        # CountTokens protected with remaining deadline and retained capacity
+        rem_s = escalation_deadline_t - time.perf_counter()
+        if rem_s < 0.5:
+            fallback = get_deterministic_fallback_decision(request, "Deadline expired before CountTokens preflight")
+            return fallback.model_copy(update={"execution_status": "timeout"})
+
+        try:
+            est_prompt_tokens = preflight_token_count(
+                client=self.client,
+                model_id=self.model_id,
+                system_prompt=SYSTEM_PROMPT,
+                user_content=req_json,
+                concurrency_controller=self.concurrency_controller,
+                timeout_s=rem_s,
+            )
+        except InvalidCountTokensError as cte:
+            logger.warning("laya.count_tokens_rejected: %s (failing closed to Section 35 fallback)", cte)
+            fallback = get_deterministic_fallback_decision(request, f"CountTokens rejected: {cte}")
+            return fallback.model_copy(update={"execution_status": "rejected_by_code"})
+
         if est_prompt_tokens > 1000:
             logger.warning(
                 "laya.prompt_exceeds_token_cap est_tokens=%d cap=1000", est_prompt_tokens
@@ -125,20 +167,25 @@ class LayaDecisionService:
             return fallback.model_copy(update={"execution_status": "rejected_by_code"})
 
         # Step 3: Bedrock Converse invocation with concurrency controller
-        timeout_s = phase_deadline_ms / 1000.0
+        rem_s = escalation_deadline_t - time.perf_counter()
+        if rem_s < 0.5:
+            logger.warning("laya.deadline_expired_before_inference rem_s=%.2f", rem_s)
+            fallback = get_deterministic_fallback_decision(request, "Deadline expired before inference")
+            return fallback.model_copy(update={"execution_status": "timeout"})
 
         def _spend_reconcile_cb(usage: dict[str, Any], latency_ms: float, status: str) -> None:
             in_tok = usage.get("inputTokens", 0) if isinstance(usage, dict) else 0
             out_tok = usage.get("outputTokens", 0) if isinstance(usage, dict) else 0
-            is_late = status != "completed"
+            is_late = status in ("late_completion", "timeout", "caller_timeout") or status != "completed"
             ledger.settle_spend(in_tok, out_tok, latency_ms, is_late=is_late, status=status)
 
         raw_response, status = self._invoke_with_retry(
             truncated_req=truncated_req,
             est_prompt_tokens=est_prompt_tokens,
-            timeout_s=timeout_s,
+            timeout_s=rem_s,
             on_spend_reconcile=_spend_reconcile_cb,
             ledger=ledger,
+            escalation_deadline_t=escalation_deadline_t,
         )
 
         if status == "admission_rejected":
@@ -146,7 +193,7 @@ class LayaDecisionService:
             fallback = get_deterministic_fallback_decision(request, "Admission queue saturated")
             return fallback.model_copy(update={"execution_status": "rejected_by_code"})
 
-        if status == "caller_timeout" or raw_response is None:
+        if status in ("caller_timeout", "timeout") or raw_response is None:
             logger.warning("laya.invocation_timeout status=%s, falling back to deterministic policy", status)
             fallback = get_deterministic_fallback_decision(request, "Provider timeout")
             return fallback.model_copy(update={"execution_status": "timeout"})
@@ -156,10 +203,14 @@ class LayaDecisionService:
             fallback = get_deterministic_fallback_decision(request, "Provider call failed")
             return fallback.model_copy(update={"execution_status": "rejected_by_code"})
 
-        # Step 4: Strict usage validation
+        # Step 4: Strict usage validation without extra slack
         usage = raw_response.get("usage")
         try:
-            in_tok, out_tok = validate_provider_usage(usage, est_prompt_tokens)
+            in_tok, out_tok = validate_provider_usage(
+                usage=usage,
+                estimated_prompt_tokens=est_prompt_tokens,
+                reserved_input_tokens=1000,
+            )
         except InvalidUsageError as e:
             logger.error("laya.invalid_usage error=%s usage=%s", e, usage)
             # Record invalid usage status without double counting already settled spend
@@ -178,8 +229,9 @@ class LayaDecisionService:
         timeout_s: float,
         on_spend_reconcile: Any,
         ledger: LayaBudgetLedger,
+        escalation_deadline_t: float,
     ) -> tuple[Any, str]:
-        """Invoke provider with 429 rate limit retry charging."""
+        """Invoke provider with 429 rate limit retry charging bounded by escalation deadline."""
         t0 = time.perf_counter()
 
         def _single_call() -> dict[str, Any]:
@@ -213,16 +265,17 @@ class LayaDecisionService:
 
         if is_429:
             ledger.record_attempt()
-            elapsed_s = time.perf_counter() - t0
-            rem_s = timeout_s - elapsed_s
+            rem_s = escalation_deadline_t - time.perf_counter()
             if rem_s >= 0.5:
                 logger.info("laya.429_throttled retrying within remaining deadline rem_s=%.2f", rem_s)
                 time.sleep(0.05)  # brief backoff
-                resp, status = self.concurrency_controller.run_provider_call(
-                    _single_call,
-                    timeout_s=rem_s,
-                    on_spend_reconcile=on_spend_reconcile,
-                )
+                rem_s = escalation_deadline_t - time.perf_counter()
+                if rem_s >= 0.5:
+                    resp, status = self.concurrency_controller.run_provider_call(
+                        _single_call,
+                        timeout_s=rem_s,
+                        on_spend_reconcile=on_spend_reconcile,
+                    )
 
         return resp, status
 

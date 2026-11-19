@@ -46,8 +46,12 @@ class LayaExpansionExecutor:
         """
         # Dynamic tombstone check on workspace BEFORE retrieval
         if boundary_repo is not None and hasattr(boundary_repo, "has_tombstone"):
-            if boundary_repo.has_tombstone(workspace_id, "workspace", workspace_id):
-                logger.warning("laya.tombstone_detected workspace_id=%s (failing closed)", workspace_id)
+            try:
+                if boundary_repo.has_tombstone(workspace_id, "workspace", workspace_id):
+                    logger.warning("laya.tombstone_detected workspace_id=%s (failing closed)", workspace_id)
+                    return [], True, "tombstoned"
+            except Exception as te:
+                logger.error("laya.workspace_tombstone_error: %s (failing closed)", te)
                 return [], True, "tombstoned"
 
         if decision.route == "none":
@@ -70,63 +74,94 @@ class LayaExpansionExecutor:
         if target_doc_ids:
             for doc_id in target_doc_ids:
                 if boundary_repo is not None and hasattr(boundary_repo, "has_tombstone"):
-                    if boundary_repo.has_tombstone(workspace_id, "source", str(doc_id)):
-                        logger.info("laya.target_doc_tombstoned doc_id=%s", doc_id)
+                    try:
+                        if boundary_repo.has_tombstone(workspace_id, "source", str(doc_id)):
+                            logger.info("laya.target_doc_tombstoned doc_id=%s", doc_id)
+                            continue
+                    except Exception:
                         continue
                 active_target_docs.append(str(doc_id))
             if not active_target_docs and target_doc_ids:
                 logger.warning("laya.all_target_docs_tombstoned, returning 0 candidates fail closed")
                 return [], True, "tombstoned"
 
+        # Avoid unrestricted workspace scan by targeting specified documents or snapshot context documents
+        target_docs_arg: list[str] | None = None
+        if active_target_docs:
+            target_docs_arg = list(active_target_docs)
+        elif snapshot_context is not None and hasattr(snapshot_context, "active_documents"):
+            target_docs_arg = [
+                d.document_id for d in snapshot_context.active_documents
+                if not getattr(d, "is_tombstoned", False)
+            ]
+
         # Hydrate active candidate chunks
         try:
             if chunk_repo is not None and hasattr(chunk_repo, "get_all_chunks"):
                 all_chunks = get_cached_chunks(
                     workspace_id,
-                    lambda: chunk_repo.get_all_chunks(document_ids=None, workspace_id=workspace_id),
+                    lambda: chunk_repo.get_all_chunks(document_ids=target_docs_arg, workspace_id=workspace_id),
                 )
             else:
                 from services.langgraph_pipeline import _get_repo
                 repo = _get_repo()
                 all_chunks = get_cached_chunks(
                     workspace_id,
-                    lambda: repo.get_all_chunks(document_ids=None, workspace_id=workspace_id),
+                    lambda: repo.get_all_chunks(document_ids=target_docs_arg, workspace_id=workspace_id),
                 )
         except Exception as e:
             logger.error("laya.chunk_retrieval_failed: %s", e)
             return [], True, "error"
 
-        # Scope chunks to active workspace and target documents
+        # Scope chunks to active workspace, exact versions, and pinned snapshot bindings
         filtered_chunks: list[Chunk] = []
         target_set = set(active_target_docs) if active_target_docs else None
 
         for c in all_chunks:
-            # Workspace isolation
-            c_ws = getattr(c, "workspace_id", None)
-            if c_ws and c_ws != workspace_id:
+            # Workspace isolation and metadata validation
+            c_meta = getattr(c, "metadata", None) or {}
+            c_ws = getattr(c, "workspace_id", None) or c_meta.get("workspace_id")
+            if not c_ws or c_ws != workspace_id:
+                # Missing or conflicting workspace -> reject
                 continue
 
-            # Target document scoping
-            c_doc = str(getattr(c, "document_id", ""))
+            # Document ID validation
+            c_doc = getattr(c, "document_id", None) or c_meta.get("document_id")
+            if not c_doc or str(c_doc) in ("doc_unknown", "unknown"):
+                # Unverified or missing document ID -> reject
+                continue
+            c_doc = str(c_doc)
+
             if target_set is not None and c_doc not in target_set:
                 continue
 
             # Dynamic source tombstone check on each chunk
             if boundary_repo is not None and hasattr(boundary_repo, "has_tombstone"):
-                if boundary_repo.has_tombstone(workspace_id, "source", c_doc):
+                try:
+                    if boundary_repo.has_tombstone(workspace_id, "source", c_doc):
+                        continue
+                except Exception:
                     continue
 
-            # Version scoping against PinnedSnapshotContext if provided
+            # Exact version validation
+            c_ver = getattr(c, "document_version", None) or getattr(c, "version", None) or c_meta.get("document_version") or c_meta.get("version")
+            if not c_ver:
+                # Missing exact version -> reject! Never fabricate v1!
+                continue
+            c_ver = str(c_ver)
+
+            # Strict PinnedSnapshotContext bindings
             if snapshot_context is not None and hasattr(snapshot_context, "get_document"):
                 pinned_doc = snapshot_context.get_document(c_doc)
-                if pinned_doc is not None:
-                    if getattr(pinned_doc, "is_tombstoned", False):
-                        continue
-                    # Check opaque string version match
-                    c_meta = getattr(c, "metadata", None) or {}
-                    c_ver = str(c_meta.get("document_version", "") or getattr(c, "document_version", "") or getattr(c, "version", "") or "")
-                    if c_ver and c_ver != str(pinned_doc.document_version):
-                        continue
+                if pinned_doc is None:
+                    # Absent from pinned bindings -> reject!
+                    continue
+                if getattr(pinned_doc, "is_tombstoned", False):
+                    # Tombstoned in snapshot -> reject!
+                    continue
+                if c_ver != str(pinned_doc.document_version):
+                    # Conflicting version metadata -> reject!
+                    continue
 
             filtered_chunks.append(c)
 

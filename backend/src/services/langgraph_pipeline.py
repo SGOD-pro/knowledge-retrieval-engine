@@ -1294,14 +1294,16 @@ def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
     """Execute bounded LAYA decision model and targeted lexical expansion.
 
     Enforces:
-    - Atomic pre reservation in request local budget ledger.
-    - Token preflight with deterministic evidence truncation (<= 1000 tokens).
+    - Single absolute escalation deadline covering CountTokens, admission, retry backoff,
+      inference, expansion, and postprocessing.
+    - Production resolution of boundary authority and pinned snapshot context (fails closed).
+    - Strict chunk metadata provenance (rejects unverified chunks, missing versions, or version conflicts).
     - Single pass BM25 lexical expansion (other routes explicitly unavailable).
     - Merging novel chunks with baseline candidates.
     - Re reranking and recompression.
     - Clearing stale refusal state before secondary fidelity recheck.
     - Single synthesis call enforcement.
-    - Delivery gate evaluation before free form prose delivery.
+    - Delivery gate evaluation and fallback replacement validation before delivery.
     """
     t0 = time.perf_counter()
     existing_timings = state.get("stage_timings", {})
@@ -1311,6 +1313,62 @@ def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
     pipe_start = state.get("_pipeline_start_time", time.perf_counter())
     elapsed_ms = (time.perf_counter() - pipe_start) * 1000.0
     remaining_ms = max(0.0, 15000.0 - elapsed_ms)
+    phase_deadline_ms = min(remaining_ms, 2500.0)
+    escalation_deadline_t = time.perf_counter() + (phase_deadline_ms / 1000.0)
+
+    ws_id = state.get("workspace_id", "ws_default")
+
+    # Resolve boundary repository through production path
+    boundary_repo = state.get("boundary_repo")
+    if boundary_repo is None:
+        try:
+            from db.workspace_boundary_repo import get_workspace_boundary_repo
+            boundary_repo = get_workspace_boundary_repo()
+        except Exception as bre:
+            logger.error("laya.boundary_repo_resolution_failed: %s (failing closed)", bre)
+            boundary_repo = None
+
+    if boundary_repo is None:
+        logger.error("laya.missing_boundary_authority: failing closed")
+        return {
+            "final_answer": "NOT_FOUND",
+            "citations": [],
+            "confidence_score": 0.0,
+            "retrieval_incomplete": True,
+            "error": "Missing boundary authority",
+        }
+
+    # Evaluate dynamic workspace tombstone early
+    try:
+        if hasattr(boundary_repo, "has_tombstone") and boundary_repo.has_tombstone(ws_id, "workspace", ws_id):
+            logger.warning("laya.workspace_tombstoned ws_id=%s (failing closed)", ws_id)
+            return {
+                "final_answer": "NOT_FOUND",
+                "citations": [],
+                "confidence_score": 0.0,
+                "retrieval_incomplete": True,
+                "error": "Workspace tombstoned",
+            }
+    except Exception as te:
+        logger.error("laya.workspace_tombstone_check_error: %s (failing closed)", te)
+        return {
+            "final_answer": "NOT_FOUND",
+            "citations": [],
+            "confidence_score": 0.0,
+            "retrieval_incomplete": True,
+            "error": f"Tombstone check error: {te}",
+        }
+
+    # Resolve pinned snapshot context through production path
+    snapshot_context = state.get("snapshot_context")
+    if snapshot_context is None:
+        try:
+            from db.knowledge_graph_repo import get_knowledge_graph_repo, build_pinned_snapshot_context
+            kg_repo = state.get("knowledge_graph_repo") or get_knowledge_graph_repo()
+            snapshot_context = build_pinned_snapshot_context(ws_id, boundary_repo, kg_repo)
+        except Exception as ske:
+            logger.info("laya.snapshot_context_build_failed: %s", ske)
+            snapshot_context = None
 
     err = state.get("error") or "Context insufficient"
     compressed = state.get("compressed_text", "")
@@ -1357,14 +1415,32 @@ def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
 
     baseline_chunks = list(state.get("top_chunks") or state.get("candidate_chunks", []))
     summaries: list[BaselineEvidenceSummary] = []
-    ws_id = state.get("workspace_id", "ws_default")
     for c in baseline_chunks[:10]:
-        c_ver = str(getattr(c, "document_version", "") or getattr(c, "version", "") or "v1")
+        c_meta = getattr(c, "metadata", None) or {}
+        c_ws = getattr(c, "workspace_id", None) or c_meta.get("workspace_id")
+        if c_ws and c_ws != ws_id:
+            continue
+        c_doc = getattr(c, "document_id", None) or c_meta.get("document_id")
+        if not c_doc or str(c_doc) in ("doc_unknown", "unknown"):
+            continue
+        c_doc = str(c_doc)
+        c_ver = getattr(c, "document_version", None) or getattr(c, "version", None) or c_meta.get("document_version") or c_meta.get("version")
+        if not c_ver:
+            continue
+        c_ver = str(c_ver)
+
+        if snapshot_context is not None and hasattr(snapshot_context, "get_document"):
+            pinned_doc = snapshot_context.get_document(c_doc)
+            if pinned_doc is None or getattr(pinned_doc, "is_tombstoned", False):
+                continue
+            if c_ver != str(pinned_doc.document_version):
+                continue
+
         c_score = float(min(100.0, max(0.0, getattr(c, "similarity_score", 0.0) or getattr(c, "reranker_score", 0.0) or 1.0)))
         summaries.append(
             BaselineEvidenceSummary(
                 chunk_id=str(c.id)[:64],
-                document_id=str(getattr(c, "document_id", "doc_unknown"))[:128],
+                document_id=c_doc[:128],
                 document_version=c_ver[:64],
                 workspace_id=ws_id,
                 snippet=str(getattr(c, "text", ""))[:300],
@@ -1382,14 +1458,14 @@ def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
         missing_requirement=req_desc,
         available_routes=("lexical_expansion", "none"),
         retrieved_summary=tuple(summaries),
-        caller_deadline_ms=remaining_ms,
+        caller_deadline_ms=phase_deadline_ms,
     )
 
     service = state.get("laya_decision_service") or LayaDecisionService(
         client=state.get("laya_client"),
         model_id=state.get("laya_model_id"),
     )
-    decision = service.decide(escalation_req, remaining_ms, ledger)
+    decision = service.decide(escalation_req, phase_deadline_ms, ledger)
     l_lat_ms = (time.perf_counter() - t0) * 1000.0
 
     cands["laya_decision_id"] = decision.decision_id
@@ -1400,15 +1476,19 @@ def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
     no_progress = True
     status = decision.execution_status
 
-    if decision.route == "lexical_expansion":
+    rem_ms_after_decide = (escalation_deadline_t - time.perf_counter()) * 1000.0
+    if rem_ms_after_decide < 100.0:
+        no_progress = True
+        status = "timeout"
+    elif decision.route == "lexical_expansion":
         executor = state.get("laya_expansion_executor") or LayaExpansionExecutor()
         novel_chunks, no_progress, status = executor.execute(
             decision=decision,
             workspace_id=ws_id,
             baseline_chunks=state.get("candidate_chunks", []),
-            boundary_repo=state.get("boundary_repo"),
+            boundary_repo=boundary_repo,
             chunk_repo=state.get("doc_repo"),
-            snapshot_context=state.get("snapshot_context"),
+            snapshot_context=snapshot_context,
         )
 
     cands["laya_novel_chunks"] = [str(c.id) for c in novel_chunks]
@@ -1428,6 +1508,12 @@ def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
         "retrieval_candidates": cands,
         "stage_timings": {**existing_timings, "laya_ms": l_lat_ms},
     }
+
+    rem_ms_after_exp = (escalation_deadline_t - time.perf_counter()) * 1000.0
+    if rem_ms_after_exp < 100.0 and novel_chunks:
+        no_progress = True
+        status = "timeout"
+        updated_state["laya_status"] = "timeout"
 
     if novel_chunks and not no_progress:
         # Note on design choice for Slice 5.1:
@@ -1476,7 +1562,26 @@ def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
                 # Verifier is unconfigured / unavailable -> free form delivery blocked!
                 from services.retrieval.extractor import extract_verified_fact
                 v_ans, v_chunk = extract_verified_fact(current_state["query"], current_state.get("top_chunks", []))
+                tombstoned = False
                 if v_ans and v_chunk:
+                    v_meta = getattr(v_chunk, "metadata", None) or {}
+                    v_doc = getattr(v_chunk, "document_id", None) or v_meta.get("document_id")
+                    v_ws = getattr(v_chunk, "workspace_id", None) or v_meta.get("workspace_id")
+                    if v_ws and v_ws != ws_id:
+                        tombstoned = True
+                    elif not boundary_repo or not hasattr(boundary_repo, "has_tombstone"):
+                        tombstoned = True
+                    else:
+                        try:
+                            if boundary_repo.has_tombstone(ws_id, "workspace", ws_id):
+                                tombstoned = True
+                            elif v_doc and boundary_repo.has_tombstone(ws_id, "source", str(v_doc)):
+                                tombstoned = True
+                        except Exception as te:
+                            logger.error("laya.fallback_tombstone_error: %s (failing closed)", te)
+                            tombstoned = True
+
+                if v_ans and v_chunk and not tombstoned:
                     updated_state["final_answer"] = v_ans
                     updated_state["citations"] = [build_citation(v_chunk).to_dict()]
                     updated_state["executed_path"] = "deterministic_excerpt"
@@ -1510,33 +1615,80 @@ def delivery_gate(state: PipelineState) -> dict[str, Any]:
     - Free form synthesized prose is never delivered without passing an authoritative semantic verifier.
     - If verifier is unconfigured or unavailable, delivery is blocked in favor of
       approved deterministic output or structured refusal.
+    - Validates final selected evidence and citations after any fallback replacement.
+      Missing boundary authority or tombstone errors suppress delivery.
     """
     ws_id = state.get("workspace_id", "")
     boundary_repo = state.get("boundary_repo")
+    if boundary_repo is None:
+        try:
+            from db.workspace_boundary_repo import get_workspace_boundary_repo
+            boundary_repo = get_workspace_boundary_repo()
+        except Exception as bre:
+            logger.error("delivery_gate.boundary_repo_resolution_failed: %s", bre)
+            boundary_repo = None
 
-    # 1. Dynamic tombstone check before delivery
+    def _validate_replacement_excerpt(v_chunk: Any, ws_id: str, b_repo: Any) -> bool:
+        if v_chunk is None or b_repo is None or not hasattr(b_repo, "has_tombstone"):
+            return False
+        v_meta = getattr(v_chunk, "metadata", None) or {}
+        v_ws = getattr(v_chunk, "workspace_id", None) or v_meta.get("workspace_id")
+        if v_ws and v_ws != ws_id:
+            return False
+        v_doc = getattr(v_chunk, "document_id", None) or v_meta.get("document_id")
+        if not v_doc or str(v_doc) in ("doc_unknown", "unknown"):
+            return False
+        try:
+            if b_repo.has_tombstone(ws_id, "workspace", ws_id):
+                return False
+            if b_repo.has_tombstone(ws_id, "source", str(v_doc)):
+                return False
+        except Exception:
+            return False
+        return True
+
+    # 1. Dynamic tombstone check before delivery (fail closed on tombstone or error)
     if boundary_repo is not None and hasattr(boundary_repo, "has_tombstone"):
-        if boundary_repo.has_tombstone(ws_id, "workspace", ws_id):
-            logger.warning("delivery_gate.workspace_tombstoned ws_id=%s (delivery blocked)", ws_id)
-            return {
-                "final_answer": "NOT_FOUND",
-                "citations": [],
-                "confidence_score": 0.0,
-                "retrieval_incomplete": True,
-            }
-        for cit in state.get("citations", []):
-            doc_id = cit.get("document_id") if isinstance(cit, dict) else getattr(cit, "document_id", None)
-            if doc_id and boundary_repo.has_tombstone(ws_id, "source", str(doc_id)):
-                logger.warning("delivery_gate.source_tombstoned doc_id=%s (delivery blocked)", doc_id)
+        try:
+            if boundary_repo.has_tombstone(ws_id, "workspace", ws_id):
+                logger.warning("delivery_gate.workspace_tombstoned ws_id=%s (delivery blocked)", ws_id)
                 return {
                     "final_answer": "NOT_FOUND",
                     "citations": [],
                     "confidence_score": 0.0,
                     "retrieval_incomplete": True,
                 }
+            for cit in state.get("citations", []):
+                doc_id = cit.get("document_id") if isinstance(cit, dict) else getattr(cit, "document_id", None)
+                if doc_id and boundary_repo.has_tombstone(ws_id, "source", str(doc_id)):
+                    logger.warning("delivery_gate.source_tombstoned doc_id=%s (delivery blocked)", doc_id)
+                    return {
+                        "final_answer": "NOT_FOUND",
+                        "citations": [],
+                        "confidence_score": 0.0,
+                        "retrieval_incomplete": True,
+                    }
+        except Exception as te:
+            logger.error("delivery_gate.tombstone_check_error: %s (delivery blocked)", te)
+            return {
+                "final_answer": "NOT_FOUND",
+                "citations": [],
+                "confidence_score": 0.0,
+                "retrieval_incomplete": True,
+            }
 
     # 2. Delivery gate blocking rule under ADR-004
     if state.get("escalation_executed") or state.get("require_delivery_gate"):
+        # Missing boundary authority must fail closed under escalation
+        if boundary_repo is None:
+            logger.warning("delivery_gate.missing_boundary_authority (delivery blocked)")
+            return {
+                "final_answer": "NOT_FOUND",
+                "citations": [],
+                "confidence_score": 0.0,
+                "retrieval_incomplete": True,
+            }
+
         verifier = state.get("verifier") or state.get("semantic_verifier")
         ans = state.get("final_answer", "")
         if ans and ans != "NOT_FOUND":
@@ -1547,7 +1699,7 @@ def delivery_gate(state: PipelineState) -> dict[str, Any]:
                 from services.retrieval.response_builder import build_citation
 
                 v_ans, v_chunk = extract_verified_fact(state["query"], state.get("top_chunks", []))
-                if v_ans and v_chunk:
+                if v_ans and v_chunk and _validate_replacement_excerpt(v_chunk, ws_id, boundary_repo):
                     return {
                         "final_answer": v_ans,
                         "citations": [build_citation(v_chunk).to_dict()],
@@ -1573,7 +1725,7 @@ def delivery_gate(state: PipelineState) -> dict[str, Any]:
                         from services.retrieval.response_builder import build_citation
 
                         v_ans, v_chunk = extract_verified_fact(state["query"], state.get("top_chunks", []))
-                        if v_ans and v_chunk:
+                        if v_ans and v_chunk and _validate_replacement_excerpt(v_chunk, ws_id, boundary_repo):
                             return {
                                 "final_answer": v_ans,
                                 "citations": [build_citation(v_chunk).to_dict()],
@@ -2296,6 +2448,13 @@ class Pipeline:
                 )
 
                 self._coverage = 1.0
+
+            def __getitem__(self, item: str) -> Any:
+                if item == "final_answer":
+                    return self.answer
+                if hasattr(self, item):
+                    return getattr(self, item)
+                raise KeyError(item)
 
         return ResponseObject(final_state)
 

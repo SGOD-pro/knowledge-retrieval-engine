@@ -44,6 +44,11 @@ class InvalidUsageError(Exception):
     pass
 
 
+class InvalidCountTokensError(Exception):
+    """Raised when count_tokens preflight fails, returns a malformed response, or exceeds proven limits."""
+    pass
+
+
 class LayaBudgetLedger(BaseModel):
     """Request local authoritative budget ledger tracking LAYA model operations."""
 
@@ -147,14 +152,19 @@ def calculate_phase_deadline(remaining_query_ms: float) -> float:
     return min(max(0.0, remaining_query_ms), MAX_PHASE_DEADLINE_MS)
 
 
-def estimate_tokens_defensible_bound(text: str) -> int:
-    """Calculate defensible upper bound on token count from characters.
+def proven_token_upper_bound(text: str) -> int:
+    """Calculate mathematically proven upper bound on BPE tokens.
 
-    Standard conservative heuristic: 1 token ~= 3 characters for English text + punctuation.
+    In UTF-8 byte encoding, every BPE token represents at least one byte.
+    Therefore, len(text.encode('utf-8')) is a mathematically proven upper bound on token count.
     """
     if not text:
         return 0
-    return max(1, (len(text) + 2) // 3)
+    return len(text.encode("utf-8"))
+
+
+# Backwards compatibility alias pointing to proven bound
+estimate_tokens_defensible_bound = proven_token_upper_bound
 
 
 def truncate_evidence_summary_for_preflight(
@@ -165,52 +175,42 @@ def truncate_evidence_summary_for_preflight(
     """Deterministically truncate baseline evidence snippets if payload exceeds input cap."""
     req_json = request.model_dump_json()
     full_text = f"{system_prompt}\n{req_json}"
-    est = estimate_tokens_defensible_bound(full_text)
-    if est <= target_max_tokens:
+    bound = proven_token_upper_bound(full_text)
+    if bound <= target_max_tokens:
         return request
 
-    # Deterministically truncate snippets in retrieved_summary
-    truncated_summaries: list[BaselineEvidenceSummary] = []
-    for item in request.retrieved_summary:
-        # Truncate snippet to 80 chars
-        short_snippet = item.snippet[:80]
-        truncated_item = BaselineEvidenceSummary(
-            chunk_id=item.chunk_id,
-            document_id=item.document_id,
-            document_version=item.document_version,
-            workspace_id=item.workspace_id,
-            snippet=short_snippet,
-            score=item.score,
-            source_kind=item.source_kind,
-            page_number=item.page_number,
-            bbox=item.bbox,
-        )
-        truncated_summaries.append(truncated_item)
+    # Deterministically truncate snippets and drop summaries until bound <= target_max_tokens
+    candidate = request
+    for snip_len in (80, 40, 20):
+        for count in range(len(request.retrieved_summary), -1, -1):
+            truncated_items = tuple(
+                BaselineEvidenceSummary(
+                    chunk_id=item.chunk_id,
+                    document_id=item.document_id,
+                    document_version=item.document_version,
+                    workspace_id=item.workspace_id,
+                    snippet=item.snippet[:snip_len],
+                    score=item.score,
+                    source_kind=item.source_kind,
+                    page_number=item.page_number,
+                    bbox=item.bbox,
+                )
+                for item in request.retrieved_summary[:count]
+            )
+            candidate = LayaEscalationRequest(
+                query_id=request.query_id,
+                workspace_id=request.workspace_id,
+                query=request.query,
+                missing_requirement=request.missing_requirement,
+                available_routes=request.available_routes,
+                retrieved_summary=truncated_items,
+                caller_deadline_ms=request.caller_deadline_ms,
+            )
+            cand_bound = proven_token_upper_bound(f"{system_prompt}\n{candidate.model_dump_json()}")
+            if cand_bound <= target_max_tokens:
+                return candidate
 
-    updated_req = LayaEscalationRequest(
-        query_id=request.query_id,
-        workspace_id=request.workspace_id,
-        query=request.query,
-        missing_requirement=request.missing_requirement,
-        available_routes=request.available_routes,
-        retrieved_summary=tuple(truncated_summaries),
-        caller_deadline_ms=request.caller_deadline_ms,
-    )
-
-    updated_full = f"{system_prompt}\n{updated_req.model_dump_json()}"
-    if estimate_tokens_defensible_bound(updated_full) > target_max_tokens:
-        # If still over, drop summaries to top 3
-        kept_summaries = tuple(truncated_summaries[:3])
-        updated_req = LayaEscalationRequest(
-            query_id=request.query_id,
-            workspace_id=request.workspace_id,
-            query=request.query,
-            missing_requirement=request.missing_requirement,
-            available_routes=request.available_routes,
-            retrieved_summary=kept_summaries,
-            caller_deadline_ms=request.caller_deadline_ms,
-        )
-    return updated_req
+    return candidate
 
 
 def preflight_token_count(
@@ -218,39 +218,76 @@ def preflight_token_count(
     model_id: str,
     system_prompt: str,
     user_content: str,
+    concurrency_controller: Any | None = None,
+    timeout_s: float = 2.5,
 ) -> int:
     """Authoritative token count preflight bound to model and complete serialized payload.
 
-    Invokes client.count_tokens if available; falls back to defensible upper bound.
-    Fails closed if counting fails and no defensible bound is available.
+    Invokes client.count_tokens with deadline and capacity protection if available.
+    Fails closed if counting fails, returns malformed responses, or exceeds proven limits.
     """
     messages = [{"role": "user", "content": [{"text": user_content}]}]
     system = [{"text": system_prompt}] if system_prompt else []
+    full_payload = f"{system_prompt}\n{user_content}"
+    proven_bound = proven_token_upper_bound(full_payload)
 
     if client is not None and hasattr(client, "count_tokens"):
-        try:
-            resp = client.count_tokens(
+        def _count_call() -> dict[str, Any]:
+            return client.count_tokens(
                 modelId=model_id,
                 input={"converse": {"messages": messages, "system": system}},
             )
-            if isinstance(resp, dict) and "inputTokens" in resp:
-                return int(resp["inputTokens"])
-        except Exception as e:
-            logger.warning("laya.count_tokens_failed: %s, falling back to defensible bound", e)
 
-    # Defensible upper bound calculation
-    combined = f"{system_prompt}\n{user_content}"
-    return estimate_tokens_defensible_bound(combined)
+        if concurrency_controller is not None and hasattr(concurrency_controller, "run_provider_call"):
+            resp, status = concurrency_controller.run_provider_call(_count_call, timeout_s=timeout_s)
+            if status == "admission_rejected":
+                raise InvalidCountTokensError("CountTokens admission queue saturated")
+            if status == "caller_timeout" or resp is None:
+                raise InvalidCountTokensError("CountTokens provider call timed out")
+            if status == "call_failed" or isinstance(resp, Exception):
+                raise InvalidCountTokensError(f"CountTokens provider call failed: {resp}")
+        else:
+            try:
+                resp = _count_call()
+            except Exception as exc:
+                raise InvalidCountTokensError(f"CountTokens invocation failed: {exc}")
+
+        # Strict validation of CountTokens response before inference
+        if not isinstance(resp, dict):
+            raise InvalidCountTokensError(f"Malformed CountTokens response: expected dict, got {type(resp).__name__}")
+
+        raw_tokens = resp.get("inputTokens")
+        if raw_tokens is None or isinstance(raw_tokens, bool) or not isinstance(raw_tokens, int):
+            raise InvalidCountTokensError(f"Malformed CountTokens response: invalid inputTokens {raw_tokens}")
+
+        if raw_tokens <= 0:
+            raise InvalidCountTokensError(f"Malformed CountTokens response: non-positive inputTokens {raw_tokens}")
+
+        return int(raw_tokens)
+
+    # Client has no count_tokens capability
+    if proven_bound <= MAX_INPUT_TOKENS_CAP:
+        return proven_bound
+
+    raise InvalidCountTokensError(
+        f"Payload byte bound ({proven_bound}) exceeds cap ({MAX_INPUT_TOKENS_CAP}) and client lacks authoritative count_tokens"
+    )
 
 
-def validate_provider_usage(usage: Any, estimated_prompt_tokens: int) -> tuple[int, int]:
+def validate_provider_usage(
+    usage: Any,
+    estimated_prompt_tokens: int,
+    reserved_input_tokens: int = MAX_INPUT_TOKENS_CAP,
+) -> tuple[int, int]:
     """Strictly validate provider usage dictionary against policy caps.
 
-    Enforces:
+    Enforces without extra slack:
     - Must be a dictionary.
     - inputTokens must be a positive integer.
     - outputTokens must be a non negative integer <= 250.
-    - inputTokens must not exceed estimated_prompt_tokens + 100 slack for tokenization variance.
+    - inputTokens must be <= estimated_prompt_tokens (zero extra slack).
+    - inputTokens must be <= reserved_input_tokens (zero extra slack).
+    - inputTokens must be <= 1000 strict cap.
     """
     if not isinstance(usage, dict):
         raise InvalidUsageError(f"Usage must be a dictionary, got {type(usage).__name__}")
@@ -281,10 +318,20 @@ def validate_provider_usage(usage: Any, estimated_prompt_tokens: int) -> tuple[i
             f"outputTokens {out_tokens} exceeds strict cap of {MAX_OUTPUT_TOKENS_CAP}"
         )
 
-    # Upper bound check against preflight estimate
-    if in_tokens > estimated_prompt_tokens + 100:
+    # Strict upper bound checks without extra slack
+    if in_tokens > estimated_prompt_tokens:
         raise InvalidUsageError(
-            f"inputTokens {in_tokens} exceeds estimated prompt tokens {estimated_prompt_tokens} by more than allowable variance"
+            f"inputTokens {in_tokens} exceeds preflight estimate of {estimated_prompt_tokens}"
+        )
+
+    if in_tokens > reserved_input_tokens:
+        raise InvalidUsageError(
+            f"inputTokens {in_tokens} exceeds reserved capacity of {reserved_input_tokens}"
+        )
+
+    if in_tokens > MAX_INPUT_TOKENS_CAP:
+        raise InvalidUsageError(
+            f"inputTokens {in_tokens} exceeds strict cap of {MAX_INPUT_TOKENS_CAP}"
         )
 
     return in_tokens, out_tokens

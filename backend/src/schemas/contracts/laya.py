@@ -8,8 +8,15 @@ Enforces:
 - Bounded payload sizes for requests, parameters, and baseline evidence summaries.
 """
 
+import sys
 from typing import Annotated, Literal, Union, Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+# Ensure identical module identity across both src.schemas.contracts.laya and schemas.contracts.laya
+if __name__ == "schemas.contracts.laya":
+    sys.modules.setdefault("src.schemas.contracts.laya", sys.modules[__name__])
+elif __name__ == "src.schemas.contracts.laya":
+    sys.modules.setdefault("schemas.contracts.laya", sys.modules[__name__])
 
 
 class MissingRequirementDescription(BaseModel):

@@ -134,9 +134,10 @@ class LayaProviderConcurrencyController:
 
                 # If caller already timed out, reconcile spend while discarding result
                 is_late = caller_timed_out.is_set()
+                late_status = "late_completion" if is_late else outcome["status"]
                 if is_late and on_spend_reconcile is not None:
                     try:
-                        on_spend_reconcile(outcome.get("usage") or {}, w_latency_ms, outcome["status"])
+                        on_spend_reconcile(outcome.get("usage") or {}, w_latency_ms, late_status)
                     except Exception as e:
                         logger.warning("laya.late_spend_reconcile_failed: %s", e)
 
