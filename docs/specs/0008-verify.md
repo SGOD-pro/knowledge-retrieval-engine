@@ -1,11 +1,11 @@
-# Verify: Bounded LAYA Escalation and Query Expansion (spec 0008 Slice 5.1, updated 2026-11-19)
+# Verify: Bounded LAYA Escalation and Query Expansion (spec 0008 Slice 5.1, updated 2026-11-20)
 _Steps derived from spec 0008 acceptance criteria. /check verify runs these; /test locks the durable ones._
 
 ## Verification Metadata
-* **Tested Commit**: `b990d48e46b69bac03f66944b06ae94f06c583bb`
+* **Tested Commit**: `2eb7c3399f9dae780b6fb689576272b8d736c848`
 * **Branch**: `re-factor`
 * **Repository**: `SGOD-pro/knowledge-retrieval-engine`
-* **Execution Date**: 2026-11-19
+* **Execution Date**: 2026-11-20
 * **Environment**: Linux x86_64, Python 3.14 via uv, DynamoDB Local (port 8000), local FastAPI and Uvicorn server (port 8001)
 * **Provider Modes**: Mocked Bedrock runtime client fixtures for CountTokens and Converse, mocked OpenRouter reranker. Zero paid provider calls made. All local mocks are documented as local test doubles and not mischaracterized as live AWS cloud verification.
 * **Status**: Slice 5.1 fully verified and passing. Spec 0008 in progress (Slice 5.1 thin lexical vertical path and admission control complete, Slice 5.2 multi route thickening planned). Spec 0003 deferred. LAYA_ENABLED=false and GRAPH_ENABLED=false defaults preserved.
@@ -16,7 +16,7 @@ _Steps derived from spec 0008 acceptance criteria. /check verify runs these; /te
 ```bash
 cd backend && uv run pytest tests/test_laya_escalation_slice5_1.py -v
 ```
-Result: **21 passed, 0 skipped in 5.27s**
+Result: **34 passed, 0 skipped in 5.47s**
 Breakdown:
 * `test_laya_contracts_strict_discriminator_and_bounds`: PASSED (frozen contract immutability, extra field rejection, strict discriminator agreement, opaque version bounds)
 * `test_baseline_evidence_summary_normalized_bbox`: PASSED (normalized bounding box coordinate order x0 < x1, y0 < y1 between 0.0 and 1.0)
@@ -39,6 +39,18 @@ Breakdown:
 * `test_single_synthesis_call_invariant`: PASSED (single synthesis call invariant enforced, second run_llm call skipped with zero model invocations)
 * `test_stale_refusal_clearing_explicit`: PASSED (stale refusal attributes error, final_answer, citations cleared before secondary verification)
 * `test_no_progress_clean_refusal`: PASSED (no progress detector halts escalation when identical chunks returned, emits structured refusal)
+* `test_compiled_pipeline_tombstoned_replacement_excerpt_suppressed`: PASSED (delivery gate blocks tombstoned replacement excerpt fail closed)
+* `test_compiled_pipeline_missing_boundary_authority_fails_closed`: PASSED (missing boundary authority fails closed to structured refusal)
+* `test_compiled_pipeline_pinned_snapshot_negative_control`: PASSED (unpinned documents, mismatched versions, and conflicting metadata rejected)
+* `test_proven_token_upper_bound_strict`: PASSED (proven token upper bound rejects char divided by 3 heuristic)
+* `test_count_tokens_authoritative_or_proven_bound`: PASSED (authoritative count tokens or proven bound enforced without extra slack)
+* `test_count_tokens_malformed_response_rejected`: PASSED (malformed count tokens responses rejected fail closed)
+* `test_targeted_lexical_expansion_bounds_search_space`: PASSED (lexical expansion targets active snapshot documents avoiding full workspace scans)
+* `test_count_tokens_concurrency_capacity_protection`: PASSED (concurrency controller protects count tokens work with retained capacity)
+* `test_compiled_pipeline_production_snapshot_no_kg_manifest`: PASSED (production snapshot resolution succeeds for baseline ready documents without KG manifest)
+* `test_compiled_pipeline_snapshot_resolution_failure_stops_expansion`: PASSED (snapshot authority failure halts expansion fail closed)
+* `test_compiled_pipeline_slow_retrieval_deadline_retains_capacity`: PASSED (slow expansion retrieval exceeding caller deadline retains capacity and discards late candidates)
+* `test_compiled_pipeline_slow_reranking_deadline_retains_capacity`: PASSED (slow post expansion reranking exceeding caller deadline retains capacity and discards late candidates)
 
 ### 2. Live Runtime Verification Over HTTP and Backend Services
 ```bash
