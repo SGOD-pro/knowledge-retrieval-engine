@@ -25,7 +25,10 @@ import threading
 from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
-from src.schemas.contracts.laya import BaselineEvidenceSummary, LayaEscalationRequest
+try:
+    from schemas.contracts.laya import BaselineEvidenceSummary, LayaEscalationRequest
+except ImportError:
+    from src.schemas.contracts.laya import BaselineEvidenceSummary, LayaEscalationRequest
 
 logger = logging.getLogger(__name__)
 

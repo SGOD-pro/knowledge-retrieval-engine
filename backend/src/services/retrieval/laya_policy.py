@@ -20,12 +20,20 @@ from __future__ import annotations
 import re
 import uuid
 
-from src.schemas.contracts.laya import (
-    LayaEscalationDecision,
-    LayaEscalationRequest,
-    LexicalExpansionParams,
-    NoneExpansionParams,
-)
+try:
+    from schemas.contracts.laya import (
+        LayaEscalationDecision,
+        LayaEscalationRequest,
+        LexicalExpansionParams,
+        NoneExpansionParams,
+    )
+except ImportError:
+    from src.schemas.contracts.laya import (
+        LayaEscalationDecision,
+        LayaEscalationRequest,
+        LexicalExpansionParams,
+        NoneExpansionParams,
+    )
 
 # In Slice 5.1, only lexical_expansion and none are available
 AVAILABLE_ROUTES_SLICE_5_1: frozenset[str] = frozenset({"lexical_expansion", "none"})

@@ -32,45 +32,86 @@ from pydantic import ValidationError
 from config import settings
 from schemas.models import Chunk, Document
 from services.retrieval.bm25_retriever import invalidate_chunk_cache
-from src.schemas.contracts.laya import (
-    BaselineEvidenceSummary,
-    DenseExpansionParams,
-    GraphExpansionParams,
-    LayaEscalationDecision,
-    LayaEscalationRequest,
-    LexicalExpansionParams,
-    MissingRequirementDescription,
-    NoneExpansionParams,
-    StructuralExpansionParams,
-    StructuredExpansionParams,
-)
-from src.schemas.contracts.verification import VerificationRecord
-from src.schemas.contracts.knowledge_graph import PinnedDocumentVersion, PinnedSnapshotContext
-from src.services.retrieval.laya_policy import (
-    AVAILABLE_ROUTES_SLICE_5_1,
-    extract_fallback_query_terms,
-    get_deterministic_fallback_decision,
-)
-from src.services.retrieval.laya_gate import (
-    InvalidCountTokensError,
-    InvalidUsageError,
-    LayaBudgetLedger,
-    calculate_phase_deadline,
-    estimate_tokens_defensible_bound,
-    preflight_token_count,
-    proven_token_upper_bound,
-    truncate_evidence_summary_for_preflight,
-    validate_provider_usage,
-)
-from src.services.retrieval.laya_concurrency import (
-    LayaProviderConcurrencyController,
-)
-from src.services.retrieval.laya_service import (
-    LayaDecisionService,
-)
-from src.services.retrieval.laya_executor import (
-    LayaExpansionExecutor,
-)
+try:
+    from schemas.contracts.laya import (
+        BaselineEvidenceSummary,
+        DenseExpansionParams,
+        GraphExpansionParams,
+        LayaEscalationDecision,
+        LayaEscalationRequest,
+        LexicalExpansionParams,
+        MissingRequirementDescription,
+        NoneExpansionParams,
+        StructuralExpansionParams,
+        StructuredExpansionParams,
+    )
+    from schemas.contracts.verification import VerificationRecord
+    from schemas.contracts.knowledge_graph import PinnedDocumentVersion, PinnedSnapshotContext
+    from services.retrieval.laya_policy import (
+        AVAILABLE_ROUTES_SLICE_5_1,
+        extract_fallback_query_terms,
+        get_deterministic_fallback_decision,
+    )
+    from services.retrieval.laya_gate import (
+        InvalidCountTokensError,
+        InvalidUsageError,
+        LayaBudgetLedger,
+        calculate_phase_deadline,
+        estimate_tokens_defensible_bound,
+        preflight_token_count,
+        proven_token_upper_bound,
+        truncate_evidence_summary_for_preflight,
+        validate_provider_usage,
+    )
+    from services.retrieval.laya_concurrency import (
+        LayaProviderConcurrencyController,
+    )
+    from services.retrieval.laya_service import (
+        LayaDecisionService,
+    )
+    from services.retrieval.laya_executor import (
+        LayaExpansionExecutor,
+    )
+except ImportError:
+    from src.schemas.contracts.laya import (
+        BaselineEvidenceSummary,
+        DenseExpansionParams,
+        GraphExpansionParams,
+        LayaEscalationDecision,
+        LayaEscalationRequest,
+        LexicalExpansionParams,
+        MissingRequirementDescription,
+        NoneExpansionParams,
+        StructuralExpansionParams,
+        StructuredExpansionParams,
+    )
+    from src.schemas.contracts.verification import VerificationRecord
+    from src.schemas.contracts.knowledge_graph import PinnedDocumentVersion, PinnedSnapshotContext
+    from src.services.retrieval.laya_policy import (
+        AVAILABLE_ROUTES_SLICE_5_1,
+        extract_fallback_query_terms,
+        get_deterministic_fallback_decision,
+    )
+    from src.services.retrieval.laya_gate import (
+        InvalidCountTokensError,
+        InvalidUsageError,
+        LayaBudgetLedger,
+        calculate_phase_deadline,
+        estimate_tokens_defensible_bound,
+        preflight_token_count,
+        proven_token_upper_bound,
+        truncate_evidence_summary_for_preflight,
+        validate_provider_usage,
+    )
+    from src.services.retrieval.laya_concurrency import (
+        LayaProviderConcurrencyController,
+    )
+    from src.services.retrieval.laya_service import (
+        LayaDecisionService,
+    )
+    from src.services.retrieval.laya_executor import (
+        LayaExpansionExecutor,
+    )
 from services.langgraph_pipeline import pipeline, run_llm, run_laya_escalation, delivery_gate
 
 

@@ -19,27 +19,50 @@ from typing import Any
 from pydantic import ValidationError
 
 from config import settings
-from src.schemas.contracts.laya import (
-    LayaEscalationDecision,
-    LayaEscalationRequest,
-)
-from src.services.retrieval.laya_concurrency import (
-    LayaProviderConcurrencyController,
-    get_laya_concurrency_controller,
-)
-from src.services.retrieval.laya_gate import (
-    InvalidCountTokensError,
-    InvalidUsageError,
-    LayaBudgetLedger,
-    calculate_phase_deadline,
-    preflight_token_count,
-    truncate_evidence_summary_for_preflight,
-    validate_provider_usage,
-)
-from src.services.retrieval.laya_policy import (
-    AVAILABLE_ROUTES_SLICE_5_1,
-    get_deterministic_fallback_decision,
-)
+try:
+    from schemas.contracts.laya import (
+        LayaEscalationDecision,
+        LayaEscalationRequest,
+    )
+    from services.retrieval.laya_concurrency import (
+        LayaProviderConcurrencyController,
+        get_laya_concurrency_controller,
+    )
+    from services.retrieval.laya_gate import (
+        InvalidCountTokensError,
+        InvalidUsageError,
+        LayaBudgetLedger,
+        calculate_phase_deadline,
+        preflight_token_count,
+        truncate_evidence_summary_for_preflight,
+        validate_provider_usage,
+    )
+    from services.retrieval.laya_policy import (
+        AVAILABLE_ROUTES_SLICE_5_1,
+        get_deterministic_fallback_decision,
+    )
+except ImportError:
+    from src.schemas.contracts.laya import (
+        LayaEscalationDecision,
+        LayaEscalationRequest,
+    )
+    from src.services.retrieval.laya_concurrency import (
+        LayaProviderConcurrencyController,
+        get_laya_concurrency_controller,
+    )
+    from src.services.retrieval.laya_gate import (
+        InvalidCountTokensError,
+        InvalidUsageError,
+        LayaBudgetLedger,
+        calculate_phase_deadline,
+        preflight_token_count,
+        truncate_evidence_summary_for_preflight,
+        validate_provider_usage,
+    )
+    from src.services.retrieval.laya_policy import (
+        AVAILABLE_ROUTES_SLICE_5_1,
+        get_deterministic_fallback_decision,
+    )
 
 logger = logging.getLogger(__name__)
 
