@@ -7,18 +7,21 @@ controlled synthetic inputs, bounded to at most five LAYA requests.
 Features:
 - Completely synthetic in-memory input (no corpus or ground truth files).
 - Distinguishes first request and subsequent request timings.
-- Records client roundtrip, reported server latency, unaccounted elapsed time,
-  dispatch, valid response, accepted route, and deterministic fallback status.
+- Records per-attempt HTTP metrics (roundtrip, server latency, unaccounted time,
+  status code, error, and late completion), preventing any measurement reuse.
 - Separates direct endpoint results from compiled pipeline results.
-- Preserves the strict 2500ms escalation phase deadline.
-- Tests targeted lexical expansion as well as route none refusal.
+- Preserves the strict 2500ms escalation phase deadline across all requests.
+- Requires observed accepted routes and actual lexical expansion for lexical success.
+- Requires an accepted none decision and clean refusal for route none.
+- Rejects fallback delivery as proof of provider readiness.
+- Enforces at most five actual HTTP transmissions (including retries) and rejects redirects.
 - Uses offline doubles for synthesis, embeddings, and reranking (zero paid calls).
 - Completely masks all credentials with zero key fragments printed.
-- Validates and enforces a strict ceiling of at most 5 requests before dispatch.
+- Offline HARNESS PASS strictly requires all explicit assertions and negative controls to pass.
 - Defaults to offline dry-run preparation; live execution requires explicit --live opt-in.
 
 Usage:
-    # 1. Default offline preparation (zero live requests):
+    # 1. Default offline preparation (zero live requests, validates all assertions and negative controls):
     cd backend && uv run python scripts/probe_laya_latency.py
 
     # 2. Explicit opt-in live probe against running LAYA server (at most 5 requests):
@@ -28,10 +31,10 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import os
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -67,24 +70,52 @@ logger = logging.getLogger("laya_probe")
 MAX_ALLOWED_PROBE_REQUESTS = 5
 
 
+class RedirectRejectedError(RuntimeError):
+    """Raised when an HTTP redirect is received or requested in the latency probe."""
+
+
+@dataclass
+class HttpAttemptRecord:
+    """Per-attempt HTTP transmission record preventing cross-request metric leakage."""
+
+    attempt_id: int
+    started_at: float
+    ended_at: float | None = None
+    roundtrip_ms: float | None = None
+    server_latency_ms: float | None = None
+    status_code: int | None = None
+    error: str | None = None
+    is_redirect: bool = False
+    late_completed: bool = False
+    response_data: dict[str, Any] = field(default_factory=dict)
+
+
 @dataclass
 class ProbeMetricRecord:
+    """Detailed observation record for a single probe query."""
+
     probe_id: str
     target: str  # "direct_endpoint" or "compiled_pipeline"
     request_sequence: str  # "first_request" or "subsequent_request"
     query_type: str  # "lexical_expansion" or "none"
-    client_roundtrip_ms: float
+    client_roundtrip_ms: float | None
     server_latency_ms: float | None
     unaccounted_elapsed_ms: float | None
     dispatched: bool
     valid_response: bool
     proposed_route: str
-    accepted_route: str
+    route_accepted: bool
+    expansion_executed: bool
     fallback: bool
     execution_status: str
     pipeline_total_ms: float | None = None
-    delivery_outcome: str | None = None
+    delivery_outcome: str | None = None  # "DELIVERED", "REFUSAL", "APPROVED", "REJECTED", "TIMEOUT"
+    phase_deadline_ms: float = 2500.0
+    completed_within_phase_deadline: bool = True
     token_usage: dict[str, int] = field(default_factory=dict)
+    error: str | None = None
+    is_redirect: bool = False
+    attempts_count: int = 1
 
 
 class MockOfflineVerifier:
@@ -205,24 +236,45 @@ def _setup_synthetic_repository() -> CloudRepository:
 
 
 class BoundedNetworkSpy:
-    """Monitors, measures, and strictly bounds network dispatches before execution."""
+    """Monitors, measures, and strictly bounds network dispatches before execution.
 
-    def __init__(self, dry_run: bool = False) -> None:
+    Maintains per-attempt records so exceptions, timeouts, and late worker completions
+    never contaminate or reuse measurements across requests.
+    """
+
+    def __init__(
+        self,
+        dry_run: bool = False,
+        max_requests: int = MAX_ALLOWED_PROBE_REQUESTS,
+    ) -> None:
         self.dry_run = dry_run
+        self.max_requests = max_requests
         self.request_count = 0
-        self.last_resp_data: dict[str, Any] = {}
-        self.last_roundtrip_ms: float = 0.0
-        self.last_server_latency_ms: float | None = None
+        self.attempts: list[HttpAttemptRecord] = []
+        self._lock = threading.Lock()
         self._orig_post = requests.post
 
-    def spy_post(self, *args: Any, **kwargs: Any) -> Any:
-        # Validate request limit BEFORE dispatch
-        if self.request_count >= MAX_ALLOWED_PROBE_REQUESTS:
-            raise RuntimeError(
-                f"Pre-dispatch validation failed: Request count ({self.request_count}) has reached maximum ceiling ({MAX_ALLOWED_PROBE_REQUESTS}). Dispatch blocked."
-            )
+        # Simulation hooks for negative control testing
+        self.simulated_exception: Exception | None = None
+        self.simulated_status_code: int | None = None
+        self.simulated_server_latency_ms: float | None = 32.5
+        self.simulated_is_redirect: bool = False
+        self.simulated_delay_s: float = 0.04
 
-        self.request_count += 1
+    def spy_post(self, *args: Any, **kwargs: Any) -> Any:
+        # Pre-dispatch validation ceiling
+        with self._lock:
+            if self.request_count >= self.max_requests:
+                raise RuntimeError(
+                    f"Pre-dispatch validation failed: Request count ({self.request_count}) has reached maximum ceiling ({self.max_requests}). Dispatch blocked."
+                )
+            self.request_count += 1
+            attempt_id = self.request_count
+            attempt = HttpAttemptRecord(
+                attempt_id=attempt_id,
+                started_at=time.perf_counter(),
+            )
+            self.attempts.append(attempt)
 
         # Confirm credentials are kept private (never logged or exposed)
         headers = kwargs.get("headers", {})
@@ -230,14 +282,35 @@ class BoundedNetworkSpy:
             auth_val = headers["Authorization"]
             assert auth_val.startswith("Bearer "), "Authorization header must use Bearer token format"
 
-        t0 = time.perf_counter()
-        if self.dry_run:
-            # Simulate realistic offline response double
-            time.sleep(0.04)  # 40ms simulated roundtrip
-            resp = MagicMock()
-            resp.status_code = 200
+        # Explicitly disallow automatic redirects in the probe to count and inspect every transmission
+        kwargs["allow_redirects"] = False
 
-            # Determine response from payload questions
+        if self.dry_run:
+            if self.simulated_delay_s > 0:
+                time.sleep(self.simulated_delay_s)
+
+            t_end = time.perf_counter()
+            attempt.ended_at = t_end
+            attempt.roundtrip_ms = (t_end - attempt.started_at) * 1000.0
+
+            # Handle simulated redirect
+            if self.simulated_is_redirect or (self.simulated_status_code in (301, 302, 303, 307, 308)):
+                attempt.is_redirect = True
+                attempt.status_code = self.simulated_status_code or 302
+                raise RedirectRejectedError(
+                    f"HTTP redirect {attempt.status_code} rejected in latency probe to prevent untracked transmissions"
+                )
+
+            # Handle simulated exception
+            if self.simulated_exception:
+                attempt.error = str(self.simulated_exception)
+                raise self.simulated_exception
+
+            # Normal dry-run mock response
+            resp = MagicMock()
+            resp.status_code = self.simulated_status_code or 200
+            resp.is_redirect = False
+
             req_json = kwargs.get("json", {})
             doc_str = req_json.get("state", {}).get("document", "")
             if "none" in doc_str.lower() or "unexpandable" in doc_str.lower():
@@ -258,28 +331,60 @@ class BoundedNetworkSpy:
                     }
                 },
                 "usage": {"input_tokens": 85, "output_tokens": 0},
-                "server_latency_ms": 32.5,
+                "server_latency_ms": self.simulated_server_latency_ms,
             }
             resp.json.return_value = resp_data
-            self.last_resp_data = resp_data
-            self.last_roundtrip_ms = (time.perf_counter() - t0) * 1000.0
-            self.last_server_latency_ms = 32.5
+            attempt.status_code = resp.status_code
+            attempt.response_data = resp_data
+            attempt.server_latency_ms = self.simulated_server_latency_ms
             return resp
 
         # Real network dispatch
-        resp = self._orig_post(*args, **kwargs)
-        self.last_roundtrip_ms = (time.perf_counter() - t0) * 1000.0
         try:
-            self.last_resp_data = resp.json()
-            # Extract server reported latency if provided by System One endpoint
-            srv_lat = self.last_resp_data.get("server_latency_ms")
-            if srv_lat is None:
-                srv_lat = self.last_resp_data.get("latency_ms")
-            self.last_server_latency_ms = float(srv_lat) if srv_lat is not None else None
-        except Exception:
-            self.last_resp_data = {}
-            self.last_server_latency_ms = None
-        return resp
+            resp = self._orig_post(*args, **kwargs)
+            t_end = time.perf_counter()
+            attempt.ended_at = t_end
+            attempt.roundtrip_ms = (t_end - attempt.started_at) * 1000.0
+            attempt.status_code = resp.status_code
+
+            # Check and reject HTTP redirects
+            if (
+                getattr(resp, "is_redirect", False)
+                or resp.status_code in (301, 302, 303, 307, 308)
+                or "Location" in getattr(resp, "headers", {})
+            ):
+                attempt.is_redirect = True
+                raise RedirectRejectedError(
+                    f"HTTP redirect {resp.status_code} rejected in latency probe to prevent untracked transmissions"
+                )
+
+            try:
+                resp_data = resp.json()
+                attempt.response_data = resp_data
+                srv_lat = resp_data.get("server_latency_ms") or resp_data.get("latency_ms")
+                if srv_lat is not None:
+                    attempt.server_latency_ms = float(srv_lat)
+            except Exception:
+                attempt.response_data = {}
+                attempt.server_latency_ms = None
+            return resp
+        except Exception as exc:
+            t_end = time.perf_counter()
+            if attempt.ended_at is None:
+                attempt.ended_at = t_end
+                attempt.roundtrip_ms = (t_end - attempt.started_at) * 1000.0
+            attempt.error = str(exc)
+            raise
+
+    def get_attempts_since(self, marker: int) -> list[HttpAttemptRecord]:
+        """Return all attempt records created since the specified index marker."""
+        with self._lock:
+            return list(self.attempts[marker:])
+
+    def get_latest_attempt(self) -> HttpAttemptRecord | None:
+        """Return the most recently created attempt record, if any."""
+        with self._lock:
+            return self.attempts[-1] if self.attempts else None
 
 
 class FidelityMockSequence:
@@ -294,15 +399,254 @@ class FidelityMockSequence:
         if self.mode == "lexical":
             if self.calls == 1:
                 from services.retrieval.fidelity_check import CoverageError
+
                 raise CoverageError("Initial fidelity check failed coverage: Missing turnover coverage")
             return 1.0
         else:  # mode == "none"
             from services.retrieval.fidelity_check import CoverageError
+
             raise CoverageError("Unexpandable general concept")
 
 
+def evaluate_probe_verdict(
+    metrics: list[ProbeMetricRecord],
+    max_phase_ms: float = 2500.0,
+) -> tuple[int, str, list[str]]:
+    """Strictly evaluate readiness criteria across all probe metrics.
+
+    Enforces:
+    1. Maximum five actual HTTP transmissions across all attempts.
+    2. Zero redirects.
+    3. Completion within the 2500ms shared escalation phase deadline.
+    4. Observed accepted routes and actual lexical expansion for lexical queries.
+    5. Observed accepted none decision and clean refusal for none queries.
+    6. Rejection of fallback delivery: deterministic fallback delivery never proves provider readiness.
+
+    Returns:
+        tuple of (exit_code, verdict_label, list_of_reasons)
+        exit_code 0: PASS
+        exit_code 1: FAIL (LATENCY BLOCKER)
+        exit_code 2: FAIL (FUNCTIONAL DEFECT)
+    """
+    failures: list[str] = []
+    latency_failures: list[str] = []
+
+    total_attempts = sum(m.attempts_count for m in metrics)
+    if total_attempts > MAX_ALLOWED_PROBE_REQUESTS:
+        failures.append(
+            f"Transmission ceiling exceeded: {total_attempts} attempts > {MAX_ALLOWED_PROBE_REQUESTS} allowed"
+        )
+
+    for idx, m in enumerate(metrics, 1):
+        if m.is_redirect:
+            failures.append(f"Request {idx} received an HTTP redirect, which is disallowed in probe")
+
+        # Check phase deadline
+        elapsed = m.pipeline_total_ms or m.client_roundtrip_ms or 0.0
+        if elapsed > max_phase_ms or not m.completed_within_phase_deadline:
+            latency_failures.append(
+                f"Request {idx} ({m.probe_id}) elapsed {elapsed:.1f}ms exceeding phase deadline {max_phase_ms:.1f}ms"
+            )
+
+        if m.fallback:
+            failures.append(
+                f"Request {idx} used fallback delivery; fallback delivery does not prove provider readiness"
+            )
+
+        if not m.dispatched:
+            failures.append(f"Request {idx} was not dispatched to provider")
+            continue
+
+        if not m.valid_response:
+            failures.append(f"Request {idx} did not receive a valid provider response")
+            continue
+
+        if not m.route_accepted:
+            failures.append(f"Request {idx} proposed route {m.proposed_route} was not accepted")
+            continue
+
+        # Target specific verification
+        if m.query_type == "lexical_expansion":
+            if m.target == "compiled_pipeline":
+                if not m.expansion_executed:
+                    failures.append(f"Request {idx} did not execute lexical expansion")
+                if m.delivery_outcome != "DELIVERED":
+                    failures.append(f"Request {idx} outcome {m.delivery_outcome} was not DELIVERED")
+        elif m.query_type == "none":
+            if m.target == "compiled_pipeline":
+                if m.expansion_executed:
+                    failures.append(f"Request {idx} unexpectedly executed expansion for route none")
+                if m.delivery_outcome != "REFUSAL":
+                    failures.append(f"Request {idx} outcome {m.delivery_outcome} was not REFUSAL")
+
+    if latency_failures:
+        return 1, "FAIL (LATENCY BLOCKER)", latency_failures + failures
+    elif failures:
+        return 2, "FAIL (FUNCTIONAL DEFECT)", failures
+    else:
+        return 0, "PASS", []
+
+
+def run_offline_negative_controls(verbose: bool = True) -> list[str]:
+    """Execute negative controls proving that probe assertions catch defects.
+
+    Negative controls verified:
+    1. Stale timeout metrics: Timed out attempts never inherit prior request roundtrip or server latency.
+    2. Fallback-only output: Deterministic fallback delivery is rejected and cannot prove provider readiness.
+    3. Phase expiry: Escalations exceeding the 2500ms phase ceiling fail with latency blocker.
+    4. Redirects: HTTP redirects are rejected before untracked transmissions occur.
+    5. Attempted sixth transmission: Pre-dispatch validation ceiling strictly blocks a sixth request.
+    """
+    passed_controls: list[str] = []
+
+    # -------------------------------------------------------------------------
+    # Negative Control 1: Stale Timeout Metrics
+    # -------------------------------------------------------------------------
+    spy1 = BoundedNetworkSpy(dry_run=True)
+    with patch("requests.post", side_effect=spy1.spy_post):
+        svc = LayaDecisionService(endpoint_url="https://mock.laya.local/v1/systemone", api_key="key1")
+        req1 = _build_synthetic_request(query="Query 1", gap="Gap 1")
+
+        # First request succeeds
+        m0 = len(spy1.attempts)
+        svc.decide(req1, deadline_remaining_ms=2500.0, ledger=LayaBudgetLedger())
+        att1 = spy1.get_attempts_since(m0)[-1]
+        assert att1.roundtrip_ms is not None, "Attempt 1 must record roundtrip"
+        assert att1.server_latency_ms == 32.5, "Attempt 1 must record server latency"
+
+        # Second request simulates timeout exception
+        spy1.simulated_exception = requests.exceptions.Timeout("Endpoint timed out")
+        spy1.simulated_delay_s = 0.05
+        m1 = len(spy1.attempts)
+        dec2 = svc.decide(req1, deadline_remaining_ms=2500.0, ledger=LayaBudgetLedger())
+        att2 = spy1.get_attempts_since(m1)[-1]
+
+        # Verify no stale metric inheritance
+        assert att2.error is not None and "timed out" in att2.error.lower(), "Attempt 2 must record timeout error"
+        assert att2.server_latency_ms is None, "Attempt 2 must NOT inherit server latency from Attempt 1"
+        assert att2.roundtrip_ms != att1.roundtrip_ms, "Attempt 2 roundtrip must be independent of Attempt 1"
+        assert dec2.execution_status in ("timeout", "provider_unavailable"), "Decision status must reflect timeout"
+        passed_controls.append("Negative Control 1: Stale timeout metrics rejected (zero measurement leakage)")
+
+    # -------------------------------------------------------------------------
+    # Negative Control 2: Fallback-Only Output
+    # -------------------------------------------------------------------------
+    rec_fallback = ProbeMetricRecord(
+        probe_id="ctrl_fallback_delivery",
+        target="compiled_pipeline",
+        request_sequence="subsequent_request",
+        query_type="lexical_expansion",
+        client_roundtrip_ms=45.0,
+        server_latency_ms=None,
+        unaccounted_elapsed_ms=None,
+        dispatched=True,
+        valid_response=False,
+        proposed_route="lexical_expansion",
+        route_accepted=False,
+        expansion_executed=True,
+        fallback=True,  # Provider failed, fallback delivered text
+        execution_status="provider_unavailable",
+        pipeline_total_ms=120.0,
+        delivery_outcome="DELIVERED",
+        completed_within_phase_deadline=True,
+    )
+    code_fb, _, reasons_fb = evaluate_probe_verdict([rec_fallback])
+    assert code_fb == 2, f"Fallback-only delivery must evaluate to code 2 (got {code_fb})"
+    assert any("fallback delivery does not prove provider readiness" in r for r in reasons_fb), (
+        "Verdict evaluation must explicitly state that fallback delivery does not prove provider readiness"
+    )
+    passed_controls.append("Negative Control 2: Fallback-only delivery rejected (provider readiness not proven)")
+
+    # -------------------------------------------------------------------------
+    # Negative Control 3: Phase Expiry
+    # -------------------------------------------------------------------------
+    rec_slow = ProbeMetricRecord(
+        probe_id="ctrl_phase_expiry",
+        target="compiled_pipeline",
+        request_sequence="subsequent_request",
+        query_type="lexical_expansion",
+        client_roundtrip_ms=2600.0,
+        server_latency_ms=30.0,
+        unaccounted_elapsed_ms=2570.0,
+        dispatched=True,
+        valid_response=True,
+        proposed_route="lexical_expansion",
+        route_accepted=True,
+        expansion_executed=True,
+        fallback=False,
+        execution_status="completed",
+        pipeline_total_ms=2650.0,  # Exceeds 2500ms phase ceiling
+        delivery_outcome="DELIVERED",
+        completed_within_phase_deadline=False,
+    )
+    code_slow, _, reasons_slow = evaluate_probe_verdict([rec_slow], max_phase_ms=2500.0)
+    assert code_slow == 1, f"Phase expiry must evaluate to code 1 LATENCY BLOCKER (got {code_slow})"
+    assert any("exceeding phase deadline" in r for r in reasons_slow), "Verdict must identify phase deadline overrun"
+    passed_controls.append("Negative Control 3: Phase expiry caught (evaluated as latency blocker)")
+
+    # -------------------------------------------------------------------------
+    # Negative Control 4: Redirects
+    # -------------------------------------------------------------------------
+    spy_redir = BoundedNetworkSpy(dry_run=True)
+    spy_redir.simulated_is_redirect = True
+    spy_redir.simulated_status_code = 301
+    try:
+        spy_redir.spy_post("https://mock.laya.local/v1/systemone", json={})
+        assert False, "Redirect must raise RedirectRejectedError"
+    except RedirectRejectedError:
+        pass
+    assert spy_redir.attempts[-1].is_redirect is True, "Attempt record must flag is_redirect"
+
+    rec_redir = ProbeMetricRecord(
+        probe_id="ctrl_redirect",
+        target="compiled_pipeline",
+        request_sequence="first_request",
+        query_type="lexical_expansion",
+        client_roundtrip_ms=50.0,
+        server_latency_ms=None,
+        unaccounted_elapsed_ms=None,
+        dispatched=True,
+        valid_response=False,
+        proposed_route="lexical_expansion",
+        route_accepted=False,
+        expansion_executed=False,
+        fallback=True,
+        execution_status="error",
+        is_redirect=True,
+    )
+    code_red, _, reasons_red = evaluate_probe_verdict([rec_redir])
+    assert code_red == 2, f"Redirect must evaluate to code 2 (got {code_red})"
+    assert any("redirect" in r.lower() for r in reasons_red), "Verdict must reject redirects"
+    passed_controls.append("Negative Control 4: Redirects rejected (untracked transmissions blocked)")
+
+    # -------------------------------------------------------------------------
+    # Negative Control 5: Attempted Sixth Transmission
+    # -------------------------------------------------------------------------
+    spy_ceiling = BoundedNetworkSpy(dry_run=True, max_requests=5)
+    for _ in range(5):
+        spy_ceiling.spy_post("https://mock.laya.local/v1/systemone", json={})
+    assert spy_ceiling.request_count == 5, "Must reach ceiling of 5 requests"
+
+    try:
+        spy_ceiling.spy_post("https://mock.laya.local/v1/systemone", json={})
+        assert False, "Sixth transmission must be blocked by pre-dispatch validation"
+    except RuntimeError as re:
+        assert "reached maximum ceiling" in str(re), "Exception must specify maximum ceiling reached"
+    assert spy_ceiling.request_count == 5, "Request count must not increment past ceiling"
+    passed_controls.append("Negative Control 5: Sixth transmission blocked before dispatch (strict ceiling enforced)")
+
+    if verbose:
+        print("\n" + "=" * 90)
+        print("OFFLINE NEGATIVE CONTROLS VERIFIED")
+        print("=" * 90)
+        for ctrl_desc in passed_controls:
+            print(f"  [PASS] {ctrl_desc}")
+
+    return passed_controls
+
+
 def run_latency_probe(endpoint_url: str, api_key: str, dry_run: bool = True) -> int:
-    """Run the 5-request bounded latency probe."""
+    """Run the 5-request bounded latency probe with per-attempt measurement tracking."""
     print("=" * 80)
     print("BOUNDED LAYA LATENCY READINESS PROBE (SPEC 0008)")
     print("=" * 80)
@@ -346,35 +690,48 @@ def run_latency_probe(endpoint_url: str, api_key: str, dry_run: bool = True) -> 
             query="What was the turnover for fiscal year 2026?",
             gap="Initial fidelity check failed coverage: Missing turnover coverage",
         )
+        marker_1 = len(spy.attempts)
         t_start = time.perf_counter()
         dec_1 = service.decide(req_1, deadline_remaining_ms=2500.0, ledger=ledger_1)
         total_time_1 = (time.perf_counter() - t_start) * 1000.0
 
+        attempts_1 = spy.get_attempts_since(marker_1)
+        att_1 = attempts_1[-1] if attempts_1 else None
+        roundtrip_1 = att_1.roundtrip_ms if att_1 else None
+        srv_lat_1 = att_1.server_latency_ms if att_1 else None
         unacc_1 = (
-            (spy.last_roundtrip_ms - spy.last_server_latency_ms)
-            if spy.last_server_latency_ms is not None
+            (roundtrip_1 - srv_lat_1)
+            if (roundtrip_1 is not None and srv_lat_1 is not None)
             else None
         )
+
         rec_1 = ProbeMetricRecord(
             probe_id="probe_direct_req1",
             target="direct_endpoint",
             request_sequence="first_request",
             query_type="lexical_expansion",
-            client_roundtrip_ms=spy.last_roundtrip_ms,
-            server_latency_ms=spy.last_server_latency_ms,
+            client_roundtrip_ms=roundtrip_1,
+            server_latency_ms=srv_lat_1,
             unaccounted_elapsed_ms=unacc_1,
-            dispatched=service.last_dispatched,
-            valid_response=service.last_valid_response,
+            dispatched=bool(service.last_dispatched),
+            valid_response=bool(service.last_valid_response),
             proposed_route=dec_1.route,
-            accepted_route=dec_1.route if service.last_route_accepted else "fallback_lexical",
-            fallback=service.last_fallback,
+            route_accepted=bool(service.last_route_accepted and dec_1.execution_status == "approved"),
+            expansion_executed=False,
+            fallback=bool(service.last_fallback or dec_1.execution_status != "approved"),
             execution_status=dec_1.execution_status,
             pipeline_total_ms=total_time_1,
+            delivery_outcome="APPROVED" if dec_1.execution_status == "approved" else dec_1.execution_status.upper(),
+            phase_deadline_ms=2500.0,
+            completed_within_phase_deadline=bool(total_time_1 <= 2500.0),
             token_usage={"inputTokens": ledger_1.total_input_tokens, "outputTokens": ledger_1.total_output_tokens},
+            error=att_1.error if att_1 else None,
+            is_redirect=att_1.is_redirect if att_1 else False,
+            attempts_count=len(attempts_1),
         )
         metrics.append(rec_1)
         print(f"    Status: {dec_1.execution_status} | Route: {dec_1.route} | Conf: {dec_1.confidence:.4f}")
-        print(f"    Client Roundtrip: {spy.last_roundtrip_ms:.2f} ms | Server Latency: {spy.last_server_latency_ms} ms")
+        print(f"    Client Roundtrip: {roundtrip_1:.2f} ms | Server Latency: {srv_lat_1} ms" if roundtrip_1 else "    Not dispatched")
 
         # Request 2: Direct Endpoint (Subsequent Request, default client behavior)
         print("\n--> Request 2/5: Direct Endpoint (Subsequent Request, default client behavior)...")
@@ -383,35 +740,48 @@ def run_latency_probe(endpoint_url: str, api_key: str, dry_run: bool = True) -> 
             query="What was the turnover for fiscal year 2026?",
             gap="Initial fidelity check failed coverage: Missing turnover coverage",
         )
+        marker_2 = len(spy.attempts)
         t_start = time.perf_counter()
         dec_2 = service.decide(req_2, deadline_remaining_ms=2500.0, ledger=ledger_2)
         total_time_2 = (time.perf_counter() - t_start) * 1000.0
 
+        attempts_2 = spy.get_attempts_since(marker_2)
+        att_2 = attempts_2[-1] if attempts_2 else None
+        roundtrip_2 = att_2.roundtrip_ms if att_2 else None
+        srv_lat_2 = att_2.server_latency_ms if att_2 else None
         unacc_2 = (
-            (spy.last_roundtrip_ms - spy.last_server_latency_ms)
-            if spy.last_server_latency_ms is not None
+            (roundtrip_2 - srv_lat_2)
+            if (roundtrip_2 is not None and srv_lat_2 is not None)
             else None
         )
+
         rec_2 = ProbeMetricRecord(
             probe_id="probe_direct_req2",
             target="direct_endpoint",
             request_sequence="subsequent_request",
             query_type="lexical_expansion",
-            client_roundtrip_ms=spy.last_roundtrip_ms,
-            server_latency_ms=spy.last_server_latency_ms,
+            client_roundtrip_ms=roundtrip_2,
+            server_latency_ms=srv_lat_2,
             unaccounted_elapsed_ms=unacc_2,
-            dispatched=service.last_dispatched,
-            valid_response=service.last_valid_response,
+            dispatched=bool(service.last_dispatched),
+            valid_response=bool(service.last_valid_response),
             proposed_route=dec_2.route,
-            accepted_route=dec_2.route if service.last_route_accepted else "fallback_lexical",
-            fallback=service.last_fallback,
+            route_accepted=bool(service.last_route_accepted and dec_2.execution_status == "approved"),
+            expansion_executed=False,
+            fallback=bool(service.last_fallback or dec_2.execution_status != "approved"),
             execution_status=dec_2.execution_status,
             pipeline_total_ms=total_time_2,
+            delivery_outcome="APPROVED" if dec_2.execution_status == "approved" else dec_2.execution_status.upper(),
+            phase_deadline_ms=2500.0,
+            completed_within_phase_deadline=bool(total_time_2 <= 2500.0),
             token_usage={"inputTokens": ledger_2.total_input_tokens, "outputTokens": ledger_2.total_output_tokens},
+            error=att_2.error if att_2 else None,
+            is_redirect=att_2.is_redirect if att_2 else False,
+            attempts_count=len(attempts_2),
         )
         metrics.append(rec_2)
         print(f"    Status: {dec_2.execution_status} | Route: {dec_2.route} | Conf: {dec_2.confidence:.4f}")
-        print(f"    Client Roundtrip: {spy.last_roundtrip_ms:.2f} ms | Server Latency: {spy.last_server_latency_ms} ms")
+        print(f"    Client Roundtrip: {roundtrip_2:.2f} ms | Server Latency: {srv_lat_2} ms" if roundtrip_2 else "    Not dispatched")
 
         # ---------------------------------------------------------------------
         # SECTION 2: Compiled LangGraph Pipeline Probes (Requests 3, 4, and 5)
@@ -425,6 +795,7 @@ def run_latency_probe(endpoint_url: str, api_key: str, dry_run: bool = True) -> 
              patch("services.langgraph_pipeline.rerank", side_effect=_mock_rerank), \
              patch("services.langgraph_pipeline.check_fidelity", side_effect=FidelityMockSequence(mode="lexical")):
 
+            marker_3 = len(spy.attempts)
             t_start = time.perf_counter()
             resp_3 = pipeline.run(
                 query="What was the turnover for fiscal year 2026?",
@@ -439,31 +810,54 @@ def run_latency_probe(endpoint_url: str, api_key: str, dry_run: bool = True) -> 
             total_time_3 = (time.perf_counter() - t_start) * 1000.0
 
             cands_3 = resp_3.retrieval_candidates or {}
+            attempts_3 = spy.get_attempts_since(marker_3)
+            att_3 = attempts_3[-1] if attempts_3 else None
+            roundtrip_3 = att_3.roundtrip_ms if att_3 else None
+            srv_lat_3 = att_3.server_latency_ms if att_3 else None
             unacc_3 = (
-                (spy.last_roundtrip_ms - spy.last_server_latency_ms)
-                if spy.last_server_latency_ms is not None
+                (roundtrip_3 - srv_lat_3)
+                if (roundtrip_3 is not None and srv_lat_3 is not None)
                 else None
             )
+
+            route_acc_3 = bool(cands_3.get("laya_route_accepted"))
+            exp_exec_3 = bool(cands_3.get("laya_expansion_executed"))
+            fallback_3 = bool(cands_3.get("laya_fallback"))
+            status_3 = str(cands_3.get("laya_status", "unknown"))
+
+            if resp_3.answer == "NOT_FOUND":
+                outcome_3 = "REFUSAL"
+            elif "$450 million" in resp_3.answer:
+                outcome_3 = "DELIVERED"
+            else:
+                outcome_3 = "UNKNOWN"
+
             rec_3 = ProbeMetricRecord(
                 probe_id="probe_pipeline_req3",
                 target="compiled_pipeline",
                 request_sequence="first_request",
                 query_type="lexical_expansion",
-                client_roundtrip_ms=spy.last_roundtrip_ms,
-                server_latency_ms=spy.last_server_latency_ms,
+                client_roundtrip_ms=roundtrip_3,
+                server_latency_ms=srv_lat_3,
                 unaccounted_elapsed_ms=unacc_3,
                 dispatched=bool(cands_3.get("laya_dispatched")),
                 valid_response=bool(cands_3.get("laya_provider_success")),
                 proposed_route=str(cands_3.get("laya_route", "lexical_expansion")),
-                accepted_route="lexical_expansion" if cands_3.get("laya_route_accepted") else "fallback",
-                fallback=bool(cands_3.get("laya_fallback")),
-                execution_status=str(cands_3.get("laya_status", "unknown")),
+                route_accepted=route_acc_3,
+                expansion_executed=exp_exec_3,
+                fallback=fallback_3,
+                execution_status=status_3,
                 pipeline_total_ms=total_time_3,
-                delivery_outcome="DELIVERED" if "$450 million" in resp_3.answer else "REFUSAL",
+                delivery_outcome=outcome_3,
+                phase_deadline_ms=2500.0,
+                completed_within_phase_deadline=bool(total_time_3 <= 2500.0),
+                error=att_3.error if att_3 else None,
+                is_redirect=att_3.is_redirect if att_3 else False,
+                attempts_count=len(attempts_3),
             )
             metrics.append(rec_3)
             print(f"    Outcome: {rec_3.delivery_outcome} | Synthesis Calls: {resp_3.synthesis_calls}")
-            print(f"    Client Roundtrip: {spy.last_roundtrip_ms:.2f} ms | Pipeline Total: {total_time_3:.2f} ms")
+            print(f"    Client Roundtrip: {roundtrip_3:.2f} ms | Pipeline Total: {total_time_3:.2f} ms" if roundtrip_3 else f"    Pipeline Total: {total_time_3:.2f} ms")
 
         # Request 4: Compiled Pipeline (Subsequent Pipeline Request, Lexical Expansion)
         print("\n--> Request 4/5: Compiled Pipeline (Subsequent Request, Lexical Expansion)...")
@@ -472,6 +866,7 @@ def run_latency_probe(endpoint_url: str, api_key: str, dry_run: bool = True) -> 
              patch("services.langgraph_pipeline.rerank", side_effect=_mock_rerank), \
              patch("services.langgraph_pipeline.check_fidelity", side_effect=FidelityMockSequence(mode="lexical")):
 
+            marker_4 = len(spy.attempts)
             t_start = time.perf_counter()
             resp_4 = pipeline.run(
                 query="What was the turnover for fiscal year 2026?",
@@ -486,31 +881,54 @@ def run_latency_probe(endpoint_url: str, api_key: str, dry_run: bool = True) -> 
             total_time_4 = (time.perf_counter() - t_start) * 1000.0
 
             cands_4 = resp_4.retrieval_candidates or {}
+            attempts_4 = spy.get_attempts_since(marker_4)
+            att_4 = attempts_4[-1] if attempts_4 else None
+            roundtrip_4 = att_4.roundtrip_ms if att_4 else None
+            srv_lat_4 = att_4.server_latency_ms if att_4 else None
             unacc_4 = (
-                (spy.last_roundtrip_ms - spy.last_server_latency_ms)
-                if spy.last_server_latency_ms is not None
+                (roundtrip_4 - srv_lat_4)
+                if (roundtrip_4 is not None and srv_lat_4 is not None)
                 else None
             )
+
+            route_acc_4 = bool(cands_4.get("laya_route_accepted"))
+            exp_exec_4 = bool(cands_4.get("laya_expansion_executed"))
+            fallback_4 = bool(cands_4.get("laya_fallback"))
+            status_4 = str(cands_4.get("laya_status", "unknown"))
+
+            if resp_4.answer == "NOT_FOUND":
+                outcome_4 = "REFUSAL"
+            elif "$450 million" in resp_4.answer:
+                outcome_4 = "DELIVERED"
+            else:
+                outcome_4 = "UNKNOWN"
+
             rec_4 = ProbeMetricRecord(
                 probe_id="probe_pipeline_req4",
                 target="compiled_pipeline",
                 request_sequence="subsequent_request",
                 query_type="lexical_expansion",
-                client_roundtrip_ms=spy.last_roundtrip_ms,
-                server_latency_ms=spy.last_server_latency_ms,
+                client_roundtrip_ms=roundtrip_4,
+                server_latency_ms=srv_lat_4,
                 unaccounted_elapsed_ms=unacc_4,
                 dispatched=bool(cands_4.get("laya_dispatched")),
                 valid_response=bool(cands_4.get("laya_provider_success")),
                 proposed_route=str(cands_4.get("laya_route", "lexical_expansion")),
-                accepted_route="lexical_expansion" if cands_4.get("laya_route_accepted") else "fallback",
-                fallback=bool(cands_4.get("laya_fallback")),
-                execution_status=str(cands_4.get("laya_status", "unknown")),
+                route_accepted=route_acc_4,
+                expansion_executed=exp_exec_4,
+                fallback=fallback_4,
+                execution_status=status_4,
                 pipeline_total_ms=total_time_4,
-                delivery_outcome="DELIVERED" if "$450 million" in resp_4.answer else "REFUSAL",
+                delivery_outcome=outcome_4,
+                phase_deadline_ms=2500.0,
+                completed_within_phase_deadline=bool(total_time_4 <= 2500.0),
+                error=att_4.error if att_4 else None,
+                is_redirect=att_4.is_redirect if att_4 else False,
+                attempts_count=len(attempts_4),
             )
             metrics.append(rec_4)
             print(f"    Outcome: {rec_4.delivery_outcome} | Synthesis Calls: {resp_4.synthesis_calls}")
-            print(f"    Client Roundtrip: {spy.last_roundtrip_ms:.2f} ms | Pipeline Total: {total_time_4:.2f} ms")
+            print(f"    Client Roundtrip: {roundtrip_4:.2f} ms | Pipeline Total: {total_time_4:.2f} ms" if roundtrip_4 else f"    Pipeline Total: {total_time_4:.2f} ms")
 
         # Request 5: Compiled Pipeline (Subsequent Pipeline Request, Route None Refusal)
         print("\n--> Request 5/5: Compiled Pipeline (Subsequent Request, Route None Refusal)...")
@@ -519,6 +937,7 @@ def run_latency_probe(endpoint_url: str, api_key: str, dry_run: bool = True) -> 
              patch("services.langgraph_pipeline.rerank", side_effect=_mock_rerank), \
              patch("services.langgraph_pipeline.check_fidelity", side_effect=FidelityMockSequence(mode="none")):
 
+            marker_5 = len(spy.attempts)
             t_start = time.perf_counter()
             resp_5 = pipeline.run(
                 query="Unexpandable general concept with no evidence in existence",
@@ -531,31 +950,49 @@ def run_latency_probe(endpoint_url: str, api_key: str, dry_run: bool = True) -> 
             total_time_5 = (time.perf_counter() - t_start) * 1000.0
 
             cands_5 = resp_5.retrieval_candidates or {}
+            attempts_5 = spy.get_attempts_since(marker_5)
+            att_5 = attempts_5[-1] if attempts_5 else None
+            roundtrip_5 = att_5.roundtrip_ms if att_5 else None
+            srv_lat_5 = att_5.server_latency_ms if att_5 else None
             unacc_5 = (
-                (spy.last_roundtrip_ms - spy.last_server_latency_ms)
-                if spy.last_server_latency_ms is not None
+                (roundtrip_5 - srv_lat_5)
+                if (roundtrip_5 is not None and srv_lat_5 is not None)
                 else None
             )
+
+            route_acc_5 = bool(cands_5.get("laya_route_accepted"))
+            exp_exec_5 = bool(cands_5.get("laya_expansion_executed"))
+            fallback_5 = bool(cands_5.get("laya_fallback"))
+            status_5 = str(cands_5.get("laya_status", "unknown"))
+
+            outcome_5 = "REFUSAL" if resp_5.answer == "NOT_FOUND" else "DELIVERED"
+
             rec_5 = ProbeMetricRecord(
                 probe_id="probe_pipeline_req5",
                 target="compiled_pipeline",
                 request_sequence="subsequent_request",
                 query_type="none",
-                client_roundtrip_ms=spy.last_roundtrip_ms,
-                server_latency_ms=spy.last_server_latency_ms,
+                client_roundtrip_ms=roundtrip_5,
+                server_latency_ms=srv_lat_5,
                 unaccounted_elapsed_ms=unacc_5,
                 dispatched=bool(cands_5.get("laya_dispatched")),
                 valid_response=bool(cands_5.get("laya_provider_success")),
                 proposed_route=str(cands_5.get("laya_route", "none")),
-                accepted_route="none" if cands_5.get("laya_route_accepted") else "fallback",
-                fallback=bool(cands_5.get("laya_fallback")),
-                execution_status=str(cands_5.get("laya_status", "unknown")),
+                route_accepted=route_acc_5,
+                expansion_executed=exp_exec_5,
+                fallback=fallback_5,
+                execution_status=status_5,
                 pipeline_total_ms=total_time_5,
-                delivery_outcome="REFUSAL" if resp_5.answer == "NOT_FOUND" else "DELIVERED",
+                delivery_outcome=outcome_5,
+                phase_deadline_ms=2500.0,
+                completed_within_phase_deadline=bool(total_time_5 <= 2500.0),
+                error=att_5.error if att_5 else None,
+                is_redirect=att_5.is_redirect if att_5 else False,
+                attempts_count=len(attempts_5),
             )
             metrics.append(rec_5)
             print(f"    Outcome: {rec_5.delivery_outcome} | Synthesis Calls: {resp_5.synthesis_calls}")
-            print(f"    Client Roundtrip: {spy.last_roundtrip_ms:.2f} ms | Pipeline Total: {total_time_5:.2f} ms")
+            print(f"    Client Roundtrip: {roundtrip_5:.2f} ms | Pipeline Total: {total_time_5:.2f} ms" if roundtrip_5 else f"    Pipeline Total: {total_time_5:.2f} ms")
 
     # -------------------------------------------------------------------------
     # PRINT STRUCTURED READINESS REPORT
@@ -572,9 +1009,10 @@ def run_latency_probe(endpoint_url: str, api_key: str, dry_run: bool = True) -> 
     for idx, m in enumerate(direct_records, 1):
         srv_str = f"{m.server_latency_ms:.1f}" if m.server_latency_ms is not None else "N/A"
         unacc_str = f"{m.unaccounted_elapsed_ms:.1f}" if m.unaccounted_elapsed_ms is not None else "N/A"
+        cli_str = f"{m.client_roundtrip_ms:.1f}" if m.client_roundtrip_ms is not None else "N/A"
         print(
             f"{idx:<4} {m.request_sequence:<20} {m.query_type:<18} "
-            f"{m.client_roundtrip_ms:<12.1f} {srv_str:<12} {unacc_str:<12} "
+            f"{cli_str:<12} {srv_str:<12} {unacc_str:<12} "
             f"{m.execution_status:<12}"
         )
 
@@ -586,17 +1024,18 @@ def run_latency_probe(endpoint_url: str, api_key: str, dry_run: bool = True) -> 
     print("-" * 90)
     for idx, m in enumerate(pipeline_records, 3):
         pipe_str = f"{m.pipeline_total_ms:.1f}" if m.pipeline_total_ms is not None else "N/A"
+        cli_str = f"{m.client_roundtrip_ms:.1f}" if m.client_roundtrip_ms is not None else "N/A"
         print(
             f"{idx:<4} {m.request_sequence:<20} {m.query_type:<18} "
-            f"{pipe_str:<14} {m.client_roundtrip_ms:<14.1f} "
+            f"{pipe_str:<14} {cli_str:<14} "
             f"{m.execution_status:<12} {m.delivery_outcome or 'N/A':<10}"
         )
 
     print("\n" + "-" * 90)
     print("[ANALYSIS: OBSERVABLE TIMING BREAKDOWN]")
 
-    first_req_times = [m.client_roundtrip_ms for m in metrics if m.request_sequence == "first_request"]
-    subsequent_req_times = [m.client_roundtrip_ms for m in metrics if m.request_sequence == "subsequent_request"]
+    first_req_times = [m.client_roundtrip_ms for m in metrics if m.request_sequence == "first_request" and m.client_roundtrip_ms is not None]
+    subsequent_req_times = [m.client_roundtrip_ms for m in metrics if m.request_sequence == "subsequent_request" and m.client_roundtrip_ms is not None]
     avg_first_ms = sum(first_req_times) / len(first_req_times) if first_req_times else 0.0
     avg_subsequent_ms = sum(subsequent_req_times) / len(subsequent_req_times) if subsequent_req_times else 0.0
 
@@ -619,38 +1058,41 @@ def run_latency_probe(endpoint_url: str, api_key: str, dry_run: bool = True) -> 
     print("* Statistical Reliability: Five requests provide boundary validation and operational sanity checks.")
     print("  Five samples do NOT provide statistical reliability or SLA percentiles (p95/p99).")
 
+    # Evaluate strict probe verdict
+    code, label, reasons = evaluate_probe_verdict(metrics, max_phase_ms=2500.0)
+
     if dry_run:
+        # In dry run mode, execute all negative controls to confirm assertion robustness
+        if code != 0:
+            print("\n" + "=" * 90)
+            print(f">> VERDICT: {label}")
+            print("=" * 90)
+            for r in reasons:
+                print(f"   [FAIL] {r}")
+            return code
+
+        # Run offline negative controls
+        run_offline_negative_controls(verbose=True)
+
         print("\n" + "=" * 90)
         print(">> VERDICT: HARNESS PASS; LIVE LATENCY READINESS UNKNOWN")
         print("=" * 90)
-        print("Harness execution and contract logic verified using offline test doubles.")
+        print("Harness execution, contract logic, and negative controls verified using offline test doubles.")
         print("Real network readiness cannot be derived from mocked timings.")
         print("To measure live network latency, run with explicit opt-in: --live")
         return 0
 
-    # Live Evaluation Pass / Fail Criteria
-    sla_threshold_ms = 2500.0
-    subsequent_sla_pass = all(t <= sla_threshold_ms for t in subsequent_req_times)
-    routes_valid = all(m.valid_response for m in metrics)
-    lexical_verified = any(m.delivery_outcome == "DELIVERED" for m in pipeline_records)
-    none_refused = any(m.delivery_outcome == "REFUSAL" and m.query_type == "none" for m in pipeline_records)
-
+    # Live Execution Verdict Output
     print("\n" + "=" * 90)
-    if subsequent_sla_pass and routes_valid and lexical_verified and none_refused:
-        print(">> VERDICT: PASS (SAMPLE OBSERVED)")
+    print(f">> VERDICT: {label}")
+    print("=" * 90)
+    if code == 0:
         print(f"   Subsequent roundtrips ({avg_subsequent_ms:.1f} ms) completed within the 2500ms phase SLA.")
-        print("   Both lexical expansion delivery and route none refusal verified.")
-        return 0
-    elif not subsequent_sla_pass:
-        print(">> VERDICT: FAIL (LATENCY BLOCKER)")
-        max_subsequent = max(subsequent_req_times) if subsequent_req_times else 0.0
-        print(f"   Subsequent roundtrips peaked at {max_subsequent:.1f} ms, exceeding the 2500.0 ms escalation phase limit.")
-        print("   Escalation will trigger caller phase timeouts and deterministic fallback.")
-        return 1
+        print("   Both lexical expansion delivery and route none refusal verified via accepted provider routes.")
     else:
-        print(">> VERDICT: FAIL (FUNCTIONAL DEFECT)")
-        print(f"   Routes valid: {routes_valid}, Lexical delivery: {lexical_verified}, None refusal: {none_refused}")
-        return 2
+        for r in reasons:
+            print(f"   [DEFECT] {r}")
+    return code
 
 
 def main() -> int:
