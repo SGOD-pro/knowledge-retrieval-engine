@@ -2,7 +2,7 @@
 _Steps derived from spec 0008 acceptance criteria. /check verify runs these; /test locks the durable ones._
 
 ## Verification Metadata
-* **Tested Commit**: `c7187471472d3e937d8d88a4b95dcaa2f4b0fac5`
+* **Tested Commit**: `5d05e5c709e99eb5962e26090c29ae022712dc26`
 * **Branch**: `re-factor`
 * **Repository**: `SGOD-pro/knowledge-retrieval-engine`
 * **Execution Date**: 2026-11-20
