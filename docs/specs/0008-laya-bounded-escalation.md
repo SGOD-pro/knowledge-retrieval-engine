@@ -5,7 +5,7 @@
 
 ## Summary
 
-This specification defines bounded LAYA escalation for the query execution pipeline. When initial baseline discovery fails to retrieve sufficient supporting evidence, leaves request coverage incomplete, or encounters missing calculation operands, LAYA activates as a bounded decision model. It never writes user facing answer prose. Instead, it inspects a structured description of missing requirements and proposes one targeted expansion route, such as lexical, dense, structural, graph, or tabular execution. Code strictly validates the proposed route against active permissions, readiness, and budget limits before executing. The pipeline preserves baseline evidence, enforces authoritative resource budgets, guarantees at most one answer synthesis call per query while preserving the final verification reserve, and returns a structured refusal if evidence remains unsupported. Furthermore, free form generated text is never emitted without passing an authoritative final answer delivery gate.
+This specification defines bounded LAYA escalation for the query execution pipeline. When initial baseline discovery fails to retrieve sufficient supporting evidence, leaves request coverage incomplete, or encounters missing calculation operands, LAYA activates as a bounded decision model. It never writes user facing answer prose. Instead, it inspects a structured description of missing requirements and proposes one targeted expansion route, such as lexical, dense, structural, graph, or tabular execution. The decision model executes through a dedicated provider adapter layer where the primary decision engine is the user's Cloudflare-hosted LAYA server (`/v1/systemone`), with Bedrock Claude Haiku maintained as an alternative provider selectable by explicit configuration (`LAYA_DECISION_PROVIDER`). Silent provider fallback is strictly prohibited. Code strictly validates the proposed route against active permissions, readiness, and budget limits before executing. The pipeline preserves baseline evidence, enforces authoritative resource budgets, guarantees at most one answer synthesis call per query while preserving the final verification reserve, and returns a structured refusal if evidence remains unsupported. Furthermore, free form generated text is never emitted without passing an authoritative final answer delivery gate.
 
 ## Context
 
@@ -32,12 +32,12 @@ Architecture Decision Record [ADR-004-model-budget-ledger.md](file:///home/swyra
 **Acceptance criteria**:
 - **AC-1**: Bounded escalation triggers if and only if initial baseline discovery lacks sufficient evidence support (such as coverage error in fidelity verification, empty compressed context, or missing required tabular operands) and the query budget retains an unused expansion slot (`expansion_steps == 0` and `laya_calls < MAX_QUERY_LAYA_CALLS`). Escalation does not activate when baseline evidence is sufficient, when deterministic math answered the query, or when remaining deadline is below the minimum viable threshold.
 - **AC-2**: LAYA operates strictly as a typed decision model and never emits user facing answer prose. It accepts a typed `LayaEscalationRequest` containing query identity, authorized workspace identity, a structured `MissingRequirementDescription`, and bounded baseline evidence locators with opaque string versions. It returns a typed `LayaEscalationDecision` specifying one chosen route (`lexical_expansion`, `dense_expansion`, `structural_expansion`, `graph_expansion`, `structured_expansion`, or `none`) alongside bounded route parameters and an explicit numeric decision confidence. The model enforces strict discriminator agreement between `route` and `parameters.route_type`. Missing, null, or out of bounds confidence is rejected, and routing confidence is never used to certify evidence sufficiency.
-- **AC-3**: Code validates the proposed decision before execution through a deterministic state machine. If LAYA proposes an unauthorized route, an inactive feature (such as `graph_expansion` while `GRAPH_ENABLED=false`), an unknown document, or malformed parameters, or if LAYA times out or encounters a provider error, code routes to the deterministic missing requirement policy defined in Architecture Bible section 35. If that fallback route is also unavailable, code transitions to clean refusal. All fallback and alternative paths share the single expansion allowance.
+- **AC-3**: Code validates the proposed decision before execution through a deterministic state machine. The decision provider is chosen explicitly by configuration (`LAYA_DECISION_PROVIDER="cloudflare"`, `"bedrock"`, or `"test"`). When a provider is configured and encounters a connection failure, timeout, HTTP error, or unavailability, the system MUST NOT silently fall back to an alternate provider model. Instead, it records `provider_unavailable` telemetry, releases capacity, and routes directly to the deterministic missing requirement policy defined in Architecture Bible section 35. If LAYA proposes an unauthorized route, an inactive feature (such as `graph_expansion` while `GRAPH_ENABLED=false`), an unknown document, or malformed parameters, code likewise routes to the deterministic section 35 policy. If that fallback route is also unavailable, code transitions to clean refusal. All fallback and alternative paths share the single expansion allowance.
 - **AC-4**: Authoritative resource budgets govern escalation under ADR-004. ADR-004 establishes the global policy limit `MAX_QUERY_LLM_CALLS = 2` across the query lifecycle (reserving 1 synthesis call and 1 final semantic verifier call for free form narrative generation). Slice 5 enforces tighter slice specific limits without redefining global policy: exactly one answer synthesis call (`MAX_SYNTHESIS_CALLS = 1`), at most 1 LAYA decision call per query (`MAX_QUERY_LAYA_CALLS = 1` for escalation), at most 1 targeted expansion step (`MAX_EXPANSION_STEPS = 1`), at most 1000 input prompt tokens, at most 250 output decision tokens, and a phase deadline derived as `min(query_remaining_ms, 2500.0)`. Pre reservation atomically checks slots and token estimates before dispatch, 429 throttling retries are charged as attempts, and worker concurrency is capped at 4 with capacity retention in Slice 5.1.
 - **AC-5**: Workspace, document version, and tombstone isolation are enforced across escalation. LAYA receives only metadata and evidence bound to the active workspace and pinned snapshot context. Document identifiers are strings up to 128 characters, and document versions are opaque strings up to 64 characters, matching [boundary.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/schemas/contracts/boundary.py) and [knowledge_graph.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/src/schemas/contracts/knowledge_graph.py). Any expanded retrieval executes strictly within the authorized workspace. Active source or workspace tombstones in `WorkspaceBoundaryRepository` are checked dynamically before and after expansion, returning zero candidates immediately fail closed on tombstone detection.
 - **AC-6**: Exactly one answer synthesis call is permitted per query. Answer synthesis (`run_llm`) executes only after all retrieval and verification stages have settled. LAYA decision tokens do not count toward or consume answer generation slots. If evidence remains unsupported after expansion, the pipeline bypasses answer synthesis entirely, returning a deterministic refusal with zero generation calls. Furthermore, free form generated wording cannot be delivered without passing the authoritative final answer delivery gate. If the semantic verifier is unconfigured or unavailable, free form delivery is explicitly blocked, falling back strictly to approved deterministic output or explicit refusal.
-- **AC-7**: Expanded retrieval candidates pool into evidence collection alongside baseline candidates. For narrative routes, candidates are reranked (consuming the second rerank batch allowed under ADR-004) and recompressed. Structured expansion executes outside reciprocal rank fusion directly through TableStore into mandatory execution evidence. Stale refusal state is cleared before rechecking support. If secondary verification succeeds, answer synthesis proceeds; if verification fails, the engine emits a structured refusal (`final_answer="NOT_FOUND"`, `citations=[]`, `confidence_score=0.0`, `retrieval_incomplete=True`). Telemetry records execution details in `QueryResponse.retrieval_candidates`.
-- **AC-8**: Comprehensive offline ablation test harness verifies escalation behavior without paid provider calls. Offline tests use mocked LAYA decision doubles, verifying successful expansion, fallback on provider failure, code rejection of invalid routes, tenant isolation, tombstone halting, no progress suppression, queue saturation, caller timeout with capacity retention, and strict enforcement of the single answer synthesis invariant. Slice 5.1 implements one thin executable vertical path through lexical expansion with unsupported routes explicitly unavailable.
+- **AC-7**: Expanded retrieval candidates pool into evidence collection alongside baseline candidates. For narrative routes, candidates are reranked (consuming the second rerank batch allowed under ADR-004) and recompressed. Structured expansion executes outside reciprocal rank fusion directly through TableStore into mandatory execution evidence. Stale refusal state is cleared before rechecking support. If secondary verification succeeds, answer synthesis proceeds; if verification fails, the engine emits a structured refusal (`final_answer="NOT_FOUND"`, `citations=[]`, `confidence_score=0.0`, `retrieval_incomplete=True`). Telemetry records execution details in `QueryResponse.retrieval_candidates`, explicitly distinguishing four operational states: `enabled` (`laya_enabled`), `invoked` (`laya_invoked`), `provider_success` (`laya_provider_success`), and `fallback` (`laya_fallback`), alongside `laya_status` and `laya_provider`.
+- **AC-8**: Comprehensive offline ablation test harness verifies escalation behavior without paid provider calls. Offline tests use mocked LAYA decision doubles, verifying successful expansion, fallback on provider failure, code rejection of invalid routes, tenant isolation, tombstone halting, no progress suppression, queue saturation, caller timeout with capacity retention, and strict enforcement of the single answer synthesis invariant. A dedicated offline adapter suite tests the Cloudflare provider adapter using mocked HTTP responses without network calls, verifying schema translation, error handling, telemetry marking, and no silent Bedrock fallback. A separate, future live smoke check script verifies real Cloudflare endpoint connectivity strictly on demand with live credentials, separated completely from automated test runs. Slice 5.1 implements one thin executable vertical path through lexical expansion with unsupported routes explicitly unavailable.
 
 ## Options considered
 
@@ -308,6 +308,7 @@ class LayaEscalationDecision(BaseModel):
         "budget_exhausted",
         "timeout",
         "storage_failed",
+        "provider_unavailable",
     ] = "proposed"
 
     @model_validator(mode="after")
@@ -326,6 +327,77 @@ class LayaEscalationDecision(BaseModel):
 In `LayaEscalationDecision`, the `confidence` field is mandatory and has no default value. The caller must provide an explicit float between 0.0 and 1.0. If the field is missing or invalid, schema validation fails, and the pipeline routes immediately to the deterministic fallback policy.
 
 Per Architecture Bible sections 36 and 2361, routing confidence indicates only the model's self reported confidence in its route choice. It does NOT certify evidence sufficiency. Evidence sufficiency is determined exclusively by mechanical and semantic support verification against retrieved text and table records.
+
+### Provider Adapter Architecture and Explicit Selection
+
+The LAYA decision boundary supports multiple backend providers through a dedicated adapter abstraction. The intended primary decision engine is the user's LAYA server exposed through Cloudflare, with Bedrock Claude Haiku (`anthropic.claude-3-haiku-20240307-v1:0`) retained as an alternative provider selectable by explicit configuration.
+
+1. **Explicit Provider Selection**:
+   - `LAYA_DECISION_PROVIDER`: `Literal["cloudflare", "bedrock", "test"]`. Default in production configuration is `"cloudflare"`. In test environments, `"test"` provides in-memory deterministic test doubles.
+   - Provider selection is mutually exclusive and authoritative. The engine invokes strictly the configured provider.
+
+2. **Strict Invariant: No Silent Bedrock Fallback**:
+   - When `LAYA_DECISION_PROVIDER="cloudflare"` is active, if the Cloudflare server is unreachable, connection times out, DNS fails, or returns HTTP errors (4xx or 5xx), the system MUST NOT silently fall back to Bedrock.
+   - Silently substituting another model violates operational predictability, introduces unbudgeted cloud expenditures, and masks infrastructure outages.
+   - On provider failure, the adapter records `execution_status="provider_unavailable"`, sets `laya_status="provider_unavailable"`, retains or settles ledger spend, and executes the existing bounded Section 35 deterministic fallback (`get_deterministic_fallback_decision`).
+
+3. **Cloudflare Server Interface and Adaptation**:
+   - Endpoint: The server is reached at `/v1/systemone` under the configured base URL (such as `https://intent-diagram-garbage-title.trycloudflare.com/v1/systemone` discovered in `backend/tmp/laya_endpoint.py`).
+   - Authentication: Injected via header `Authorization: Bearer <API_KEY>` from environment variable `LAYA_CLOUDFLARE_API_KEY`.
+   - Request Adaptation: The adapter maps typed `LayaEscalationRequest` into the custom System One JSON format:
+     ```json
+     {
+       "state": {
+         "document": "<query and missing requirement context>"
+       },
+       "questions": {
+         "route": {
+           "type": "choice",
+           "instructions": "Which expansion route should the retrieval engine take?",
+           "criteria": {
+             "lexical_expansion": "keyword search for missing terms",
+             "dense_expansion": "semantic vector search for missing concepts",
+             "structural_expansion": "page or section navigation",
+             "graph_expansion": "entity graph traversal",
+             "structured_expansion": "table or database lookup",
+             "none": "no viable expansion possible"
+           }
+         },
+         "complexity": {
+           "type": "score",
+           "instructions": "How complex is this retrieval gap?",
+           "criteria": ["simple", "moderate", "complex"]
+         }
+       }
+     }
+     ```
+   - Response Parsing: The adapter extracts the selected route from the response JSON, validates agreement with `available_routes`, derives or validates an explicit float confidence between 0.0 and 1.0, and instantiates the matching typed `LayaRouteParameters`.
+   - Timeout Bounding: The request enforces `timeout = phase_deadline_ms / 1000.0`, strictly capped by the 2500ms phase allowance.
+
+4. **Surface Missing Server Contract Details**:
+   - Exact Model Identity: The endpoint masks the underlying weights or model name behind `/v1/systemone`.
+   - Response JSON Schema: The exact key hierarchy returned by `/v1/systemone` is not yet documented in the repository.
+   - Usage Accounting: Does `/v1/systemone` emit token usage in response headers or JSON payload, or must KRE compute token estimates exclusively through client-side token bounding?
+   - Tunnel Stability: `trycloudflare.com` URLs are ephemeral tunnels. Production deployment requires a persistent Cloudflare Tunnel domain or fixed URL.
+   - Error Response Schema: The exact error JSON payload emitted on 4xx/5xx responses is not yet documented.
+
+### Telemetry and Four Explicit Outcome States
+
+To provide complete operational transparency without ambiguity between rerankers, providers, and fallbacks, query execution telemetry in `QueryResponse.retrieval_candidates` must record four explicit boolean outcome flags and supporting attributes:
+
+1. `laya_enabled` (bool): True if LAYA escalation was enabled for the query (`LAYA_ENABLED=True`).
+2. `laya_invoked` (bool): True if a decision provider network call was actually dispatched (`ledger.laya_calls >= 1`).
+3. `laya_provider_success` (bool): True if the configured provider returned a valid, schema-compliant route and confidence within deadline.
+4. `laya_fallback` (bool): True if the pipeline executed the Section 35 deterministic fallback policy (due to provider failure, timeout, queue saturation, code rejection, or unavailable route).
+
+Supporting telemetry attributes recorded alongside these flags:
+- `laya_provider`: string identifier of configured provider (`"cloudflare"`, `"bedrock"`, or `"test"`).
+- `laya_status`: execution status string (`"provider_success"`, `"provider_unavailable"`, `"timeout"`, `"admission_rejected"`, `"rejected_by_code"`, `"storage_failed"`).
+- `laya_latency_ms`: total elapsed time across decision and validation.
+- `laya_tokens`: dictionary with `input_tokens` and `output_tokens`.
+- `laya_decision_id`: identifier of the active decision.
+- `laya_route`: selected route name.
+- `laya_confidence`: explicit numeric confidence score.
 
 ### State Machine and Pipeline Topology
 
@@ -442,14 +514,11 @@ Escalation adheres strictly to the budget governance model established in ADR-00
    - If an HTTP 429 rate limit is encountered, the attempt is charged against `MAX_TOOL_ATTEMPTS = 3`.
    - At most 1 retry is permitted for HTTP 429 if the remaining phase deadline permits. If the retry fails or times out, execution transitions to the deterministic fallback policy.
 5. **Authoritative Token Preflight and Usage Handling**:
-   - Token preflight is bound to the configured provider model (`settings.LAYA_BEDROCK_MODEL_ID` or active Bedrock client) and the complete serialized request payload (system prompt plus user message with serialized `LayaEscalationRequest` JSON).
-   - Preflight invokes supported authoritative counting: `client.count_tokens(modelId=model_id, input={"converse": {"messages": messages, "system": system}})`.
-   - If `count_tokens` is unsupported on the client or provider, the pipeline evaluates a defensible token upper bound. If no defensible bound is available, the gate **fails closed** immediately without dispatching a network call.
-   - Estimated prompt tokens must not exceed 1000 (`estimated_prompt_tokens <= 1000`). If exceeded, baseline evidence snippets are truncated deterministically to fit within 1000 tokens. If compliant prompt length cannot be achieved, the call is rejected before any billable provider call is made.
-   - The provider request explicitly sets `inferenceConfig={"maxTokens": 250, "temperature": 0.0}`.
+   - Token preflight is bound to the configured provider adapter.
+   - For Bedrock (`LAYA_DECISION_PROVIDER="bedrock"`), preflight invokes supported authoritative counting: `client.count_tokens(modelId=model_id, input={"converse": {"messages": messages, "system": system}})`. If unsupported, the pipeline evaluates a defensible token upper bound or fails closed.
+   - For Cloudflare (`LAYA_DECISION_PROVIDER="cloudflare"`), preflight evaluates a defensible token upper bound over the serialized payload (`state` plus `questions`) to verify that prompt tokens do not exceed the 1000 token limit (`estimated_prompt_tokens <= 1000`). If exceeded, baseline evidence snippets are truncated deterministically to fit within 1000 tokens. If compliant prompt length cannot be achieved, the call is rejected before any provider call is made.
    - Per call output token cap is strictly 250 tokens (`max_output_tokens = 250`).
-   - Upon provider response, `response.get("usage")` is inspected. Usage must be a dictionary containing valid positive integer `inputTokens` and non negative integer `outputTokens`.
-   - If usage is missing, non integer, negative, or if `outputTokens > 250`, or if `inputTokens > estimated_prompt_tokens`: the pipeline treats the response as invalid provider usage, fails closed, settles known spent tokens in the ledger, and transitions immediately to `DefaultPolicy` without leaking unmetered usage.
+   - If usage information is returned by the provider, it is validated for positive integer input tokens and non negative integer output tokens. If missing or unsupported by the external API, the settled ledger spend uses the validated preflight estimate for input tokens and exact response payload length upper bound for output tokens, avoiding unmetered usage leaks.
 6. **Dynamic Deadline Calculation**:
    - The escalation phase deadline is calculated as `phase_deadline_ms = min(query_remaining_ms, 2500.0)`.
    - If `phase_deadline_ms < 500.0` ms, escalation is aborted immediately, failing closed to refusal without calling the provider.
@@ -512,6 +581,9 @@ Escalation adheres strictly to the budget governance model established in ADR-00
 - **Scenario 16 (Caller Timeout with Capacity Retention and Late Completion Discarding)**: Caller deadline expires after 1.0s while underlying Bedrock call takes 1.8s. Controller retains worker slot until completion, preventing thread leak or provider stampede. Late completion arriving after caller exit is discarded without mutating state. (AC-4)
 - **Scenario 17 (Final Delivery Gate Blocks Free Form Delivery)**: Expansion and secondary fidelity pass, but generative semantic verifier is unconfigured in the environment. Delivery gate blocks free form synthesis, falling back to verified deterministic excerpt or refusal, proving that reserving a slot alone does not emit unverified text. (AC-6)
 - **Scenario 18 (Missing or Invalid Provider Usage Handling)**: Bedrock response returns missing usage dict, negative input tokens, or output tokens exceeding 250. Gate catches invalid usage, fails closed, settles spent tokens, and executes deterministic fallback. (AC-4)
+- **Scenario 19 (Cloudflare Provider Unavailable and No Bedrock Fallback)**: `LAYA_DECISION_PROVIDER="cloudflare"` is active. The Cloudflare endpoint returns HTTP 502 Bad Gateway or connection timeout. The adapter records `laya_status="provider_unavailable"`, `laya_provider_success=False`, `laya_fallback=True`, settles spent capacity, and executes Section 35 deterministic fallback. Bedrock Converse is never called, verifying no silent model substitution. (AC-3, AC-7)
+- **Scenario 20 (Cloudflare Provider Success and Outcome State Telemetry)**: The Cloudflare adapter returns a valid route decision within the 2500ms phase deadline. Telemetry records `laya_enabled=True`, `laya_invoked=True`, `laya_provider_success=True`, `laya_fallback=False`, `laya_status="provider_success"`, and `laya_provider="cloudflare"`. (AC-2, AC-7)
+- **Scenario 21 (Offline Adapter Isolation and Manual Smoke Check)**: Automated unit tests exercise Cloudflare adapter serialization, headers, status handling, and fallback with mocked HTTP transport. A separate manual script (`backend/scripts/smoke_cloudflare_laya.py`) tests live endpoint connectivity strictly on demand, with zero execution in automated test suites. (AC-8)
 
 ## Build plan (Tracer Bullet Approach)
 
@@ -522,10 +594,20 @@ The build plan follows a vertical Tracer Bullet slice, implementing the thinnest
 2. **Deterministic Missing Requirement Policy**: Implement Architecture Bible section 35 deterministic fallback rules in `backend/src/services/retrieval/laya_policy.py`, mapping missing dimensions to approved expansion routes. Satisfies **AC-3**.
 3. **Pre Reservation and Preflight Gate**: Implement atomic pre reservation checks, authoritative `count_tokens` preflight estimation with defensible bound fallback, and deadline calculation `min(query_remaining_ms, 2500.0)` in `backend/src/services/retrieval/laya_gate.py`. Satisfies **AC-4**.
 4. **Bounded Admission and Capacity Retention**: Implement `LayaProviderConcurrencyController` in `backend/src/services/retrieval/laya_concurrency.py` capping active workers at 4, queuing at 8, enforcing immediate load shedding on saturation, capacity retention on caller timeout, and late completion discarding. Satisfies **AC-4**.
-5. **LAYA Decision Provider Boundary**: Implement `LayaDecisionService` in `backend/src/services/retrieval/laya_service.py` with Bedrock Converse structured output parsing (`inferenceConfig` maxTokens 250, temperature 0.0), usage dictionary validation, output cap enforcement, and offline test double injection. In Slice 5.1, unsupported routes (`structural_expansion`, `dense_expansion`, `graph_expansion`, `structured_expansion`) are explicitly registered as unavailable, causing code validation to reject them or fall back. Satisfies **AC-2**, **AC-3**, **AC-4**.
+5. **LAYA Decision Provider Boundary and Cloudflare Adapter**:
+   - Define `LayaDecisionProviderAdapter` protocol in `backend/src/services/retrieval/laya_service.py` to abstract model backends.
+   - Implement `CloudflareLayaAdapter` targeting `/v1/systemone` with Bearer auth, request adapting from `LayaEscalationRequest` to the Cloudflare schema, response parsing, and explicit timeout bounding.
+   - Implement `BedrockLayaAdapter` preserving Bedrock Converse Claude Haiku as an alternative selectable provider.
+   - Add configuration settings: `LAYA_DECISION_PROVIDER` (`"cloudflare"` | `"bedrock"` | `"test"`), `LAYA_CLOUDFLARE_BASE_URL`, `LAYA_CLOUDFLARE_API_KEY`, `LAYA_CLOUDFLARE_TIMEOUT_MS`.
+   - Enforce fail safe behavior: if the configured provider fails or is unreachable, record `laya_status="provider_unavailable"` and route immediately to Section 35 deterministic fallback with ZERO silent fallback to Bedrock.
+   - Emit explicit telemetry for the four outcome states: `enabled`, `invoked`, `provider_success`, `fallback`.
+   - In Slice 5.1, unsupported routes (`structural_expansion`, `dense_expansion`, `graph_expansion`, `structured_expansion`) are explicitly registered as unavailable, causing code validation to reject them or fall back. Satisfies **AC-2**, **AC-3**, **AC-4**, **AC-7**.
 6. **Targeted Lexical Expansion Handler**: Wire targeted single pass BM25 retrieval handler in `LayaExpansionExecutor`. Satisfies **AC-1**, **AC-5**.
 7. **LangGraph Pipeline Integration and Final Delivery Gate**: Wire `run_laya_escalation` node into `backend/src/services/langgraph_pipeline.py` between `run_fidelity` and `run_llm`, clearing stale refusal state upon expansion, reranking, recompressing, enforcing the single synthesis call limit, and gating free form delivery against verifier availability. Satisfies **AC-1**, **AC-6**, **AC-7**.
-8. **Offline Slice 5.1 Test Suite**: Implement offline regression suite in `backend/tests/test_laya_escalation_slice5_1.py` exercising lexical expansion, code rejection of unavailable routes, deterministic fallback, token preflight, discriminator validation, queue saturation, caller timeout with capacity retention, late completion discarding, delivery gate blocking, and single synthesis limit with mocked providers. Satisfies **AC-8**.
+8. **Offline Slice 5.1 Test Suite and Adapter Verification**:
+   - Implement offline regression suite in `backend/tests/test_laya_escalation_slice5_1.py` exercising lexical expansion, code rejection of unavailable routes, deterministic fallback, token preflight, discriminator validation, queue saturation, caller timeout with capacity retention, late completion discarding, delivery gate blocking, and single synthesis limit with mocked providers.
+   - Implement dedicated provider adapter suite in `backend/tests/test_cloudflare_laya_adapter.py` testing Cloudflare request formatting, response parsing, 502/timeout handling, `provider_unavailable` telemetry, and proof that Bedrock is not invoked when Cloudflare fails.
+   - Provide standalone manual live smoke check script in `backend/scripts/smoke_cloudflare_laya.py` for manual verification outside CI. Satisfies **AC-8**.
 
 ### Slice 5.2: Bounded Multi Route Thickening
 1. **Remaining Expansion Handlers**: Wire targeted handlers for `dense_expansion` (vector search), `structural_expansion` (PageIndex), `structured_expansion` (TableStore non RRF execution), and optional `graph_expansion` when `GRAPH_ENABLED=true`.

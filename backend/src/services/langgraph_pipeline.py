@@ -154,6 +154,8 @@ class PipelineState(TypedDict):
     semantic_verifier: Any | None
     laya_client: Any | None
     laya_model_id: str | None
+    laya_endpoint_url: str | None
+    laya_api_key: str | None
     laya_decision_service: Any | None
     laya_expansion_executor: Any | None
     laya_budget_ledger: Any | None
@@ -1532,6 +1534,8 @@ def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
         client=state.get("laya_client"),
         model_id=state.get("laya_model_id"),
         concurrency_controller=ctrl,
+        endpoint_url=state.get("laya_endpoint_url"),
+        api_key=state.get("laya_api_key"),
     )
     decision = service.decide(escalation_req, rem_ms_decide, ledger)
     l_lat_ms = (time.perf_counter() - t0) * 1000.0
@@ -1572,8 +1576,20 @@ def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
         else:
             novel_chunks, no_progress, status = [], True, "error"
 
+    exp_executed = bool(novel_chunks and not no_progress)
     cands["laya_novel_chunks"] = [str(c.id) for c in novel_chunks]
     cands["laya_no_progress"] = no_progress
+    cands["laya_configured"] = bool(state.get("laya_enabled", getattr(settings, "LAYA_ENABLED", False)))
+    cands["laya_enabled"] = bool(state.get("laya_enabled", getattr(settings, "LAYA_ENABLED", False)))
+    cands["laya_dispatched"] = bool(getattr(service, "last_dispatched", False))
+    cands["laya_invoked"] = bool(getattr(service, "last_dispatched", False))
+    cands["laya_valid_response"] = bool(getattr(service, "last_valid_response", False))
+    cands["laya_provider_success"] = bool(getattr(service, "last_valid_response", False))
+    cands["laya_route_accepted"] = bool(getattr(service, "last_route_accepted", False) and decision.execution_status == "approved")
+    cands["laya_expansion_executed"] = exp_executed
+    cands["laya_fallback"] = bool(getattr(service, "last_fallback", False) or decision.execution_status != "approved")
+    cands["laya_status"] = status
+    cands["laya_provider"] = "endpoint" if getattr(service, "endpoint_url", None) else ("bedrock" if getattr(service, "client", None) else "mock")
 
     updated_state: dict[str, Any] = {
         "laya_calls": ledger.laya_calls,
@@ -2653,6 +2669,8 @@ class Pipeline:
             "semantic_verifier": kwargs.get("semantic_verifier"),
             "laya_client": kwargs.get("laya_client"),
             "laya_model_id": kwargs.get("laya_model_id"),
+            "laya_endpoint_url": kwargs.get("laya_endpoint_url"),
+            "laya_api_key": kwargs.get("laya_api_key"),
             "laya_decision_service": kwargs.get("laya_decision_service"),
             "laya_expansion_executor": kwargs.get("laya_expansion_executor"),
             "laya_budget_ledger": kwargs.get("laya_budget_ledger"),

@@ -120,6 +120,8 @@ class Settings(BaseSettings):
     LAYA_MAX_CONCURRENCY: int = 4
     LAYA_MAX_QUEUE: int = 8
     LAYA_BEDROCK_MODEL_ID: str = "anthropic.claude-3-haiku-20240307-v1:0"
+    LAYA_ENDPOINT_URL: str = ""
+    LAYA_API_KEY: str = ""
 
     model_config = {"env_file": _ENV_FILES, "extra": "ignore"}
 

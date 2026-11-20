@@ -21,8 +21,14 @@ from pydantic import ValidationError
 from config import settings
 try:
     from schemas.contracts.laya import (
+        DenseExpansionParams,
+        GraphExpansionParams,
         LayaEscalationDecision,
         LayaEscalationRequest,
+        LexicalExpansionParams,
+        NoneExpansionParams,
+        StructuralExpansionParams,
+        StructuredExpansionParams,
     )
     from services.retrieval.laya_concurrency import (
         LayaProviderConcurrencyController,
@@ -43,8 +49,14 @@ try:
     )
 except ImportError:
     from src.schemas.contracts.laya import (
+        DenseExpansionParams,
+        GraphExpansionParams,
         LayaEscalationDecision,
         LayaEscalationRequest,
+        LexicalExpansionParams,
+        NoneExpansionParams,
+        StructuralExpansionParams,
+        StructuredExpansionParams,
     )
     from src.services.retrieval.laya_concurrency import (
         LayaProviderConcurrencyController,
@@ -87,12 +99,27 @@ class LayaDecisionService:
         client: Any | None = None,
         model_id: str | None = None,
         concurrency_controller: LayaProviderConcurrencyController | None = None,
+        endpoint_url: str | None = None,
+        api_key: str | None = None,
     ) -> None:
-        if client is None:
-            client = self._get_production_bedrock_client()
-        self.client = client
+        if client is not None:
+            self.client = client
+            self.endpoint_url = "" if not endpoint_url or client is not None else endpoint_url
+            self.api_key = api_key or ""
+        elif endpoint_url or getattr(settings, "LAYA_ENDPOINT_URL", ""):
+            self.endpoint_url = endpoint_url or getattr(settings, "LAYA_ENDPOINT_URL", "")
+            self.api_key = api_key or getattr(settings, "LAYA_API_KEY", "")
+            self.client = None
+        else:
+            self.endpoint_url = ""
+            self.api_key = ""
+            self.client = self._get_production_bedrock_client()
         self.model_id = model_id or getattr(settings, "LAYA_BEDROCK_MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0")
         self.concurrency_controller = concurrency_controller or get_laya_concurrency_controller()
+        self.last_dispatched = False
+        self.last_valid_response = False
+        self.last_route_accepted = False
+        self.last_fallback = False
 
     @staticmethod
     def _get_production_bedrock_client() -> Any | None:
@@ -130,10 +157,15 @@ class LayaDecisionService:
         8. Deterministic fallback on any failure.
         """
         phase_deadline_ms = calculate_phase_deadline(deadline_remaining_ms)
+        self.last_dispatched = False
+        self.last_valid_response = False
+        self.last_route_accepted = False
+        self.last_fallback = False
         if phase_deadline_ms < 500.0:
             logger.warning(
                 "laya.deadline_insufficient remaining_ms=%.1f min=500.0", phase_deadline_ms
             )
+            self.last_fallback = True
             fallback = get_deterministic_fallback_decision(request, "Deadline expired before escalation")
             return fallback.model_copy(update={"execution_status": "timeout"})
 
@@ -143,6 +175,7 @@ class LayaDecisionService:
         # Step 1: Pre-reservation check
         rem_ms = (escalation_deadline_t - time.perf_counter()) * 1000.0
         if rem_ms < 500.0:
+            self.last_fallback = True
             fallback = get_deterministic_fallback_decision(request, "Deadline expired before pre-reservation")
             return fallback.model_copy(update={"execution_status": "timeout"})
 
@@ -153,18 +186,26 @@ class LayaDecisionService:
         )
         if not reserved:
             logger.warning("laya.pre_reservation_failed reason=%s", reason)
+            self.last_fallback = True
             fallback = get_deterministic_fallback_decision(request, f"Pre-reservation failed: {reason}")
             return fallback.model_copy(update={"execution_status": "budget_exhausted"})
 
         # Step 2: Token preflight with deterministic evidence truncation
+        endpoint_mode = bool(self.endpoint_url)
+        active_system_prompt = "" if endpoint_mode else SYSTEM_PROMPT
         truncated_req = truncate_evidence_summary_for_preflight(
-            request, target_max_tokens=1000, system_prompt=SYSTEM_PROMPT
+            request, target_max_tokens=1000, system_prompt=active_system_prompt
         )
-        req_json = truncated_req.model_dump_json()
+        if endpoint_mode:
+            endpoint_payload = self._format_endpoint_payload(truncated_req)
+            user_content = json.dumps(endpoint_payload)
+        else:
+            user_content = truncated_req.model_dump_json()
 
         # CountTokens protected with remaining deadline and retained capacity
         rem_s = escalation_deadline_t - time.perf_counter()
         if rem_s < 0.5:
+            self.last_fallback = True
             fallback = get_deterministic_fallback_decision(request, "Deadline expired before CountTokens preflight")
             return fallback.model_copy(update={"execution_status": "timeout"})
 
@@ -172,13 +213,14 @@ class LayaDecisionService:
             est_prompt_tokens = preflight_token_count(
                 client=self.client,
                 model_id=self.model_id,
-                system_prompt=SYSTEM_PROMPT,
-                user_content=req_json,
+                system_prompt=active_system_prompt,
+                user_content=user_content,
                 concurrency_controller=self.concurrency_controller,
                 timeout_s=rem_s,
             )
         except InvalidCountTokensError as cte:
             logger.warning("laya.count_tokens_rejected: %s (failing closed to Section 35 fallback)", cte)
+            self.last_fallback = True
             fallback = get_deterministic_fallback_decision(request, f"CountTokens rejected: {cte}")
             return fallback.model_copy(update={"execution_status": "rejected_by_code"})
 
@@ -186,6 +228,7 @@ class LayaDecisionService:
             logger.warning(
                 "laya.prompt_exceeds_token_cap est_tokens=%d cap=1000", est_prompt_tokens
             )
+            self.last_fallback = True
             fallback = get_deterministic_fallback_decision(request, "Payload exceeds 1000 token cap")
             return fallback.model_copy(update={"execution_status": "rejected_by_code"})
 
@@ -193,6 +236,7 @@ class LayaDecisionService:
         rem_s = escalation_deadline_t - time.perf_counter()
         if rem_s < 0.5:
             logger.warning("laya.deadline_expired_before_inference rem_s=%.2f", rem_s)
+            self.last_fallback = True
             fallback = get_deterministic_fallback_decision(request, "Deadline expired before inference")
             return fallback.model_copy(update={"execution_status": "timeout"})
 
@@ -213,15 +257,23 @@ class LayaDecisionService:
 
         if status == "admission_rejected":
             logger.warning("laya.admission_rejected, falling back to deterministic policy")
+            self.last_fallback = True
             fallback = get_deterministic_fallback_decision(request, "Admission queue saturated")
             return fallback.model_copy(update={"execution_status": "rejected_by_code"})
 
-        if status in ("caller_timeout", "timeout") or raw_response is None:
+        if status in ("caller_timeout", "timeout") or isinstance(raw_response, TimeoutError):
             logger.warning("laya.invocation_timeout status=%s, falling back to deterministic policy", status)
+            self.last_fallback = True
             fallback = get_deterministic_fallback_decision(request, "Provider timeout")
             return fallback.model_copy(update={"execution_status": "timeout"})
 
-        if status == "call_failed" or isinstance(raw_response, Exception):
+        if status == "call_failed" or isinstance(raw_response, Exception) or raw_response is None:
+            err_str = str(raw_response).lower()
+            self.last_fallback = True
+            if self.endpoint_url or "unavailable" in err_str or "connection" in err_str or "permission" in err_str or "502" in err_str or "503" in err_str:
+                logger.warning("laya.provider_unavailable err=%s, falling back to deterministic policy", raw_response)
+                fallback = get_deterministic_fallback_decision(request, f"Provider unavailable: {raw_response}")
+                return fallback.model_copy(update={"execution_status": "provider_unavailable"})
             logger.warning("laya.call_failed err=%s, falling back to deterministic policy", raw_response)
             fallback = get_deterministic_fallback_decision(request, "Provider call failed")
             return fallback.model_copy(update={"execution_status": "rejected_by_code"})
@@ -238,6 +290,7 @@ class LayaDecisionService:
             logger.error("laya.invalid_usage error=%s usage=%s", e, usage)
             # Record invalid usage status without double counting already settled spend
             ledger.record_invalid_usage()
+            self.last_fallback = True
             fallback = get_deterministic_fallback_decision(request, f"Invalid provider usage: {e}")
             return fallback.model_copy(update={"execution_status": "rejected_by_code"})
 
@@ -258,6 +311,50 @@ class LayaDecisionService:
         t0 = time.perf_counter()
 
         def _single_call() -> dict[str, Any]:
+            self.last_dispatched = True
+            if self.endpoint_url:
+                import requests
+
+                payload = self._format_endpoint_payload(truncated_req)
+                headers = {
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                }
+                call_timeout = max(0.1, timeout_s)
+                try:
+                    resp = requests.post(
+                        self.endpoint_url,
+                        json=payload,
+                        headers=headers,
+                        timeout=call_timeout,
+                    )
+                except requests.Timeout as te:
+                    raise TimeoutError(f"LAYA endpoint timed out: {te}") from te
+                except requests.RequestException as re:
+                    raise ConnectionError(f"LAYA endpoint unavailable: {re}") from re
+
+                if resp.status_code == 429:
+                    raise RuntimeError("LAYA endpoint returned 429 rate limit")
+                if resp.status_code in (401, 403):
+                    raise PermissionError(f"LAYA endpoint authorization failed: {resp.status_code}")
+                if resp.status_code != 200:
+                    raise ConnectionError(f"LAYA endpoint returned error status {resp.status_code}: {resp.text[:200]}")
+
+                try:
+                    data = resp.json()
+                except Exception as je:
+                    raise ValueError(f"LAYA endpoint returned invalid JSON: {je}") from je
+
+                usage = data.get("usage")
+                if isinstance(usage, dict):
+                    in_t = usage.get("input_tokens", usage.get("inputTokens", 1))
+                    out_t = usage.get("output_tokens", usage.get("outputTokens", 0))
+                    data["usage"] = {
+                        "inputTokens": max(1, int(in_t)) if isinstance(in_t, (int, float)) and not isinstance(in_t, bool) else 1,
+                        "outputTokens": max(0, int(out_t)) if isinstance(out_t, (int, float)) and not isinstance(out_t, bool) else 0,
+                    }
+                return data
+
             if self.client is None:
                 # Offline test mode or mock
                 raise RuntimeError("No provider client configured")
@@ -309,13 +406,169 @@ class LayaDecisionService:
 
         return resp, status
 
+    def _format_endpoint_payload(self, req: LayaEscalationRequest) -> dict[str, Any]:
+        """Format LayaEscalationRequest into /v1/systemone JSON payload."""
+        snippets = " ".join(s.snippet for s in req.retrieved_summary[:3])
+        doc_context = (
+            f"Query: {req.query}\n"
+            f"Gap detected: {req.missing_requirement.detected_gap}\n"
+            f"Missing dimension: {req.missing_requirement.missing_dimension}\n"
+            f"Context: {snippets}"
+        )
+        base_payload = {
+            "state": {
+                "document": doc_context[:650],
+            },
+            "questions": {
+                "route": {
+                    "type": "choice",
+                    "instructions": "Which targeted retrieval expansion route should be executed?",
+                    "criteria": {
+                        "lexical_expansion": "Perform keyword BM25 search for specific missing terms or exact phrases",
+                        "dense_expansion": "Perform vector similarity search for semantic concepts",
+                        "structural_expansion": "Navigate document structure or specific sections",
+                        "graph_expansion": "Traverse knowledge graph entity relationships",
+                        "structured_expansion": "Query structured table columns or database operands",
+                        "none": "No expansion needed or evidence is fundamentally missing",
+                    },
+                },
+                "complexity": {
+                    "type": "score",
+                    "instructions": "How complex is this retrieval gap?",
+                    "criteria": ["simple", "moderate", "complex"],
+                },
+            },
+        }
+        raw_bytes = len(json.dumps(base_payload).encode("utf-8"))
+        while raw_bytes > 900 and len(base_payload["state"]["document"]) > 20:
+            excess = raw_bytes - 900
+            curr = base_payload["state"]["document"]
+            trim_amount = max(excess + 10, 20)
+            base_payload["state"]["document"] = curr[:-trim_amount]
+            raw_bytes = len(json.dumps(base_payload).encode("utf-8"))
+        return base_payload
+
+    def _parse_endpoint_response(
+        self,
+        raw_response: dict[str, Any],
+        request: LayaEscalationRequest,
+    ) -> LayaEscalationDecision:
+        """Parse and validate /v1/systemone answers into LayaEscalationDecision."""
+        import uuid
+
+        answers = raw_response.get("answers", {})
+        route_data = answers.get("route", {})
+        if not isinstance(route_data, dict):
+            logger.warning("laya.malformed_answers_route: %s", route_data)
+            self.last_fallback = True
+            return get_deterministic_fallback_decision(request, "Malformed route answer from endpoint")
+
+        chosen_route = route_data.get("choice")
+        if not chosen_route or not isinstance(chosen_route, str):
+            logger.warning("laya.missing_route_choice: %s", route_data)
+            self.last_fallback = True
+            return get_deterministic_fallback_decision(request, "Missing route choice in endpoint answer")
+
+        if chosen_route not in (
+            "lexical_expansion",
+            "dense_expansion",
+            "structural_expansion",
+            "graph_expansion",
+            "structured_expansion",
+            "none",
+        ):
+            logger.warning("laya.unknown_route_choice: %s", chosen_route)
+            self.last_fallback = True
+            return get_deterministic_fallback_decision(request, f"Unknown route choice: {chosen_route}")
+
+        conf = route_data.get("answer_confidence")
+        if conf is None:
+            conf = route_data.get("confidence")
+        if conf is None or isinstance(conf, bool) or not isinstance(conf, (int, float)):
+            logger.warning("laya.missing_or_invalid_endpoint_confidence: %s", conf)
+            self.last_fallback = True
+            return get_deterministic_fallback_decision(request, "Missing or invalid confidence score from endpoint")
+
+        conf_float = float(conf)
+        if conf_float < 0.0 or conf_float > 1.0:
+            logger.warning("laya.out_of_bounds_endpoint_confidence: %f", conf_float)
+            self.last_fallback = True
+            return get_deterministic_fallback_decision(request, f"Confidence {conf_float} out of bounds")
+
+        parameters: Any
+        if chosen_route == "lexical_expansion":
+            raw_terms = request.missing_requirement.detected_gap.split() or request.query.split()
+            query_terms = tuple(t[:64] for t in raw_terms[:5] if t) or ("term",)
+            parameters = LexicalExpansionParams(
+                route_type="lexical_expansion",
+                query_terms=query_terms,
+            )
+        elif chosen_route == "none":
+            parameters = NoneExpansionParams(
+                route_type="none",
+                reason=f"Endpoint selected route 'none' (confidence {conf_float:.3f})",
+            )
+        elif chosen_route == "dense_expansion":
+            parameters = DenseExpansionParams(
+                route_type="dense_expansion",
+                concept_query=request.query[:200] or "expansion concept",
+            )
+        elif chosen_route == "structural_expansion":
+            doc_id = request.retrieved_summary[0].document_id if request.retrieved_summary else "doc_unknown"
+            parameters = StructuralExpansionParams(
+                route_type="structural_expansion",
+                document_id=doc_id,
+            )
+        elif chosen_route == "graph_expansion":
+            parameters = GraphExpansionParams(
+                route_type="graph_expansion",
+                seed_entity_id="entity_unknown",
+            )
+        else:  # structured_expansion
+            parameters = StructuredExpansionParams(
+                route_type="structured_expansion",
+                table_name="table_unknown",
+                required_columns=("col1",),
+            )
+
+        decision = LayaEscalationDecision(
+            decision_id=f"dec_{uuid.uuid4().hex[:8]}",
+            route=chosen_route,
+            parameters=parameters,
+            confidence=conf_float,
+            rationale=f"LAYA endpoint selected {chosen_route}",
+            execution_status="proposed",
+        )
+        self.last_valid_response = True
+
+        if decision.route not in AVAILABLE_ROUTES_SLICE_5_1:
+            logger.info(
+                "laya.route_unavailable_in_slice5_1 route=%s, falling back to deterministic policy",
+                decision.route,
+            )
+            self.last_route_accepted = False
+            self.last_fallback = True
+            fallback = get_deterministic_fallback_decision(
+                request,
+                f"Route '{decision.route}' unavailable in Slice 5.1; falling back to lexical",
+            )
+            return fallback
+
+        self.last_route_accepted = True
+        self.last_fallback = False
+        return decision.model_copy(update={"execution_status": "approved"})
+
     def _parse_and_validate_decision(
         self,
         raw_response: dict[str, Any],
         request: LayaEscalationRequest,
     ) -> LayaEscalationDecision:
-        """Parse structured Converse output into LayaEscalationDecision and validate against Slice 5.1 rules."""
+        """Parse structured Converse or endpoint output into LayaEscalationDecision and validate against Slice 5.1 rules."""
         try:
+            # Handle direct LAYA API endpoint response
+            if "answers" in raw_response and isinstance(raw_response["answers"], dict):
+                return self._parse_endpoint_response(raw_response, request)
+
             # Extract text from Converse response
             output_msg = raw_response.get("output", {}).get("message", {})
             content_list = output_msg.get("content", [])
@@ -324,6 +577,7 @@ class LayaDecisionService:
 
             if not raw_text:
                 logger.warning("laya.empty_text_returned, falling back to deterministic policy")
+                self.last_fallback = True
                 return get_deterministic_fallback_decision(request, "Empty model response text")
 
             # Extract JSON block if wrapped in markdown fences
@@ -335,20 +589,24 @@ class LayaDecisionService:
             parsed = json.loads(raw_text)
             if not isinstance(parsed, dict):
                 logger.warning("laya.non_dict_json_returned: %s", raw_text)
+                self.last_fallback = True
                 return get_deterministic_fallback_decision(request, "Non dictionary JSON returned")
 
             # Validate confidence is explicit float between 0.0 and 1.0
             conf = parsed.get("confidence")
             if conf is None or not isinstance(conf, (int, float)) or isinstance(conf, bool):
                 logger.warning("laya.missing_or_invalid_confidence: %s", conf)
+                self.last_fallback = True
                 return get_deterministic_fallback_decision(request, "Missing or invalid confidence score")
 
             if conf < 0.0 or conf > 1.0:
                 logger.warning("laya.out_of_bounds_confidence: %f", conf)
+                self.last_fallback = True
                 return get_deterministic_fallback_decision(request, f"Confidence {conf} out of bounds")
 
             # Validate Pydantic schema
             decision = LayaEscalationDecision.model_validate(parsed)
+            self.last_valid_response = True
 
             # Code Validation: In Slice 5.1, non lexical routes are explicitly unavailable
             if decision.route not in AVAILABLE_ROUTES_SLICE_5_1:
@@ -356,6 +614,8 @@ class LayaDecisionService:
                     "laya.route_unavailable_in_slice5_1 route=%s, falling back to deterministic policy",
                     decision.route,
                 )
+                self.last_route_accepted = False
+                self.last_fallback = True
                 fallback = get_deterministic_fallback_decision(
                     request,
                     f"Route '{decision.route}' unavailable in Slice 5.1; falling back to lexical",
@@ -363,8 +623,11 @@ class LayaDecisionService:
                 return fallback
 
             # Decision is approved
+            self.last_route_accepted = True
+            self.last_fallback = False
             return decision.model_copy(update={"execution_status": "approved"})
 
         except (json.JSONDecodeError, ValidationError, ValueError, KeyError) as e:
             logger.warning("laya.validation_failed error=%s, falling back to deterministic policy", e)
+            self.last_fallback = True
             return get_deterministic_fallback_decision(request, f"Decision validation failed: {e}")

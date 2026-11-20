@@ -100,6 +100,39 @@ Integrated test count reconciliation:
 * Count of 150 tests reflected the 5 initial compiled application path regressions in `tests/test_laya_escalation_slice5_1.py` covering slow compression, slow secondary fidelity, slow answer synthesis with capacity retention and spend reconciliation, and cross field provenance disagreement gating, bringing slice tests to 40 (40 + 110 = 150).
 * Current count of 152 tests reflects the 2 additional compiled application path regressions under default production timing: `test_compiled_pipeline_default_timing_expired_phase_zero_verifier_dispatch` and `test_compiled_pipeline_default_timing_slow_verification_retains_capacity_and_suppresses_late_text`, bringing slice tests to 42 and total integrated tests to 152 (42 + 110 = 152 passed).
 
+### 4. Cloudflare LAYA Endpoint Adapter Regression Suite
+```bash
+cd backend && uv run pytest tests/test_laya_endpoint_adapter.py -v
+```
+Result: **15 passed, 1 skipped in 3.19s**
+
+Breakdown:
+* `test_endpoint_happy_path_lexical`: PASSED (endpoint returns lexical expansion choice, approved decision produced)
+* `test_endpoint_route_none_clean_refusal`: PASSED (endpoint selects route none, approved decision produced)
+* `test_endpoint_unsupported_route_falls_back_to_lexical`: PASSED (endpoint selects dense expansion, rejected by code validation and falls back to lexical)
+* `test_endpoint_malformed_json_response`: PASSED (malformed JSON response falls back to deterministic decision)
+* `test_endpoint_missing_route_choice`: PASSED (missing route choice falls back cleanly)
+* `test_endpoint_missing_confidence`: PASSED (missing confidence rejected, mandatory numeric score enforced)
+* `test_endpoint_out_of_bounds_confidence`: PASSED (confidence 1.2 rejected, bounds 0.0 to 1.0 enforced)
+* `test_endpoint_auth_failure_401`: PASSED (401 response raises PermissionError, falls back to deterministic decision)
+* `test_endpoint_rate_limit_429`: PASSED (429 response handled with bounded retry charging)
+* `test_endpoint_server_error_502_provider_unavailable`: PASSED (502 response sets execution_status to provider_unavailable)
+* `test_simulated_4_4s_phase_deadline_timeout_and_capacity_retention`: PASSED (simulated slow 4.4 second network call exceeding 2500ms phase allowance triggers caller timeout, retains worker slot, discards late arrival, and reconciles ledger spend)
+* `test_pipeline_endpoint_successful_lexical_expansion`: PASSED (compiled pipeline expands via BM25, delivers verified answer, sets explicit telemetry flags)
+* `test_pipeline_endpoint_valid_route_none`: PASSED (compiled pipeline route none produces clean refusal NOT_FOUND without answer synthesis calls)
+* `test_pipeline_endpoint_unsupported_route_fallback`: PASSED (compiled pipeline dense expansion proposal rejected, deterministic Section 35 fallback executed, laya_route_accepted is False, laya_fallback is True)
+* `test_pipeline_endpoint_provider_unavailable_fallback`: PASSED (compiled pipeline connection failure marked provider_unavailable, executes Section 35 fallback with zero Bedrock fallback)
+* `test_pipeline_laya_invoked_distinction_not_dispatched_on_preflight_abort`: PASSED (laya_invoked is False when escalation aborts before provider dispatch)
+* `test_live_endpoint_roundtrip_opt_in`: SKIPPED (live opt in check guarded by RUN_LIVE_LAYA_TESTS=true to avoid unexpected paid or network calls during automated test suites)
+
+### 5. Performance and Latency Finding
+The manual live endpoint smoke check confirmed System One response compatibility (`choice: "none"`, `confidence: 0.476`, `answer_confidence: 0.7413`, model `"laya-rl-agent"`). However, the Cloudflare tunnel roundtrip measured at 4409.25ms (server latency 50.86ms). Since 4409ms exceeds KRE's 2500ms escalation phase ceiling, this constitutes a known latency readiness blocker for benchmark evaluation until the server is co-located or deployed behind a low-latency Cloudflare Tunnel.
+
+Combined LAYA offline regression count:
+* `tests/test_laya_escalation_slice5_1.py`: 42 passed
+* `tests/test_laya_endpoint_adapter.py`: 15 passed, 1 skipped
+* Combined total: 57 passed, 1 skipped in 13.81s
+
 ## Acceptance Criteria Coverage (Slice 5.1)
 - AC-1: Bounded escalation triggers when baseline discovery lacks sufficient evidence support (such as coverage error in fidelity verification or empty context) and the query budget retains an unused expansion slot (expansion_steps == 0 and laya_calls < MAX_QUERY_LAYA_CALLS). Escalation does not activate when baseline evidence is sufficient or remaining deadline is below the minimum viable threshold (500ms).
 - AC-2: LAYA operates as a typed decision model and never emits user facing answer prose. It accepts a typed LayaEscalationRequest and returns a typed LayaEscalationDecision specifying route, parameters, and numeric confidence. Enforces strict discriminator agreement between route and parameters.route_type. Missing, null, or boolean confidence is rejected. Routing confidence is never used to certify evidence sufficiency.

@@ -230,6 +230,7 @@ class LayaEscalationDecision(BaseModel):
         "budget_exhausted",
         "timeout",
         "storage_failed",
+        "provider_unavailable",
     ] = "proposed"
 
     @model_validator(mode="after")
