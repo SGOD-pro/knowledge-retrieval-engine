@@ -16,7 +16,7 @@ _Steps derived from spec 0008 acceptance criteria. /check verify runs these; /te
 ```bash
 cd backend && uv run pytest tests/test_laya_escalation_slice5_1.py -v
 ```
-Result: **35 passed, 0 skipped in 4.90s**
+Result: **40 passed, 0 skipped in 7.43s**
 Breakdown:
 * `test_laya_contracts_strict_discriminator_and_bounds`: PASSED (frozen contract immutability, extra field rejection, strict discriminator agreement, opaque version bounds)
 * `test_baseline_evidence_summary_normalized_bbox`: PASSED (normalized bounding box coordinate order x0 < x1, y0 < y1 between 0.0 and 1.0)
@@ -40,18 +40,24 @@ Breakdown:
 * `test_single_synthesis_call_invariant`: PASSED (single synthesis call invariant enforced, second run_llm call skipped with zero model invocations)
 * `test_stale_refusal_clearing_explicit`: PASSED (stale refusal attributes error, final_answer, citations cleared before secondary verification)
 * `test_no_progress_clean_refusal`: PASSED (no progress detector halts escalation when identical chunks returned, emits structured refusal)
+* `test_invalid_usage_fallback_through_decision_service`: PASSED (invalid usage dict falls back safely through decision service)
+* `test_missing_usage_dict_fallback_through_decision_service`: PASSED (missing usage dict falls back safely through decision service)
+* `test_dynamic_missing_dimension_derivation_in_pipeline`: PASSED (dynamic missing dimension derivation maps runtime coverage failures to lexical fallback)
+* `test_laya_policy_empty_terms_routes_to_none`: PASSED (policy with empty fallback terms cleanly routes to none expansion)
 * `test_compiled_pipeline_tombstoned_replacement_excerpt_suppressed`: PASSED (delivery gate blocks tombstoned replacement excerpt fail closed)
 * `test_compiled_pipeline_missing_boundary_authority_fails_closed`: PASSED (missing boundary authority fails closed to structured refusal)
 * `test_compiled_pipeline_pinned_snapshot_negative_control`: PASSED (unpinned documents, mismatched versions, and conflicting metadata rejected)
-* `test_proven_token_upper_bound_strict`: PASSED (proven token upper bound rejects char divided by 3 heuristic)
-* `test_count_tokens_authoritative_or_proven_bound`: PASSED (authoritative count tokens or proven bound enforced without extra slack)
-* `test_count_tokens_malformed_response_rejected`: PASSED (malformed count tokens responses rejected fail closed)
-* `test_targeted_lexical_expansion_bounds_search_space`: PASSED (lexical expansion targets active snapshot documents avoiding full workspace scans)
-* `test_count_tokens_concurrency_capacity_protection`: PASSED (concurrency controller protects count tokens work with retained capacity)
+* `test_count_tokens_capacity_retention_and_malformed_rejection`: PASSED (malformed count tokens response rejected and capacity preserved)
+* `test_strict_usage_validation_zero_slack`: PASSED (zero slack validation on provider usage response)
 * `test_compiled_pipeline_production_snapshot_no_kg_manifest`: PASSED (production snapshot resolution succeeds for baseline ready documents without KG manifest)
 * `test_compiled_pipeline_snapshot_resolution_failure_stops_expansion`: PASSED (snapshot authority failure halts expansion fail closed)
 * `test_compiled_pipeline_slow_retrieval_deadline_retains_capacity`: PASSED (slow expansion retrieval exceeding caller deadline retains capacity and discards late candidates)
 * `test_compiled_pipeline_slow_reranking_deadline_retains_capacity`: PASSED (slow post expansion reranking exceeding caller deadline retains capacity and discards late candidates)
+* `test_compiled_pipeline_slow_compression_retains_capacity_and_suppresses_late_result`: PASSED (slow post expansion compression exceeding caller deadline retains capacity and suppresses late output)
+* `test_compiled_pipeline_slow_fidelity_retains_capacity_and_suppresses_late_result`: PASSED (slow secondary fidelity exceeding caller deadline retains capacity and triggers clean refusal)
+* `test_compiled_pipeline_slow_synthesis_retains_capacity_suppresses_late_result_and_reconciles_spend`: PASSED (slow answer synthesis exceeding caller deadline retains capacity, suppresses late answer, and reconciles ledger spend)
+* `test_provenance_validation_rejects_conflicting_metadata_and_accepts_valid_control`: PASSED (provenance validator compares all populated attributes and metadata across workspace, document, and version, rejecting any disagreement)
+* `test_compiled_pipeline_provenance_conflicts_rejected_and_positive_control_expanded`: PASSED (compiled pipeline rejects chunks with conflicting metadata while expanding valid positive control chunk)
 
 ### 2. Live Runtime Verification Over HTTP and Backend Services
 ```bash
@@ -84,7 +90,12 @@ Breakdown:
 ```bash
 cd backend && uv run pytest tests/test_laya_escalation_slice5_1.py tests/test_contracts_and_identity.py tests/test_workspace_boundary_isolation.py tests/test_phase2.py tests/test_phase3.py tests/test_deterministic_pipeline_wiring.py tests/test_mandatory_audit_guards.py -q
 ```
-Result: **131 passed, 1 warning in 12.17s**
+Result: **150 passed, 1 warning in 15.48s**
+
+Integrated test count reconciliation:
+* Historical count of 131 tests derived from a previous run before wiring and audit guard suites were added (35 slice tests plus 96 baseline tests).
+* Intermediate count of 145 tests occurred after integrating the full baseline regression suites (35 slice tests plus 61 contracts, 22 boundary isolation, 14 phase 2, 8 phase 3, 7 deterministic wiring, 4 mandatory audit guards, totaling 110 baseline tests, 35 + 110 = 145).
+* Current count of 150 tests reflects the 5 additional compiled application path regressions in `tests/test_laya_escalation_slice5_1.py` covering slow compression, slow secondary fidelity, slow answer synthesis with capacity retention and spend reconciliation, and cross field provenance disagreement gating, bringing slice tests to 40 and total integrated tests to 150 (40 + 110 = 150 passed).
 
 ## Acceptance Criteria Coverage (Slice 5.1)
 - AC-1: Bounded escalation triggers when baseline discovery lacks sufficient evidence support (such as coverage error in fidelity verification or empty context) and the query budget retains an unused expansion slot (expansion_steps == 0 and laya_calls < MAX_QUERY_LAYA_CALLS). Escalation does not activate when baseline evidence is sufficient or remaining deadline is below the minimum viable threshold (500ms).

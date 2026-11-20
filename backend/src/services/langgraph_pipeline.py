@@ -27,7 +27,7 @@ try:
         LayaEscalationRequest,
         MissingRequirementDescription,
     )
-    from services.retrieval.laya_executor import LayaExpansionExecutor
+    from services.retrieval.laya_executor import LayaExpansionExecutor, validate_chunk_provenance
     from services.retrieval.laya_gate import (
         LayaBudgetLedger,
         calculate_phase_deadline,
@@ -40,7 +40,7 @@ except ImportError:
         LayaEscalationRequest,
         MissingRequirementDescription,
     )
-    from src.services.retrieval.laya_executor import LayaExpansionExecutor
+    from src.services.retrieval.laya_executor import LayaExpansionExecutor, validate_chunk_provenance
     from src.services.retrieval.laya_gate import (
         LayaBudgetLedger,
         calculate_phase_deadline,
@@ -161,6 +161,7 @@ class PipelineState(TypedDict):
     caller_deadline_ms: float | None
     snapshot_context: Any | None
     _pipeline_start_time: float
+    _escalation_start_time: float
 
 
 # ---------------------------------------------------------------------------
@@ -951,8 +952,10 @@ def run_reranker(state: PipelineState):
         reranker_mode,
     )
     existing = state.get("stage_timings", {})
+    existing_cands = dict(state.get("retrieval_candidates", {}))
 
     retrieval_candidates = {
+        **existing_cands,
         "bm25": [str(c.id) for c in bm25],
         "vector": [str(c.id) for c in vector],
         "graph": [str(c.id) for c in graph],
@@ -1449,25 +1452,14 @@ def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
     baseline_chunks = list(state.get("top_chunks") or state.get("candidate_chunks", []))
     summaries: list[BaselineEvidenceSummary] = []
     for c in baseline_chunks[:10]:
-        c_meta = getattr(c, "metadata", None) or {}
-        c_ws = getattr(c, "workspace_id", None) or c_meta.get("workspace_id")
-        if c_ws and c_ws != ws_id:
+        is_prov_valid, c_ws, c_doc, c_ver, prov_reason = validate_chunk_provenance(
+            c,
+            expected_workspace_id=ws_id,
+            snapshot_context=snapshot_context,
+        )
+        if not is_prov_valid:
+            logger.info("laya.baseline_chunk_provenance_rejected chunk_id=%s reason=%s", getattr(c, "id", None), prov_reason)
             continue
-        c_doc = getattr(c, "document_id", None) or c_meta.get("document_id")
-        if not c_doc or str(c_doc) in ("doc_unknown", "unknown"):
-            continue
-        c_doc = str(c_doc)
-        c_ver = getattr(c, "document_version", None) or getattr(c, "version", None) or c_meta.get("document_version") or c_meta.get("version")
-        if not c_ver:
-            continue
-        c_ver = str(c_ver)
-
-        if snapshot_context is not None and hasattr(snapshot_context, "get_document"):
-            pinned_doc = snapshot_context.get_document(c_doc)
-            if pinned_doc is None or getattr(pinned_doc, "is_tombstoned", False):
-                continue
-            if c_ver != str(pinned_doc.document_version):
-                continue
 
         c_score = float(min(100.0, max(0.0, getattr(c, "similarity_score", 0.0) or getattr(c, "reranker_score", 0.0) or 1.0)))
         summaries.append(
@@ -1554,6 +1546,7 @@ def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
         },
         "retrieval_candidates": cands,
         "stage_timings": {**existing_timings, "laya_ms": l_lat_ms},
+        "_escalation_start_time": t0,
     }
 
     rem_s_post = max(0.0, escalation_deadline_t - time.perf_counter())
@@ -1575,10 +1568,23 @@ def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
         current_state = {**state, **updated_state, "candidate_chunks": merged_candidates}
 
         # 2. Rerank updated candidate pool under deadline protection
+        rem_s_rerank = max(0.0, escalation_deadline_t - time.perf_counter())
+        if rem_s_rerank < 0.050:
+            logger.warning("laya.rerank_deadline_insufficient failing closed with timeout refusal")
+            return {
+                "final_answer": "NOT_FOUND",
+                "citations": [],
+                "confidence_score": 0.0,
+                "retrieval_incomplete": True,
+                "laya_status": "timeout",
+                "error": "Caller deadline exceeded before post-expansion reranking",
+                "stage_timings": {**existing_timings, "laya_ms": (time.perf_counter() - t0) * 1000.0},
+            }
+
         def _do_rerank() -> dict[str, Any]:
             return run_reranker(current_state)
 
-        rerank_res, rerank_status = ctrl.run_provider_call(_do_rerank, timeout_s=rem_s_post)
+        rerank_res, rerank_status = ctrl.run_provider_call(_do_rerank, timeout_s=rem_s_rerank)
         if rerank_status == "caller_timeout":
             logger.warning("laya.rerank_caller_timeout failing closed with timeout refusal")
             return {
@@ -1604,8 +1610,47 @@ def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
 
         current_state.update(rerank_res)
 
-        # 3. Recompress top chunks
-        comp_res = run_compressor(current_state)
+        # 3. Recompress top chunks under deadline protection
+        rem_s_comp = max(0.0, escalation_deadline_t - time.perf_counter())
+        if rem_s_comp < 0.050:
+            logger.warning("laya.compression_deadline_insufficient failing closed with timeout refusal")
+            return {
+                "final_answer": "NOT_FOUND",
+                "citations": [],
+                "confidence_score": 0.0,
+                "retrieval_incomplete": True,
+                "laya_status": "timeout",
+                "error": "Caller deadline exceeded before context compression",
+                "stage_timings": {**existing_timings, "laya_ms": (time.perf_counter() - t0) * 1000.0},
+            }
+
+        def _do_compress() -> dict[str, Any]:
+            return run_compressor(current_state)
+
+        comp_res, comp_status = ctrl.run_provider_call(_do_compress, timeout_s=rem_s_comp)
+        if comp_status == "caller_timeout":
+            logger.warning("laya.compression_caller_timeout failing closed with timeout refusal")
+            return {
+                "final_answer": "NOT_FOUND",
+                "citations": [],
+                "confidence_score": 0.0,
+                "retrieval_incomplete": True,
+                "laya_status": "timeout",
+                "error": "Caller deadline exceeded during context compression",
+                "stage_timings": {**existing_timings, "laya_ms": (time.perf_counter() - t0) * 1000.0},
+            }
+        elif comp_status != "completed" or comp_res is None:
+            logger.warning("laya.compression_failed failing closed with error refusal")
+            return {
+                "final_answer": "NOT_FOUND",
+                "citations": [],
+                "confidence_score": 0.0,
+                "retrieval_incomplete": True,
+                "laya_status": "error",
+                "error": "Post-expansion context compression failed",
+                "stage_timings": {**existing_timings, "laya_ms": (time.perf_counter() - t0) * 1000.0},
+            }
+
         current_state.update(comp_res)
 
         # 4. Clear stale refusal state before secondary check
@@ -1613,12 +1658,52 @@ def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
         current_state["final_answer"] = None
         current_state["citations"] = []
 
-        # 5. Secondary fidelity check
-        fid_res = run_fidelity(current_state)
+        # 5. Secondary fidelity check under deadline protection
+        rem_s_fid = max(0.0, escalation_deadline_t - time.perf_counter())
+        if rem_s_fid < 0.050:
+            logger.warning("laya.fidelity_deadline_insufficient failing closed with timeout refusal")
+            return {
+                "final_answer": "NOT_FOUND",
+                "citations": [],
+                "confidence_score": 0.0,
+                "retrieval_incomplete": True,
+                "laya_status": "timeout",
+                "error": "Caller deadline exceeded before secondary fidelity check",
+                "stage_timings": {**existing_timings, "laya_ms": (time.perf_counter() - t0) * 1000.0},
+            }
+
+        def _do_fidelity() -> dict[str, Any]:
+            return run_fidelity(current_state)
+
+        fid_res, fid_status = ctrl.run_provider_call(_do_fidelity, timeout_s=rem_s_fid)
+        if fid_status == "caller_timeout":
+            logger.warning("laya.fidelity_caller_timeout failing closed with timeout refusal")
+            return {
+                "final_answer": "NOT_FOUND",
+                "citations": [],
+                "confidence_score": 0.0,
+                "retrieval_incomplete": True,
+                "laya_status": "timeout",
+                "error": "Caller deadline exceeded during secondary fidelity check",
+                "stage_timings": {**existing_timings, "laya_ms": (time.perf_counter() - t0) * 1000.0},
+            }
+        elif fid_status != "completed" or fid_res is None:
+            logger.warning("laya.fidelity_failed failing closed with error refusal")
+            return {
+                "final_answer": "NOT_FOUND",
+                "citations": [],
+                "confidence_score": 0.0,
+                "retrieval_incomplete": True,
+                "laya_status": "error",
+                "error": "Secondary fidelity check failed",
+                "stage_timings": {**existing_timings, "laya_ms": (time.perf_counter() - t0) * 1000.0},
+            }
+
         current_state.update(fid_res)
 
         updated_state.update(rerank_res)
         updated_state.update(comp_res)
+        updated_state["retrieval_candidates"] = {**updated_state.get("retrieval_candidates", {}), **cands}
         updated_state["candidate_chunks"] = merged_candidates
         updated_state["escalation_executed"] = True
 
@@ -1639,18 +1724,51 @@ def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
                 else:
                     synth_calls = ledger.record_synthesis_call() if hasattr(ledger, "record_synthesis_call") else (ledger.synthesis_calls + 1)
                     updated_state["synthesis_calls"] = synth_calls
-                    llm_res = run_llm(current_state)
-                    updated_state.update(llm_res)
+
+                    def _spend_reconcile_synthesis(usage: dict[str, Any], latency_ms: float, status: str) -> None:
+                        in_tok = (usage.get("input_tokens") or usage.get("inputTokens", 0)) if isinstance(usage, dict) else 0
+                        out_tok = (usage.get("output_tokens") or usage.get("outputTokens", 0)) if isinstance(usage, dict) else 0
+                        is_late = status != "completed"
+                        ledger.settle_spend(in_tok, out_tok, latency_ms, is_late=is_late, status=status)
+
+                    def _do_synthesis() -> dict[str, Any]:
+                        return run_llm(current_state)
+
+                    llm_res, llm_status = ctrl.run_provider_call(
+                        _do_synthesis,
+                        timeout_s=rem_s_synthesis,
+                        on_spend_reconcile=_spend_reconcile_synthesis,
+                    )
+                    if llm_status == "caller_timeout":
+                        logger.warning("laya.synthesis_caller_timeout failing closed with timeout refusal")
+                        updated_state["final_answer"] = "NOT_FOUND"
+                        updated_state["citations"] = []
+                        updated_state["confidence_score"] = 0.0
+                        updated_state["retrieval_incomplete"] = True
+                        updated_state["error"] = "Caller deadline exceeded during synthesis"
+                        updated_state["laya_status"] = "timeout"
+                    elif llm_status != "completed" or llm_res is None:
+                        logger.warning("laya.synthesis_failed failing closed with error refusal")
+                        updated_state["final_answer"] = "NOT_FOUND"
+                        updated_state["citations"] = []
+                        updated_state["confidence_score"] = 0.0
+                        updated_state["retrieval_incomplete"] = True
+                        updated_state["error"] = "Answer synthesis failed"
+                        updated_state["laya_status"] = "error"
+                    else:
+                        updated_state.update(llm_res)
             else:
                 # Verifier is unconfigured / unavailable -> free form delivery blocked!
                 from services.retrieval.extractor import extract_verified_fact
                 v_ans, v_chunk = extract_verified_fact(current_state["query"], current_state.get("top_chunks", []))
                 tombstoned = False
                 if v_ans and v_chunk:
-                    v_meta = getattr(v_chunk, "metadata", None) or {}
-                    v_doc = getattr(v_chunk, "document_id", None) or v_meta.get("document_id")
-                    v_ws = getattr(v_chunk, "workspace_id", None) or v_meta.get("workspace_id")
-                    if v_ws and v_ws != ws_id:
+                    is_prov_valid, p_ws, p_doc, p_ver, p_reason = validate_chunk_provenance(
+                        v_chunk,
+                        expected_workspace_id=ws_id,
+                        snapshot_context=snapshot_context,
+                    )
+                    if not is_prov_valid:
                         tombstoned = True
                     elif not boundary_repo or not hasattr(boundary_repo, "has_tombstone"):
                         tombstoned = True
@@ -1658,7 +1776,7 @@ def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
                         try:
                             if boundary_repo.has_tombstone(ws_id, "workspace", ws_id):
                                 tombstoned = True
-                            elif v_doc and boundary_repo.has_tombstone(ws_id, "source", str(v_doc)):
+                            elif p_doc and boundary_repo.has_tombstone(ws_id, "source", str(p_doc)):
                                 tombstoned = True
                         except Exception as te:
                             logger.error("laya.fallback_tombstone_error: %s (failing closed)", te)
@@ -1711,20 +1829,16 @@ def delivery_gate(state: PipelineState) -> dict[str, Any]:
             logger.error("delivery_gate.boundary_repo_resolution_failed: %s", bre)
             boundary_repo = None
 
-    def _validate_replacement_excerpt(v_chunk: Any, ws_id: str, b_repo: Any) -> bool:
+    def _validate_replacement_excerpt(v_chunk: Any, ws_id: str, b_repo: Any, snap_ctx: Any | None = None) -> bool:
         if v_chunk is None or b_repo is None or not hasattr(b_repo, "has_tombstone"):
             return False
-        v_meta = getattr(v_chunk, "metadata", None) or {}
-        v_ws = getattr(v_chunk, "workspace_id", None) or v_meta.get("workspace_id")
-        if v_ws and v_ws != ws_id:
-            return False
-        v_doc = getattr(v_chunk, "document_id", None) or v_meta.get("document_id")
-        if not v_doc or str(v_doc) in ("doc_unknown", "unknown"):
+        is_prov_valid, p_ws, p_doc, p_ver, _ = validate_chunk_provenance(v_chunk, ws_id, snap_ctx)
+        if not is_prov_valid:
             return False
         try:
             if b_repo.has_tombstone(ws_id, "workspace", ws_id):
                 return False
-            if b_repo.has_tombstone(ws_id, "source", str(v_doc)):
+            if p_doc and b_repo.has_tombstone(ws_id, "source", str(p_doc)):
                 return False
         except Exception:
             return False
@@ -1782,7 +1896,7 @@ def delivery_gate(state: PipelineState) -> dict[str, Any]:
                 from services.retrieval.response_builder import build_citation
 
                 v_ans, v_chunk = extract_verified_fact(state["query"], state.get("top_chunks", []))
-                if v_ans and v_chunk and _validate_replacement_excerpt(v_chunk, ws_id, boundary_repo):
+                if v_ans and v_chunk and _validate_replacement_excerpt(v_chunk, ws_id, boundary_repo, state.get("snapshot_context")):
                     return {
                         "final_answer": v_ans,
                         "citations": [build_citation(v_chunk).to_dict()],
@@ -1796,33 +1910,73 @@ def delivery_gate(state: PipelineState) -> dict[str, Any]:
                     "retrieval_incomplete": True,
                 }
             else:
-                # Verifier is present -> verify actual synthesized text
+                # Verifier is present -> verify actual synthesized text under deadline protection
                 comp_text = state.get("compressed_text", "")
                 cits = state.get("citations", [])
-                try:
-                    v_rec = verifier.verify(text=ans, context=comp_text, citations=cits)
-                    status = getattr(v_rec, "support_status", None)
-                    if status != "ASSERTED":
-                        logger.warning("delivery_gate.verifier_rejected status=%s", status)
-                        from services.retrieval.extractor import extract_verified_fact
-                        from services.retrieval.response_builder import build_citation
 
-                        v_ans, v_chunk = extract_verified_fact(state["query"], state.get("top_chunks", []))
-                        if v_ans and v_chunk and _validate_replacement_excerpt(v_chunk, ws_id, boundary_repo):
-                            return {
-                                "final_answer": v_ans,
-                                "citations": [build_citation(v_chunk).to_dict()],
-                                "executed_path": "deterministic_excerpt",
-                                "confidence_score": 0.8,
-                            }
+                pipe_start = state.get("_pipeline_start_time", time.perf_counter())
+                caller_spec_deadline = state.get("caller_deadline_ms") or state.get("phase_deadline_ms")
+                if caller_spec_deadline is not None:
+                    escalation_start = state.get("_escalation_start_time", pipe_start)
+                    elapsed_esc_ms = (time.perf_counter() - escalation_start) * 1000.0
+                    rem_s_verify = max(0.0, (float(caller_spec_deadline) - elapsed_esc_ms) / 1000.0)
+                else:
+                    elapsed_ms = (time.perf_counter() - pipe_start) * 1000.0
+                    rem_s_verify = max(0.0, (15000.0 - elapsed_ms) / 1000.0)
+
+                ctrl = state.get("laya_concurrency_controller")
+                if ctrl is None:
+                    try:
+                        from services.retrieval.laya_concurrency import get_laya_concurrency_controller
+                        ctrl = get_laya_concurrency_controller()
+                    except ImportError:
+                        from src.services.retrieval.laya_concurrency import get_laya_concurrency_controller
+                        ctrl = get_laya_concurrency_controller()
+
+                if rem_s_verify < 0.050:
+                    logger.warning("delivery_gate.verifier_deadline_insufficient (delivery blocked)")
+                    return {
+                        "final_answer": "NOT_FOUND",
+                        "citations": [],
+                        "confidence_score": 0.0,
+                        "retrieval_incomplete": True,
+                    }
+
+                def _do_verify() -> Any:
+                    return verifier.verify(text=ans, context=comp_text, citations=cits)
+
+                v_rec, v_status = ctrl.run_provider_call(_do_verify, timeout_s=rem_s_verify)
+                if v_status == "caller_timeout":
+                    logger.warning("delivery_gate.verifier_caller_timeout (delivery blocked)")
+                    return {
+                        "final_answer": "NOT_FOUND",
+                        "citations": [],
+                        "confidence_score": 0.0,
+                        "retrieval_incomplete": True,
+                    }
+                elif v_status != "completed" or v_rec is None or isinstance(v_rec, Exception):
+                    logger.error("delivery_gate.verifier_failed status=%s", v_status)
+                    return {
+                        "final_answer": "NOT_FOUND",
+                        "citations": [],
+                        "confidence_score": 0.0,
+                        "retrieval_incomplete": True,
+                    }
+
+                status = getattr(v_rec, "support_status", None)
+                if status != "ASSERTED":
+                    logger.warning("delivery_gate.verifier_rejected status=%s", status)
+                    from services.retrieval.extractor import extract_verified_fact
+                    from services.retrieval.response_builder import build_citation
+
+                    v_ans, v_chunk = extract_verified_fact(state["query"], state.get("top_chunks", []))
+                    if v_ans and v_chunk and _validate_replacement_excerpt(v_chunk, ws_id, boundary_repo, state.get("snapshot_context")):
                         return {
-                            "final_answer": "NOT_FOUND",
-                            "citations": [],
-                            "confidence_score": 0.0,
-                            "retrieval_incomplete": True,
+                            "final_answer": v_ans,
+                            "citations": [build_citation(v_chunk).to_dict()],
+                            "executed_path": "deterministic_excerpt",
+                            "confidence_score": 0.8,
                         }
-                except Exception as e:
-                    logger.error("delivery_gate.verifier_exception error=%s", e)
                     return {
                         "final_answer": "NOT_FOUND",
                         "citations": [],
@@ -2423,6 +2577,7 @@ class Pipeline:
             "caller_deadline_ms": kwargs.get("caller_deadline_ms"),
             "snapshot_context": kwargs.get("snapshot_context"),
             "_pipeline_start_time": time.perf_counter(),
+            "_escalation_start_time": time.perf_counter(),
         }
 
         if table_store is not None:

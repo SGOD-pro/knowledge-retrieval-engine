@@ -27,6 +27,92 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def validate_chunk_provenance(
+    chunk: Any,
+    expected_workspace_id: str,
+    snapshot_context: Any | None = None,
+) -> tuple[bool, str | None, str | None, str | None, str | None]:
+    """Validate chunk provenance across attributes and metadata against authoritative pinned bindings.
+
+    Compares all populated workspace, document identity, and version fields across attributes
+    and metadata, rejecting any disagreement rather than picking the first non empty field.
+    Preserves opaque version strings without relabeling or coercion.
+
+    Returns:
+    (is_valid, workspace_id, document_id, version, rejection_reason)
+    """
+    if chunk is None:
+        return False, None, None, None, "null_chunk"
+
+    c_meta = getattr(chunk, "metadata", None)
+    if not isinstance(c_meta, dict):
+        c_meta = {}
+
+    # 1. Compare all populated workspace fields
+    ws_attr = getattr(chunk, "workspace_id", None)
+    ws_meta = c_meta.get("workspace_id")
+    populated_ws = [
+        str(w).strip()
+        for w in (ws_attr, ws_meta)
+        if w is not None and str(w).strip() != ""
+    ]
+    if not populated_ws:
+        return False, None, None, None, "missing_workspace_id"
+    c_ws = populated_ws[0]
+    if any(w != c_ws for w in populated_ws):
+        return False, None, None, None, "conflicting_workspace_provenance"
+    if expected_workspace_id and c_ws != str(expected_workspace_id).strip():
+        return False, None, None, None, "workspace_boundary_mismatch"
+
+    # 2. Compare all populated document identity fields
+    doc_attr = getattr(chunk, "document_id", None)
+    doc_meta = c_meta.get("document_id")
+    populated_doc = [
+        str(d).strip()
+        for d in (doc_attr, doc_meta)
+        if d is not None and str(d).strip() != ""
+    ]
+    if not populated_doc:
+        return False, None, None, None, "missing_document_id"
+    c_doc = populated_doc[0]
+    if any(d != c_doc for d in populated_doc):
+        return False, None, None, None, "conflicting_document_provenance"
+    if c_doc in ("doc_unknown", "unknown"):
+        return False, None, None, None, "unknown_document_id"
+
+    # 3. Compare all populated version fields (preserve exact opaque string)
+    ver_attr_doc = getattr(chunk, "document_version", None)
+    ver_attr_v = getattr(chunk, "version", None)
+    ver_meta_doc = c_meta.get("document_version")
+    ver_meta_v = c_meta.get("version")
+    populated_ver = [
+        str(v).strip()
+        for v in (ver_attr_doc, ver_attr_v, ver_meta_doc, ver_meta_v)
+        if v is not None and str(v).strip() != ""
+    ]
+    if not populated_ver:
+        return False, None, None, None, "missing_document_version"
+    c_ver = populated_ver[0]
+    if any(v != c_ver for v in populated_ver):
+        return False, None, None, None, "conflicting_version_provenance"
+
+    # 4. Validate against authoritative pinned snapshot context if provided
+    if snapshot_context is not None and hasattr(snapshot_context, "get_document"):
+        pinned_doc = snapshot_context.get_document(c_doc)
+        if pinned_doc is None:
+            return False, None, None, None, "document_absent_from_pinned_snapshot"
+        if getattr(pinned_doc, "is_tombstoned", False):
+            return False, None, None, None, "pinned_document_tombstoned"
+        pinned_ver = str(getattr(pinned_doc, "document_version", "")).strip()
+        if c_ver != pinned_ver:
+            return False, None, None, None, "version_mismatch_with_pinned_snapshot"
+        pinned_ws = getattr(pinned_doc, "workspace_id", None)
+        if pinned_ws and str(pinned_ws).strip() != c_ws:
+            return False, None, None, None, "workspace_mismatch_with_pinned_snapshot"
+
+    return True, c_ws, c_doc, c_ver, None
+
+
 class LayaExpansionExecutor:
     """Dispatches validated LAYA expansion decisions to underlying retrieval adapters."""
 
@@ -136,19 +222,14 @@ class LayaExpansionExecutor:
         target_set = set(active_target_docs) if active_target_docs else None
 
         for c in all_chunks:
-            # Workspace isolation and metadata validation
-            c_meta = getattr(c, "metadata", None) or {}
-            c_ws = getattr(c, "workspace_id", None) or c_meta.get("workspace_id")
-            if not c_ws or c_ws != workspace_id:
-                # Missing or conflicting workspace -> reject
+            is_valid, c_ws, c_doc, c_ver, reason = validate_chunk_provenance(
+                c,
+                expected_workspace_id=workspace_id,
+                snapshot_context=snapshot_context,
+            )
+            if not is_valid:
+                logger.info("laya.chunk_provenance_rejected chunk_id=%s reason=%s", getattr(c, "id", None), reason)
                 continue
-
-            # Document ID validation
-            c_doc = getattr(c, "document_id", None) or c_meta.get("document_id")
-            if not c_doc or str(c_doc) in ("doc_unknown", "unknown"):
-                # Unverified or missing document ID -> reject
-                continue
-            c_doc = str(c_doc)
 
             if target_set is not None and c_doc not in target_set:
                 continue
@@ -160,25 +241,6 @@ class LayaExpansionExecutor:
                         continue
                 except Exception:
                     continue
-
-            # Exact version validation
-            c_ver = getattr(c, "document_version", None) or getattr(c, "version", None) or c_meta.get("document_version") or c_meta.get("version")
-            if not c_ver:
-                # Missing exact version -> reject! Never fabricate v1!
-                continue
-            c_ver = str(c_ver)
-
-            # Strict PinnedSnapshotContext bindings
-            pinned_doc = snapshot_context.get_document(c_doc)
-            if pinned_doc is None:
-                # Absent from pinned bindings -> reject!
-                continue
-            if getattr(pinned_doc, "is_tombstoned", False):
-                # Tombstoned in snapshot -> reject!
-                continue
-            if c_ver != str(pinned_doc.document_version):
-                # Conflicting version metadata -> reject!
-                continue
 
             filtered_chunks.append(c)
 

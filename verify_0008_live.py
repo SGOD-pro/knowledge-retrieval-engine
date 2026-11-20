@@ -113,20 +113,36 @@ record(
 # ---------------------------------------------------------------------------
 # 2. Frozen Contracts, Discriminator Agreement & Bounds (AC-2, AC-5)
 # ---------------------------------------------------------------------------
-from src.schemas.contracts.laya import (
-    BaselineEvidenceSummary,
-    DenseExpansionParams,
-    GraphExpansionParams,
-    LayaEscalationDecision,
-    LayaEscalationRequest,
-    LexicalExpansionParams,
-    MissingRequirementDescription,
-    NoneExpansionParams,
-    StructuralExpansionParams,
-    StructuredExpansionParams,
-)
-from src.schemas.contracts.verification import VerificationRecord
-from src.schemas.contracts.knowledge_graph import PinnedDocumentVersion, PinnedSnapshotContext
+try:
+    from schemas.contracts.laya import (
+        BaselineEvidenceSummary,
+        DenseExpansionParams,
+        GraphExpansionParams,
+        LayaEscalationDecision,
+        LayaEscalationRequest,
+        LexicalExpansionParams,
+        MissingRequirementDescription,
+        NoneExpansionParams,
+        StructuralExpansionParams,
+        StructuredExpansionParams,
+    )
+    from schemas.contracts.verification import VerificationRecord
+    from schemas.contracts.knowledge_graph import PinnedDocumentVersion, PinnedSnapshotContext
+except ImportError:
+    from src.schemas.contracts.laya import (
+        BaselineEvidenceSummary,
+        DenseExpansionParams,
+        GraphExpansionParams,
+        LayaEscalationDecision,
+        LayaEscalationRequest,
+        LexicalExpansionParams,
+        MissingRequirementDescription,
+        NoneExpansionParams,
+        StructuralExpansionParams,
+        StructuredExpansionParams,
+    )
+    from src.schemas.contracts.verification import VerificationRecord
+    from src.schemas.contracts.knowledge_graph import PinnedDocumentVersion, PinnedSnapshotContext
 
 try:
     valid_dec = LayaEscalationDecision(
@@ -222,11 +238,18 @@ except Exception as e:
 # ---------------------------------------------------------------------------
 # 4. Deterministic Section 35 Fallback Policy (AC-3)
 # ---------------------------------------------------------------------------
-from src.services.retrieval.laya_policy import (
-    AVAILABLE_ROUTES_SLICE_5_1,
-    extract_fallback_query_terms,
-    get_deterministic_fallback_decision,
-)
+try:
+    from services.retrieval.laya_policy import (
+        AVAILABLE_ROUTES_SLICE_5_1,
+        extract_fallback_query_terms,
+        get_deterministic_fallback_decision,
+    )
+except ImportError:
+    from src.services.retrieval.laya_policy import (
+        AVAILABLE_ROUTES_SLICE_5_1,
+        extract_fallback_query_terms,
+        get_deterministic_fallback_decision,
+    )
 
 req_exact = LayaEscalationRequest(
     query_id="q_fb_1",
@@ -260,14 +283,26 @@ record(
 # ---------------------------------------------------------------------------
 # 5. Atomic Budget Ledger Pre-Reservation and Phase Deadline (AC-1, AC-4)
 # ---------------------------------------------------------------------------
-from src.services.retrieval.laya_gate import (
-    InvalidUsageError,
-    LayaBudgetLedger,
-    calculate_phase_deadline,
-    preflight_token_count,
-    truncate_evidence_summary_for_preflight,
-    validate_provider_usage,
-)
+try:
+    from services.retrieval.laya_gate import (
+        InvalidUsageError,
+        LayaBudgetLedger,
+        calculate_phase_deadline,
+        estimate_tokens_defensible_bound,
+        preflight_token_count,
+        truncate_evidence_summary_for_preflight,
+        validate_provider_usage,
+    )
+except ImportError:
+    from src.services.retrieval.laya_gate import (
+        InvalidUsageError,
+        LayaBudgetLedger,
+        calculate_phase_deadline,
+        estimate_tokens_defensible_bound,
+        preflight_token_count,
+        truncate_evidence_summary_for_preflight,
+        validate_provider_usage,
+    )
 
 ledger = LayaBudgetLedger()
 res1, reason1 = ledger.pre_reserve(deadline_remaining_ms=1800.0, estimated_input_tokens=300, estimated_output_tokens=250)
@@ -298,7 +333,6 @@ record(
 # ---------------------------------------------------------------------------
 # 6. Authoritative Token Preflight and Evidence Truncation (AC-4)
 # ---------------------------------------------------------------------------
-from src.services.retrieval.laya_gate import estimate_tokens_defensible_bound
 
 oversized_summaries = tuple(
     BaselineEvidenceSummary(
@@ -389,9 +423,14 @@ record(
 # 8. Concurrency Controller Queue Saturation and Load Shedding (AC-4)
 # ---------------------------------------------------------------------------
 import threading
-from src.services.retrieval.laya_concurrency import (
-    LayaProviderConcurrencyController,
-)
+try:
+    from services.retrieval.laya_concurrency import (
+        LayaProviderConcurrencyController,
+    )
+except ImportError:
+    from src.services.retrieval.laya_concurrency import (
+        LayaProviderConcurrencyController,
+    )
 
 controller = LayaProviderConcurrencyController(max_concurrency=2, max_queue=3)
 blocker_event = threading.Event()
@@ -431,7 +470,10 @@ record(
 # ---------------------------------------------------------------------------
 # 9. HTTP 429 Throttling Retries Charged as Attempts (AC-4)
 # ---------------------------------------------------------------------------
-from src.services.retrieval.laya_service import LayaDecisionService
+try:
+    from services.retrieval.laya_service import LayaDecisionService
+except ImportError:
+    from src.services.retrieval.laya_service import LayaDecisionService
 from botocore.exceptions import ClientError
 
 ledger_429 = LayaBudgetLedger()
@@ -684,7 +726,10 @@ record(
 # ---------------------------------------------------------------------------
 # 12. Version Isolation and Opaque Version Bounds (AC-5)
 # ---------------------------------------------------------------------------
-from src.services.retrieval.laya_executor import LayaExpansionExecutor
+try:
+    from services.retrieval.laya_executor import LayaExpansionExecutor
+except ImportError:
+    from src.services.retrieval.laya_executor import LayaExpansionExecutor
 
 executor = LayaExpansionExecutor()
 mock_chunk_repo = MagicMock()
@@ -921,7 +966,12 @@ state_no_progress = {
     "candidate_chunks": [doc_chunk],
 }
 
-with patch("src.services.retrieval.laya_service.LayaDecisionService.decide") as mock_decide:
+decide_target = (
+    "services.retrieval.laya_service.LayaDecisionService.decide"
+    if "services.retrieval.laya_service" in sys.modules
+    else "src.services.retrieval.laya_service.LayaDecisionService.decide"
+)
+with patch(decide_target) as mock_decide:
     mock_decide.return_value = LayaEscalationDecision(
         decision_id="dec_np_01",
         route="lexical_expansion",

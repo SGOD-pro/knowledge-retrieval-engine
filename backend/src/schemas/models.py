@@ -33,6 +33,8 @@ class Chunk:
     # Tuple (not list) to stay consistent with section_path and keep Chunk hashable.
     image_s3_keys: tuple[str, ...] = ()
     workspace_id: str = ""
+    version: str | None = None
+    document_version: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)

@@ -2010,4 +2010,590 @@ def test_compiled_pipeline_slow_reranking_deadline_retains_capacity():
     ctrl.shutdown(wait=False)
 
 
+def test_compiled_pipeline_slow_compression_retains_capacity_and_suppresses_late_result():
+    """Verify slow post-expansion compression exceeding caller deadline retains capacity and discards late results."""
+    ws_id = "ws_slow_compression"
+    ctrl = LayaProviderConcurrencyController(max_concurrency=1, max_queue=2)
+    from db.database import CloudRepository
+    from src.db.workspace_boundary_repo import get_workspace_boundary_repo
+    from src.schemas.contracts.boundary import DocumentSnapshot
+    from services.retrieval.fidelity_check import CoverageError
+    from datetime import datetime, timezone
+
+    repo = CloudRepository()
+    boundary_repo = get_workspace_boundary_repo()
+
+    doc_chunk = Chunk(
+        id="chunk_slow_comp_1",
+        document_id="doc_slow_comp",
+        source_format="pdf",
+        text="Novel chunk before slow compression.",
+        element_type="narrative_block",
+        workspace_id=ws_id,
+        metadata={"document_version": "v1"},
+        embedding_fast=[0.1] * 384,
+        embedding_full=[0.1] * 1024,
+    )
+    doc = Document(
+        id="doc_slow_comp",
+        filename="doc_slow_comp.pdf",
+        source_format="pdf",
+        chunks=(doc_chunk,),
+        workspace_id=ws_id,
+    )
+    repo.save(doc)
+    repo.add_document_to_workspace(ws_id, doc)
+    boundary_repo.save_document_snapshot(
+        DocumentSnapshot(
+            workspace_id=ws_id,
+            document_id="doc_slow_comp",
+            source="doc_slow_comp.pdf",
+            version="v1",
+            format="pdf",
+            created_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        )
+    )
+
+    started = threading.Event()
+    finish = threading.Event()
+
+    def slow_compressor(st):
+        if st.get("laya_decision") is not None:
+            started.set()
+            finish.wait(timeout=10.0)
+        return {
+            "compressed_text": "Late arrived compressed context that must not be published",
+            "context_snippet": "Late snippet",
+            "retrieval_candidates": {"compressed_context": ["chunk_slow_comp_1"]},
+            "stage_timings": {"compressor_ms": 10.0},
+        }
+
+    mock_client = MockBedrockConverseClient(
+        response_payload={
+            "decision_id": "dec_slow_comp",
+            "route": "lexical_expansion",
+            "parameters": {
+                "route_type": "lexical_expansion",
+                "query_terms": ["novel", "chunk"],
+                "document_ids": ["doc_slow_comp"],
+            },
+            "confidence": 0.9,
+            "rationale": "Lexical expansion for slow compression test",
+        }
+    )
+
+    def _mock_rerank_baseline(q, chunks, top_k=6, return_mode=False):
+        top = list(chunks)[:top_k]
+        return (top, "mocked") if return_mode else top
+
+    with patch("services.langgraph_pipeline.call_llm", return_value={"answer": "Late text", "citations": []}):
+        with patch("services.langgraph_pipeline._get_repo", return_value=repo):
+            with patch("services.langgraph_pipeline.rerank", side_effect=_mock_rerank_baseline):
+                with patch("services.langgraph_pipeline.run_compressor", side_effect=slow_compressor):
+                    with patch("services.langgraph_pipeline.check_fidelity", side_effect=CoverageError("Gap")):
+                        response = pipeline.run(
+                            query="Find novel chunk for compression",
+                            workspace_id=ws_id,
+                            laya_enabled=True,
+                            laya_client=mock_client,
+                            laya_concurrency_controller=ctrl,
+                            caller_deadline_ms=600.0,
+                        )
+
+                        # Caller must time out and abort with NOT_FOUND refusal
+                        assert response.answer == "NOT_FOUND"
+                        assert response.retrieval_incomplete is True
+                        assert started.is_set() is True, "slow_compressor was never started!"
+                        # Worker slot MUST remain retained while slow_compressor is executing!
+                        assert ctrl.active_count == 1
+
+    # Release worker and confirm clean release
+    finish.set()
+    time.sleep(0.1)
+    assert ctrl.active_count == 0
+    ctrl.shutdown(wait=False)
+
+
+def test_compiled_pipeline_slow_fidelity_retains_capacity_and_suppresses_late_result():
+    """Verify slow secondary fidelity exceeding caller deadline retains capacity and discards late results."""
+    ws_id = "ws_slow_fidelity"
+    ctrl = LayaProviderConcurrencyController(max_concurrency=1, max_queue=2)
+    from db.database import CloudRepository
+    from src.db.workspace_boundary_repo import get_workspace_boundary_repo
+    from src.schemas.contracts.boundary import DocumentSnapshot
+    from services.retrieval.fidelity_check import CoverageError
+    from datetime import datetime, timezone
+
+    repo = CloudRepository()
+    boundary_repo = get_workspace_boundary_repo()
+
+    doc_chunk = Chunk(
+        id="chunk_slow_fid_1",
+        document_id="doc_slow_fid",
+        source_format="pdf",
+        text="Novel chunk before slow fidelity.",
+        element_type="narrative_block",
+        workspace_id=ws_id,
+        metadata={"document_version": "v1"},
+        embedding_fast=[0.1] * 384,
+        embedding_full=[0.1] * 1024,
+    )
+    doc = Document(
+        id="doc_slow_fid",
+        filename="doc_slow_fid.pdf",
+        source_format="pdf",
+        chunks=(doc_chunk,),
+        workspace_id=ws_id,
+    )
+    repo.save(doc)
+    repo.add_document_to_workspace(ws_id, doc)
+    boundary_repo.save_document_snapshot(
+        DocumentSnapshot(
+            workspace_id=ws_id,
+            document_id="doc_slow_fid",
+            source="doc_slow_fid.pdf",
+            version="v1",
+            format="pdf",
+            created_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        )
+    )
+
+    started = threading.Event()
+    finish = threading.Event()
+
+    fidelity_call_count = 0
+
+    def slow_check_fidelity(q, ctx, **kw):
+        nonlocal fidelity_call_count
+        fidelity_call_count += 1
+        if fidelity_call_count == 1:
+            raise CoverageError("Initial baseline gap")
+        started.set()
+        finish.wait(timeout=10.0)
+        return None
+
+    mock_client = MockBedrockConverseClient(
+        response_payload={
+            "decision_id": "dec_slow_fid",
+            "route": "lexical_expansion",
+            "parameters": {
+                "route_type": "lexical_expansion",
+                "query_terms": ["novel", "chunk"],
+                "document_ids": ["doc_slow_fid"],
+            },
+            "confidence": 0.9,
+            "rationale": "Lexical expansion for slow fidelity test",
+        }
+    )
+
+    def _mock_rerank_baseline(q, chunks, top_k=6, return_mode=False):
+        top = list(chunks)[:top_k]
+        return (top, "mocked") if return_mode else top
+
+    with patch("services.langgraph_pipeline.call_llm", return_value={"answer": "Late text", "citations": []}):
+        with patch("services.langgraph_pipeline._get_repo", return_value=repo):
+            with patch("services.langgraph_pipeline.rerank", side_effect=_mock_rerank_baseline):
+                with patch("services.langgraph_pipeline.check_fidelity", side_effect=slow_check_fidelity):
+                    response = pipeline.run(
+                        query="Find novel chunk for fidelity",
+                        workspace_id=ws_id,
+                        laya_enabled=True,
+                        laya_client=mock_client,
+                        laya_concurrency_controller=ctrl,
+                        caller_deadline_ms=600.0,
+                    )
+
+                    # Caller must time out and abort with NOT_FOUND refusal
+                    assert response.answer == "NOT_FOUND"
+                    assert response.retrieval_incomplete is True
+                    assert started.is_set() is True, "slow_check_fidelity was never started!"
+                    # Worker slot MUST remain retained while slow_check_fidelity is executing!
+                    assert ctrl.active_count == 1
+
+    # Release worker and confirm clean release
+    finish.set()
+    time.sleep(0.1)
+    assert ctrl.active_count == 0
+    ctrl.shutdown(wait=False)
+
+
+def test_compiled_pipeline_slow_synthesis_retains_capacity_suppresses_late_result_and_reconciles_spend():
+    """Verify slow synthesis exceeding caller deadline retains capacity, discards late results, and settles spend."""
+    ws_id = "ws_slow_synthesis"
+    ctrl = LayaProviderConcurrencyController(max_concurrency=1, max_queue=2)
+    ledger = LayaBudgetLedger()
+    from db.database import CloudRepository
+    from src.db.workspace_boundary_repo import get_workspace_boundary_repo
+    from src.schemas.contracts.boundary import DocumentSnapshot
+    from services.retrieval.fidelity_check import CoverageError
+    from datetime import datetime, timezone
+
+    repo = CloudRepository()
+    boundary_repo = get_workspace_boundary_repo()
+
+    doc_chunk = Chunk(
+        id="chunk_slow_synth_1",
+        document_id="doc_slow_synth",
+        source_format="pdf",
+        text="Novel chunk before slow synthesis.",
+        element_type="narrative_block",
+        workspace_id=ws_id,
+        metadata={"document_version": "v1"},
+        embedding_fast=[0.1] * 384,
+        embedding_full=[0.1] * 1024,
+    )
+    doc = Document(
+        id="doc_slow_synth",
+        filename="doc_slow_synth.pdf",
+        source_format="pdf",
+        chunks=(doc_chunk,),
+        workspace_id=ws_id,
+    )
+    repo.save(doc)
+    repo.add_document_to_workspace(ws_id, doc)
+    boundary_repo.save_document_snapshot(
+        DocumentSnapshot(
+            workspace_id=ws_id,
+            document_id="doc_slow_synth",
+            source="doc_slow_synth.pdf",
+            version="v1",
+            format="pdf",
+            created_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        )
+    )
+
+    started = threading.Event()
+    finish = threading.Event()
+
+    def slow_call_llm(q, ctx):
+        started.set()
+        finish.wait(timeout=10.0)
+        return {
+            "answer": "Late published synthesis text that must never reach response",
+            "citations": ["chunk_slow_synth_1"],
+            "usage": {"input_tokens": 150, "output_tokens": 50},
+        }
+
+    mock_client = MockBedrockConverseClient(
+        response_payload={
+            "decision_id": "dec_slow_synth",
+            "route": "lexical_expansion",
+            "parameters": {
+                "route_type": "lexical_expansion",
+                "query_terms": ["novel", "chunk"],
+                "document_ids": ["doc_slow_synth"],
+            },
+            "confidence": 0.9,
+            "rationale": "Lexical expansion for slow synthesis test",
+        }
+    )
+
+    mock_verifier = MagicMock()
+    mock_verifier.is_ready.return_value = True
+
+    def _mock_rerank_baseline(q, chunks, top_k=6, return_mode=False):
+        top = list(chunks)[:top_k]
+        return (top, "mocked") if return_mode else top
+
+    # Initial check fails; secondary check succeeds
+    fidelity_call_count = 0
+
+    def mock_check_fidelity(q, ctx, **kw):
+        nonlocal fidelity_call_count
+        fidelity_call_count += 1
+        if fidelity_call_count == 1:
+            raise CoverageError("Initial baseline gap")
+        return None
+
+    with patch("services.langgraph_pipeline._get_repo", return_value=repo):
+        with patch("services.langgraph_pipeline.rerank", side_effect=_mock_rerank_baseline):
+            with patch("services.langgraph_pipeline.check_fidelity", side_effect=mock_check_fidelity):
+                with patch("services.langgraph_pipeline.call_llm", side_effect=slow_call_llm):
+                    response = pipeline.run(
+                        query="Find novel chunk for synthesis",
+                        workspace_id=ws_id,
+                        laya_enabled=True,
+                        laya_client=mock_client,
+                        laya_concurrency_controller=ctrl,
+                        laya_budget_ledger=ledger,
+                        verifier=mock_verifier,
+                        caller_deadline_ms=600.0,
+                    )
+
+                    # Caller must time out and abort with NOT_FOUND refusal
+                    assert response.answer == "NOT_FOUND"
+                    assert response.retrieval_incomplete is True
+                    assert "Late published synthesis text" not in response.answer
+                    assert started.is_set() is True, "slow_call_llm was never started!"
+                    # Worker slot MUST remain retained while slow_call_llm is executing!
+                    assert ctrl.active_count == 1
+
+    # Release worker and confirm spend reconciliation and clean capacity release
+    finish.set()
+    time.sleep(0.1)
+    assert ctrl.active_count == 0
+    # Spend accounting was reconciled for late synthesis
+    assert ledger.total_input_tokens >= 150
+    assert ledger.total_output_tokens >= 50
+    ctrl.shutdown(wait=False)
+
+
+def test_provenance_validation_rejects_conflicting_metadata_and_accepts_valid_control():
+    """Verify validate_chunk_provenance rejects conflicting metadata and accepts valid opaque version control."""
+    from services.retrieval.laya_executor import validate_chunk_provenance
+
+    # Mock snapshot context with opaque string version
+    opaque_version = "rev-2026.10-sha256:7f8e4b1a"
+    mock_doc = PinnedDocumentVersion(
+        document_id="doc_prov_1",
+        document_version=opaque_version,
+        publication_id="pub_prov_1",
+        is_tombstoned=False,
+    )
+    mock_ctx = MagicMock()
+    mock_ctx.get_document.side_effect = lambda d: mock_doc if d == "doc_prov_1" else None
+
+    # 1. Matching attribute with conflicting metadata for workspace
+    c_ws_conflict = Chunk(
+        id="c1",
+        document_id="doc_prov_1",
+        workspace_id="ws_main",
+        document_version=opaque_version,
+        element_type="narrative_block",
+        text="Sample text",
+        source_format="pdf",
+        metadata={"workspace_id": "ws_other"},
+    )
+    valid, ws, doc, ver, reason = validate_chunk_provenance(c_ws_conflict, "ws_main", mock_ctx)
+    assert valid is False
+    assert reason == "conflicting_workspace_provenance"
+
+    # 2. Matching attribute with conflicting metadata for document identity
+    c_doc_conflict = Chunk(
+        id="c2",
+        document_id="doc_prov_1",
+        workspace_id="ws_main",
+        document_version=opaque_version,
+        element_type="narrative_block",
+        text="Sample text",
+        source_format="pdf",
+        metadata={"document_id": "doc_prov_other"},
+    )
+    valid, ws, doc, ver, reason = validate_chunk_provenance(c_doc_conflict, "ws_main", mock_ctx)
+    assert valid is False
+    assert reason == "conflicting_document_provenance"
+
+    # 3. Matching attribute with conflicting metadata for version
+    c_ver_conflict = Chunk(
+        id="c3",
+        document_id="doc_prov_1",
+        workspace_id="ws_main",
+        document_version=opaque_version,
+        element_type="narrative_block",
+        text="Sample text",
+        source_format="pdf",
+        metadata={"document_version": "v_conflicting_version"},
+    )
+    valid, ws, doc, ver, reason = validate_chunk_provenance(c_ver_conflict, "ws_main", mock_ctx)
+    assert valid is False
+    assert reason == "conflicting_version_provenance"
+
+    # 4. Disagreement between document_version attribute and version attribute
+    c_attr_ver_conflict = Chunk(
+        id="c4",
+        document_id="doc_prov_1",
+        workspace_id="ws_main",
+        document_version=opaque_version,
+        version="v_different",
+        element_type="narrative_block",
+        text="Sample text",
+        source_format="pdf",
+        metadata={},
+    )
+    valid, ws, doc, ver, reason = validate_chunk_provenance(c_attr_ver_conflict, "ws_main", mock_ctx)
+    assert valid is False
+    assert reason == "conflicting_version_provenance"
+
+    # 5. Missing version
+    c_no_ver = Chunk(
+        id="c5",
+        document_id="doc_prov_1",
+        workspace_id="ws_main",
+        element_type="narrative_block",
+        text="Sample text",
+        source_format="pdf",
+        metadata={},
+    )
+    valid, ws, doc, ver, reason = validate_chunk_provenance(c_no_ver, "ws_main", mock_ctx)
+    assert valid is False
+    assert reason == "missing_document_version"
+
+    # 6. Valid consistent provenance with exact opaque version string (positive control)
+    c_valid = Chunk(
+        id="c6",
+        document_id="doc_prov_1",
+        workspace_id="ws_main",
+        document_version=opaque_version,
+        element_type="narrative_block",
+        text="Valid chunk text",
+        source_format="pdf",
+        metadata={"workspace_id": "ws_main", "document_id": "doc_prov_1", "document_version": opaque_version},
+    )
+    valid, ws, doc, ver, reason = validate_chunk_provenance(c_valid, "ws_main", mock_ctx)
+    assert valid is True
+    assert ws == "ws_main"
+    assert doc == "doc_prov_1"
+    # Version must be preserved exactly as the opaque string without relabeling or coercion
+    assert ver == opaque_version
+    assert reason is None
+
+
+def test_compiled_pipeline_provenance_conflicts_rejected_and_positive_control_expanded():
+    """Verify compiled pipeline rejects chunks with conflicting metadata across workspace, doc, version, and accepts control."""
+    ws_id = "ws_pipeline_provenance"
+    from db.database import CloudRepository
+    from src.db.workspace_boundary_repo import get_workspace_boundary_repo
+    from src.schemas.contracts.boundary import DocumentSnapshot
+    from services.retrieval.fidelity_check import CoverageError
+    from datetime import datetime, timezone
+
+    repo = CloudRepository()
+    boundary_repo = get_workspace_boundary_repo()
+    opaque_ver = "rev-2026.10-sha256:e3b0c442"
+
+    # 1. Chunk with matching attribute but conflicting metadata for workspace
+    c_ws_bad = Chunk(
+        id="c_ws_bad",
+        document_id="doc_prov_test",
+        workspace_id=ws_id,
+        document_version=opaque_ver,
+        element_type="narrative_block",
+        text="Bad workspace metadata expanded_provenance_keyword",
+        source_format="pdf",
+        metadata={"workspace_id": "ws_conflict_other"},
+        embedding_fast=[0.1] * 384,
+        embedding_full=[0.1] * 1024,
+    )
+    # 2. Chunk with matching attribute but conflicting metadata for document_id
+    c_doc_bad = Chunk(
+        id="c_doc_bad",
+        document_id="doc_prov_test",
+        workspace_id=ws_id,
+        document_version=opaque_ver,
+        element_type="narrative_block",
+        text="Bad doc metadata expanded_provenance_keyword",
+        source_format="pdf",
+        metadata={"document_id": "doc_conflict_other"},
+        embedding_fast=[0.1] * 384,
+        embedding_full=[0.1] * 1024,
+    )
+    # 3. Chunk with matching attribute but conflicting metadata for version
+    c_ver_bad = Chunk(
+        id="c_ver_bad",
+        document_id="doc_prov_test",
+        workspace_id=ws_id,
+        document_version=opaque_ver,
+        element_type="narrative_block",
+        text="Bad version metadata expanded_provenance_keyword",
+        source_format="pdf",
+        metadata={"document_version": "v_stale_mismatch"},
+        embedding_fast=[0.1] * 384,
+        embedding_full=[0.1] * 1024,
+    )
+    # 4. Valid consistent chunk (positive control)
+    c_valid = Chunk(
+        id="c_valid_control",
+        document_id="doc_prov_test",
+        workspace_id=ws_id,
+        document_version=opaque_ver,
+        element_type="narrative_block",
+        text="The positive control chunk holds the secret truth expanded_provenance_keyword.",
+        source_format="pdf",
+        metadata={"workspace_id": ws_id, "document_id": "doc_prov_test", "document_version": opaque_ver},
+        embedding_fast=[0.1] * 384,
+        embedding_full=[0.1] * 1024,
+    )
+
+    doc = Document(
+        id="doc_prov_test",
+        filename="doc_prov_test.pdf",
+        source_format="pdf",
+        chunks=(c_ws_bad, c_doc_bad, c_ver_bad, c_valid),
+        workspace_id=ws_id,
+    )
+    repo.save(doc)
+    repo.add_document_to_workspace(ws_id, doc)
+    invalidate_chunk_cache(ws_id)
+    boundary_repo.save_document_snapshot(
+        DocumentSnapshot(
+            workspace_id=ws_id,
+            document_id="doc_prov_test",
+            source="doc_prov_test.pdf",
+            version=opaque_ver,
+            format="pdf",
+            created_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        )
+    )
+
+    mock_client = MockBedrockConverseClient(
+        response_payload={
+            "decision_id": "dec_prov_test",
+            "route": "lexical_expansion",
+            "parameters": {
+                "route_type": "lexical_expansion",
+                "query_terms": ["expanded_provenance_keyword"],
+                "document_ids": ["doc_prov_test"],
+            },
+            "confidence": 0.95,
+            "rationale": "Lexical expansion testing provenance filtering",
+        }
+    )
+
+    mock_verifier = MockVerifier(support_status="ASSERTED")
+
+    def _mock_rerank(q, chunks, top_k=6, return_mode=False):
+        top = list(chunks)[:top_k]
+        return (top, "mocked") if return_mode else top
+
+    fidelity_call_count = 0
+
+    def mock_check_fidelity(q, ctx, **kw):
+        nonlocal fidelity_call_count
+        fidelity_call_count += 1
+        if fidelity_call_count == 1:
+            raise CoverageError("Initial baseline gap")
+        return None
+
+    with patch("services.langgraph_pipeline._get_repo", return_value=repo):
+        with patch("services.langgraph_pipeline.rerank", side_effect=_mock_rerank):
+            with patch("services.langgraph_pipeline.check_fidelity", side_effect=mock_check_fidelity):
+                with patch(
+                    "services.langgraph_pipeline.call_llm",
+                    return_value={"answer": "Factual answer from valid chunk", "citations": ["c_valid_control"]},
+                ):
+                    response = pipeline.run(
+                        query="What is the secret specification for project alpha?",
+                        workspace_id=ws_id,
+                        laya_enabled=True,
+                        laya_client=mock_client,
+                        boundary_repo=boundary_repo,
+                        doc_repo=repo,
+                        verifier=mock_verifier,
+                        require_delivery_gate=True,
+                    )
+
+                    # Successful answer from positive control chunk
+                    assert response.answer == "Factual answer from valid chunk"
+                    assert response.retrieval_incomplete is False
+                    assert response.expansion_steps == 1
+
+                    # Novel chunks in candidates must contain c_valid_control and NONE of the conflicting chunks!
+                    novel = response.retrieval_candidates.get("laya_novel_chunks", [])
+                    assert "c_valid_control" in novel
+                    assert "c_ws_bad" not in novel
+                    assert "c_doc_bad" not in novel
+                    assert "c_ver_bad" not in novel
+
+
+
 
