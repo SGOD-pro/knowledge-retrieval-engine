@@ -45,6 +45,7 @@ try:
     )
     from services.retrieval.laya_policy import (
         AVAILABLE_ROUTES_SLICE_5_1,
+        extract_domain_query_terms,
         get_deterministic_fallback_decision,
     )
 except ImportError:
@@ -73,10 +74,26 @@ except ImportError:
     )
     from src.services.retrieval.laya_policy import (
         AVAILABLE_ROUTES_SLICE_5_1,
+        extract_domain_query_terms,
         get_deterministic_fallback_decision,
     )
 
 logger = logging.getLogger(__name__)
+
+
+class PayloadBudgetExceededError(ValueError):
+    """Raised when mandatory payload content exceeds the preflight byte budget before dispatch."""
+    pass
+
+
+def _trim_utf8_to_bytes(text: str, max_bytes: int) -> str:
+    """Trim a string so its UTF-8 encoding does not exceed max_bytes, without splitting multi-byte characters."""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    if max_bytes <= 0:
+        return ""
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
 
 SYSTEM_PROMPT = """You are LAYA, a bounded routing decision model for the Knowledge Retrieval Engine.
 Your role is exclusively to inspect missing evidence requirements and propose ONE targeted expansion route.
@@ -197,7 +214,14 @@ class LayaDecisionService:
             request, target_max_tokens=1000, system_prompt=active_system_prompt
         )
         if endpoint_mode:
-            endpoint_payload = self._format_endpoint_payload(truncated_req)
+            try:
+                endpoint_payload = self._format_endpoint_payload(truncated_req)
+            except PayloadBudgetExceededError as pbe:
+                logger.warning("laya.payload_budget_exceeded: %s (failing closed before dispatch)", pbe)
+                self.last_dispatched = False
+                self.last_fallback = True
+                fallback = get_deterministic_fallback_decision(request, f"Payload budget exceeded: {pbe}")
+                return fallback.model_copy(update={"execution_status": "rejected_by_code"})
             user_content = json.dumps(endpoint_payload)
         else:
             user_content = truncated_req.model_dump_json()
@@ -241,8 +265,15 @@ class LayaDecisionService:
             return fallback.model_copy(update={"execution_status": "timeout"})
 
         def _spend_reconcile_cb(usage: dict[str, Any], latency_ms: float, status: str) -> None:
-            in_tok = usage.get("inputTokens", 0) if isinstance(usage, dict) else 0
-            out_tok = usage.get("outputTokens", 0) if isinstance(usage, dict) else 0
+            in_tok = 0
+            out_tok = 0
+            if isinstance(usage, dict):
+                raw_in = usage.get("inputTokens") if "inputTokens" in usage else usage.get("input_tokens")
+                raw_out = usage.get("outputTokens") if "outputTokens" in usage else usage.get("output_tokens")
+                if isinstance(raw_in, int) and not isinstance(raw_in, bool) and raw_in > 0:
+                    in_tok = raw_in
+                if isinstance(raw_out, int) and not isinstance(raw_out, bool) and raw_out >= 0:
+                    out_tok = raw_out
             is_late = status != "completed"
             ledger.settle_spend(in_tok, out_tok, latency_ms, is_late=is_late, status=status)
 
@@ -286,6 +317,10 @@ class LayaDecisionService:
                 estimated_prompt_tokens=est_prompt_tokens,
                 reserved_input_tokens=1000,
             )
+            raw_response["usage"] = {
+                "inputTokens": in_tok,
+                "outputTokens": out_tok,
+            }
         except InvalidUsageError as e:
             logger.error("laya.invalid_usage error=%s usage=%s", e, usage)
             # Record invalid usage status without double counting already settled spend
@@ -345,14 +380,7 @@ class LayaDecisionService:
                 except Exception as je:
                     raise ValueError(f"LAYA endpoint returned invalid JSON: {je}") from je
 
-                usage = data.get("usage")
-                if isinstance(usage, dict):
-                    in_t = usage.get("input_tokens", usage.get("inputTokens", 1))
-                    out_t = usage.get("output_tokens", usage.get("outputTokens", 0))
-                    data["usage"] = {
-                        "inputTokens": max(1, int(in_t)) if isinstance(in_t, (int, float)) and not isinstance(in_t, bool) else 1,
-                        "outputTokens": max(0, int(out_t)) if isinstance(out_t, (int, float)) and not isinstance(out_t, bool) else 0,
-                    }
+                # Do not clamp, truncate, or invent usage tokens. Preserve raw usage for validate_provider_usage.
                 return data
 
             if self.client is None:
@@ -407,29 +435,29 @@ class LayaDecisionService:
         return resp, status
 
     def _format_endpoint_payload(self, req: LayaEscalationRequest) -> dict[str, Any]:
-        """Format LayaEscalationRequest into /v1/systemone JSON payload."""
-        snippets = " ".join(s.snippet for s in req.retrieved_summary[:3])
-        doc_context = (
-            f"Query: {req.query}\n"
-            f"Gap detected: {req.missing_requirement.detected_gap}\n"
-            f"Missing dimension: {req.missing_requirement.missing_dimension}\n"
-            f"Context: {snippets}"
-        )
-        base_payload = {
+        """Format LayaEscalationRequest into /v1/systemone JSON payload.
+
+        Budgets fields separately:
+        - Mandatory: query, detected gap, missing dimension.
+        - Optional: context snippets from retrieved summary.
+        - If mandatory content exceeds document budget, raises PayloadBudgetExceededError before dispatch.
+        - Optional snippets are trimmed first to ensure total serialized payload <= 980 bytes.
+        """
+        base_skeleton: dict[str, Any] = {
             "state": {
-                "document": doc_context[:650],
+                "document": "",
             },
             "questions": {
                 "route": {
                     "type": "choice",
-                    "instructions": "Which targeted retrieval expansion route should be executed?",
+                    "instructions": "Targeted retrieval expansion route to execute",
                     "criteria": {
-                        "lexical_expansion": "Perform keyword BM25 search for specific missing terms or exact phrases",
-                        "dense_expansion": "Perform vector similarity search for semantic concepts",
-                        "structural_expansion": "Navigate document structure or specific sections",
-                        "graph_expansion": "Traverse knowledge graph entity relationships",
-                        "structured_expansion": "Query structured table columns or database operands",
-                        "none": "No expansion needed or evidence is fundamentally missing",
+                        "lexical_expansion": "Keyword BM25 search for specific terms or exact phrases",
+                        "dense_expansion": "Vector similarity search for semantic concepts",
+                        "structural_expansion": "Navigate document structure or sections",
+                        "graph_expansion": "Traverse knowledge graph entity links",
+                        "structured_expansion": "Query structured table columns or database",
+                        "none": "No expansion needed or evidence fundamentally missing",
                     },
                 },
                 "complexity": {
@@ -439,14 +467,58 @@ class LayaDecisionService:
                 },
             },
         }
-        raw_bytes = len(json.dumps(base_payload).encode("utf-8"))
-        while raw_bytes > 900 and len(base_payload["state"]["document"]) > 20:
-            excess = raw_bytes - 900
-            curr = base_payload["state"]["document"]
-            trim_amount = max(excess + 10, 20)
-            base_payload["state"]["document"] = curr[:-trim_amount]
-            raw_bytes = len(json.dumps(base_payload).encode("utf-8"))
-        return base_payload
+
+        # Calculate exact wrapper overhead in bytes with safety margin for JSON escaping
+        wrapper_bytes = len(json.dumps(base_skeleton).encode("utf-8"))
+        max_total_bytes = 980
+        # Reserve 16 bytes for JSON escaping of newlines/quotes
+        doc_budget = max_total_bytes - wrapper_bytes - 16
+
+        mandatory_text = (
+            f"Query: {req.query}\n"
+            f"Gap detected: {req.missing_requirement.detected_gap}\n"
+            f"Missing dimension: {req.missing_requirement.missing_dimension}"
+        )
+        mandatory_bytes = len(mandatory_text.encode("utf-8"))
+
+        if mandatory_bytes > doc_budget:
+            raise PayloadBudgetExceededError(
+                f"Mandatory payload content ({mandatory_bytes} bytes) exceeds document budget ({doc_budget} bytes)"
+            )
+
+        # Snippets are optional and trimmed first
+        remaining_budget = doc_budget - mandatory_bytes
+        snippets = " ".join(s.snippet for s in req.retrieved_summary[:3]).strip()
+        context_prefix = "\nContext: "
+        prefix_bytes = len(context_prefix.encode("utf-8"))
+
+        if snippets and remaining_budget > prefix_bytes + 20:
+            avail_snippet_bytes = remaining_budget - prefix_bytes
+            trimmed_snippets = _trim_utf8_to_bytes(snippets, avail_snippet_bytes)
+            doc_context = f"{mandatory_text}{context_prefix}{trimmed_snippets}"
+        else:
+            doc_context = mandatory_text
+
+        base_skeleton["state"]["document"] = doc_context
+
+        # Guarantee total serialized payload is strictly <= max_total_bytes
+        total_payload_bytes = len(json.dumps(base_skeleton).encode("utf-8"))
+        if total_payload_bytes > max_total_bytes and context_prefix in doc_context:
+            excess = total_payload_bytes - max_total_bytes
+            mandatory_part, snippet_part = doc_context.split(context_prefix, 1)
+            trimmed_snippet = _trim_utf8_to_bytes(snippet_part, max(0, len(snippet_part.encode("utf-8")) - excess - 4))
+            if trimmed_snippet:
+                base_skeleton["state"]["document"] = f"{mandatory_part}{context_prefix}{trimmed_snippet}"
+            else:
+                base_skeleton["state"]["document"] = mandatory_part
+            total_payload_bytes = len(json.dumps(base_skeleton).encode("utf-8"))
+
+        if total_payload_bytes > 1000:
+            raise PayloadBudgetExceededError(
+                f"Total serialized payload ({total_payload_bytes} bytes) exceeds 1000 byte policy cap"
+            )
+
+        return base_skeleton
 
     def _parse_endpoint_response(
         self,
@@ -497,8 +569,13 @@ class LayaDecisionService:
 
         parameters: Any
         if chosen_route == "lexical_expansion":
-            raw_terms = request.missing_requirement.detected_gap.split() or request.query.split()
-            query_terms = tuple(t[:64] for t in raw_terms[:5] if t) or ("term",)
+            query_terms = extract_domain_query_terms(
+                query=request.query,
+                detected_gap=request.missing_requirement.detected_gap,
+                max_terms=5,
+            )
+            if not query_terms:
+                query_terms = ("term",)
             parameters = LexicalExpansionParams(
                 route_type="lexical_expansion",
                 query_terms=query_terms,

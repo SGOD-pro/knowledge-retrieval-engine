@@ -104,34 +104,44 @@ Integrated test count reconciliation:
 ```bash
 cd backend && uv run pytest tests/test_laya_endpoint_adapter.py -v
 ```
-Result: **15 passed, 1 skipped in 3.19s**
+Result: **26 passed, 1 skipped in 3.49s**
 
 Breakdown:
-* `test_endpoint_happy_path_lexical`: PASSED (endpoint returns lexical expansion choice, approved decision produced)
-* `test_endpoint_route_none_clean_refusal`: PASSED (endpoint selects route none, approved decision produced)
-* `test_endpoint_unsupported_route_falls_back_to_lexical`: PASSED (endpoint selects dense expansion, rejected by code validation and falls back to lexical)
-* `test_endpoint_malformed_json_response`: PASSED (malformed JSON response falls back to deterministic decision)
-* `test_endpoint_missing_route_choice`: PASSED (missing route choice falls back cleanly)
-* `test_endpoint_missing_confidence`: PASSED (missing confidence rejected, mandatory numeric score enforced)
-* `test_endpoint_out_of_bounds_confidence`: PASSED (confidence 1.2 rejected, bounds 0.0 to 1.0 enforced)
 * `test_endpoint_auth_failure_401`: PASSED (401 response raises PermissionError, falls back to deterministic decision)
-* `test_endpoint_rate_limit_429`: PASSED (429 response handled with bounded retry charging)
-* `test_endpoint_server_error_502_provider_unavailable`: PASSED (502 response sets execution_status to provider_unavailable)
+* `test_endpoint_happy_path_lexical`: PASSED (endpoint returns lexical expansion choice, approved decision produced)
+* `test_endpoint_happy_path_none`: PASSED (endpoint returns none choice, approved decision produced)
+* `test_endpoint_invalid_confidence`: PASSED (confidence 2.5 rejected, bounds 0.0 to 1.0 enforced)
+* `test_endpoint_lexical_parameters_exclude_generic_operational_phrases`: PASSED (domain terms extracted, generic error phrases strictly excluded)
+* `test_endpoint_malformed_json_response`: PASSED (malformed JSON response falls back to deterministic decision)
+* `test_endpoint_payload_budget_exceeded_rejects_before_dispatch`: PASSED (mandatory content exceeding budget fails closed before dispatch with rejected_by_code)
+* `test_endpoint_payload_budget_trims_optional_snippets_first`: PASSED (optional snippets trimmed first, preserving mandatory query, gap, and dimension <= 980 bytes)
+* `test_endpoint_payload_multibyte_utf8_preserved_without_corruption`: PASSED (multibyte Japanese text and emojis preserved without byte slicing corruption)
+* `test_endpoint_timeout`: PASSED (endpoint timeout produces timeout execution status)
+* `test_endpoint_unavailable_connection_error`: PASSED (connection failure marked provider_unavailable and routes to Section 35 fallback)
+* `test_endpoint_unavailable_http_502`: PASSED (502 Bad Gateway sets execution_status to provider_unavailable)
+* `test_endpoint_unsupported_route_fallback`: PASSED (dense expansion rejected by code validation and falls back to lexical)
+* `test_endpoint_usage_boolean_tokens_rejected`: PASSED (boolean token counts rejected fail closed)
+* `test_endpoint_usage_fractional_tokens_rejected`: PASSED (fractional float token counts rejected fail closed)
+* `test_endpoint_usage_known_spend_preserved_and_invalid_usage_recorded`: PASSED (known integer spend recorded in ledger while marking invalid usage)
+* `test_endpoint_usage_missing_fields_rejected`: PASSED (missing token fields rejected fail closed)
+* `test_endpoint_usage_negative_tokens_rejected`: PASSED (negative token counts rejected fail closed)
+* `test_endpoint_usage_policy_overrun_rejected`: PASSED (input tokens exceeding 1000 cap rejected fail closed)
 * `test_simulated_4_4s_phase_deadline_timeout_and_capacity_retention`: PASSED (simulated slow 4.4 second network call exceeding 2500ms phase allowance triggers caller timeout, retains worker slot, discards late arrival, and reconciles ledger spend)
-* `test_pipeline_endpoint_successful_lexical_expansion`: PASSED (compiled pipeline expands via BM25, delivers verified answer, sets explicit telemetry flags)
-* `test_pipeline_endpoint_valid_route_none`: PASSED (compiled pipeline route none produces clean refusal NOT_FOUND without answer synthesis calls)
-* `test_pipeline_endpoint_unsupported_route_fallback`: PASSED (compiled pipeline dense expansion proposal rejected, deterministic Section 35 fallback executed, laya_route_accepted is False, laya_fallback is True)
+* `test_pipeline_endpoint_lexical_expansion_executes_with_clean_domain_terms`: PASSED (pipeline BM25 expansion executes with clean domain terms and verifies dispatched payload content)
 * `test_pipeline_endpoint_provider_unavailable_fallback`: PASSED (compiled pipeline connection failure marked provider_unavailable, executes Section 35 fallback with zero Bedrock fallback)
+* `test_pipeline_endpoint_successful_lexical_expansion`: PASSED (compiled pipeline expands via BM25, delivers verified answer, sets explicit telemetry flags)
+* `test_pipeline_endpoint_unsupported_route_fallback`: PASSED (compiled pipeline dense expansion proposal rejected, deterministic Section 35 fallback executed, laya_route_accepted is False, laya_fallback is True)
+* `test_pipeline_endpoint_valid_route_none`: PASSED (compiled pipeline route none produces clean refusal NOT_FOUND without answer synthesis calls)
 * `test_pipeline_laya_invoked_distinction_not_dispatched_on_preflight_abort`: PASSED (laya_invoked is False when escalation aborts before provider dispatch)
-* `test_live_endpoint_roundtrip_opt_in`: SKIPPED (live opt in check guarded by RUN_LIVE_LAYA_TESTS=true to avoid unexpected paid or network calls during automated test suites)
+* `test_live_server_decision`: SKIPPED (live opt in check guarded by RUN_LIVE_LAYA_TESTS=true to avoid unexpected network calls during automated test suites)
 
 ### 5. Performance and Latency Finding
-The manual live endpoint smoke check confirmed System One response compatibility (`choice: "none"`, `confidence: 0.476`, `answer_confidence: 0.7413`, model `"laya-rl-agent"`). However, the Cloudflare tunnel roundtrip measured at 4409.25ms (server latency 50.86ms). Since 4409ms exceeds KRE's 2500ms escalation phase ceiling, this constitutes a known latency readiness blocker for benchmark evaluation until the server is co-located or deployed behind a low-latency Cloudflare Tunnel.
+The manual live endpoint smoke check confirmed System One response compatibility (choice "none", confidence 0.476, answer_confidence 0.7413, model "laya-rl-agent"). However, the Cloudflare tunnel roundtrip measured at 4409.25ms (server latency 50.86ms). Since 4409ms exceeds KRE's 2500ms escalation phase ceiling, this constitutes a known latency readiness blocker for benchmark evaluation until the server is co-located or deployed behind a low-latency Cloudflare Tunnel.
 
 Combined LAYA offline regression count:
 * `tests/test_laya_escalation_slice5_1.py`: 42 passed
-* `tests/test_laya_endpoint_adapter.py`: 15 passed, 1 skipped
-* Combined total: 57 passed, 1 skipped in 13.81s
+* `tests/test_laya_endpoint_adapter.py`: 26 passed, 1 skipped
+* Combined total: 68 passed, 1 skipped in 16.52s
 
 ## Acceptance Criteria Coverage (Slice 5.1)
 - AC-1: Bounded escalation triggers when baseline discovery lacks sufficient evidence support (such as coverage error in fidelity verification or empty context) and the query budget retains an unused expansion slot (expansion_steps == 0 and laya_calls < MAX_QUERY_LAYA_CALLS). Escalation does not activate when baseline evidence is sufficient or remaining deadline is below the minimum viable threshold (500ms).

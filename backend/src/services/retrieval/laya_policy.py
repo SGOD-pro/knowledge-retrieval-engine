@@ -49,6 +49,73 @@ _STOP_WORDS: frozenset[str] = frozenset(
     }
 )
 
+_GENERIC_OPERATIONAL_WORDS: frozenset[str] = frozenset(
+    {
+        "error", "errors", "coverageerror", "runtimeerror", "valueerror", "typeerror",
+        "exception", "exceptions", "failed", "failure", "fails", "fail",
+        "stage", "check", "checks", "checking", "fidelity", "coverage", "missing",
+        "detected", "gap", "gaps", "initial", "baseline", "runtime", "traceback",
+        "reason", "unhandled", "timeout", "requirement", "requirements",
+        "dimension", "dimensions", "execution", "status", "operand", "operands",
+        "run_fidelity", "run_fidelity_coverage", "run_fidelity_empty_context",
+        "run_deterministic_math_operands", "evidence", "context", "document", "documents",
+    }
+)
+
+
+def extract_domain_query_terms(
+    query: str,
+    detected_gap: str = "",
+    max_terms: int = 5,
+) -> tuple[str, ...]:
+    """Extract validated domain keywords from query and gap, strictly excluding operational error phrases.
+
+    Prioritizes:
+    1. Clean terms inside quotes from detected_gap (e.g. 'turnover').
+    2. Validated domain terms from detected_gap (excluding operational words like 'fidelity', 'check', 'failed').
+    3. Validated domain terms from user query.
+    Never returns generic operational error phrases.
+    """
+    terms: list[str] = []
+    seen: set[str] = set()
+
+    def _add_word(w: str) -> None:
+        clean = w.lower().strip()
+        if (
+            len(clean) >= 2
+            and clean not in _STOP_WORDS
+            and clean not in _GENERIC_OPERATIONAL_WORDS
+            and clean not in seen
+        ):
+            seen.add(clean)
+            terms.append(clean[:64])
+
+    # 1. Quoted terms from detected_gap take highest priority
+    if detected_gap:
+        for quoted in re.findall(r"['\"]([^'\"]+)['\"]", detected_gap):
+            for w in re.findall(r"[a-zA-Z0-9_\-]+", quoted):
+                _add_word(w)
+
+    # 2. Domain words from detected_gap (skipping generic operational words)
+    if detected_gap:
+        for w in re.findall(r"[a-zA-Z0-9_\-]+", detected_gap):
+            _add_word(w)
+
+    # 3. Domain words from query
+    if query:
+        for w in re.findall(r"[a-zA-Z0-9_\-]+", query):
+            _add_word(w)
+
+    # 4. Fallback if no non operational domain terms found
+    if not terms and query:
+        for w in re.findall(r"[a-zA-Z0-9_\-]+", query):
+            clean = w.lower().strip()
+            if len(clean) >= 2 and clean not in _STOP_WORDS and clean not in seen:
+                seen.add(clean)
+                terms.append(clean[:64])
+
+    return tuple(terms[:max_terms])
+
 
 def extract_fallback_query_terms(text: str, max_terms: int = 5) -> tuple[str, ...]:
     """Extract bounded, clean alphanumeric query terms from text for BM25 fallback."""
@@ -56,13 +123,19 @@ def extract_fallback_query_terms(text: str, max_terms: int = 5) -> tuple[str, ..
     terms: list[str] = []
     seen: set[str] = set()
     for w in words:
-        if len(w) >= 2 and w not in _STOP_WORDS and w not in seen:
+        if len(w) >= 2 and w not in _STOP_WORDS and w not in _GENERIC_OPERATIONAL_WORDS and w not in seen:
             seen.add(w)
             terms.append(w[:64])
             if len(terms) >= max_terms:
                 break
     if not terms and words:
-        # If all were stop words, pick the first word truncated
+        for w in words:
+            if len(w) >= 2 and w not in _STOP_WORDS and w not in seen:
+                seen.add(w)
+                terms.append(w[:64])
+                if len(terms) >= max_terms:
+                    break
+    if not terms and words:
         terms.append(words[0][:64])
     return tuple(terms)
 
@@ -81,8 +154,7 @@ def get_deterministic_fallback_decision(
     detected_gap = request.missing_requirement.detected_gap
 
     # Extract targeted keywords prioritizing detected gap, then query
-    text_source = f"{detected_gap} {request.query}".strip()
-    terms = extract_fallback_query_terms(text_source, max_terms=5)
+    terms = extract_domain_query_terms(query=request.query, detected_gap=detected_gap, max_terms=5)
 
     doc_ids: list[str] = []
     seen_docs: set[str] = set()

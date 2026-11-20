@@ -65,6 +65,7 @@ class LayaBudgetLedger(BaseModel):
     total_latency_ms: float = 0.0
     tool_attempts: int = 0
     late_settled_calls: int = 0
+    invalid_usage_calls: int = 0
     settled_history: list[dict[str, Any]] = Field(default_factory=list)
     _lock: threading.Lock = PrivateAttr(default_factory=threading.Lock)
 
@@ -148,6 +149,7 @@ class LayaBudgetLedger(BaseModel):
     def record_invalid_usage(self) -> None:
         """Mark last settlement or record invalid usage event without double counting spend."""
         with self._lock:
+            self.invalid_usage_calls += 1
             if self.settled_history:
                 self.settled_history[-1]["status"] = "invalid_usage"
             else:
@@ -300,7 +302,11 @@ def validate_provider_usage(
 
     Enforces without extra slack:
     - Must be a dictionary.
-    - inputTokens must be a positive integer.
+    - inputTokens or input_tokens must be present.
+    - outputTokens or output_tokens must be present.
+    - Neither token count may be boolean.
+    - Neither token count may be fractional (float).
+    - inputTokens must be a strictly positive integer.
     - outputTokens must be a non negative integer <= 250.
     - inputTokens must be <= estimated_prompt_tokens (zero extra slack).
     - inputTokens must be <= reserved_input_tokens (zero extra slack).
@@ -309,15 +315,27 @@ def validate_provider_usage(
     if not isinstance(usage, dict):
         raise InvalidUsageError(f"Usage must be a dictionary, got {type(usage).__name__}")
 
-    in_tokens = usage.get("inputTokens")
-    out_tokens = usage.get("outputTokens")
+    has_in = "inputTokens" in usage or "input_tokens" in usage
+    has_out = "outputTokens" in usage or "output_tokens" in usage
+
+    if not has_in or not has_out:
+        raise InvalidUsageError("Usage dictionary missing required inputTokens/input_tokens or outputTokens/output_tokens")
+
+    in_tokens = usage.get("inputTokens") if "inputTokens" in usage else usage.get("input_tokens")
+    out_tokens = usage.get("outputTokens") if "outputTokens" in usage else usage.get("output_tokens")
 
     if in_tokens is None or out_tokens is None:
-        raise InvalidUsageError("Usage dictionary missing inputTokens or outputTokens")
+        raise InvalidUsageError("Usage dictionary contains null input or output tokens")
 
     # Reject booleans (isinstance(True, int) is True in Python)
     if isinstance(in_tokens, bool) or isinstance(out_tokens, bool):
         raise InvalidUsageError("Token counts must not be boolean")
+
+    # Reject fractional counts (floats)
+    if isinstance(in_tokens, float) or isinstance(out_tokens, float):
+        raise InvalidUsageError(
+            f"Token counts must not be fractional: input={in_tokens}, output={out_tokens}"
+        )
 
     if not isinstance(in_tokens, int) or not isinstance(out_tokens, int):
         raise InvalidUsageError(
