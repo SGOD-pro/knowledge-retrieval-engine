@@ -16,7 +16,7 @@ _Steps derived from spec 0008 acceptance criteria. /check verify runs these; /te
 ```bash
 cd backend && uv run pytest tests/test_laya_escalation_slice5_1.py -v
 ```
-Result: **40 passed, 0 skipped in 7.43s**
+Result: **42 passed, 0 skipped in 13.01s**
 Breakdown:
 * `test_laya_contracts_strict_discriminator_and_bounds`: PASSED (frozen contract immutability, extra field rejection, strict discriminator agreement, opaque version bounds)
 * `test_baseline_evidence_summary_normalized_bbox`: PASSED (normalized bounding box coordinate order x0 < x1, y0 < y1 between 0.0 and 1.0)
@@ -58,6 +58,8 @@ Breakdown:
 * `test_compiled_pipeline_slow_synthesis_retains_capacity_suppresses_late_result_and_reconciles_spend`: PASSED (slow answer synthesis exceeding caller deadline retains capacity, suppresses late answer, and reconciles ledger spend)
 * `test_provenance_validation_rejects_conflicting_metadata_and_accepts_valid_control`: PASSED (provenance validator compares all populated attributes and metadata across workspace, document, and version, rejecting any disagreement)
 * `test_compiled_pipeline_provenance_conflicts_rejected_and_positive_control_expanded`: PASSED (compiled pipeline rejects chunks with conflicting metadata while expanding valid positive control chunk)
+* `test_compiled_pipeline_default_timing_expired_phase_zero_verifier_dispatch`: PASSED (default production timing enforces 2500ms phase ceiling, causing 0 verifier dispatch when expired)
+* `test_compiled_pipeline_default_timing_slow_verification_retains_capacity_and_suppresses_late_text`: PASSED (default production timing gives verifier only remaining phase allowance, retaining capacity and suppressing late text)
 
 ### 2. Live Runtime Verification Over HTTP and Backend Services
 ```bash
@@ -90,12 +92,13 @@ Breakdown:
 ```bash
 cd backend && uv run pytest tests/test_laya_escalation_slice5_1.py tests/test_contracts_and_identity.py tests/test_workspace_boundary_isolation.py tests/test_phase2.py tests/test_phase3.py tests/test_deterministic_pipeline_wiring.py tests/test_mandatory_audit_guards.py -q
 ```
-Result: **150 passed, 1 warning in 15.48s**
+Result: **152 passed, 1 warning in 28.01s**
 
 Integrated test count reconciliation:
 * Historical count of 131 tests derived from a previous run before wiring and audit guard suites were added (35 slice tests plus 96 baseline tests).
 * Intermediate count of 145 tests occurred after integrating the full baseline regression suites (35 slice tests plus 61 contracts, 22 boundary isolation, 14 phase 2, 8 phase 3, 7 deterministic wiring, 4 mandatory audit guards, totaling 110 baseline tests, 35 + 110 = 145).
-* Current count of 150 tests reflects the 5 additional compiled application path regressions in `tests/test_laya_escalation_slice5_1.py` covering slow compression, slow secondary fidelity, slow answer synthesis with capacity retention and spend reconciliation, and cross field provenance disagreement gating, bringing slice tests to 40 and total integrated tests to 150 (40 + 110 = 150 passed).
+* Count of 150 tests reflected the 5 initial compiled application path regressions in `tests/test_laya_escalation_slice5_1.py` covering slow compression, slow secondary fidelity, slow answer synthesis with capacity retention and spend reconciliation, and cross field provenance disagreement gating, bringing slice tests to 40 (40 + 110 = 150).
+* Current count of 152 tests reflects the 2 additional compiled application path regressions under default production timing: `test_compiled_pipeline_default_timing_expired_phase_zero_verifier_dispatch` and `test_compiled_pipeline_default_timing_slow_verification_retains_capacity_and_suppresses_late_text`, bringing slice tests to 42 and total integrated tests to 152 (42 + 110 = 152 passed).
 
 ## Acceptance Criteria Coverage (Slice 5.1)
 - AC-1: Bounded escalation triggers when baseline discovery lacks sufficient evidence support (such as coverage error in fidelity verification or empty context) and the query budget retains an unused expansion slot (expansion_steps == 0 and laya_calls < MAX_QUERY_LAYA_CALLS). Escalation does not activate when baseline evidence is sufficient or remaining deadline is below the minimum viable threshold (500ms).

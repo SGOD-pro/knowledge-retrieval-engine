@@ -2595,5 +2595,247 @@ def test_compiled_pipeline_provenance_conflicts_rejected_and_positive_control_ex
                     assert "c_ver_bad" not in novel
 
 
+def test_compiled_pipeline_default_timing_expired_phase_zero_verifier_dispatch():
+    """Verify default production timing enforces 2500ms phase ceiling, causing 0 verifier dispatch when expired."""
+    ws_id = "ws_default_timing_expired"
+    from db.database import CloudRepository
+    from src.db.workspace_boundary_repo import get_workspace_boundary_repo
+    from src.schemas.contracts.boundary import DocumentSnapshot
+    from services.retrieval.fidelity_check import CoverageError
+    from datetime import datetime, timezone
+
+    repo = CloudRepository()
+    boundary_repo = get_workspace_boundary_repo()
+    opaque_ver = "rev-2026.10-sha256:d8b2a1"
+
+    doc_chunk = Chunk(
+        id="chunk_expired_1",
+        document_id="doc_expired",
+        workspace_id=ws_id,
+        document_version=opaque_ver,
+        element_type="narrative_block",
+        text="Target chunk for expired phase verification test.",
+        source_format="pdf",
+        metadata={"workspace_id": ws_id, "document_id": "doc_expired", "document_version": opaque_ver},
+        embedding_fast=[0.1] * 384,
+        embedding_full=[0.1] * 1024,
+    )
+    doc = Document(
+        id="doc_expired",
+        filename="doc_expired.pdf",
+        source_format="pdf",
+        chunks=(doc_chunk,),
+        workspace_id=ws_id,
+    )
+    repo.save(doc)
+    repo.add_document_to_workspace(ws_id, doc)
+    invalidate_chunk_cache(ws_id)
+    boundary_repo.save_document_snapshot(
+        DocumentSnapshot(
+            workspace_id=ws_id,
+            document_id="doc_expired",
+            source="doc_expired.pdf",
+            version=opaque_ver,
+            format="pdf",
+            created_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        )
+    )
+
+    mock_client = MockBedrockConverseClient(
+        response_payload={
+            "decision_id": "dec_expired_phase",
+            "route": "lexical_expansion",
+            "parameters": {
+                "route_type": "lexical_expansion",
+                "query_terms": ["target", "expired"],
+                "document_ids": ["doc_expired"],
+            },
+            "confidence": 0.92,
+            "rationale": "Lexical expansion for expired phase test",
+        }
+    )
+
+    mock_verifier = MagicMock()
+    mock_verifier.is_ready.return_value = True
+
+    def _mock_rerank(q, chunks, top_k=6, return_mode=False):
+        top = list(chunks)[:top_k]
+        return (top, "mocked") if return_mode else top
+
+    fidelity_call_count = 0
+
+    def mock_check_fidelity(q, ctx, **kw):
+        nonlocal fidelity_call_count
+        fidelity_call_count += 1
+        if fidelity_call_count == 1:
+            raise CoverageError("Initial baseline gap")
+        return None
+
+    def synthesis_consumes_full_phase(q, ctx):
+        # Consume the 2500ms phase ceiling during synthesis
+        time.sleep(2.55)
+        return {
+            "answer": "Synthesized text after expired phase",
+            "citations": ["chunk_expired_1"],
+            "usage": {"input_tokens": 100, "output_tokens": 40},
+        }
+
+    with patch("services.langgraph_pipeline._get_repo", return_value=repo):
+        with patch("services.langgraph_pipeline.rerank", side_effect=_mock_rerank):
+            with patch("services.langgraph_pipeline.check_fidelity", side_effect=mock_check_fidelity):
+                with patch("services.langgraph_pipeline.call_llm", side_effect=synthesis_consumes_full_phase):
+                    # Run under default production timing: NO caller_deadline_ms or phase_deadline_ms
+                    response = pipeline.run(
+                        query="Find answer under default timing with expired phase",
+                        workspace_id=ws_id,
+                        laya_enabled=True,
+                        laya_client=mock_client,
+                        boundary_repo=boundary_repo,
+                        doc_repo=repo,
+                        verifier=mock_verifier,
+                    )
+
+                    # Expired phase must cause zero verifier dispatch
+                    assert mock_verifier.verify.call_count == 0
+                    assert response.answer == "NOT_FOUND"
+                    assert response.retrieval_incomplete is True
+
+
+def test_compiled_pipeline_default_timing_slow_verification_retains_capacity_and_suppresses_late_text():
+    """Verify default production timing gives verifier only remaining phase allowance, retaining capacity and suppressing late text."""
+    ws_id = "ws_default_timing_slow_ver"
+    ctrl = LayaProviderConcurrencyController(max_concurrency=1, max_queue=2)
+    from db.database import CloudRepository
+    from src.db.workspace_boundary_repo import get_workspace_boundary_repo
+    from src.schemas.contracts.boundary import DocumentSnapshot
+    from services.retrieval.fidelity_check import CoverageError
+    from datetime import datetime, timezone
+
+    repo = CloudRepository()
+    boundary_repo = get_workspace_boundary_repo()
+    opaque_ver = "rev-2026.10-sha256:f7c3e9"
+
+    doc_chunk = Chunk(
+        id="chunk_slow_ver_1",
+        document_id="doc_slow_ver",
+        workspace_id=ws_id,
+        document_version=opaque_ver,
+        element_type="narrative_block",
+        text="Target chunk for slow verification test under default production timing.",
+        source_format="pdf",
+        metadata={"workspace_id": ws_id, "document_id": "doc_slow_ver", "document_version": opaque_ver},
+        embedding_fast=[0.1] * 384,
+        embedding_full=[0.1] * 1024,
+    )
+    doc = Document(
+        id="doc_slow_ver",
+        filename="doc_slow_ver.pdf",
+        source_format="pdf",
+        chunks=(doc_chunk,),
+        workspace_id=ws_id,
+    )
+    repo.save(doc)
+    repo.add_document_to_workspace(ws_id, doc)
+    invalidate_chunk_cache(ws_id)
+    boundary_repo.save_document_snapshot(
+        DocumentSnapshot(
+            workspace_id=ws_id,
+            document_id="doc_slow_ver",
+            source="doc_slow_ver.pdf",
+            version=opaque_ver,
+            format="pdf",
+            created_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        )
+    )
+
+    mock_client = MockBedrockConverseClient(
+        response_payload={
+            "decision_id": "dec_slow_ver",
+            "route": "lexical_expansion",
+            "parameters": {
+                "route_type": "lexical_expansion",
+                "query_terms": ["target", "slow"],
+                "document_ids": ["doc_slow_ver"],
+            },
+            "confidence": 0.94,
+            "rationale": "Lexical expansion for slow verifier test",
+        }
+    )
+
+    started = threading.Event()
+    finish = threading.Event()
+
+    def slow_verify(text, context, citations):
+        started.set()
+        finish.wait(timeout=10.0)
+        rec = MagicMock()
+        rec.support_status = "ASSERTED"
+        return rec
+
+    mock_verifier = MagicMock()
+    mock_verifier.is_ready.return_value = True
+    mock_verifier.verify.side_effect = slow_verify
+
+    def _mock_rerank(q, chunks, top_k=6, return_mode=False):
+        top = list(chunks)[:top_k]
+        return (top, "mocked") if return_mode else top
+
+    fidelity_call_count = 0
+
+    def mock_check_fidelity(q, ctx, **kw):
+        nonlocal fidelity_call_count
+        fidelity_call_count += 1
+        if fidelity_call_count == 1:
+            raise CoverageError("Initial baseline gap")
+        return None
+
+    def synthesis_consumes_most_of_phase(q, ctx):
+        # Consume most of the 2500ms phase ceiling (2.1s), leaving ~0.4s for verification
+        time.sleep(2.1)
+        return {
+            "answer": "Late published synthesis text that must never reach response",
+            "citations": ["chunk_slow_ver_1"],
+            "usage": {"input_tokens": 120, "output_tokens": 40},
+        }
+
+    with patch("services.langgraph_pipeline._get_repo", return_value=repo):
+        with patch("services.langgraph_pipeline.rerank", side_effect=_mock_rerank):
+            with patch("services.langgraph_pipeline.check_fidelity", side_effect=mock_check_fidelity):
+                with patch("services.langgraph_pipeline.call_llm", side_effect=synthesis_consumes_most_of_phase):
+                    t_start = time.perf_counter()
+                    # Run under default production timing: NO caller_deadline_ms or phase_deadline_ms passed
+                    response = pipeline.run(
+                        query="Find answer under default timing slow verifier",
+                        workspace_id=ws_id,
+                        laya_enabled=True,
+                        laya_client=mock_client,
+                        boundary_repo=boundary_repo,
+                        doc_repo=repo,
+                        verifier=mock_verifier,
+                        laya_concurrency_controller=ctrl,
+                    )
+                    elapsed_total = time.perf_counter() - t_start
+
+                    # Execution must time out around the 2500ms phase ceiling (~2.5s - 3.2s)
+                    # NOT after the 15-second query budget or 10-second finish timeout!
+                    assert elapsed_total < 4.5
+                    assert started.is_set() is True, "slow_verify was never dispatched!"
+
+                    # Response must fail closed
+                    assert response.answer == "NOT_FOUND"
+                    assert response.retrieval_incomplete is True
+                    assert "Late published synthesis text" not in response.answer
+
+                    # Worker capacity MUST remain retained while slow_verify is executing!
+                    assert ctrl.active_count == 1
+
+    # Release slow worker and confirm clean release of capacity
+    finish.set()
+    time.sleep(0.1)
+    assert ctrl.active_count == 0
+    ctrl.shutdown(wait=False)
+
+
+
 
 

@@ -159,9 +159,12 @@ class PipelineState(TypedDict):
     laya_budget_ledger: Any | None
     laya_concurrency_controller: Any | None
     caller_deadline_ms: float | None
+    phase_deadline_ms: float | None
     snapshot_context: Any | None
     _pipeline_start_time: float
     _escalation_start_time: float
+    _escalation_deadline_t: float | None
+    escalation_deadline_t: float | None
 
 
 # ---------------------------------------------------------------------------
@@ -1281,7 +1284,19 @@ def route_after_fidelity(state: PipelineState) -> str:
         pipe_start = state.get("_pipeline_start_time", time.perf_counter())
         elapsed_ms = (time.perf_counter() - pipe_start) * 1000.0
         remaining_ms = max(0.0, 15000.0 - elapsed_ms)
-        if laya_enabled and expansion_steps < 1 and laya_calls < 1 and remaining_ms >= 500.0:
+        caller_spec = state.get("caller_deadline_ms") or state.get("phase_deadline_ms")
+        effective_rem_ms = min(remaining_ms, 2500.0)
+        if caller_spec is not None:
+            try:
+                c_val = float(caller_spec)
+                if c_val > 0.0:
+                    effective_rem_ms = min(effective_rem_ms, c_val)
+            except (ValueError, TypeError):
+                pass
+        existing_deadline_t = state.get("_escalation_deadline_t") or state.get("escalation_deadline_t")
+        if existing_deadline_t is not None:
+            effective_rem_ms = min(effective_rem_ms, max(0.0, (float(existing_deadline_t) - time.perf_counter()) * 1000.0))
+        if laya_enabled and expansion_steps < 1 and laya_calls < 1 and effective_rem_ms >= 500.0:
             return "run_laya_escalation"
         return "delivery_gate"
 
@@ -1315,15 +1330,29 @@ def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
     cands = dict(state.get("retrieval_candidates", {}))
     ledger = state.get("laya_budget_ledger") or LayaBudgetLedger()
 
-    pipe_start = state.get("_pipeline_start_time", time.perf_counter())
-    elapsed_ms = (time.perf_counter() - pipe_start) * 1000.0
-    remaining_ms = max(0.0, 15000.0 - elapsed_ms)
-    caller_spec_deadline = state.get("caller_deadline_ms") or state.get("phase_deadline_ms")
-    if caller_spec_deadline is not None:
-        phase_deadline_ms = float(caller_spec_deadline)
+    pipe_start = state.get("_pipeline_start_time", t0)
+    elapsed_query_ms = (t0 - pipe_start) * 1000.0
+    remaining_query_ms = max(0.0, 15000.0 - elapsed_query_ms)
+
+    # Persist one absolute monotonic escalation deadline in pipeline state.
+    # Derive it from the minimum of remaining query time, the 2500ms phase ceiling,
+    # and any valid tighter caller limit.
+    existing_deadline_t = state.get("_escalation_deadline_t") or state.get("escalation_deadline_t")
+    if existing_deadline_t is not None:
+        escalation_deadline_t = float(existing_deadline_t)
+        phase_deadline_ms = max(0.0, (escalation_deadline_t - t0) * 1000.0)
     else:
-        phase_deadline_ms = min(remaining_ms, 2500.0)
-    escalation_deadline_t = time.perf_counter() + (phase_deadline_ms / 1000.0)
+        limits = [remaining_query_ms, 2500.0]
+        caller_spec = state.get("caller_deadline_ms") or state.get("phase_deadline_ms")
+        if caller_spec is not None:
+            try:
+                c_val = float(caller_spec)
+                if c_val > 0.0:
+                    limits.append(c_val)
+            except (ValueError, TypeError):
+                pass
+        phase_deadline_ms = min(limits)
+        escalation_deadline_t = t0 + (phase_deadline_ms / 1000.0)
 
     try:
         from services.retrieval.laya_concurrency import get_laya_concurrency_controller
@@ -1351,6 +1380,9 @@ def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
             "confidence_score": 0.0,
             "retrieval_incomplete": True,
             "error": "Missing boundary authority",
+            "_escalation_deadline_t": escalation_deadline_t,
+            "escalation_deadline_t": escalation_deadline_t,
+            "escalation_executed": True,
         }
 
     # Evaluate dynamic workspace tombstone early
@@ -1363,6 +1395,9 @@ def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
                 "confidence_score": 0.0,
                 "retrieval_incomplete": True,
                 "error": "Workspace tombstoned",
+                "_escalation_deadline_t": escalation_deadline_t,
+                "escalation_deadline_t": escalation_deadline_t,
+                "escalation_executed": True,
             }
     except Exception as te:
         logger.error("laya.workspace_tombstone_check_error: %s (failing closed)", te)
@@ -1372,6 +1407,9 @@ def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
             "confidence_score": 0.0,
             "retrieval_incomplete": True,
             "error": f"Tombstone check error: {te}",
+            "_escalation_deadline_t": escalation_deadline_t,
+            "escalation_deadline_t": escalation_deadline_t,
+            "escalation_executed": True,
         }
 
     # Resolve pinned snapshot context through production path
@@ -1403,6 +1441,9 @@ def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
             "confidence_score": 0.0,
             "retrieval_incomplete": True,
             "error": "Missing or failed snapshot authority",
+            "_escalation_deadline_t": escalation_deadline_t,
+            "escalation_deadline_t": escalation_deadline_t,
+            "escalation_executed": True,
         }
 
     err = state.get("error") or "Context insufficient"
@@ -1483,15 +1524,16 @@ def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
         missing_requirement=req_desc,
         available_routes=("lexical_expansion", "none"),
         retrieved_summary=tuple(summaries),
-        caller_deadline_ms=phase_deadline_ms,
+        caller_deadline_ms=max(0.0, (escalation_deadline_t - time.perf_counter()) * 1000.0),
     )
 
+    rem_ms_decide = max(0.0, (escalation_deadline_t - time.perf_counter()) * 1000.0)
     service = state.get("laya_decision_service") or LayaDecisionService(
         client=state.get("laya_client"),
         model_id=state.get("laya_model_id"),
         concurrency_controller=ctrl,
     )
-    decision = service.decide(escalation_req, phase_deadline_ms, ledger)
+    decision = service.decide(escalation_req, rem_ms_decide, ledger)
     l_lat_ms = (time.perf_counter() - t0) * 1000.0
 
     cands["laya_decision_id"] = decision.decision_id
@@ -1547,6 +1589,9 @@ def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
         "retrieval_candidates": cands,
         "stage_timings": {**existing_timings, "laya_ms": l_lat_ms},
         "_escalation_start_time": t0,
+        "_escalation_deadline_t": escalation_deadline_t,
+        "escalation_deadline_t": escalation_deadline_t,
+        "escalation_executed": True,
     }
 
     rem_s_post = max(0.0, escalation_deadline_t - time.perf_counter())
@@ -1579,6 +1624,9 @@ def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
                 "laya_status": "timeout",
                 "error": "Caller deadline exceeded before post-expansion reranking",
                 "stage_timings": {**existing_timings, "laya_ms": (time.perf_counter() - t0) * 1000.0},
+                "_escalation_deadline_t": escalation_deadline_t,
+                "escalation_deadline_t": escalation_deadline_t,
+                "escalation_executed": True,
             }
 
         def _do_rerank() -> dict[str, Any]:
@@ -1595,6 +1643,9 @@ def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
                 "laya_status": "timeout",
                 "error": "Caller deadline exceeded during post-expansion reranking",
                 "stage_timings": {**existing_timings, "laya_ms": (time.perf_counter() - t0) * 1000.0},
+                "_escalation_deadline_t": escalation_deadline_t,
+                "escalation_deadline_t": escalation_deadline_t,
+                "escalation_executed": True,
             }
         elif rerank_status != "completed" or rerank_res is None:
             logger.warning("laya.rerank_failed failing closed with error refusal")
@@ -1606,6 +1657,9 @@ def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
                 "laya_status": "error",
                 "error": "Post-expansion reranking failed",
                 "stage_timings": {**existing_timings, "laya_ms": (time.perf_counter() - t0) * 1000.0},
+                "_escalation_deadline_t": escalation_deadline_t,
+                "escalation_deadline_t": escalation_deadline_t,
+                "escalation_executed": True,
             }
 
         current_state.update(rerank_res)
@@ -1622,6 +1676,9 @@ def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
                 "laya_status": "timeout",
                 "error": "Caller deadline exceeded before context compression",
                 "stage_timings": {**existing_timings, "laya_ms": (time.perf_counter() - t0) * 1000.0},
+                "_escalation_deadline_t": escalation_deadline_t,
+                "escalation_deadline_t": escalation_deadline_t,
+                "escalation_executed": True,
             }
 
         def _do_compress() -> dict[str, Any]:
@@ -1638,6 +1695,9 @@ def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
                 "laya_status": "timeout",
                 "error": "Caller deadline exceeded during context compression",
                 "stage_timings": {**existing_timings, "laya_ms": (time.perf_counter() - t0) * 1000.0},
+                "_escalation_deadline_t": escalation_deadline_t,
+                "escalation_deadline_t": escalation_deadline_t,
+                "escalation_executed": True,
             }
         elif comp_status != "completed" or comp_res is None:
             logger.warning("laya.compression_failed failing closed with error refusal")
@@ -1649,6 +1709,9 @@ def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
                 "laya_status": "error",
                 "error": "Post-expansion context compression failed",
                 "stage_timings": {**existing_timings, "laya_ms": (time.perf_counter() - t0) * 1000.0},
+                "_escalation_deadline_t": escalation_deadline_t,
+                "escalation_deadline_t": escalation_deadline_t,
+                "escalation_executed": True,
             }
 
         current_state.update(comp_res)
@@ -1670,6 +1733,9 @@ def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
                 "laya_status": "timeout",
                 "error": "Caller deadline exceeded before secondary fidelity check",
                 "stage_timings": {**existing_timings, "laya_ms": (time.perf_counter() - t0) * 1000.0},
+                "_escalation_deadline_t": escalation_deadline_t,
+                "escalation_deadline_t": escalation_deadline_t,
+                "escalation_executed": True,
             }
 
         def _do_fidelity() -> dict[str, Any]:
@@ -1686,6 +1752,9 @@ def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
                 "laya_status": "timeout",
                 "error": "Caller deadline exceeded during secondary fidelity check",
                 "stage_timings": {**existing_timings, "laya_ms": (time.perf_counter() - t0) * 1000.0},
+                "_escalation_deadline_t": escalation_deadline_t,
+                "escalation_deadline_t": escalation_deadline_t,
+                "escalation_executed": True,
             }
         elif fid_status != "completed" or fid_res is None:
             logger.warning("laya.fidelity_failed failing closed with error refusal")
@@ -1697,6 +1766,9 @@ def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
                 "laya_status": "error",
                 "error": "Secondary fidelity check failed",
                 "stage_timings": {**existing_timings, "laya_ms": (time.perf_counter() - t0) * 1000.0},
+                "_escalation_deadline_t": escalation_deadline_t,
+                "escalation_deadline_t": escalation_deadline_t,
+                "escalation_executed": True,
             }
 
         current_state.update(fid_res)
@@ -1706,6 +1778,8 @@ def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
         updated_state["retrieval_candidates"] = {**updated_state.get("retrieval_candidates", {}), **cands}
         updated_state["candidate_chunks"] = merged_candidates
         updated_state["escalation_executed"] = True
+        updated_state["_escalation_deadline_t"] = escalation_deadline_t
+        updated_state["escalation_deadline_t"] = escalation_deadline_t
 
         if current_state.get("error") is None:
             # Secondary fidelity succeeded!
@@ -1915,14 +1989,23 @@ def delivery_gate(state: PipelineState) -> dict[str, Any]:
                 cits = state.get("citations", [])
 
                 pipe_start = state.get("_pipeline_start_time", time.perf_counter())
-                caller_spec_deadline = state.get("caller_deadline_ms") or state.get("phase_deadline_ms")
-                if caller_spec_deadline is not None:
+                esc_deadline_t = state.get("_escalation_deadline_t") or state.get("escalation_deadline_t")
+                if esc_deadline_t is not None:
+                    rem_s_verify = max(0.0, float(esc_deadline_t) - time.perf_counter())
+                elif state.get("escalation_executed"):
+                    caller_spec_deadline = state.get("caller_deadline_ms") or state.get("phase_deadline_ms")
                     escalation_start = state.get("_escalation_start_time", pipe_start)
                     elapsed_esc_ms = (time.perf_counter() - escalation_start) * 1000.0
-                    rem_s_verify = max(0.0, (float(caller_spec_deadline) - elapsed_esc_ms) / 1000.0)
+                    phase_budget_ms = float(caller_spec_deadline) if caller_spec_deadline is not None else 2500.0
+                    rem_s_verify = max(0.0, (phase_budget_ms - elapsed_esc_ms) / 1000.0)
                 else:
-                    elapsed_ms = (time.perf_counter() - pipe_start) * 1000.0
-                    rem_s_verify = max(0.0, (15000.0 - elapsed_ms) / 1000.0)
+                    caller_spec_deadline = state.get("caller_deadline_ms") or state.get("phase_deadline_ms")
+                    if caller_spec_deadline is not None:
+                        elapsed_ms = (time.perf_counter() - pipe_start) * 1000.0
+                        rem_s_verify = max(0.0, (float(caller_spec_deadline) - elapsed_ms) / 1000.0)
+                    else:
+                        elapsed_ms = (time.perf_counter() - pipe_start) * 1000.0
+                        rem_s_verify = max(0.0, (15000.0 - elapsed_ms) / 1000.0)
 
                 ctrl = state.get("laya_concurrency_controller")
                 if ctrl is None:
@@ -2575,9 +2658,12 @@ class Pipeline:
             "laya_budget_ledger": kwargs.get("laya_budget_ledger"),
             "laya_concurrency_controller": kwargs.get("laya_concurrency_controller"),
             "caller_deadline_ms": kwargs.get("caller_deadline_ms"),
+            "phase_deadline_ms": kwargs.get("phase_deadline_ms"),
             "snapshot_context": kwargs.get("snapshot_context"),
             "_pipeline_start_time": time.perf_counter(),
             "_escalation_start_time": time.perf_counter(),
+            "_escalation_deadline_t": kwargs.get("_escalation_deadline_t"),
+            "escalation_deadline_t": kwargs.get("escalation_deadline_t"),
         }
 
         if table_store is not None:
