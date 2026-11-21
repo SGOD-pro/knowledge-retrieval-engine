@@ -80,38 +80,58 @@ class TestProbePerAttemptRecords:
             assert dec2.execution_status in ("timeout", "provider_unavailable")
 
     def test_late_worker_completion_associated_with_original_attempt(self) -> None:
-        """Confirms that late completions in worker threads update their own attempt record."""
-        spy = BoundedNetworkSpy(dry_run=False)
+        """Confirms that late completions in worker threads update their own attempt record without manual population."""
+        spy = BoundedNetworkSpy(dry_run=True)
+        worker_started = threading.Event()
+        worker_release = threading.Event()
 
-        # Create attempt 1
-        att1 = HttpAttemptRecord(attempt_id=1, started_at=time.perf_counter())
-        spy.attempts.append(att1)
+        spy.on_worker_start = lambda: worker_started.set()
+        spy.pause_event = worker_release
 
-        # Simulate caller timeout on attempt 1
-        att1.error = "caller_timeout"
+        with patch("requests.post", side_effect=spy.spy_post):
+            svc = LayaDecisionService(endpoint_url="https://mock.laya.local/v1/systemone", api_key="key_async")
+            req = _build_synthetic_request(query="Query Async", gap="Gap Async")
 
-        # Simulate worker completing attempt 1 late
-        t_end = time.perf_counter()
-        att1.ended_at = t_end
-        att1.roundtrip_ms = 150.0
-        att1.status_code = 200
-        att1.server_latency_ms = 35.0
-        att1.late_completed = True
+            # 1. First request times out at caller level while worker remains paused
+            spy.set_probe_id("probe_req1")
+            dec1 = svc.decide(req, deadline_remaining_ms=520.0, ledger=LayaBudgetLedger())
+            assert dec1.execution_status == "timeout", "Caller must time out"
+            spy.record_caller_timeout("probe_req1")
 
-        # Attempt 2 begins subsequently
-        att2 = HttpAttemptRecord(attempt_id=2, started_at=time.perf_counter())
-        spy.attempts.append(att2)
+            attempts_1 = spy.get_attempts_for_probe("probe_req1")
+            assert len(attempts_1) == 1
+            att1 = attempts_1[0]
+            assert att1.caller_timed_out is True
+            assert att1.ended_at is None
+            assert att1.late_completed is False
+            assert att1.roundtrip_ms is None
 
-        # Assert isolation between attempt 1 and attempt 2
-        assert att1.attempt_id == 1
-        assert att1.late_completed is True
-        assert att1.roundtrip_ms == 150.0
-        assert att1.server_latency_ms == 35.0
+            # 2. Subsequent request runs and completes normally
+            spy.pause_event = None
+            spy.on_worker_start = None
+            spy.set_probe_id("probe_req2")
+            dec2 = svc.decide(req, deadline_remaining_ms=2500.0, ledger=LayaBudgetLedger())
+            assert dec2.execution_status == "approved"
 
-        assert att2.attempt_id == 2
-        assert att2.late_completed is False
-        assert att2.ended_at is None
-        assert att2.server_latency_ms is None
+            attempts_2 = spy.get_attempts_for_probe("probe_req2")
+            assert len(attempts_2) == 1
+            att2 = attempts_2[0]
+            assert att2.attempt_id == 2
+            assert att2.caller_timed_out is False
+            assert att2.late_completed is False
+            assert att2.ended_at is not None
+            assert att2.roundtrip_ms is not None
+
+            # 3. Eventual original-worker completion updates att1 without overwriting caller outcome
+            worker_release.set()
+            time.sleep(0.05)
+
+            assert att1.attempt_id == 1
+            assert att1.caller_timed_out is True
+            assert att1.late_completed is True, "Original attempt must be marked late_completed by worker"
+            assert att1.ended_at is not None, "Original attempt must record ended_at upon completion"
+            assert att1.roundtrip_ms is not None, "Original attempt must record roundtrip_ms"
+            assert dec1.execution_status == "timeout", "Caller outcome must not be overwritten"
 
 
 class TestProbeVerdictLogic:
@@ -239,6 +259,56 @@ class TestProbeVerdictLogic:
         assert code_deliv == 2
         assert any("was not REFUSAL" in r for r in reasons_deliv)
 
+    def test_verdict_rejects_missing_route_telemetry(self) -> None:
+        """Route telemetry must not be empty or missing."""
+        rec = ProbeMetricRecord(
+            probe_id="test_missing_route",
+            target="compiled_pipeline",
+            request_sequence="subsequent_request",
+            query_type="lexical_expansion",
+            client_roundtrip_ms=40.0,
+            server_latency_ms=30.0,
+            unaccounted_elapsed_ms=10.0,
+            dispatched=True,
+            valid_response=True,
+            proposed_route="",  # Missing telemetry
+            route_accepted=True,
+            expansion_executed=True,
+            fallback=False,
+            execution_status="approved",
+            pipeline_total_ms=80.0,
+            delivery_outcome="DELIVERED",
+        )
+        code, label, reasons = evaluate_probe_verdict([rec])
+        assert code == 2
+        assert label == "FAIL (FUNCTIONAL DEFECT)"
+        assert any("missing provider route telemetry" in r for r in reasons)
+
+    def test_verdict_rejects_mismatched_route_in_none_scenario_even_if_pipeline_refuses(self) -> None:
+        """Observed route lexical_expansion in none scenario must be rejected even if pipeline refused."""
+        rec = ProbeMetricRecord(
+            probe_id="test_mismatched_none",
+            target="compiled_pipeline",
+            request_sequence="subsequent_request",
+            query_type="none",
+            client_roundtrip_ms=40.0,
+            server_latency_ms=30.0,
+            unaccounted_elapsed_ms=10.0,
+            dispatched=True,
+            valid_response=True,
+            proposed_route="lexical_expansion",  # Mismatched route
+            route_accepted=True,
+            expansion_executed=False,
+            fallback=False,
+            execution_status="approved",
+            pipeline_total_ms=80.0,
+            delivery_outcome="REFUSAL",  # Pipeline refused, but route didn't match scenario
+        )
+        code, label, reasons = evaluate_probe_verdict([rec])
+        assert code == 2
+        assert label == "FAIL (FUNCTIONAL DEFECT)"
+        assert any("does not match expected route none" in r for r in reasons)
+
     def test_verdict_rejects_phase_deadline_overrun(self) -> None:
         """Any request exceeding 2500ms phase ceiling is evaluated as latency blocker."""
         rec = ProbeMetricRecord(
@@ -317,7 +387,7 @@ class TestOfflineHarnessSuite:
 
     def test_negative_controls_pass_explicitly(self) -> None:
         passed = run_offline_negative_controls(verbose=False)
-        assert len(passed) == 5
+        assert len(passed) == 8
 
     def test_offline_harness_pass_assertions_end_to_end(self) -> None:
         exit_code = run_latency_probe(endpoint_url="", api_key="", dry_run=True)

@@ -80,12 +80,15 @@ class HttpAttemptRecord:
 
     attempt_id: int
     started_at: float
+    probe_id: str | None = None
     ended_at: float | None = None
     roundtrip_ms: float | None = None
     server_latency_ms: float | None = None
     status_code: int | None = None
     error: str | None = None
     is_redirect: bool = False
+    caller_timed_out: bool = False
+    caller_timeout_at: float | None = None
     late_completed: bool = False
     response_data: dict[str, Any] = field(default_factory=dict)
 
@@ -253,6 +256,7 @@ class BoundedNetworkSpy:
         self.attempts: list[HttpAttemptRecord] = []
         self._lock = threading.Lock()
         self._orig_post = requests.post
+        self.current_probe_id: str | None = None
 
         # Simulation hooks for negative control testing
         self.simulated_exception: Exception | None = None
@@ -260,6 +264,34 @@ class BoundedNetworkSpy:
         self.simulated_server_latency_ms: float | None = 32.5
         self.simulated_is_redirect: bool = False
         self.simulated_delay_s: float = 0.04
+
+        # Event-controlled worker hooks for asynchronous timeout/late-completion testing
+        self.on_worker_start: Any | None = None
+        self.pause_event: threading.Event | None = None
+
+    def set_probe_id(self, probe_id: str | None) -> None:
+        """Associate subsequent attempts with an originating probe request."""
+        with self._lock:
+            self.current_probe_id = probe_id
+
+    def get_attempts_for_probe(self, probe_id: str) -> list[HttpAttemptRecord]:
+        """Return all attempts associated with an originating probe request."""
+        with self._lock:
+            return [att for att in self.attempts if att.probe_id == probe_id]
+
+    def record_caller_timeout(self, probe_id: str | None = None) -> None:
+        """Record caller timeout on matching active attempt without waiting for HTTP completion."""
+        with self._lock:
+            target_attempts = [
+                att for att in self.attempts
+                if (probe_id is None or att.probe_id == probe_id) and att.ended_at is None
+            ]
+            now = time.perf_counter()
+            for att in target_attempts:
+                att.caller_timed_out = True
+                att.caller_timeout_at = now
+                if not att.error:
+                    att.error = "caller_timeout"
 
     def spy_post(self, *args: Any, **kwargs: Any) -> Any:
         # Pre-dispatch validation ceiling
@@ -272,6 +304,7 @@ class BoundedNetworkSpy:
             attempt_id = self.request_count
             attempt = HttpAttemptRecord(
                 attempt_id=attempt_id,
+                probe_id=self.current_probe_id,
                 started_at=time.perf_counter(),
             )
             self.attempts.append(attempt)
@@ -285,25 +318,41 @@ class BoundedNetworkSpy:
         # Explicitly disallow automatic redirects in the probe to count and inspect every transmission
         kwargs["allow_redirects"] = False
 
+        # Fire worker start hook if configured
+        if self.on_worker_start is not None:
+            try:
+                self.on_worker_start()
+            except Exception:
+                pass
+
+        # Wait on pause event if configured (for event-controlled asynchronous testing)
+        if self.pause_event is not None:
+            self.pause_event.wait()
+
         if self.dry_run:
             if self.simulated_delay_s > 0:
                 time.sleep(self.simulated_delay_s)
 
             t_end = time.perf_counter()
-            attempt.ended_at = t_end
-            attempt.roundtrip_ms = (t_end - attempt.started_at) * 1000.0
+            with self._lock:
+                attempt.ended_at = t_end
+                attempt.roundtrip_ms = (t_end - attempt.started_at) * 1000.0
+                if attempt.caller_timed_out:
+                    attempt.late_completed = True
 
             # Handle simulated redirect
             if self.simulated_is_redirect or (self.simulated_status_code in (301, 302, 303, 307, 308)):
-                attempt.is_redirect = True
-                attempt.status_code = self.simulated_status_code or 302
+                with self._lock:
+                    attempt.is_redirect = True
+                    attempt.status_code = self.simulated_status_code or 302
                 raise RedirectRejectedError(
                     f"HTTP redirect {attempt.status_code} rejected in latency probe to prevent untracked transmissions"
                 )
 
             # Handle simulated exception
             if self.simulated_exception:
-                attempt.error = str(self.simulated_exception)
+                with self._lock:
+                    attempt.error = str(self.simulated_exception)
                 raise self.simulated_exception
 
             # Normal dry-run mock response
@@ -334,18 +383,22 @@ class BoundedNetworkSpy:
                 "server_latency_ms": self.simulated_server_latency_ms,
             }
             resp.json.return_value = resp_data
-            attempt.status_code = resp.status_code
-            attempt.response_data = resp_data
-            attempt.server_latency_ms = self.simulated_server_latency_ms
+            with self._lock:
+                attempt.status_code = resp.status_code
+                attempt.response_data = resp_data
+                attempt.server_latency_ms = self.simulated_server_latency_ms
             return resp
 
         # Real network dispatch
         try:
             resp = self._orig_post(*args, **kwargs)
             t_end = time.perf_counter()
-            attempt.ended_at = t_end
-            attempt.roundtrip_ms = (t_end - attempt.started_at) * 1000.0
-            attempt.status_code = resp.status_code
+            with self._lock:
+                attempt.ended_at = t_end
+                attempt.roundtrip_ms = (t_end - attempt.started_at) * 1000.0
+                attempt.status_code = resp.status_code
+                if attempt.caller_timed_out:
+                    attempt.late_completed = True
 
             # Check and reject HTTP redirects
             if (
@@ -353,27 +406,33 @@ class BoundedNetworkSpy:
                 or resp.status_code in (301, 302, 303, 307, 308)
                 or "Location" in getattr(resp, "headers", {})
             ):
-                attempt.is_redirect = True
+                with self._lock:
+                    attempt.is_redirect = True
                 raise RedirectRejectedError(
                     f"HTTP redirect {resp.status_code} rejected in latency probe to prevent untracked transmissions"
                 )
 
             try:
                 resp_data = resp.json()
-                attempt.response_data = resp_data
-                srv_lat = resp_data.get("server_latency_ms") or resp_data.get("latency_ms")
-                if srv_lat is not None:
-                    attempt.server_latency_ms = float(srv_lat)
+                with self._lock:
+                    attempt.response_data = resp_data
+                    srv_lat = resp_data.get("server_latency_ms") or resp_data.get("latency_ms")
+                    if srv_lat is not None:
+                        attempt.server_latency_ms = float(srv_lat)
             except Exception:
-                attempt.response_data = {}
-                attempt.server_latency_ms = None
+                with self._lock:
+                    attempt.response_data = {}
+                    attempt.server_latency_ms = None
             return resp
         except Exception as exc:
             t_end = time.perf_counter()
-            if attempt.ended_at is None:
-                attempt.ended_at = t_end
-                attempt.roundtrip_ms = (t_end - attempt.started_at) * 1000.0
-            attempt.error = str(exc)
+            with self._lock:
+                if attempt.ended_at is None:
+                    attempt.ended_at = t_end
+                    attempt.roundtrip_ms = (t_end - attempt.started_at) * 1000.0
+                if attempt.caller_timed_out:
+                    attempt.late_completed = True
+                attempt.error = str(exc)
             raise
 
     def get_attempts_since(self, marker: int) -> list[HttpAttemptRecord]:
@@ -464,6 +523,18 @@ def evaluate_probe_verdict(
         if not m.route_accepted:
             failures.append(f"Request {idx} proposed route {m.proposed_route} was not accepted")
             continue
+
+        # Require actual observed provider route to match scenario and reject missing telemetry
+        if not m.proposed_route or m.proposed_route in ("unknown", "None", ""):
+            failures.append(f"Request {idx} missing provider route telemetry")
+        elif m.query_type == "lexical_expansion" and m.proposed_route != "lexical_expansion":
+            failures.append(
+                f"Request {idx} observed provider route '{m.proposed_route}' does not match expected lexical_expansion"
+            )
+        elif m.query_type == "none" and m.proposed_route != "none":
+            failures.append(
+                f"Request {idx} observed provider route '{m.proposed_route}' does not match expected route none (rejected even if pipeline refused)"
+            )
 
         # Target specific verification
         if m.query_type == "lexical_expansion":
@@ -635,6 +706,108 @@ def run_offline_negative_controls(verbose: bool = True) -> list[str]:
     assert spy_ceiling.request_count == 5, "Request count must not increment past ceiling"
     passed_controls.append("Negative Control 5: Sixth transmission blocked before dispatch (strict ceiling enforced)")
 
+    # -------------------------------------------------------------------------
+    # Negative Control 6: Mismatched Route in None Scenario
+    # -------------------------------------------------------------------------
+    rec_mismatched = ProbeMetricRecord(
+        probe_id="ctrl_mismatched_route",
+        target="compiled_pipeline",
+        request_sequence="subsequent_request",
+        query_type="none",
+        client_roundtrip_ms=45.0,
+        server_latency_ms=30.0,
+        unaccounted_elapsed_ms=15.0,
+        dispatched=True,
+        valid_response=True,
+        proposed_route="lexical_expansion",  # Mismatched route for none scenario
+        route_accepted=True,
+        expansion_executed=False,
+        fallback=False,
+        execution_status="approved",
+        pipeline_total_ms=90.0,
+        delivery_outcome="REFUSAL",  # Pipeline refused, but provider route was lexical_expansion
+        completed_within_phase_deadline=True,
+    )
+    code_mm, _, reasons_mm = evaluate_probe_verdict([rec_mismatched])
+    assert code_mm == 2, f"Mismatched route on none scenario must evaluate to code 2 (got {code_mm})"
+    assert any("does not match expected route none" in r for r in reasons_mm), (
+        "Verdict must reject lexical_expansion returned during none scenario"
+    )
+    passed_controls.append("Negative Control 6: Mismatched route in none scenario rejected (even on pipeline refusal)")
+
+    # -------------------------------------------------------------------------
+    # Negative Control 7: Missing Route Telemetry
+    # -------------------------------------------------------------------------
+    rec_missing_route = ProbeMetricRecord(
+        probe_id="ctrl_missing_route",
+        target="compiled_pipeline",
+        request_sequence="subsequent_request",
+        query_type="lexical_expansion",
+        client_roundtrip_ms=45.0,
+        server_latency_ms=30.0,
+        unaccounted_elapsed_ms=15.0,
+        dispatched=True,
+        valid_response=True,
+        proposed_route="",  # Missing route telemetry
+        route_accepted=True,
+        expansion_executed=True,
+        fallback=False,
+        execution_status="approved",
+        pipeline_total_ms=90.0,
+        delivery_outcome="DELIVERED",
+        completed_within_phase_deadline=True,
+    )
+    code_mr, _, reasons_mr = evaluate_probe_verdict([rec_missing_route])
+    assert code_mr == 2, f"Missing route telemetry must evaluate to code 2 (got {code_mr})"
+    assert any("missing provider route telemetry" in r for r in reasons_mr), "Verdict must reject missing route telemetry"
+    passed_controls.append("Negative Control 7: Missing route telemetry rejected")
+
+    # -------------------------------------------------------------------------
+    # Negative Control 8: Event-Controlled Delayed Worker & Late Completion
+    # -------------------------------------------------------------------------
+    spy_async = BoundedNetworkSpy(dry_run=True)
+    worker_started_ev = threading.Event()
+    worker_release_ev = threading.Event()
+
+    spy_async.on_worker_start = lambda: worker_started_ev.set()
+    spy_async.pause_event = worker_release_ev
+
+    with patch("requests.post", side_effect=spy_async.spy_post):
+        svc_async = LayaDecisionService(endpoint_url="https://mock.laya.local/v1/systemone", api_key="key_async")
+        req_async = _build_synthetic_request(query="Async Query", gap="Async Gap")
+
+        spy_async.set_probe_id("probe_async_req1")
+        dec_async1 = svc_async.decide(req_async, deadline_remaining_ms=520.0, ledger=LayaBudgetLedger())
+        assert dec_async1.execution_status == "timeout", "Caller must time out"
+        spy_async.record_caller_timeout("probe_async_req1")
+
+        att_async1 = spy_async.get_attempts_for_probe("probe_async_req1")[0]
+        assert att_async1.caller_timed_out is True, "Attempt 1 must record caller_timed_out"
+        assert att_async1.ended_at is None, "Attempt 1 must not have ended while paused"
+        assert att_async1.late_completed is False, "Attempt 1 must not be marked late_completed yet"
+
+        # Subsequent request runs and completes without delay
+        spy_async.pause_event = None
+        spy_async.on_worker_start = None
+        spy_async.set_probe_id("probe_async_req2")
+        dec_async2 = svc_async.decide(req_async, deadline_remaining_ms=2500.0, ledger=LayaBudgetLedger())
+        assert dec_async2.execution_status == "approved"
+        att_async2 = spy_async.get_attempts_for_probe("probe_async_req2")[0]
+        assert att_async2.attempt_id == 2
+        assert att_async2.probe_id == "probe_async_req2"
+        assert att_async2.caller_timed_out is False
+        assert att_async2.late_completed is False
+        assert att_async2.ended_at is not None
+
+        # Eventual original worker completion
+        worker_release_ev.set()
+        time.sleep(0.05)
+        assert att_async1.late_completed is True, "Attempt 1 must be marked late_completed upon eventual finish"
+        assert att_async1.ended_at is not None, "Attempt 1 must record ended_at"
+        assert dec_async1.execution_status == "timeout", "Caller outcome must not be overwritten"
+
+    passed_controls.append("Negative Control 8: Event-controlled delayed worker and late completion verified")
+
     if verbose:
         print("\n" + "=" * 90)
         print("OFFLINE NEGATIVE CONTROLS VERIFIED")
@@ -685,6 +858,7 @@ def run_latency_probe(endpoint_url: str, api_key: str, dry_run: bool = True) -> 
 
         # Request 1: Direct Endpoint (First Request)
         print("\n--> Request 1/5: Direct Endpoint (First Request, Lexical Intent)...")
+        spy.set_probe_id("probe_direct_req1")
         ledger_1 = LayaBudgetLedger()
         req_1 = _build_synthetic_request(
             query="What was the turnover for fiscal year 2026?",
@@ -694,8 +868,10 @@ def run_latency_probe(endpoint_url: str, api_key: str, dry_run: bool = True) -> 
         t_start = time.perf_counter()
         dec_1 = service.decide(req_1, deadline_remaining_ms=2500.0, ledger=ledger_1)
         total_time_1 = (time.perf_counter() - t_start) * 1000.0
+        if dec_1.execution_status == "timeout":
+            spy.record_caller_timeout("probe_direct_req1")
 
-        attempts_1 = spy.get_attempts_since(marker_1)
+        attempts_1 = spy.get_attempts_for_probe("probe_direct_req1") or spy.get_attempts_since(marker_1)
         att_1 = attempts_1[-1] if attempts_1 else None
         roundtrip_1 = att_1.roundtrip_ms if att_1 else None
         srv_lat_1 = att_1.server_latency_ms if att_1 else None
@@ -715,7 +891,7 @@ def run_latency_probe(endpoint_url: str, api_key: str, dry_run: bool = True) -> 
             unaccounted_elapsed_ms=unacc_1,
             dispatched=bool(service.last_dispatched),
             valid_response=bool(service.last_valid_response),
-            proposed_route=dec_1.route,
+            proposed_route=str(dec_1.route) if getattr(dec_1, "route", None) is not None else "",
             route_accepted=bool(service.last_route_accepted and dec_1.execution_status == "approved"),
             expansion_executed=False,
             fallback=bool(service.last_fallback or dec_1.execution_status != "approved"),
@@ -735,6 +911,7 @@ def run_latency_probe(endpoint_url: str, api_key: str, dry_run: bool = True) -> 
 
         # Request 2: Direct Endpoint (Subsequent Request, default client behavior)
         print("\n--> Request 2/5: Direct Endpoint (Subsequent Request, default client behavior)...")
+        spy.set_probe_id("probe_direct_req2")
         ledger_2 = LayaBudgetLedger()
         req_2 = _build_synthetic_request(
             query="What was the turnover for fiscal year 2026?",
@@ -744,8 +921,10 @@ def run_latency_probe(endpoint_url: str, api_key: str, dry_run: bool = True) -> 
         t_start = time.perf_counter()
         dec_2 = service.decide(req_2, deadline_remaining_ms=2500.0, ledger=ledger_2)
         total_time_2 = (time.perf_counter() - t_start) * 1000.0
+        if dec_2.execution_status == "timeout":
+            spy.record_caller_timeout("probe_direct_req2")
 
-        attempts_2 = spy.get_attempts_since(marker_2)
+        attempts_2 = spy.get_attempts_for_probe("probe_direct_req2") or spy.get_attempts_since(marker_2)
         att_2 = attempts_2[-1] if attempts_2 else None
         roundtrip_2 = att_2.roundtrip_ms if att_2 else None
         srv_lat_2 = att_2.server_latency_ms if att_2 else None
@@ -765,7 +944,7 @@ def run_latency_probe(endpoint_url: str, api_key: str, dry_run: bool = True) -> 
             unaccounted_elapsed_ms=unacc_2,
             dispatched=bool(service.last_dispatched),
             valid_response=bool(service.last_valid_response),
-            proposed_route=dec_2.route,
+            proposed_route=str(dec_2.route) if getattr(dec_2, "route", None) is not None else "",
             route_accepted=bool(service.last_route_accepted and dec_2.execution_status == "approved"),
             expansion_executed=False,
             fallback=bool(service.last_fallback or dec_2.execution_status != "approved"),
@@ -795,6 +974,7 @@ def run_latency_probe(endpoint_url: str, api_key: str, dry_run: bool = True) -> 
              patch("services.langgraph_pipeline.rerank", side_effect=_mock_rerank), \
              patch("services.langgraph_pipeline.check_fidelity", side_effect=FidelityMockSequence(mode="lexical")):
 
+            spy.set_probe_id("probe_pipeline_req3")
             marker_3 = len(spy.attempts)
             t_start = time.perf_counter()
             resp_3 = pipeline.run(
@@ -810,7 +990,9 @@ def run_latency_probe(endpoint_url: str, api_key: str, dry_run: bool = True) -> 
             total_time_3 = (time.perf_counter() - t_start) * 1000.0
 
             cands_3 = resp_3.retrieval_candidates or {}
-            attempts_3 = spy.get_attempts_since(marker_3)
+            if str(cands_3.get("laya_status")) == "timeout":
+                spy.record_caller_timeout("probe_pipeline_req3")
+            attempts_3 = spy.get_attempts_for_probe("probe_pipeline_req3") or spy.get_attempts_since(marker_3)
             att_3 = attempts_3[-1] if attempts_3 else None
             roundtrip_3 = att_3.roundtrip_ms if att_3 else None
             srv_lat_3 = att_3.server_latency_ms if att_3 else None
@@ -832,6 +1014,9 @@ def run_latency_probe(endpoint_url: str, api_key: str, dry_run: bool = True) -> 
             else:
                 outcome_3 = "UNKNOWN"
 
+            observed_route_3 = cands_3.get("laya_route")
+            proposed_route_3 = str(observed_route_3) if observed_route_3 is not None else ""
+
             rec_3 = ProbeMetricRecord(
                 probe_id="probe_pipeline_req3",
                 target="compiled_pipeline",
@@ -842,7 +1027,7 @@ def run_latency_probe(endpoint_url: str, api_key: str, dry_run: bool = True) -> 
                 unaccounted_elapsed_ms=unacc_3,
                 dispatched=bool(cands_3.get("laya_dispatched")),
                 valid_response=bool(cands_3.get("laya_provider_success")),
-                proposed_route=str(cands_3.get("laya_route", "lexical_expansion")),
+                proposed_route=proposed_route_3,
                 route_accepted=route_acc_3,
                 expansion_executed=exp_exec_3,
                 fallback=fallback_3,
@@ -866,6 +1051,7 @@ def run_latency_probe(endpoint_url: str, api_key: str, dry_run: bool = True) -> 
              patch("services.langgraph_pipeline.rerank", side_effect=_mock_rerank), \
              patch("services.langgraph_pipeline.check_fidelity", side_effect=FidelityMockSequence(mode="lexical")):
 
+            spy.set_probe_id("probe_pipeline_req4")
             marker_4 = len(spy.attempts)
             t_start = time.perf_counter()
             resp_4 = pipeline.run(
@@ -881,7 +1067,9 @@ def run_latency_probe(endpoint_url: str, api_key: str, dry_run: bool = True) -> 
             total_time_4 = (time.perf_counter() - t_start) * 1000.0
 
             cands_4 = resp_4.retrieval_candidates or {}
-            attempts_4 = spy.get_attempts_since(marker_4)
+            if str(cands_4.get("laya_status")) == "timeout":
+                spy.record_caller_timeout("probe_pipeline_req4")
+            attempts_4 = spy.get_attempts_for_probe("probe_pipeline_req4") or spy.get_attempts_since(marker_4)
             att_4 = attempts_4[-1] if attempts_4 else None
             roundtrip_4 = att_4.roundtrip_ms if att_4 else None
             srv_lat_4 = att_4.server_latency_ms if att_4 else None
@@ -903,6 +1091,9 @@ def run_latency_probe(endpoint_url: str, api_key: str, dry_run: bool = True) -> 
             else:
                 outcome_4 = "UNKNOWN"
 
+            observed_route_4 = cands_4.get("laya_route")
+            proposed_route_4 = str(observed_route_4) if observed_route_4 is not None else ""
+
             rec_4 = ProbeMetricRecord(
                 probe_id="probe_pipeline_req4",
                 target="compiled_pipeline",
@@ -913,7 +1104,7 @@ def run_latency_probe(endpoint_url: str, api_key: str, dry_run: bool = True) -> 
                 unaccounted_elapsed_ms=unacc_4,
                 dispatched=bool(cands_4.get("laya_dispatched")),
                 valid_response=bool(cands_4.get("laya_provider_success")),
-                proposed_route=str(cands_4.get("laya_route", "lexical_expansion")),
+                proposed_route=proposed_route_4,
                 route_accepted=route_acc_4,
                 expansion_executed=exp_exec_4,
                 fallback=fallback_4,
@@ -937,6 +1128,7 @@ def run_latency_probe(endpoint_url: str, api_key: str, dry_run: bool = True) -> 
              patch("services.langgraph_pipeline.rerank", side_effect=_mock_rerank), \
              patch("services.langgraph_pipeline.check_fidelity", side_effect=FidelityMockSequence(mode="none")):
 
+            spy.set_probe_id("probe_pipeline_req5")
             marker_5 = len(spy.attempts)
             t_start = time.perf_counter()
             resp_5 = pipeline.run(
@@ -950,7 +1142,9 @@ def run_latency_probe(endpoint_url: str, api_key: str, dry_run: bool = True) -> 
             total_time_5 = (time.perf_counter() - t_start) * 1000.0
 
             cands_5 = resp_5.retrieval_candidates or {}
-            attempts_5 = spy.get_attempts_since(marker_5)
+            if str(cands_5.get("laya_status")) == "timeout":
+                spy.record_caller_timeout("probe_pipeline_req5")
+            attempts_5 = spy.get_attempts_for_probe("probe_pipeline_req5") or spy.get_attempts_since(marker_5)
             att_5 = attempts_5[-1] if attempts_5 else None
             roundtrip_5 = att_5.roundtrip_ms if att_5 else None
             srv_lat_5 = att_5.server_latency_ms if att_5 else None
@@ -966,6 +1160,8 @@ def run_latency_probe(endpoint_url: str, api_key: str, dry_run: bool = True) -> 
             status_5 = str(cands_5.get("laya_status", "unknown"))
 
             outcome_5 = "REFUSAL" if resp_5.answer == "NOT_FOUND" else "DELIVERED"
+            observed_route_5 = cands_5.get("laya_route")
+            proposed_route_5 = str(observed_route_5) if observed_route_5 is not None else ""
 
             rec_5 = ProbeMetricRecord(
                 probe_id="probe_pipeline_req5",
@@ -977,7 +1173,7 @@ def run_latency_probe(endpoint_url: str, api_key: str, dry_run: bool = True) -> 
                 unaccounted_elapsed_ms=unacc_5,
                 dispatched=bool(cands_5.get("laya_dispatched")),
                 valid_response=bool(cands_5.get("laya_provider_success")),
-                proposed_route=str(cands_5.get("laya_route", "none")),
+                proposed_route=proposed_route_5,
                 route_accepted=route_acc_5,
                 expansion_executed=exp_exec_5,
                 fallback=fallback_5,
