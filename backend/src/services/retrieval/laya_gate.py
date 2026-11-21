@@ -186,6 +186,69 @@ def proven_token_upper_bound(text: str) -> int:
 estimate_tokens_defensible_bound = proven_token_upper_bound
 
 
+def estimate_laya_tokens(payload: dict) -> dict[str, Any]:
+    """Approximate LAYA multilingual input tokens.
+
+    No external dependencies.
+    Calibrated question overhead:
+        route      = 81 tokens
+        complexity = 32 tokens
+
+    These overheads apply only to the exact question
+    definitions used in the two measured examples.
+    """
+    state = payload.get("state", "")
+
+    if isinstance(state, dict):
+        state_text = json.dumps(
+            state,
+            ensure_ascii=False,
+            separators=(", ", ": "),
+        )
+    else:
+        state_text = str(state)
+
+    char_count = len(state_text)
+
+    # Conservative heuristic for predominantly English text.
+    estimated_state_tokens = (char_count + 2) // 3
+
+    overhead = {
+        "route": 81,
+        "complexity": 32,
+    }
+
+    questions = {}
+
+    for name in payload.get("questions", {}):
+        question_overhead = overhead.get(name)
+
+        if question_overhead is None:
+            raise ValueError(
+                f"No calibrated overhead for question: {name}"
+            )
+
+        questions[name] = (
+            estimated_state_tokens + question_overhead
+        )
+
+    max_sequence_tokens = max(
+        questions.values(),
+        default=0,
+    )
+
+    total_input_tokens = sum(questions.values())
+
+    return {
+        "state_characters": char_count,
+        "estimated_state_tokens": estimated_state_tokens,
+        "questions": questions,
+        "estimated_max_sequence_tokens": max_sequence_tokens,
+        "estimated_total_input_tokens": total_input_tokens,
+        "within_estimated_limit": max_sequence_tokens <= 8192,
+    }
+
+
 def truncate_evidence_summary_for_preflight(
     request: LayaEscalationRequest,
     target_max_tokens: int = MAX_INPUT_TOKENS_CAP,

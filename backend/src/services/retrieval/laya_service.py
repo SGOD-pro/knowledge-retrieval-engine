@@ -39,6 +39,7 @@ try:
         InvalidUsageError,
         LayaBudgetLedger,
         calculate_phase_deadline,
+        estimate_laya_tokens,
         preflight_token_count,
         truncate_evidence_summary_for_preflight,
         validate_provider_usage,
@@ -68,6 +69,7 @@ except ImportError:
         InvalidUsageError,
         LayaBudgetLedger,
         calculate_phase_deadline,
+        estimate_laya_tokens,
         preflight_token_count,
         truncate_evidence_summary_for_preflight,
         validate_provider_usage,
@@ -216,6 +218,11 @@ class LayaDecisionService:
         if endpoint_mode:
             try:
                 endpoint_payload = self._format_endpoint_payload(truncated_req)
+                token_estimates = estimate_laya_tokens(endpoint_payload)
+                if not token_estimates.get("within_estimated_limit", True):
+                    raise PayloadBudgetExceededError(
+                        f"Estimated sequence tokens ({token_estimates['estimated_max_sequence_tokens']}) exceeds limit (8192)"
+                    )
             except PayloadBudgetExceededError as pbe:
                 logger.warning("laya.payload_budget_exceeded: %s (failing closed before dispatch)", pbe)
                 self.last_dispatched = False
@@ -351,6 +358,11 @@ class LayaDecisionService:
                 import requests
 
                 payload = self._format_endpoint_payload(truncated_req)
+                token_estimates = estimate_laya_tokens(payload)
+                if not token_estimates.get("within_estimated_limit", True):
+                    raise PayloadBudgetExceededError(
+                        f"Estimated sequence tokens ({token_estimates['estimated_max_sequence_tokens']}) exceeds limit (8192)"
+                    )
                 headers = {
                     "Authorization": f"Bearer {self.api_key}",
                     "Content-Type": "application/json",
@@ -516,6 +528,13 @@ class LayaDecisionService:
         if total_payload_bytes > 1000:
             raise PayloadBudgetExceededError(
                 f"Total serialized payload ({total_payload_bytes} bytes) exceeds 1000 byte policy cap"
+            )
+
+        token_estimates = estimate_laya_tokens(base_skeleton)
+        if not token_estimates.get("within_estimated_limit", True):
+            raise PayloadBudgetExceededError(
+                f"Estimated sequence tokens ({token_estimates['estimated_max_sequence_tokens']}) "
+                f"exceeds calibrated limit (8192)"
             )
 
         return base_skeleton

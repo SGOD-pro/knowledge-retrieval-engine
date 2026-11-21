@@ -6,7 +6,7 @@ __pycache__/
 .pytest_cache/
 .venv/
 backend/.venv/
-
+skill-lock.json
 # Environment files and credentials
 .env
 .env.*
@@ -24,3 +24,5 @@ backend/reports/
 *.db-shm
 backend/data/kre_okf.db
 .agents
+skill-lock.json
+frontend/skill-lock.json

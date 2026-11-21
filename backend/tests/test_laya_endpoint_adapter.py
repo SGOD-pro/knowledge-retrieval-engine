@@ -41,8 +41,8 @@ from schemas.contracts.laya import (
 )
 from schemas.contracts.verification import VerificationRecord
 from schemas.contracts.knowledge_graph import PinnedDocumentVersion, PinnedSnapshotContext
-from services.retrieval.laya_gate import LayaBudgetLedger
-from services.retrieval.laya_service import LayaDecisionService
+from services.retrieval.laya_gate import LayaBudgetLedger, estimate_laya_tokens
+from services.retrieval.laya_service import LayaDecisionService, PayloadBudgetExceededError
 from services.langgraph_pipeline import pipeline
 
 
@@ -1068,6 +1068,67 @@ class TestCompiledPipelineEndpointRegressions(unittest.TestCase):
             self.assertIn("turnover", expansion_query)
             for bad_word in ("initial", "fidelity", "check", "failed", "coverage"):
                 self.assertNotIn(bad_word, expansion_query.split())
+
+    def test_estimate_laya_tokens_calibrated_overhead(self) -> None:
+        """Token estimation calculates exact calibrated overhead for route and complexity."""
+        payload = {
+            "state": {
+                "document": "Query: Revenue Q3\nGap: None\nDimension: tabular_operand"
+            },
+            "questions": {
+                "route": {"type": "choice"},
+                "complexity": {"type": "score"},
+            },
+        }
+        res = estimate_laya_tokens(payload)
+        self.assertIn("state_characters", res)
+        self.assertIn("estimated_state_tokens", res)
+        self.assertIn("questions", res)
+        self.assertIn("route", res["questions"])
+        self.assertIn("complexity", res["questions"])
+        # route overhead is 81, complexity overhead is 32
+        st = res["estimated_state_tokens"]
+        self.assertEqual(res["questions"]["route"], st + 81)
+        self.assertEqual(res["questions"]["complexity"], st + 32)
+        self.assertEqual(res["estimated_max_sequence_tokens"], st + 81)
+        self.assertEqual(res["estimated_total_input_tokens"], (st + 81) + (st + 32))
+        self.assertTrue(res["within_estimated_limit"])
+
+    def test_estimate_laya_tokens_unknown_question_rejected(self) -> None:
+        """Unknown question names without calibrated overhead raise ValueError."""
+        payload = {
+            "state": {"document": "test"},
+            "questions": {
+                "unknown_question_type": {"type": "choice"},
+            },
+        }
+        with self.assertRaises(ValueError) as ctx:
+            estimate_laya_tokens(payload)
+        self.assertIn("No calibrated overhead for question: unknown_question_type", str(ctx.exception))
+
+    def test_estimate_laya_tokens_limit_exceeded(self) -> None:
+        """Very large state exceeding sequence limit sets within_estimated_limit to False."""
+        # 8192 - 81 = 8111 tokens -> 8111 * 3 = ~24333 characters
+        payload = {
+            "state": {"document": "x" * 25000},
+            "questions": {
+                "route": {"type": "choice"},
+                "complexity": {"type": "score"},
+            },
+        }
+        res = estimate_laya_tokens(payload)
+        self.assertFalse(res["within_estimated_limit"])
+        self.assertGreater(res["estimated_max_sequence_tokens"], 8192)
+
+    def test_format_endpoint_payload_verifies_with_estimate_laya_tokens(self) -> None:
+        """Service format payload runs estimate_laya_tokens and verifies within limit."""
+        service = LayaDecisionService(endpoint_url=self.endpoint_url, api_key=self.api_key)
+        req = _build_test_request("How much was spent on maintenance in fiscal 2024?")
+        payload = service._format_endpoint_payload(req)
+        token_info = estimate_laya_tokens(payload)
+        self.assertTrue(token_info["within_estimated_limit"])
+        self.assertGreater(token_info["estimated_state_tokens"], 0)
+        self.assertGreater(token_info["estimated_total_input_tokens"], 0)
 
 
 @unittest.skipUnless(
