@@ -90,6 +90,7 @@ class HttpAttemptRecord:
     caller_timed_out: bool = False
     caller_timeout_at: float | None = None
     late_completed: bool = False
+    request_payload: dict[str, Any] = field(default_factory=dict)
     response_data: dict[str, Any] = field(default_factory=dict)
 
 
@@ -207,7 +208,7 @@ def _setup_synthetic_repository() -> CloudRepository:
         id="chk_probe_baseline",
         document_id="doc_probe_2026",
         source_format="pdf",
-        text="General corporate overview with background metrics.",
+        text="General corporate background and operational metrics for 2026.",
         element_type="narrative_block",
         workspace_id=ws_id,
         metadata={"document_version": "ver_probe_v1"},
@@ -218,7 +219,7 @@ def _setup_synthetic_repository() -> CloudRepository:
         id="chk_probe_turnover",
         document_id="doc_probe_2026",
         source_format="pdf",
-        text="The fiscal year 2026 turnover was officially confirmed as $450 million.",
+        text="Audited turnover was officially confirmed as $450 million.",
         element_type="narrative_block",
         workspace_id=ws_id,
         metadata={"document_version": "ver_probe_v1"},
@@ -306,6 +307,7 @@ class BoundedNetworkSpy:
                 attempt_id=attempt_id,
                 probe_id=self.current_probe_id,
                 started_at=time.perf_counter(),
+                request_payload=dict(kwargs.get("json") or {}),
             )
             self.attempts.append(attempt)
 
@@ -847,6 +849,8 @@ def run_latency_probe(endpoint_url: str, api_key: str, dry_run: bool = True) -> 
 
     def _mock_rerank(q: str, chunks: Any, top_k: int = 6, return_mode: bool = False) -> Any:
         c_list = list(chunks)
+        if "turnover" not in q.lower():
+            c_list = [c for c in c_list if "turnover" not in c.text.lower()]
         return (c_list[:top_k], "mocked") if return_mode else c_list[:top_k]
 
     with patch("requests.post", side_effect=spy.spy_post):
@@ -861,7 +865,7 @@ def run_latency_probe(endpoint_url: str, api_key: str, dry_run: bool = True) -> 
         spy.set_probe_id("probe_direct_req1")
         ledger_1 = LayaBudgetLedger()
         req_1 = _build_synthetic_request(
-            query="What was the turnover for fiscal year 2026?",
+            query="What was the corporate background for 2026?",
             gap="Initial fidelity check failed coverage: Missing turnover coverage",
         )
         marker_1 = len(spy.attempts)
@@ -914,7 +918,7 @@ def run_latency_probe(endpoint_url: str, api_key: str, dry_run: bool = True) -> 
         spy.set_probe_id("probe_direct_req2")
         ledger_2 = LayaBudgetLedger()
         req_2 = _build_synthetic_request(
-            query="What was the turnover for fiscal year 2026?",
+            query="What was the corporate background for 2026?",
             gap="Initial fidelity check failed coverage: Missing turnover coverage",
         )
         marker_2 = len(spy.attempts)
@@ -978,7 +982,7 @@ def run_latency_probe(endpoint_url: str, api_key: str, dry_run: bool = True) -> 
             marker_3 = len(spy.attempts)
             t_start = time.perf_counter()
             resp_3 = pipeline.run(
-                query="What was the turnover for fiscal year 2026?",
+                query="What was the corporate background for 2026?",
                 workspace_id="ws_latency_probe",
                 laya_enabled=True,
                 laya_endpoint_url=effective_url,
@@ -1002,10 +1006,23 @@ def run_latency_probe(endpoint_url: str, api_key: str, dry_run: bool = True) -> 
                 else None
             )
 
+            # Assert before provider dispatch that answer chunk and answer text are absent from baseline candidates and serialized context
+            req_payload_3 = att_3.request_payload if att_3 else {}
+            doc_str_3 = req_payload_3.get("state", {}).get("document", "")
+            context_part_3 = doc_str_3.split("\nContext: ")[-1] if "\nContext: " in doc_str_3 else ""
+            assert "chk_probe_turnover" not in context_part_3, "Answer chunk chk_probe_turnover must be absent from baseline serialized context"
+            assert "$450 million" not in context_part_3 and "450 million" not in context_part_3, "Answer text must be absent from baseline serialized context"
+            assert "chk_probe_turnover" not in [str(c) for c in cands_3.get("reranked", [])], "Answer chunk chk_probe_turnover must be absent from baseline candidates"
+
             route_acc_3 = bool(cands_3.get("laya_route_accepted"))
             exp_exec_3 = bool(cands_3.get("laya_expansion_executed"))
             fallback_3 = bool(cands_3.get("laya_fallback"))
             status_3 = str(cands_3.get("laya_status", "unknown"))
+
+            # Assert after mocked lexical approval that executor retrieves that novel chunk and grounded delivery succeeds
+            assert "chk_probe_turnover" in cands_3.get("laya_novel_chunks", []), "Executor must retrieve novel chunk chk_probe_turnover"
+            assert exp_exec_3 is True, "Expansion must be executed after lexical approval"
+            assert "$450 million" in resp_3.answer, "Grounded delivery answer must contain $450 million"
 
             if resp_3.answer == "NOT_FOUND":
                 outcome_3 = "REFUSAL"
@@ -1055,7 +1072,7 @@ def run_latency_probe(endpoint_url: str, api_key: str, dry_run: bool = True) -> 
             marker_4 = len(spy.attempts)
             t_start = time.perf_counter()
             resp_4 = pipeline.run(
-                query="What was the turnover for fiscal year 2026?",
+                query="What was the corporate background for 2026?",
                 workspace_id="ws_latency_probe",
                 laya_enabled=True,
                 laya_endpoint_url=effective_url,
@@ -1079,10 +1096,23 @@ def run_latency_probe(endpoint_url: str, api_key: str, dry_run: bool = True) -> 
                 else None
             )
 
+            # Assert before provider dispatch that answer chunk and answer text are absent from baseline candidates and serialized context
+            req_payload_4 = att_4.request_payload if att_4 else {}
+            doc_str_4 = req_payload_4.get("state", {}).get("document", "")
+            context_part_4 = doc_str_4.split("\nContext: ")[-1] if "\nContext: " in doc_str_4 else ""
+            assert "chk_probe_turnover" not in context_part_4, "Answer chunk chk_probe_turnover must be absent from baseline serialized context"
+            assert "$450 million" not in context_part_4 and "450 million" not in context_part_4, "Answer text must be absent from baseline serialized context"
+            assert "chk_probe_turnover" not in [str(c) for c in cands_4.get("reranked", [])], "Answer chunk chk_probe_turnover must be absent from baseline candidates"
+
             route_acc_4 = bool(cands_4.get("laya_route_accepted"))
             exp_exec_4 = bool(cands_4.get("laya_expansion_executed"))
             fallback_4 = bool(cands_4.get("laya_fallback"))
             status_4 = str(cands_4.get("laya_status", "unknown"))
+
+            # Assert after mocked lexical approval that executor retrieves that novel chunk and grounded delivery succeeds
+            assert "chk_probe_turnover" in cands_4.get("laya_novel_chunks", []), "Executor must retrieve novel chunk chk_probe_turnover"
+            assert exp_exec_4 is True, "Expansion must be executed after lexical approval"
+            assert "$450 million" in resp_4.answer, "Grounded delivery answer must contain $450 million"
 
             if resp_4.answer == "NOT_FOUND":
                 outcome_4 = "REFUSAL"

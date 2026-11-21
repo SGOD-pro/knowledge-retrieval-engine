@@ -31,14 +31,18 @@ if scripts_dir not in sys.path:
 
 from probe_laya_latency import (
     BoundedNetworkSpy,
+    FidelityMockSequence,
     HttpAttemptRecord,
+    MockOfflineVerifier,
     ProbeMetricRecord,
     RedirectRejectedError,
     _build_synthetic_request,
+    _setup_synthetic_repository,
     evaluate_probe_verdict,
     run_latency_probe,
     run_offline_negative_controls,
 )
+from services.langgraph_pipeline import pipeline
 from services.retrieval.laya_gate import LayaBudgetLedger
 from services.retrieval.laya_service import LayaDecisionService
 
@@ -392,3 +396,68 @@ class TestOfflineHarnessSuite:
     def test_offline_harness_pass_assertions_end_to_end(self) -> None:
         exit_code = run_latency_probe(endpoint_url="", api_key="", dry_run=True)
         assert exit_code == 0
+
+
+class TestLexicalScenarioIsolation:
+    """Verifies that baseline discovery exposes only background evidence and expansion retrieves novel chunk."""
+
+    def test_captured_actual_serialized_pipeline_payload_offline(self) -> None:
+        """Verifies that BoundedNetworkSpy captures actual compiled pipeline payload offline without manual reconstruction."""
+        spy = BoundedNetworkSpy(dry_run=True)
+        repo = _setup_synthetic_repository()
+        mock_llm_response = {
+            "answer": "The fiscal year 2026 turnover was $450 million.",
+            "citations": ["chk_probe_turnover"],
+            "usage": {"input_tokens": 120, "output_tokens": 18},
+        }
+        mock_verifier = MockOfflineVerifier(support_status="ASSERTED")
+
+        def _mock_rerank(q: str, chunks: Any, top_k: int = 6, return_mode: bool = False) -> Any:
+            c_list = list(chunks)
+            if "turnover" not in q.lower():
+                c_list = [c for c in c_list if "turnover" not in c.text.lower()]
+            return (c_list[:top_k], "mocked") if return_mode else c_list[:top_k]
+
+        with patch("requests.post", side_effect=spy.spy_post), \
+             patch("services.langgraph_pipeline.call_llm", return_value=mock_llm_response), \
+             patch("services.langgraph_pipeline._get_repo", return_value=repo), \
+             patch("services.langgraph_pipeline.rerank", side_effect=_mock_rerank), \
+             patch("services.langgraph_pipeline.check_fidelity", side_effect=FidelityMockSequence(mode="lexical")):
+
+            spy.set_probe_id("probe_pipeline_test")
+            resp = pipeline.run(
+                query="What was the corporate background for 2026?",
+                workspace_id="ws_latency_probe",
+                laya_enabled=True,
+                laya_endpoint_url="https://mock.laya.local/v1/systemone",
+                laya_api_key="mock_key",
+                verifier=mock_verifier,
+                require_delivery_gate=True,
+                caller_deadline_ms=2500.0,
+            )
+
+        attempts = spy.get_attempts_for_probe("probe_pipeline_test")
+        assert len(attempts) == 1
+        att = attempts[0]
+        payload = att.request_payload
+        assert isinstance(payload, dict) and "state" in payload and "questions" in payload
+        assert "route" in payload["questions"]
+
+        doc_str = payload["state"]["document"]
+        assert "Query: What was the corporate background for 2026?" in doc_str
+        assert "Gap detected: Initial fidelity check failed coverage: Missing turnover coverage" in doc_str
+
+        # Assert answer chunk and text are absent from baseline serialized context
+        context_part = doc_str.split("\nContext: ")[-1] if "\nContext: " in doc_str else ""
+        assert "chk_probe_turnover" not in context_part
+        assert "$450 million" not in context_part
+        assert "450 million" not in context_part
+
+        # Assert answer chunk is absent from baseline candidates
+        cands = resp.retrieval_candidates or {}
+        assert "chk_probe_turnover" not in [str(c) for c in cands.get("reranked", [])]
+
+        # Assert after mocked lexical approval that executor retrieves novel chunk and delivery succeeds
+        assert "chk_probe_turnover" in cands.get("laya_novel_chunks", [])
+        assert cands.get("laya_expansion_executed") is True
+        assert "$450 million" in resp.answer
