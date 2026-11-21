@@ -1130,6 +1130,118 @@ class TestCompiledPipelineEndpointRegressions(unittest.TestCase):
         self.assertGreater(token_info["estimated_state_tokens"], 0)
         self.assertGreater(token_info["estimated_total_input_tokens"], 0)
 
+    def test_reconstructed_direct_and_compiled_payload_contract_controls(self) -> None:
+        """Positive and negative controls for reconstructed System One payload formatting.
+
+        Verifies:
+        - Positive control: Retains Query, Gap detected, Missing dimension, and Context.
+        - Positive control: Byte length strictly <= 980 bytes and tokens <= 8192.
+        - Negative control: Payloads with mandatory content exceeding budget fail closed.
+        """
+        service = LayaDecisionService(endpoint_url=self.endpoint_url, api_key=self.api_key)
+
+        # Positive Control 1: Direct payload serialization
+        req_direct = LayaEscalationRequest(
+            query_id="q_probe_synthetic",
+            workspace_id="ws_latency_probe",
+            query="What was the turnover for fiscal year 2026?",
+            missing_requirement=MissingRequirementDescription(
+                requirement_id="req_probe_001",
+                missing_dimension="exact_term",
+                description="Synthetic probe missing requirement",
+                failed_stage="run_fidelity_coverage",
+                detected_gap="Initial fidelity check failed coverage: Missing turnover coverage",
+            ),
+            available_routes=("lexical_expansion", "none"),
+            retrieved_summary=(
+                BaselineEvidenceSummary(
+                    chunk_id="chk_probe_baseline",
+                    document_id="doc_probe_2026",
+                    document_version="ver_probe_v1",
+                    workspace_id="ws_latency_probe",
+                    snippet="General corporate overview with background metrics.",
+                    score=10.0,
+                    source_kind="text",
+                ),
+            ),
+            caller_deadline_ms=2500.0,
+        )
+        payload_direct = service._format_endpoint_payload(req_direct)
+        doc_text = payload_direct["state"]["document"]
+        self.assertIn("Query: What was the turnover for fiscal year 2026?", doc_text)
+        self.assertIn("Gap detected: Initial fidelity check failed coverage: Missing turnover coverage", doc_text)
+        self.assertIn("Missing dimension: exact_term", doc_text)
+        self.assertIn("Context: General corporate overview with background metrics.", doc_text)
+
+        total_bytes_direct = len(json.dumps(payload_direct).encode("utf-8"))
+        self.assertLessEqual(total_bytes_direct, 980)
+
+        tokens_direct = estimate_laya_tokens(payload_direct)
+        self.assertTrue(tokens_direct["within_estimated_limit"])
+        self.assertLessEqual(tokens_direct["estimated_max_sequence_tokens"], 8192)
+
+        # Positive Control 2: Compiled pipeline payload with larger retrieved summary
+        req_compiled = LayaEscalationRequest(
+            query_id="q_probe_synthetic_compiled",
+            workspace_id="ws_latency_probe",
+            query="What was the turnover for fiscal year 2026?",
+            missing_requirement=MissingRequirementDescription(
+                requirement_id="req_probe_002",
+                missing_dimension="exact_term",
+                description="Synthetic probe compiled gap",
+                failed_stage="run_fidelity_coverage",
+                detected_gap="Initial fidelity check failed coverage: Missing turnover coverage",
+            ),
+            available_routes=("lexical_expansion", "none"),
+            retrieved_summary=(
+                BaselineEvidenceSummary(
+                    chunk_id="chk_probe_turnover",
+                    document_id="doc_probe_2026",
+                    document_version="ver_probe_v1",
+                    workspace_id="ws_latency_probe",
+                    snippet="The fiscal year 2026 turnover was officially confirmed as $450 million.",
+                    score=15.0,
+                    source_kind="text",
+                ),
+                BaselineEvidenceSummary(
+                    chunk_id="chk_probe_baseline",
+                    document_id="doc_probe_2026",
+                    document_version="ver_probe_v1",
+                    workspace_id="ws_latency_probe",
+                    snippet="General corporate overview with background metrics.",
+                    score=10.0,
+                    source_kind="text",
+                ),
+            ),
+            caller_deadline_ms=2500.0,
+        )
+        payload_compiled = service._format_endpoint_payload(req_compiled)
+        total_bytes_compiled = len(json.dumps(payload_compiled).encode("utf-8"))
+        self.assertLessEqual(total_bytes_compiled, 980)
+        tokens_compiled = estimate_laya_tokens(payload_compiled)
+        self.assertTrue(tokens_compiled["within_estimated_limit"])
+
+        # Negative Control: Oversized mandatory requirement fails closed before dispatch
+        huge_query = "Excessive query text " * 20
+        req_oversized = LayaEscalationRequest(
+            query_id="q_probe_oversized",
+            workspace_id="ws_latency_probe",
+            query=huge_query,
+            missing_requirement=MissingRequirementDescription(
+                requirement_id="req_probe_over",
+                missing_dimension="exact_term",
+                description="Oversized gap description",
+                failed_stage="run_fidelity_coverage",
+                detected_gap="Missing mandatory requirement term",
+            ),
+            available_routes=("lexical_expansion", "none"),
+            retrieved_summary=(),
+            caller_deadline_ms=2500.0,
+        )
+        with self.assertRaises(PayloadBudgetExceededError) as ctx:
+            service._format_endpoint_payload(req_oversized)
+        self.assertIn("exceeds document budget", str(ctx.exception))
+
 
 @unittest.skipUnless(
     os.environ.get("RUN_LIVE_LAYA_TESTS") == "true",

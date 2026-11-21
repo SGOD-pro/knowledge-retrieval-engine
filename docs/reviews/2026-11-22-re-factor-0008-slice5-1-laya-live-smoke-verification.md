@@ -106,7 +106,8 @@ Exit code: 2
   * Conformance check: FAILED (expected `lexical_expansion` and `DELIVERED`, observed `none` and `REFUSAL`)
 
 * **Request 5: Compiled Pipeline (Subsequent Pipeline Request, Route None Refusal Intent)**
-  * Query: "Explain the philosophy of business in general"
+  * Query: "Unexpandable general concept with no evidence in existence" (reconciled from committed probe code and execution logs; an earlier draft of this report noted "Explain the philosophy of business in general")
+  * Gap detected: "Unexpandable general concept"
   * Target: `compiled_pipeline`
   * Expected route: `none`
   * Actual observed route: `none`
