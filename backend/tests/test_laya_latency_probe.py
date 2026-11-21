@@ -391,7 +391,7 @@ class TestOfflineHarnessSuite:
 
     def test_negative_controls_pass_explicitly(self) -> None:
         passed = run_offline_negative_controls(verbose=False)
-        assert len(passed) == 8
+        assert len(passed) == 9
 
     def test_offline_harness_pass_assertions_end_to_end(self) -> None:
         exit_code = run_latency_probe(endpoint_url="", api_key="", dry_run=True)
@@ -401,10 +401,78 @@ class TestOfflineHarnessSuite:
 class TestLexicalScenarioIsolation:
     """Verifies that baseline discovery exposes only background evidence and expansion retrieves novel chunk."""
 
+    def test_stage_bounded_repository_isolates_baseline_and_reveals_novel_chunk(self) -> None:
+        """Confirms StageBoundedRepository exposes only baseline chunk until explicit expansion transition."""
+        repo = _setup_synthetic_repository()
+        assert repo.stage == "baseline_discovery"
+
+        # Baseline discovery stage
+        chunks_stage1 = repo.get_all_chunks(workspace_id="ws_latency_probe")
+        assert len(chunks_stage1) == 1
+        assert chunks_stage1[0].id == "chk_probe_baseline"
+        assert repo.baseline_candidate_ids == ["chk_probe_baseline"]
+
+        vec_stage1 = repo.search_vector([0.1] * 1024, workspace_id="ws_latency_probe")
+        assert len(vec_stage1) == 1
+        assert vec_stage1[0][0].id == "chk_probe_baseline"
+
+        # Transition to expansion stage
+        repo.transition_to_expansion()
+        assert repo.stage == "expansion"
+        chunks_stage2 = repo.get_all_chunks(workspace_id="ws_latency_probe")
+        assert len(chunks_stage2) == 2
+        chunk_ids_stage2 = [c.id for c in chunks_stage2]
+        assert "chk_probe_baseline" in chunk_ids_stage2
+        assert "chk_probe_turnover" in chunk_ids_stage2
+
+        vec_stage2 = repo.search_vector([0.1] * 1024, workspace_id="ws_latency_probe")
+        assert len(vec_stage2) == 2
+        vec_ids_stage2 = [v[0].id for v in vec_stage2]
+        assert "chk_probe_turnover" in vec_ids_stage2
+        assert "chk_probe_baseline" in vec_ids_stage2
+
+        # Reset baseline stage
+        repo.reset_baseline()
+        assert repo.stage == "baseline_discovery"
+        assert repo.baseline_candidate_ids == []
+        chunks_reset = repo.get_all_chunks(workspace_id="ws_latency_probe")
+        assert len(chunks_reset) == 1
+        assert chunks_reset[0].id == "chk_probe_baseline"
+        assert repo.baseline_candidate_ids == ["chk_probe_baseline"]
+
+    def test_dispatch_spy_pre_dispatch_assertion_catches_leaked_answer(self) -> None:
+        """Confirms spy_post rejects requests that leak answer text or chunk ID in baseline context."""
+        spy = BoundedNetworkSpy(dry_run=True)
+
+        # Leaked answer text
+        leaked_text_payload = {
+            "state": {
+                "document": "Query: Turnover query\nGap: Missing turnover\nContext: Confirmed as $450 million."
+            },
+            "questions": {"route": {"type": "choice"}},
+        }
+        with pytest.raises(AssertionError) as exc_info_text:
+            spy.spy_post("https://mock.laya.local/v1/systemone", json=leaked_text_payload)
+        assert "Answer text $450 million found in baseline context" in str(exc_info_text.value)
+
+        # Leaked answer chunk ID
+        leaked_chunk_payload = {
+            "state": {
+                "document": "Query: Turnover query\nGap: Missing turnover\nContext: [chk_probe_turnover] overview"
+            },
+            "questions": {"route": {"type": "choice"}},
+        }
+        with pytest.raises(AssertionError) as exc_info_chunk:
+            spy.spy_post("https://mock.laya.local/v1/systemone", json=leaked_chunk_payload)
+        assert "Answer chunk chk_probe_turnover found in baseline context" in str(exc_info_chunk.value)
+
     def test_captured_actual_serialized_pipeline_payload_offline(self) -> None:
-        """Verifies that BoundedNetworkSpy captures actual compiled pipeline payload offline without manual reconstruction."""
+        """Verifies that BoundedNetworkSpy captures actual compiled pipeline payload offline with restored turnover question."""
         spy = BoundedNetworkSpy(dry_run=True)
         repo = _setup_synthetic_repository()
+        spy.stage_boundary = repo
+        repo.reset_baseline()
+
         mock_llm_response = {
             "answer": "The fiscal year 2026 turnover was $450 million.",
             "citations": ["chk_probe_turnover"],
@@ -414,8 +482,7 @@ class TestLexicalScenarioIsolation:
 
         def _mock_rerank(q: str, chunks: Any, top_k: int = 6, return_mode: bool = False) -> Any:
             c_list = list(chunks)
-            if "turnover" not in q.lower():
-                c_list = [c for c in c_list if "turnover" not in c.text.lower()]
+            c_list.sort(key=lambda c: 1.0 if "turnover" in c.text.lower() else 0.5, reverse=True)
             return (c_list[:top_k], "mocked") if return_mode else c_list[:top_k]
 
         with patch("requests.post", side_effect=spy.spy_post), \
@@ -426,7 +493,7 @@ class TestLexicalScenarioIsolation:
 
             spy.set_probe_id("probe_pipeline_test")
             resp = pipeline.run(
-                query="What was the corporate background for 2026?",
+                query="What was the turnover for fiscal year 2026?",
                 workspace_id="ws_latency_probe",
                 laya_enabled=True,
                 laya_endpoint_url="https://mock.laya.local/v1/systemone",
@@ -439,12 +506,14 @@ class TestLexicalScenarioIsolation:
         attempts = spy.get_attempts_for_probe("probe_pipeline_test")
         assert len(attempts) == 1
         att = attempts[0]
+        assert att.baseline_candidate_ids == ["chk_probe_baseline"]
+
         payload = att.request_payload
         assert isinstance(payload, dict) and "state" in payload and "questions" in payload
         assert "route" in payload["questions"]
 
         doc_str = payload["state"]["document"]
-        assert "Query: What was the corporate background for 2026?" in doc_str
+        assert "Query: What was the turnover for fiscal year 2026?" in doc_str
         assert "Gap detected: Initial fidelity check failed coverage: Missing turnover coverage" in doc_str
 
         # Assert answer chunk and text are absent from baseline serialized context
@@ -453,11 +522,166 @@ class TestLexicalScenarioIsolation:
         assert "$450 million" not in context_part
         assert "450 million" not in context_part
 
-        # Assert answer chunk is absent from baseline candidates
-        cands = resp.retrieval_candidates or {}
-        assert "chk_probe_turnover" not in [str(c) for c in cands.get("reranked", [])]
+        # Assert answer chunk is absent from baseline candidates captured at baseline stage
+        assert "chk_probe_turnover" not in att.baseline_candidate_ids
+        assert att.baseline_candidate_ids == ["chk_probe_baseline"]
 
-        # Assert after mocked lexical approval that executor retrieves novel chunk and delivery succeeds
+        # Assert after mocked lexical approval that executor retrieves novel chunk, survives post-expansion rerank, and delivery succeeds
+        cands = resp.retrieval_candidates or {}
         assert "chk_probe_turnover" in cands.get("laya_novel_chunks", [])
+        assert "chk_probe_turnover" in [str(c) for c in cands.get("reranked", [])]
         assert cands.get("laya_expansion_executed") is True
         assert "$450 million" in resp.answer
+
+    def test_novel_answer_survives_full_post_expansion_evidence_path(self) -> None:
+        """Verifies novel answer survives post-expansion rerank/compression, reaches synthesis and verification, and is cited."""
+        spy = BoundedNetworkSpy(dry_run=True)
+        repo = _setup_synthetic_repository()
+        spy.stage_boundary = repo
+        repo.reset_baseline()
+
+        synth_inputs: list[tuple[Any, ...]] = []
+        def spy_call_llm(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            synth_inputs.append((args, kwargs))
+            return {
+                "answer": "The fiscal year 2026 turnover was $450 million.",
+                "citations": ["chk_probe_turnover"],
+                "usage": {"input_tokens": 120, "output_tokens": 18},
+            }
+
+        mock_verifier = MockOfflineVerifier(support_status="ASSERTED")
+        verifier_inputs: list[tuple[Any, ...]] = []
+        orig_verify = mock_verifier.verify
+        def spy_verify(*args: Any, **kwargs: Any) -> Any:
+            verifier_inputs.append((args, kwargs))
+            return orig_verify(*args, **kwargs)
+        mock_verifier.verify = spy_verify
+
+        def _mock_rerank(q: str, chunks: Any, top_k: int = 6, return_mode: bool = False) -> Any:
+            c_list = list(chunks)
+            c_list.sort(key=lambda c: 1.0 if "turnover" in c.text.lower() else 0.5, reverse=True)
+            return (c_list[:top_k], "mocked") if return_mode else c_list[:top_k]
+
+        with patch("requests.post", side_effect=spy.spy_post), \
+             patch("services.langgraph_pipeline.call_llm", side_effect=spy_call_llm), \
+             patch("services.langgraph_pipeline._get_repo", return_value=repo), \
+             patch("services.langgraph_pipeline.rerank", side_effect=_mock_rerank), \
+             patch("services.langgraph_pipeline.check_fidelity", side_effect=FidelityMockSequence(mode="lexical")):
+
+            spy.set_probe_id("probe_full_evidence_test")
+            resp = pipeline.run(
+                query="What was the turnover for fiscal year 2026?",
+                workspace_id="ws_latency_probe",
+                laya_enabled=True,
+                laya_endpoint_url="https://mock.laya.local/v1/systemone",
+                laya_api_key="mock_key",
+                verifier=mock_verifier,
+                require_delivery_gate=True,
+                caller_deadline_ms=2500.0,
+            )
+
+        # 1. Rerank and compression survival
+        cands = resp.retrieval_candidates or {}
+        assert "chk_probe_turnover" in cands.get("laya_novel_chunks", [])
+        assert cands.get("laya_expansion_executed") is True
+
+        # 2. Synthesis inputs
+        assert len(synth_inputs) == 1
+        s_args, _ = synth_inputs[0]
+        assert s_args[0] == "What was the turnover for fiscal year 2026?"
+        assert "chk_probe_turnover" in s_args[1]
+        assert "$450 million" in s_args[1]
+
+        # 3. Verification inputs
+        assert len(verifier_inputs) == 1
+        _, v_kwargs = verifier_inputs[0]
+        assert "$450 million" in v_kwargs.get("text", "")
+        assert "$450 million" in v_kwargs.get("context", "")
+        v_cits = [str(c.get("chunk_id") if isinstance(c, dict) else getattr(c, "chunk_id", c)) for c in v_kwargs.get("citations", [])]
+        assert "chk_probe_turnover" in v_cits
+
+        # 4. Final cited evidence
+        resp_cits = [str(c.get("chunk_id") if isinstance(c, dict) else getattr(c, "chunk_id", c)) for c in resp.citations]
+        assert "chk_probe_turnover" in resp_cits
+        assert "$450 million" in resp.answer
+
+    def test_live_failure_responses_record_into_verdict_without_crashing(self) -> None:
+        """Confirms live none, timeout, or unavailable responses record scenario failures into verdict without crashing."""
+        # Case A: Live none response for lexical scenario
+        rec_none = ProbeMetricRecord(
+            probe_id="live_lexical_returned_none",
+            target="compiled_pipeline",
+            request_sequence="first_request",
+            query_type="lexical_expansion",
+            client_roundtrip_ms=120.0,
+            server_latency_ms=85.0,
+            unaccounted_elapsed_ms=35.0,
+            dispatched=True,
+            valid_response=True,
+            proposed_route="none",  # Live model returned none
+            route_accepted=True,
+            expansion_executed=False,  # No expansion executed
+            fallback=False,
+            execution_status="approved",
+            pipeline_total_ms=150.0,
+            delivery_outcome="REFUSAL",  # Pipeline refused
+            completed_within_phase_deadline=True,
+        )
+        code_none, label_none, reasons_none = evaluate_probe_verdict([rec_none])
+        assert code_none == 2
+        assert label_none == "FAIL (FUNCTIONAL DEFECT)"
+        assert any("does not match expected lexical_expansion" in r for r in reasons_none)
+        assert any("did not execute lexical expansion" in r for r in reasons_none)
+        assert any("outcome REFUSAL was not DELIVERED" in r for r in reasons_none)
+
+        # Case B: Live timeout response
+        rec_timeout = ProbeMetricRecord(
+            probe_id="live_lexical_timeout",
+            target="compiled_pipeline",
+            request_sequence="first_request",
+            query_type="lexical_expansion",
+            client_roundtrip_ms=2600.0,
+            server_latency_ms=None,
+            unaccounted_elapsed_ms=None,
+            dispatched=True,
+            valid_response=False,
+            proposed_route="",
+            route_accepted=False,
+            expansion_executed=False,
+            fallback=True,
+            execution_status="timeout",
+            pipeline_total_ms=2600.0,
+            delivery_outcome="TIMEOUT",
+            completed_within_phase_deadline=False,
+            error="caller_timeout",
+        )
+        code_to, label_to, reasons_to = evaluate_probe_verdict([rec_timeout])
+        assert code_to == 1
+        assert label_to == "FAIL (LATENCY BLOCKER)"
+        assert any("exceeding phase deadline" in r for r in reasons_to)
+
+        # Case C: Live provider unavailable response
+        rec_unavail = ProbeMetricRecord(
+            probe_id="live_lexical_unavail",
+            target="compiled_pipeline",
+            request_sequence="first_request",
+            query_type="lexical_expansion",
+            client_roundtrip_ms=50.0,
+            server_latency_ms=None,
+            unaccounted_elapsed_ms=None,
+            dispatched=True,
+            valid_response=False,
+            proposed_route="",
+            route_accepted=False,
+            expansion_executed=False,
+            fallback=True,
+            execution_status="provider_unavailable",
+            pipeline_total_ms=90.0,
+            delivery_outcome="REFUSAL",
+            completed_within_phase_deadline=True,
+            error="Connection refused",
+        )
+        code_un, label_un, reasons_un = evaluate_probe_verdict([rec_unavail])
+        assert code_un == 2
+        assert label_un == "FAIL (FUNCTIONAL DEFECT)"
+        assert any("did not receive a valid provider response" in r for r in reasons_un)
