@@ -2166,64 +2166,6 @@ def end_fast_path(state: PipelineState):
             "stage_timings": {**existing, "fast_path_ms": latency_ms},
         }
 
-    # Sentence-level extractive fallback for fast-path prose queries
-    _STOPS = {
-        "what", "is", "the", "a", "an", "in", "on", "at", "to", "for", "of", "and",
-        "or", "with", "by", "from", "as", "are", "how", "many", "does", "do", "did",
-    }
-    q_words = {w.lower().strip(".,?!\"'") for w in query.split() if w.lower().strip(".,?!\"'") not in _STOPS and len(w) > 2}
-    if not q_words:
-        q_words = {w.lower().strip(".,?!\"'") for w in query.split() if len(w) > 1}
-
-    selected_sentences = []
-    contributing_chunks = []
-
-    for c in non_heading_chunks:
-        sentences = re.split(r"(?<=[.!?])\s+", c.text.strip())
-        chunk_matched = False
-        for s in sentences:
-            s_words = {w.lower().strip(".,?!\"'") for w in s.split()}
-            if q_words & s_words:
-                selected_sentences.append(s.strip())
-                chunk_matched = True
-        if chunk_matched:
-            contributing_chunks.append(c)
-
-    if selected_sentences and contributing_chunks:
-        answer = " ".join(selected_sentences)[:800]
-        top_chunks = contributing_chunks
-        citations = [build_citation(c).to_dict() for c in contributing_chunks]
-        util_rate = round(len(contributing_chunks) / len(all_top), 4) if all_top else 1.0
-        conf = getattr(contributing_chunks[0], "similarity_score", None)
-        if conf is None:
-            conf = 1.0
-
-        latency_ms = (time.perf_counter() - t0) * 1000.0
-        from services.retrieval.evidence_contract import evidence_item_from_chunk
-        retained_evidence_items = [
-            evidence_item_from_chunk(c, workspace_id=state.get("workspace_id", ""), strategy="vector_rerank")
-            for c in top_chunks
-        ]
-        return {
-            "final_answer": answer,
-            "confidence_score": float(conf),
-            "faithfulness": 1.0,
-            "citation_utilization_rate": util_rate,
-            "usage": {"input_tokens": 0, "output_tokens": 0},
-            "top_chunks": top_chunks,
-            "citations": citations,
-            "retained_evidence_items": retained_evidence_items,
-            "executed_path": "fast",
-            "status": "success",
-            "retrieval_candidates": {
-                **dict(state.get("retrieval_candidates", {})),
-                "reranked": [str(c.id) for c in top_chunks],
-                "compressed_context": [str(c.id) for c in top_chunks],
-                "llm_citations": [str(c.get("chunk_id", "")) for c in citations if c.get("chunk_id")],
-            },
-            "stage_timings": {**existing, "fast_path_ms": latency_ms},
-        }
-
     # If extraction finds no supported answer, escalate to full path without fabricating confidence or chunk
     latency_ms = (time.perf_counter() - t0) * 1000.0
     logger.info("fast_path.no_supported_answer escalating_to_full_path latency_ms=%.2f", latency_ms)
@@ -2371,18 +2313,13 @@ def route_after_vector(state: PipelineState):
 
 def route_after_extraction(state: PipelineState):
     """If verified extraction succeeded, end fast path.
-    If high confidence top chunk exists (similarity >= 0.40), end fast path via extractive fallback.
-    Otherwise escalate to full path."""
+    Otherwise escalate to full path via end_fast_path for telemetry and escalation."""
     if state.get("verified_answer") and state.get("verified_chunk"):
         return "end_fast_path"
 
     candidates = state.get("candidate_chunks", [])
     if candidates:
-        top_c = candidates[0]
-        top_sim = getattr(top_c, "similarity_score", 0.0) or 0.0
-        threshold = 0.40
-        if top_sim >= threshold:
-            return "end_fast_path"
+        return "end_fast_path"
 
     # Escalate to full generation path
     return "escalate_to_full_retrieval"

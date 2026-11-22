@@ -786,3 +786,215 @@ def test_trusted_1024_dimensional_vector_with_model_provenance_is_reused(monkeyp
     assert result["query_embedding_provenance"] == expected_model
 
 
+def test_end_fast_path_rejects_unsupported_token_overlap_prose():
+    """Unit regression: end_fast_path must NOT return fast success for token-overlap prose.
+    Question: 'What is Apple's Commission File Number?'
+    Chunk: 'The Commission regulates financial reporting.'
+    Must escalate to full path, return NOT_FOUND, 0.0 confidence, and empty citations.
+    """
+    chunk = Chunk(
+        id="c_apple_comm",
+        document_id="doc_apple_sec",
+        text="The Commission regulates financial reporting.",
+        source_format="pdf",
+        page_number=1,
+        element_type="paragraph",
+        section_path=("General",),
+        similarity_score=0.88,
+        workspace_id="ws_test_repro",
+    )
+
+    state = {
+        "query": "What is Apple's Commission File Number?",
+        "top_chunks": [chunk],
+        "candidate_chunks": [chunk],
+        "stage_timings": {},
+        "workspace_id": "ws_test_repro",
+    }
+
+    result = end_fast_path(state)
+    assert result.get("executed_path") == "full"
+    assert result.get("status") != "success"
+    assert result.get("final_answer") == "NOT_FOUND"
+    assert result.get("confidence_score") == 0.0
+    assert result.get("top_chunks") == []
+    assert result.get("citations") == []
+    assert "fast_path_ms" in result.get("stage_timings", {})
+
+
+def test_end_fast_path_preserves_supported_verified_factual_answers():
+    """Unit regression: Supported verified factual extractions (e.g. abbreviation
+    expansion or generic structured row) must complete on fast path with status='success'.
+    """
+    chunk = Chunk(
+        id="c_sec_cfn",
+        document_id="doc_sec_defs",
+        text="Commission File Number (CFN) is assigned by the SEC to reporting entities.",
+        source_format="pdf",
+        page_number=1,
+        element_type="paragraph",
+        section_path=("Definitions",),
+        similarity_score=0.92,
+        workspace_id="ws_test_verified",
+    )
+
+    state = {
+        "query": "What does CFN stand for in SEC filings?",
+        "top_chunks": [chunk],
+        "candidate_chunks": [chunk],
+        "stage_timings": {},
+        "workspace_id": "ws_test_verified",
+    }
+
+    result = end_fast_path(state)
+    assert result.get("executed_path") == "fast"
+    assert result.get("status") == "success"
+    assert result.get("final_answer") == "Commission File Number"
+    assert result.get("confidence_score") == 0.92
+    assert len(result.get("citations", [])) == 1
+    assert result["citations"][0]["chunk_id"] == "c_sec_cfn"
+
+
+def test_compiled_pipeline_escalates_unsupported_fast_prose_and_refreshes_retrieval(monkeypatch):
+    """Compiled pipeline regression with mocked providers:
+    1. Distractor chunk with token overlap matches fast vector search:
+       'The Commission regulates financial reporting.'
+    2. Supporting evidence chunk outside fast top-1 has full embedding:
+       'Apple Inc. Commission File Number is 001-36743.'
+    3. Fast extraction cannot establish the answer from the distractor.
+    4. Compiled pipeline escalates to full retrieval, refreshes candidate chunks,
+       executes at most one synthesis, and returns the grounded answer.
+    """
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    repo = CloudRepository()
+    ws_id = "ws_cfn_recovery"
+
+    query = "Apple Commission File Number in annual disclosures"
+
+    # Distractor document matches query on fast embedding
+    distractor_text = "The Commission regulates financial reporting and disclosure requirements."
+    doc_distractor = Document(
+        id="doc_distractor_sec",
+        filename="sec_rules.pdf",
+        source_format="pdf",
+        chunks=(
+            Chunk(
+                id="doc_distractor_sec:c1",
+                document_id="doc_distractor_sec",
+                text=distractor_text,
+                source_format="pdf",
+                page_number=1,
+                element_type="paragraph",
+                section_path=("Rules",),
+                embedding_fast=embed_fast_local(query),
+                embedding_full=_deterministic_vector("sec financial regulations overview", 1024),
+                workspace_id=ws_id,
+                similarity_score=0.90,
+            ),
+        ),
+        workspace_id=ws_id,
+    )
+    repo.save(doc_distractor)
+
+    # Supporting document has the actual factual answer
+    supporting_text = "Apple Inc. Commission File Number is 001-36743 as reported in annual disclosures."
+    doc_supporting = Document(
+        id="doc_apple_cfn",
+        filename="apple_10k.pdf",
+        source_format="pdf",
+        chunks=(
+            Chunk(
+                id="doc_apple_cfn:c1",
+                document_id="doc_apple_cfn",
+                text=supporting_text,
+                source_format="pdf",
+                page_number=1,
+                element_type="paragraph",
+                section_path=("Filing",),
+                embedding_fast=_deterministic_vector("unrelated general electronics text", 384),
+                embedding_full=_deterministic_vector(supporting_text, 1024),
+                workspace_id=ws_id,
+                similarity_score=0.25,
+            ),
+        ),
+        workspace_id=ws_id,
+    )
+    repo.save(doc_supporting)
+
+    reset_llm_counter()
+    response = pipeline.run(query, workspace_id=ws_id)
+
+    # Must escalate to full path
+    assert response.planned_path == "fast"
+    assert response.executed_path == "full"
+    assert response.fast_path is False
+
+    # Refreshed retrieval recovered supporting chunk in full vector candidate set
+    vector_candidates = response.retrieval_candidates.get("vector", [])
+    assert "doc_apple_cfn:c1" in vector_candidates
+
+    # Correct grounded answer and citations
+    assert "001-36743" in response.answer
+    assert any(c.get("chunk_id") == "doc_apple_cfn:c1" for c in response.citations)
+    assert "The Commission regulates" not in response.answer
+
+    # At most one synthesis call
+    assert get_llm_counter()["generation_calls"] == 1
+
+
+def test_compiled_pipeline_refusal_when_evidence_remains_insufficient(monkeypatch):
+    """Compiled pipeline regression with mocked providers:
+    When fast path extraction fails and escalates to full retrieval, but full evidence
+    remains insufficient to answer the query, the engine issues a clean refusal with
+    empty citations and at most one synthesis.
+    """
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    repo = CloudRepository()
+    ws_id = "ws_insufficient_evidence"
+
+    query = "Apple Commission File Number in annual disclosures"
+
+    # Only unrelated/unsupported chunk in workspace
+    distractor_text = "The Commission regulates financial reporting and general disclosure."
+    doc = Document(
+        id="doc_only_distractor",
+        filename="overview.pdf",
+        source_format="pdf",
+        chunks=(
+            Chunk(
+                id="doc_only_distractor:c1",
+                document_id="doc_only_distractor",
+                text=distractor_text,
+                source_format="pdf",
+                page_number=1,
+                element_type="paragraph",
+                section_path=("Overview",),
+                embedding_fast=embed_fast_local(query),
+                embedding_full=_deterministic_vector(distractor_text, 1024),
+                workspace_id=ws_id,
+                similarity_score=0.75,
+            ),
+        ),
+        workspace_id=ws_id,
+    )
+    repo.save(doc)
+
+    from modules.query.query_service import QueryService
+    from schemas.models import QueryRequest
+
+    qs = QueryService()
+    req = QueryRequest(workspace_id=ws_id, query=query, cache=False)
+
+    reset_llm_counter()
+    res = qs.execute_query(req)
+
+    # Must refuse cleanly with empty citations
+    assert "couldn't find any relevant passages" in res["answer"].lower() or res["answer"] == "NOT_FOUND"
+    assert res["citations"] == []
+    assert res["confidence"] == 0.0
+
+    # At most one synthesis call occurred across pipeline execution
+    assert get_llm_counter()["generation_calls"] <= 1
+
+
+

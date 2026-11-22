@@ -32,6 +32,8 @@ def test_fast_path_confidence_varies_with_match_strength():
         "query": "What is the attention mechanism?",
         "top_chunks": [strong_chunk],
         "candidate_chunks": [strong_chunk],
+        "verified_answer": "weighted sum of values based on query key dot products",
+        "verified_chunk": strong_chunk,
         "stage_timings": {},
     }
     res_strong = end_fast_path(state_strong)
@@ -41,6 +43,8 @@ def test_fast_path_confidence_varies_with_match_strength():
         "query": "What is the attention mechanism?",
         "top_chunks": [weak_chunk],
         "candidate_chunks": [weak_chunk],
+        "verified_answer": "attention mechanism among general corporate items",
+        "verified_chunk": weak_chunk,
         "stage_timings": {},
     }
     res_weak = end_fast_path(state_weak)
