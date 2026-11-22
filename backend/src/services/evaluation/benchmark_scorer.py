@@ -739,12 +739,36 @@ def grade_structured_premise(answer: str, contract: dict) -> bool:
     return True
 
 
+def extract_numbers_normalized(text: str) -> set[str]:
+    """Extracts normalized numbers (including percentages, floats, ints, removing commas) from text."""
+    if not text:
+        return set()
+    cleaned = re.sub(r"(?<=\d),(?=\d)", "", text)
+    raw_nums = re.findall(r"\b\d+(?:\.\d+)?%?\b", cleaned)
+    nums = set()
+    for n in raw_nums:
+        nums.add(n)
+        clean = n.rstrip("%")
+        nums.add(clean)
+        try:
+            f = float(clean)
+            if f.is_integer():
+                nums.add(str(int(f)))
+            else:
+                nums.add(str(f))
+        except ValueError:
+            pass
+    return nums
+
+
 def validate_citations(
     citations: list[dict],
     context_chunk_ids: list[str] | set[str] | None = None,
     ground_truth_chunk_ids: list[str] | set[str] | None = None,
     retained_structured_hashes: set[str] | None = None,
     retained_evidence_items: list[Any] | None = None,
+    expected_sources: list[str] | set[str] | None = None,
+    expected_source_version: int | str | None = None,
 ) -> dict[str, Any]:
     """Validates that citations:
       1. Have non-empty document_filename and chunk_id.
@@ -756,9 +780,17 @@ def validate_citations(
          executed and retained for this request (not invented).
       6. When retained_evidence_items is provided, every citation must map back to an EvidenceItem
          retained for this request.
+      7. If expected_sources provided, every citation's document/table source must match expected sources.
+      8. If expected_source_version provided, every citation's document_version must match expected version.
     """
     if not citations:
-        return {"valid": True, "citation_count": 0, "errors": []}
+        return {
+            "valid": True,
+            "citation_count": 0,
+            "valid_count": 0,
+            "ground_truth_matched_count": 0,
+            "errors": [],
+        }
 
     # Extract retained hashes and chunk IDs from retained_evidence_items if provided
     retained_chunk_ids: set[str] | None = None
@@ -789,6 +821,7 @@ def validate_citations(
 
     context_set = set(context_chunk_ids) if context_chunk_ids is not None else None
     gt_set = set(ground_truth_chunk_ids) if ground_truth_chunk_ids else None
+    exp_sources_set = {str(s) for s in expected_sources} if expected_sources else None
     errors = []
     valid_count = 0
     gt_matched_count = 0
@@ -820,6 +853,24 @@ def validate_citations(
             if sel_count < 1:
                 errors.append(f"Citation {idx}: selection_count must be >= 1 in structured evidence")
                 continue
+
+            # Verify source matches expected_sources if provided
+            if exp_sources_set:
+                c_src = c.get("document_filename") or c.get("source_id") or table_id
+                if c_src and c_src not in exp_sources_set and table_id not in exp_sources_set:
+                    errors.append(f"Citation {idx}: source '{c_src}' not in expected sources {exp_sources_set}")
+                    continue
+
+            # Verify version matches expected_source_version if provided
+            if expected_source_version is not None and doc_ver is not None:
+                try:
+                    if int(doc_ver) != int(expected_source_version):
+                        errors.append(f"Citation {idx}: document_version '{doc_ver}' does not match expected version '{expected_source_version}'")
+                        continue
+                except (ValueError, TypeError):
+                    if str(doc_ver) != str(expected_source_version):
+                        errors.append(f"Citation {idx}: document_version '{doc_ver}' does not match expected version '{expected_source_version}'")
+                        continue
 
             # Verify hash matches a real executed query when caller supplies retained hashes/evidence
             if all_retained_hashes is not None and sel_hash not in all_retained_hashes:
@@ -920,6 +971,56 @@ def validate_citations(
             errors.append(f"Citation {idx}: missing page_number and location_reference")
             continue
 
+        # Verify source matches expected_sources if provided
+        if exp_sources_set and doc_file not in exp_sources_set:
+            errors.append(f"Citation {idx}: source document '{doc_file}' not in expected sources {exp_sources_set}")
+            continue
+
+        # Verify version matches expected_source_version if provided
+        c_ver = c.get("document_version") or c.get("source_version")
+        if expected_source_version is not None and c_ver is not None:
+            try:
+                if int(c_ver) != int(expected_source_version):
+                    errors.append(f"Citation {idx}: document_version '{c_ver}' does not match expected version '{expected_source_version}'")
+                    continue
+            except (ValueError, TypeError):
+                if str(c_ver) != str(expected_source_version):
+                    errors.append(f"Citation {idx}: document_version '{c_ver}' does not match expected version '{expected_source_version}'")
+                    continue
+
+        # When retained_evidence_items is supplied, verify regular citation fields match the retained record
+        if retained_evidence_items is not None:
+            matching_ev = None
+            for ev_it in retained_evidence_items:
+                ev_id = str(getattr(ev_it, "evidence_id", ""))
+                loc = getattr(ev_it, "locator", {}) or {}
+                cp = getattr(ev_it, "citation_payload", {}) or {}
+                if cid in (ev_id, str(loc.get("chunk_id", "")), str(cp.get("chunk_id", ""))):
+                    matching_ev = ev_it
+                    break
+
+            if matching_ev is not None:
+                exp_doc_file = getattr(matching_ev, "document_filename", None) or (getattr(matching_ev, "locator", {}) or {}).get("document_filename")
+                exp_ver = getattr(matching_ev, "document_version", None) or (getattr(matching_ev, "locator", {}) or {}).get("document_version")
+                exp_did = getattr(matching_ev, "document_id", None) or (getattr(matching_ev, "locator", {}) or {}).get("document_id")
+
+                if exp_doc_file and doc_file != exp_doc_file:
+                    errors.append(f"Citation {idx}: document_filename '{doc_file}' altered from retained evidence '{exp_doc_file}'")
+                    continue
+                if exp_ver is not None and c_ver is not None:
+                    try:
+                        if int(c_ver) != int(exp_ver):
+                            errors.append(f"Citation {idx}: document_version '{c_ver}' altered from retained evidence '{exp_ver}'")
+                            continue
+                    except (ValueError, TypeError):
+                        if str(c_ver) != str(exp_ver):
+                            errors.append(f"Citation {idx}: document_version '{c_ver}' altered from retained evidence '{exp_ver}'")
+                            continue
+                c_did = c.get("document_id")
+                if exp_did and c_did and str(c_did) != str(exp_did):
+                    errors.append(f"Citation {idx}: document_id '{c_did}' altered from retained evidence '{exp_did}'")
+                    continue
+
         if gt_set is not None and cid in gt_set:
             gt_matched_count += 1
 
@@ -935,5 +1036,299 @@ def validate_citations(
         "valid_count": valid_count,
         "ground_truth_matched_count": gt_matched_count,
         "errors": errors,
+    }
+
+
+def evaluate_grounded_answer(
+    answer: str,
+    citations: list[dict[str, Any]],
+    is_answer_text_correct: bool,
+    contract_type: str = "semantic",
+    contract: dict[str, Any] | None = None,
+    expected_sources: list[str] | set[str] | None = None,
+    expected_source_version: int | str | None = None,
+    retained_evidence_items: list[Any] | None = None,
+    retained_structured_hashes: set[str] | None = None,
+    context_chunk_ids: list[str] | set[str] | None = None,
+    ground_truth_chunk_ids: list[str] | set[str] | None = None,
+    is_infra_error: bool = False,
+    ans_is_refusal: bool = False,
+    question_type: str = "retrieval",
+    outcome: dict[str, Any] | Any | None = None,
+) -> dict[str, Any]:
+    """Evaluates grounded correctness of an answer requiring text correctness plus
+
+    validated request-retained evidence support.
+
+    Requirements:
+      1. Infrastructure failures must fail grounded scoring.
+      2. Incorrect answer text fails grounded scoring.
+      3. Refusal contracts:
+         - Clean refusal with zero citations passes grounded scoring.
+         - Fabricating citations on a refusal fails grounded scoring.
+      4. Answerable queries:
+         - Missing citations fails grounded scoring.
+         - Invalid citations (missing fields, wrong source, wrong version, altered retained fields) fails.
+         - Matching citation IDs alone must not establish claim support:
+           - For structured aggregate: answer must assert the operation-specific result_value
+             (and not merely metadata like selection_count or total_rows).
+           - For text retrieval: citation context snippets must support the answer
+             (compute_faithfulness >= 0.25 and numeric claims in the answer must appear in context snippets
+             or valid contract target values).
+    """
+    cit_val = validate_citations(
+        citations=citations,
+        context_chunk_ids=context_chunk_ids,
+        ground_truth_chunk_ids=ground_truth_chunk_ids,
+        retained_structured_hashes=retained_structured_hashes,
+        retained_evidence_items=retained_evidence_items,
+        expected_sources=expected_sources,
+        expected_source_version=expected_source_version,
+    )
+
+    if is_infra_error:
+        return {
+            "is_grounded_correct": False,
+            "grounded_correct": False,
+            "reason": "infrastructure_error",
+            "citation_validation": cit_val,
+            "faithfulness": None,
+        }
+
+    is_refusal_required = contract_type == "refusal" or bool(contract and contract.get("is_refusal_required"))
+
+    # Refusal contract evaluation
+    if is_refusal_required:
+        if citations and len(citations) > 0:
+            return {
+                "is_grounded_correct": False,
+                "grounded_correct": False,
+                "reason": "refusal_contract_with_fabricated_citations",
+                "citation_validation": cit_val,
+                "faithfulness": None,
+            }
+        if not is_answer_text_correct or not ans_is_refusal:
+            return {
+                "is_grounded_correct": False,
+                "grounded_correct": False,
+                "reason": "refusal_contract_failed_to_refuse",
+                "citation_validation": cit_val,
+                "faithfulness": None,
+            }
+        return {
+            "is_grounded_correct": True,
+            "grounded_correct": True,
+            "reason": "valid_unsupported_refusal",
+            "citation_validation": cit_val,
+            "faithfulness": None,
+        }
+
+    # Non-refusal, answerable query evaluation
+    if not is_answer_text_correct:
+        return {
+            "is_grounded_correct": False,
+            "grounded_correct": False,
+            "reason": "answer_text_incorrect",
+            "citation_validation": cit_val,
+            "faithfulness": None,
+        }
+
+    if not answer or str(answer).strip() in ("", "NOT_FOUND") or ans_is_refusal:
+        return {
+            "is_grounded_correct": False,
+            "grounded_correct": False,
+            "reason": "empty_or_refusal_on_answerable_query",
+            "citation_validation": cit_val,
+            "faithfulness": None,
+        }
+
+    if not citations or len(citations) == 0:
+        return {
+            "is_grounded_correct": False,
+            "grounded_correct": False,
+            "reason": "missing_citations",
+            "citation_validation": {"valid": False, "citation_count": 0, "errors": ["Missing citations for answerable query"]},
+            "faithfulness": None,
+        }
+
+    if not cit_val["valid"]:
+        first_err = cit_val["errors"][0] if cit_val["errors"] else "invalid_citations"
+        return {
+            "is_grounded_correct": False,
+            "grounded_correct": False,
+            "reason": f"invalid_citations: {first_err}",
+            "citation_validation": cit_val,
+            "faithfulness": None,
+        }
+
+    # Claim support validation: matching citation IDs alone must not establish claim support
+    is_structured_agg = (
+        question_type == "structured_aggregate"
+        or contract_type == "structured_aggregate"
+        or any(c.get("evidence_type") == "structured_aggregate" for c in citations)
+        or (isinstance(outcome, dict) and outcome.get("structured_aggregate") is True)
+        or (isinstance(outcome, dict) and outcome.get("execution_type") == "deterministic")
+    )
+
+    if is_structured_agg:
+        operators = set()
+        computed_results = set()
+        metadata_counts = set()
+
+        def _inspect_d(d: dict):
+            op = d.get("operator") or d.get("operation")
+            if op:
+                operators.add(str(op).lower())
+            rv = d.get("result_value")
+            if rv is not None:
+                computed_results.update(extract_numbers_normalized(str(rv)))
+            sv = d.get("secondary_value")
+            if sv is not None:
+                computed_results.update(extract_numbers_normalized(str(sv)))
+            sc = d.get("selection_count") or d.get("records_matched")
+            if sc is not None:
+                metadata_counts.update(extract_numbers_normalized(str(sc)))
+            tr = d.get("total_rows_in_table") or d.get("total_rows") or d.get("records_examined")
+            if tr is not None:
+                metadata_counts.update(extract_numbers_normalized(str(tr)))
+
+        if isinstance(outcome, dict):
+            _inspect_d(outcome)
+            for k in ("structured_payload", "structured_execution_result", "execution_result"):
+                sp = outcome.get(k)
+                if isinstance(sp, dict):
+                    _inspect_d(sp)
+                elif sp is not None and hasattr(sp, "__dict__"):
+                    _inspect_d(vars(sp))
+
+        for c in citations:
+            _inspect_d(c)
+            sp = c.get("structured_payload")
+            if isinstance(sp, dict):
+                _inspect_d(sp)
+            elif sp is not None and hasattr(sp, "__dict__"):
+                _inspect_d(vars(sp))
+
+        if retained_evidence_items:
+            for ev in retained_evidence_items:
+                sp = getattr(ev, "structured_payload", {}) or {}
+                if isinstance(sp, dict):
+                    _inspect_d(sp)
+                loc = getattr(ev, "locator", {}) or {}
+                if isinstance(loc, dict):
+                    _inspect_d(loc)
+
+        if contract and contract_type == "numeric":
+            for tv in contract.get("target_values", []):
+                computed_results.update(extract_numbers_normalized(str(tv)))
+
+        is_count_op = "count" in operators
+        if is_count_op:
+            if not computed_results and metadata_counts:
+                computed_results.update(metadata_counts)
+        else:
+            computed_results = computed_results - metadata_counts
+
+        ans_nums = extract_numbers_normalized(str(answer))
+        ans_years = {n for n in ans_nums if len(n) == 4 and n.isdigit() and 1900 <= int(n) <= 2099}
+        ans_amounts = ans_nums - ans_years
+
+        if computed_results:
+            if not (ans_nums & computed_results):
+                return {
+                    "is_grounded_correct": False,
+                    "grounded_correct": False,
+                    "reason": f"claim_unsupported: answer does not assert computed result {computed_results}",
+                    "citation_validation": cit_val,
+                    "faithfulness": None,
+                }
+            if ans_amounts and not (ans_amounts & computed_results):
+                return {
+                    "is_grounded_correct": False,
+                    "grounded_correct": False,
+                    "reason": f"claim_unsupported: answer amounts {ans_amounts} do not match computed result {computed_results}",
+                    "citation_validation": cit_val,
+                    "faithfulness": None,
+                }
+            return {
+                "is_grounded_correct": True,
+                "grounded_correct": True,
+                "reason": "grounded_structured_aggregate",
+                "citation_validation": cit_val,
+                "faithfulness": 1.0,
+            }
+        else:
+            return {
+                "is_grounded_correct": True,
+                "grounded_correct": True,
+                "reason": "grounded_structured_aggregate_fallback",
+                "citation_validation": cit_val,
+                "faithfulness": 1.0,
+            }
+
+    # Text retrieval claim support validation
+    snippets = [
+        str(c.get("snippet") or c.get("text") or c.get("text_snippet") or "").strip()
+        for c in citations
+    ]
+    joined_context = " ".join(s for s in snippets if s).strip()
+    if not joined_context:
+        return {
+            "is_grounded_correct": False,
+            "grounded_correct": False,
+            "reason": "claim_unsupported: cited context snippets are empty",
+            "citation_validation": cit_val,
+            "faithfulness": None,
+        }
+
+    faith_score = compute_faithfulness(str(answer), joined_context)
+    if faith_score is None or faith_score < 0.25:
+        return {
+            "is_grounded_correct": False,
+            "grounded_correct": False,
+            "reason": f"claim_unsupported: low citation faithfulness ({faith_score})",
+            "citation_validation": cit_val,
+            "faithfulness": faith_score,
+        }
+
+    # Verify numeric claims against context snippets or contract target values
+    ans_nums = extract_numbers_normalized(str(answer))
+    context_nums = extract_numbers_normalized(joined_context)
+    contract_targets = set()
+    if contract and contract_type == "numeric":
+        for tv in contract.get("target_values", []):
+            contract_targets.update(extract_numbers_normalized(str(tv)))
+        for op_val in contract.get("operands", []):
+            contract_targets.update(extract_numbers_normalized(str(op_val)))
+
+    ans_years = {n for n in ans_nums if len(n) == 4 and n.isdigit() and 1900 <= int(n) <= 2099}
+    ans_amounts = ans_nums - ans_years
+
+    if ans_amounts:
+        unsupported = ans_amounts - context_nums - contract_targets
+        if unsupported:
+            return {
+                "is_grounded_correct": False,
+                "grounded_correct": False,
+                "reason": f"claim_unsupported: numeric claims {unsupported} not supported by cited snippets",
+                "citation_validation": cit_val,
+                "faithfulness": faith_score,
+            }
+    if ans_years and context_nums:
+        if not (ans_years & (context_nums | contract_targets)):
+            return {
+                "is_grounded_correct": False,
+                "grounded_correct": False,
+                "reason": f"claim_unsupported: year claims {ans_years} not supported by cited snippets",
+                "citation_validation": cit_val,
+                "faithfulness": faith_score,
+            }
+
+    return {
+        "is_grounded_correct": True,
+        "grounded_correct": True,
+        "reason": "grounded_and_verified",
+        "citation_validation": cit_val,
+        "faithfulness": faith_score,
     }
 

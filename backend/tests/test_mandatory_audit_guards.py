@@ -370,7 +370,7 @@ def test_fast_path_zero_remote_calls():
         id="fast_c1",
         document_id="doc_fast",
         source_format="pdf",
-        text="The Commission File Number is 001-36743.",
+        text="Commission File Number (CFN) is 001-36743 assigned by the SEC.",
         element_type="paragraph",
         page_number=1,
         similarity_score=0.98,
@@ -394,7 +394,7 @@ def test_fast_path_zero_remote_calls():
         mock_bedrock_client.side_effect = RuntimeError("Bedrock must NOT be called on fast path")
 
         res = pipeline.run(
-            query="What is the Commission File Number?",
+            query="What does CFN stand for?",
             workspace_id="ws_test",
         )
 

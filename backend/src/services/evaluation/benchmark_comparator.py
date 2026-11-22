@@ -71,6 +71,8 @@ def compare_manifests(
 
     deltas = {
         "overall_accuracy_delta": _diff("overall_accuracy"),
+        "answer_text_accuracy_delta": _diff("answer_text_accuracy") if "answer_text_accuracy" in cand_metrics and "answer_text_accuracy" in base_metrics else _diff("overall_accuracy"),
+        "grounded_accuracy_delta": _diff("grounded_accuracy") if "grounded_accuracy" in cand_metrics and "grounded_accuracy" in base_metrics else 0.0,
         "refusal_accuracy_delta": _diff("refusal_accuracy"),
         "grounded_recall_at_5_delta": _diff("grounded_recall_at_5"),
         "precision_at_3_delta": _diff("precision_at_3"),

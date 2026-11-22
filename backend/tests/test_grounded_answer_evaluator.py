@@ -1,0 +1,475 @@
+"""Unit tests for grounded-answer scoring in the canonical benchmark evaluator.
+
+Covers:
+  - Preserved answer-text scoring vs grounded-answer scoring
+  - Grounded correctness requiring answer correctness plus validated request-retained evidence
+  - Answerable responses with missing, invalid, wrong-source, or wrong-version citations failing
+  - Structured aggregate evidence validation (asserting computed result_value, not metadata counts)
+  - Refusal contracts (clean refusal with 0 citations passes; fabricated citations fail)
+  - Matching citation IDs alone not establishing claim support
+  - Explicit defect control: contradictory-answer grading defect in text scoring kept explicitly open
+"""
+
+import pytest
+from types import SimpleNamespace
+
+from services.evaluation.benchmark_scorer import (
+    validate_citations,
+    evaluate_grounded_answer,
+    content_match,
+    compute_answer_relevancy,
+    extract_numbers_normalized,
+)
+
+
+def _make_retained_evidence_item(
+    evidence_id: str = "chunk_sec_001",
+    document_filename: str = "SEC-Form-10Q.pdf",
+    document_version: int = 1,
+    document_id: str = "doc_sec_01",
+    text: str = "Apple Inc. Commission File Number: 001-36743. Form 10-Q.",
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        evidence_id=evidence_id,
+        document_filename=document_filename,
+        document_version=document_version,
+        document_id=document_id,
+        locator={"chunk_id": evidence_id, "document_filename": document_filename, "document_version": document_version, "document_id": document_id},
+        citation_payload={"chunk_id": evidence_id},
+        text=text,
+    )
+
+
+# ===========================================================================
+# Positive Controls
+# ===========================================================================
+
+def test_supported_text_answer_positive_control():
+    """Valid text answer with supported citation, matching source, and context text passes grounded scoring."""
+    retained_item = _make_retained_evidence_item()
+    citations = [
+        {
+            "chunk_id": "chunk_sec_001",
+            "document_filename": "SEC-Form-10Q.pdf",
+            "document_version": 1,
+            "document_id": "doc_sec_01",
+            "page_number": 1,
+            "text": "Commission File Number: 001-36743. Apple Inc. Quarterly Report.",
+        }
+    ]
+
+    result = evaluate_grounded_answer(
+        answer="Apple's Commission File Number is 001-36743.",
+        citations=citations,
+        is_answer_text_correct=True,
+        contract_type="semantic",
+        expected_sources=["SEC-Form-10Q.pdf"],
+        expected_source_version=1,
+        retained_evidence_items=[retained_item],
+        ground_truth_chunk_ids={"chunk_sec_001"},
+    )
+
+    assert result["is_grounded_correct"] is True
+    assert result["grounded_correct"] is True
+    assert result["reason"] == "grounded_and_verified"
+    assert result["citation_validation"]["valid"] is True
+
+
+def test_clean_refusal_positive_control():
+    """A clean refusal with zero citations for a refusal contract passes grounded scoring."""
+    result = evaluate_grounded_answer(
+        answer="I couldn't find any relevant passages in the workspace documents matching your query.",
+        citations=[],
+        is_answer_text_correct=True,
+        contract_type="refusal",
+        contract={"contract_type": "refusal", "is_refusal_required": True},
+        ans_is_refusal=True,
+    )
+
+    assert result["is_grounded_correct"] is True
+    assert result["reason"] == "valid_unsupported_refusal"
+    assert result["citation_validation"]["valid"] is True
+
+
+def test_premise_correction_positive_control():
+    """A valid premise correction citing the ground truth evidence passes grounded scoring."""
+    retained_item = _make_retained_evidence_item(
+        evidence_id="chunk_sec_eps",
+        text="Basic earnings per share was $2.03 for the three months ended June 27, 2026.",
+    )
+    citations = [
+        {
+            "chunk_id": "chunk_sec_eps",
+            "document_filename": "SEC-Form-10Q.pdf",
+            "document_version": 1,
+            "page_number": 4,
+            "text": "Basic earnings per share was $2.03 for the three months ended June 27, 2026.",
+        }
+    ]
+
+    result = evaluate_grounded_answer(
+        answer="No. Basic EPS is $2.03 per share for the three months ended June 27, 2026.",
+        citations=citations,
+        is_answer_text_correct=True,
+        contract_type="premise_correction",
+        expected_sources=["SEC-Form-10Q.pdf"],
+        retained_evidence_items=[retained_item],
+    )
+
+    assert result["is_grounded_correct"] is True
+    assert result["reason"] == "grounded_and_verified"
+
+
+def test_structured_aggregate_positive_control():
+    """Structured aggregate answer asserting the computed result_value passes grounded scoring."""
+    hash_val = "1234567890abcdef"
+    ev = SimpleNamespace(
+        evidence_id="ev_agg_1",
+        workspace_id="ws_01",
+        document_version="1",
+        structured_payload={
+            "selection_hash": hash_val,
+            "table_id": "survay",
+            "operator": "sum",
+            "target_column": "Total_Value",
+            "selection_count": 5,
+            "result_value": "157000",
+        },
+        locator={"selection_hash": hash_val, "table_id": "survay", "selection_count": 5},
+    )
+    citations = [
+        {
+            "evidence_type": "structured_aggregate",
+            "table_id": "survay",
+            "document_version": "1",
+            "operator": "sum",
+            "target_column": "Total_Value",
+            "selection_count": 5,
+            "selection_hash": hash_val,
+            "result_value": "157000",
+        }
+    ]
+
+    result = evaluate_grounded_answer(
+        answer="The total sum of Total_Value across the selected records is 157,000.",
+        citations=citations,
+        is_answer_text_correct=True,
+        contract_type="numeric",
+        contract={"contract_type": "numeric", "target_values": [157000]},
+        question_type="structured_aggregate",
+        retained_evidence_items=[ev],
+        retained_structured_hashes={hash_val},
+    )
+
+    assert result["is_grounded_correct"] is True
+    assert result["reason"] == "grounded_structured_aggregate"
+
+
+# ===========================================================================
+# Negative Controls
+# ===========================================================================
+
+def test_missing_citations_fails_grounded_scoring():
+    """Answerable responses with missing citations must fail grounded scoring."""
+    result = evaluate_grounded_answer(
+        answer="Apple's Commission File Number is 001-36743.",
+        citations=[],
+        is_answer_text_correct=True,
+        contract_type="semantic",
+        expected_sources=["SEC-Form-10Q.pdf"],
+    )
+
+    assert result["is_grounded_correct"] is False
+    assert result["reason"] == "missing_citations"
+
+
+def test_invalid_citation_fields_fails_grounded_scoring():
+    """Citations missing required fields must fail grounded scoring."""
+    citations = [
+        {
+            # missing chunk_id
+            "document_filename": "SEC-Form-10Q.pdf",
+            "page_number": 1,
+            "text": "Some text",
+        }
+    ]
+
+    result = evaluate_grounded_answer(
+        answer="Apple's Commission File Number is 001-36743.",
+        citations=citations,
+        is_answer_text_correct=True,
+        contract_type="semantic",
+    )
+
+    assert result["is_grounded_correct"] is False
+    assert "invalid_citations" in result["reason"]
+
+
+def test_wrong_source_citation_fails_grounded_scoring():
+    """Citations citing the wrong source document must fail grounded scoring."""
+    citations = [
+        {
+            "chunk_id": "chunk_arxiv_01",
+            "document_filename": "2212.14776v3.pdf",  # Wrong source!
+            "page_number": 1,
+            "text": "Attention network interpretability research.",
+        }
+    ]
+
+    result = evaluate_grounded_answer(
+        answer="Apple's Commission File Number is 001-36743.",
+        citations=citations,
+        is_answer_text_correct=True,
+        contract_type="semantic",
+        expected_sources=["SEC-Form-10Q.pdf"],
+    )
+
+    assert result["is_grounded_correct"] is False
+    assert "not in expected sources" in result["reason"]
+
+
+def test_wrong_version_citation_fails_grounded_scoring():
+    """Citations with a version differing from expected version must fail grounded scoring."""
+    citations = [
+        {
+            "chunk_id": "chunk_sec_001",
+            "document_filename": "SEC-Form-10Q.pdf",
+            "document_version": 2,  # Expected 1!
+            "page_number": 1,
+            "text": "Commission File Number: 001-36743.",
+        }
+    ]
+
+    result = evaluate_grounded_answer(
+        answer="Apple's Commission File Number is 001-36743.",
+        citations=citations,
+        is_answer_text_correct=True,
+        contract_type="semantic",
+        expected_sources=["SEC-Form-10Q.pdf"],
+        expected_source_version=1,
+    )
+
+    assert result["is_grounded_correct"] is False
+    assert "does not match expected version" in result["reason"]
+
+
+def test_altered_retained_evidence_fails_grounded_scoring():
+    """Citations that alter document_filename compared to retained evidence must fail."""
+    retained_item = _make_retained_evidence_item(
+        evidence_id="chunk_sec_001",
+        document_filename="SEC-Form-10Q.pdf",
+    )
+    citations = [
+        {
+            "chunk_id": "chunk_sec_001",
+            "document_filename": "Forged-Document.pdf",  # Altered!
+            "page_number": 1,
+            "text": "Commission File Number: 001-36743.",
+        }
+    ]
+
+    result = evaluate_grounded_answer(
+        answer="Apple's Commission File Number is 001-36743.",
+        citations=citations,
+        is_answer_text_correct=True,
+        contract_type="semantic",
+        retained_evidence_items=[retained_item],
+    )
+
+    assert result["is_grounded_correct"] is False
+    assert "altered from retained evidence" in result["reason"]
+
+
+def test_matching_citation_id_alone_low_faithfulness_fails():
+    """Matching citation ID alone must not establish claim support when context does not support answer."""
+    retained_item = _make_retained_evidence_item(
+        evidence_id="chunk_sec_001",
+        text="The Commission regulates corporate financial disclosure filings under the Securities Act.",
+    )
+    citations = [
+        {
+            "chunk_id": "chunk_sec_001",  # Matches ground truth ID!
+            "document_filename": "SEC-Form-10Q.pdf",
+            "page_number": 1,
+            # Snippet has no mention of Steve Jobs or Los Altos
+            "text": "The Commission regulates corporate financial disclosure filings under the Securities Act.",
+        }
+    ]
+
+    result = evaluate_grounded_answer(
+        answer="Apple was founded in 1976 by Steve Jobs in a garage in Los Altos California.",
+        citations=citations,
+        is_answer_text_correct=True,
+        contract_type="semantic",
+        expected_sources=["SEC-Form-10Q.pdf"],
+        retained_evidence_items=[retained_item],
+        ground_truth_chunk_ids={"chunk_sec_001"},
+    )
+
+    assert result["is_grounded_correct"] is False
+    assert "low citation faithfulness" in result["reason"] or "claim_unsupported" in result["reason"]
+
+
+def test_matching_citation_id_alone_unsupported_numeric_claim_fails():
+    """Matching citation ID alone must not establish claim support when answer invents numbers not in context."""
+    retained_item = _make_retained_evidence_item(
+        evidence_id="chunk_sec_001",
+        text="Apple Inc. reports quarterly revenue and expenses in accordance with GAAP.",
+    )
+    citations = [
+        {
+            "chunk_id": "chunk_sec_001",
+            "document_filename": "SEC-Form-10Q.pdf",
+            "page_number": 1,
+            "text": "Apple Inc. reports quarterly revenue and expenses in accordance with GAAP.",
+        }
+    ]
+
+    # The answer shares text terms with the snippet so faithfulness passes, but claims 999,888 which is NOT in the cited snippet
+    result = evaluate_grounded_answer(
+        answer="Apple Inc. reports quarterly revenue of 999888.",
+        citations=citations,
+        is_answer_text_correct=True,
+        contract_type="semantic",
+        expected_sources=["SEC-Form-10Q.pdf"],
+        retained_evidence_items=[retained_item],
+        ground_truth_chunk_ids={"chunk_sec_001"},
+    )
+
+    assert result["is_grounded_correct"] is False
+    assert "numeric claims" in result["reason"]
+
+
+def test_refusal_with_fabricated_citations_fails():
+    """Refusal contract where model answered refusal, but cited fabricated citations fails."""
+    citations = [
+        {
+            "chunk_id": "chunk_invented_01",
+            "document_filename": "survay.csv",
+            "page_number": 1,
+            "text": "Fabricated evidence snippet.",
+        }
+    ]
+
+    result = evaluate_grounded_answer(
+        answer="I couldn't find any relevant passages in the workspace documents matching your query.",
+        citations=citations,
+        is_answer_text_correct=True,
+        contract_type="refusal",
+        contract={"contract_type": "refusal", "is_refusal_required": True},
+        ans_is_refusal=True,
+    )
+
+    assert result["is_grounded_correct"] is False
+    assert result["reason"] == "refusal_contract_with_fabricated_citations"
+
+
+def test_structured_aggregate_claiming_selection_count_fails():
+    """Structured aggregate claiming selection_count instead of result_value fails grounded scoring."""
+    hash_val = "1234567890abcdef"
+    ev = SimpleNamespace(
+        evidence_id="ev_agg_1",
+        workspace_id="ws_01",
+        document_version="1",
+        structured_payload={
+            "selection_hash": hash_val,
+            "table_id": "survay",
+            "operator": "sum",
+            "target_column": "Total_Value",
+            "selection_count": 14,
+            "result_value": "500000",
+        },
+        locator={"selection_hash": hash_val, "table_id": "survay", "selection_count": 14},
+    )
+    citations = [
+        {
+            "evidence_type": "structured_aggregate",
+            "table_id": "survay",
+            "document_version": "1",
+            "operator": "sum",
+            "target_column": "Total_Value",
+            "selection_count": 14,
+            "selection_hash": hash_val,
+            "result_value": "500000",
+        }
+    ]
+
+    # Model incorrectly claims 14 (the selection count) as the sum
+    result = evaluate_grounded_answer(
+        answer="The total sum of Total_Value is 14.",
+        citations=citations,
+        is_answer_text_correct=True,
+        contract_type="numeric",
+        contract={"contract_type": "numeric", "target_values": [500000]},
+        question_type="structured_aggregate",
+        retained_evidence_items=[ev],
+        retained_structured_hashes={hash_val},
+    )
+
+    assert result["is_grounded_correct"] is False
+    assert "does not assert computed result" in result["reason"] or "amounts" in result["reason"]
+
+
+def test_infrastructure_error_fails():
+    """Infrastructure failure must immediately fail grounded scoring."""
+    result = evaluate_grounded_answer(
+        answer="Database timeout",
+        citations=[],
+        is_answer_text_correct=False,
+        is_infra_error=True,
+    )
+
+    assert result["is_grounded_correct"] is False
+    assert result["reason"] == "infrastructure_error"
+
+
+def test_incorrect_answer_text_fails():
+    """If answer text is incorrect, grounded scoring must fail even with valid citations."""
+    retained_item = _make_retained_evidence_item()
+    citations = [
+        {
+            "chunk_id": "chunk_sec_001",
+            "document_filename": "SEC-Form-10Q.pdf",
+            "page_number": 1,
+            "text": "Commission File Number: 001-36743.",
+        }
+    ]
+
+    result = evaluate_grounded_answer(
+        answer="Apple's Commission File Number is 999-99999.",
+        citations=citations,
+        is_answer_text_correct=False,  # Text score failed
+        contract_type="semantic",
+        retained_evidence_items=[retained_item],
+    )
+
+    assert result["is_grounded_correct"] is False
+    assert result["reason"] == "answer_text_incorrect"
+
+
+# ===========================================================================
+# Defect Control: Contradictory Answer Grading Defect Kept Explicitly Open
+# ===========================================================================
+
+def test_contradictory_answer_defect_remains_open_in_text_scoring():
+    """Proves the known contradictory-answer grading defect remains explicitly open in text scoring.
+
+    For question Q136: 'What is Apple's Commission File Number?'
+    Gold answer: '001-36743'
+    Contradictory answer: 'According to the SEC filing, Apple's Commission File Number is definitely NOT 001-36743.'
+
+    The legacy text scorer evaluates token recall and relevancy without negation awareness,
+    grading this contradictory answer as is_correct = True.
+    This test verifies that this defect is preserved unchanged in text scoring.
+    """
+    gold_answer = "001-36743"
+    contradictory_answer = "According to the SEC filing, Apple's Commission File Number is definitely NOT 001-36743."
+
+    c_match = content_match(contradictory_answer, gold_answer)
+    relevancy = compute_answer_relevancy(contradictory_answer, gold_answer)
+    is_text_correct = c_match and relevancy >= 0.40
+
+    # Defect must be explicitly open: text scorer marks contradictory answer as correct
+    assert is_text_correct is True, (
+        "Expected contradictory answer to score True in legacy text scoring due to token overlap defect."
+    )

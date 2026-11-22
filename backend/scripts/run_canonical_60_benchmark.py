@@ -51,6 +51,7 @@ from services.evaluation.benchmark_scorer import (
     grade_structured_json,
     grade_structured_premise,
     validate_citations,
+    evaluate_grounded_answer,
     content_match,
     compute_answer_relevancy,
     compute_faithfulness,
@@ -537,12 +538,33 @@ def run_benchmark(
                     c_match = content_match(ans_text, expected_ans)
                     is_correct = c_match and relevancy >= 0.40
 
-            # Check citations validity against compressed context and ground truth
-            cit_val = validate_citations(
-                top_citations,
+            # Expected source docs and version from question or ground truth
+            expected_sources = q.get("expected_source_docs") or [
+                e.get("source_filename") for e in gt_entry.get("relevant_evidence", []) if e.get("source_filename")
+            ]
+            expected_version = gt_entry.get("expected_source_version")
+            retained_ev_items = resp.get("retained_evidence_items")
+
+            # Evaluate grounded correctness requiring text correctness plus validated evidence
+            grounded_eval = evaluate_grounded_answer(
+                answer=ans_text,
+                citations=top_citations,
+                is_answer_text_correct=is_correct,
+                contract_type=contract_type,
+                contract=contract,
+                expected_sources=expected_sources,
+                expected_source_version=expected_version,
+                retained_evidence_items=retained_ev_items,
                 context_chunk_ids=compressed_ids if compressed_ids else None,
                 ground_truth_chunk_ids=rel_ids if rel_ids else None,
+                is_infra_error=is_infra_error,
+                ans_is_refusal=ans_is_refusal,
+                question_type=question_type,
+                outcome=resp,
             )
+            is_grounded_correct = grounded_eval["is_grounded_correct"]
+            grounded_reason = grounded_eval["reason"]
+            cit_val = grounded_eval["citation_validation"]
 
             executed_path = resp.get("executed_path", "full")
             gen_calls = resp.get("generation_calls", 0)
@@ -556,6 +578,10 @@ def run_benchmark(
                 "expected_answer": expected_ans,
                 "answer": ans_text,
                 "is_correct": is_correct,
+                "answer_text_correct": is_correct,
+                "is_grounded_correct": is_grounded_correct,
+                "grounded_correct": is_grounded_correct,
+                "grounded_evaluation_reason": grounded_reason,
                 "is_refusal": is_refusal,
                 "executed_path": executed_path,
                 "planned_path": resp.get("planned_path", "full"),
@@ -576,12 +602,13 @@ def run_benchmark(
             query_results.append(res_entry)
 
             logger.info(
-                "[%02d/%02d] %s (%s): %s | Path=%s | Reranker=%s | Latency=%.1fms",
+                "[%02d/%02d] %s (%s): %s (grounded=%s) | Path=%s | Reranker=%s | Latency=%.1fms",
                 idx,
                 total_q,
                 qid,
                 category,
                 "PASS" if is_correct else "FAIL",
+                "PASS" if is_grounded_correct else "FAIL",
                 executed_path,
                 resp.get("reranker_mode", "remote_success"),
                 query_latency_ms,
@@ -590,6 +617,8 @@ def run_benchmark(
         # Compute aggregate metrics with strict denominator handling
         pos_count = len(all_recalls)
         overall_acc = round(sum(1 for r in query_results if r["is_correct"]) / total_q, 4)
+        answer_text_acc = overall_acc
+        grounded_acc = round(sum(1 for r in query_results if r["is_grounded_correct"]) / total_q, 4)
         refusal_acc = round(refusal_correct / max(1, refusal_total), 4) if refusal_total > 0 else 1.0
         avg_recall_5 = round(sum(all_recalls) / pos_count, 4) if pos_count > 0 else 0.0
         avg_precision_3 = round(sum(all_precisions) / pos_count, 4) if pos_count > 0 else 0.0
@@ -638,6 +667,8 @@ def run_benchmark(
             },
             "metrics": {
                 "overall_accuracy": overall_acc,
+                "answer_text_accuracy": answer_text_acc,
+                "grounded_accuracy": grounded_acc,
                 "refusal_accuracy": refusal_acc,
                 "grounded_recall_at_5": avg_recall_5,
                 "precision_at_3": avg_precision_3,
@@ -691,7 +722,9 @@ def run_benchmark(
 
     | Metric | Measured | Target | Status |
     | :--- | :--- | :--- | :--- |
-    | **Overall Accuracy** | {overall_acc * 100:.1f}% | > 80.0% | {'PASS' if overall_acc >= 0.80 else 'FAIL'} |
+    | **Answer Text Accuracy** | {answer_text_acc * 100:.1f}% | > 80.0% | {'PASS' if answer_text_acc >= 0.80 else 'FAIL'} |
+    | **Grounded Accuracy** | {grounded_acc * 100:.1f}% | > 80.0% | {'PASS' if grounded_acc >= 0.80 else 'FAIL'} |
+    | **Overall Accuracy (Legacy)** | {overall_acc * 100:.1f}% | > 80.0% | {'PASS' if overall_acc >= 0.80 else 'FAIL'} |
     | **Refusal Accuracy** | {refusal_acc * 100:.1f}% | > 85.0% | {'PASS' if refusal_acc >= 0.85 else 'FAIL'} |
     | **Grounded Recall@5** | {avg_recall_5 * 100:.1f}% | > 85.0% | {'PASS' if avg_recall_5 >= 0.85 else 'FAIL'} |
     | **Precision@3** | {avg_precision_3 * 100:.1f}% | > 60.0% | {'PASS' if avg_precision_3 >= 0.60 else 'FAIL'} |
