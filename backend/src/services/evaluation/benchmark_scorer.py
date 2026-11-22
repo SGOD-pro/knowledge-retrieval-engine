@@ -971,9 +971,50 @@ def validate_citations(
                     if expected_ws and c.get("workspace_id") and c.get("workspace_id") != expected_ws:
                         errors.append(f"Citation {idx}: workspace_id '{c.get('workspace_id')}' altered from retained evidence '{expected_ws}'")
                         continue
-                    if expected_res is not None and c.get("result_value") is not None and str(c.get("result_value")) != str(expected_res):
-                        errors.append(f"Citation {idx}: result_value '{c.get('result_value')}' altered from retained evidence '{expected_res}'")
-                        continue
+                    expected_sec = sp.get("secondary_value")
+
+                    # Result value validation
+                    if expected_res is not None:
+                        if c.get("result_value") is not None and str(c.get("result_value")) != str(expected_res):
+                            errors.append(f"Citation {idx}: result_value '{c.get('result_value')}' altered from retained evidence '{expected_res}'")
+                            continue
+                    else:
+                        if c.get("result_value") is not None:
+                            errors.append(f"Citation {idx}: result_value '{c.get('result_value')}' fabricated (not in retained evidence)")
+                            continue
+
+                    # Secondary value validation
+                    if expected_sec is not None:
+                        if c.get("secondary_value") is not None and str(c.get("secondary_value")) != str(expected_sec):
+                            errors.append(f"Citation {idx}: secondary_value '{c.get('secondary_value')}' altered from retained evidence '{expected_sec}'")
+                            continue
+                    else:
+                        if c.get("secondary_value") is not None:
+                            errors.append(f"Citation {idx}: secondary_value '{c.get('secondary_value')}' fabricated (not in retained evidence)")
+                            continue
+
+                    # Nested structured_payload validation
+                    c_sp = c.get("structured_payload")
+                    if isinstance(c_sp, dict):
+                        c_sp_res = c_sp.get("result_value")
+                        if expected_res is not None:
+                            if c_sp_res is not None and str(c_sp_res) != str(expected_res):
+                                errors.append(f"Citation {idx}: nested structured_payload result_value '{c_sp_res}' altered from retained evidence '{expected_res}'")
+                                continue
+                        else:
+                            if c_sp_res is not None:
+                                errors.append(f"Citation {idx}: nested structured_payload result_value '{c_sp_res}' fabricated (not in retained evidence)")
+                                continue
+
+                        c_sp_sec = c_sp.get("secondary_value")
+                        if expected_sec is not None:
+                            if c_sp_sec is not None and str(c_sp_sec) != str(expected_sec):
+                                errors.append(f"Citation {idx}: nested structured_payload secondary_value '{c_sp_sec}' altered from retained evidence '{expected_sec}'")
+                                continue
+                        else:
+                            if c_sp_sec is not None:
+                                errors.append(f"Citation {idx}: nested structured_payload secondary_value '{c_sp_sec}' fabricated (not in retained evidence)")
+                                continue
 
                     # Predicates validation
                     cp = getattr(matching_ev, "citation_payload", {}) or {}
@@ -1278,31 +1319,35 @@ def evaluate_grounded_answer(
             if tr is not None and str(tr).strip() != "":
                 metadata_counts.update(extract_numbers_normalized(str(tr)))
 
-        if isinstance(outcome, dict):
-            _inspect_d(outcome)
-            for k in ("structured_payload", "structured_execution_result", "execution_result"):
-                sp = outcome.get(k)
-                if isinstance(sp, dict):
-                    _inspect_d(sp)
-                elif sp is not None and hasattr(sp, "__dict__"):
-                    _inspect_d(vars(sp))
-
+        # Obtain structured results strictly from matching authoritative retained executions.
+        # Citation result_value, secondary_value, and nested payloads must NOT introduce additional accepted results.
+        matching_structured_items = []
         for c in citations:
-            _inspect_d(c)
-            sp = c.get("structured_payload")
+            sel_hash = str(c.get("selection_hash", ""))
+            for ev in retained_evidence_items:
+                sp = getattr(ev, "structured_payload", {}) or (ev.get("structured_payload") if isinstance(ev, dict) else {}) or {}
+                loc = getattr(ev, "locator", {}) or (ev.get("locator") if isinstance(ev, dict) else {}) or {}
+                h = sp.get("selection_hash") or loc.get("selection_hash")
+                if sel_hash and str(h) == sel_hash:
+                    matching_structured_items.append(ev)
+                    break
+                elif not sel_hash and _ev_matches_citation(ev, c):
+                    matching_structured_items.append(ev)
+                    break
+
+        if not matching_structured_items:
+            for ev in retained_evidence_items:
+                sp = getattr(ev, "structured_payload", {}) or (ev.get("structured_payload") if isinstance(ev, dict) else {}) or {}
+                if sp:
+                    matching_structured_items.append(ev)
+
+        for ev in matching_structured_items:
+            sp = getattr(ev, "structured_payload", {}) or (ev.get("structured_payload") if isinstance(ev, dict) else {}) or {}
             if isinstance(sp, dict):
                 _inspect_d(sp)
-            elif sp is not None and hasattr(sp, "__dict__"):
-                _inspect_d(vars(sp))
-
-        if retained_evidence_items:
-            for ev in retained_evidence_items:
-                sp = getattr(ev, "structured_payload", {}) or {}
-                if isinstance(sp, dict):
-                    _inspect_d(sp)
-                loc = getattr(ev, "locator", {}) or {}
-                if isinstance(loc, dict):
-                    _inspect_d(loc)
+            loc = getattr(ev, "locator", {}) or (ev.get("locator") if isinstance(ev, dict) else {}) or {}
+            if isinstance(loc, dict):
+                _inspect_d(loc)
 
         is_count_op = (
             "count" in operators
@@ -1395,24 +1440,23 @@ def evaluate_grounded_answer(
     ans_nums = extract_numbers_normalized(str(answer))
     context_nums = extract_numbers_normalized(joined_context)
     contract_targets = set()
-    contract_operands = set()
+    raw_operands = contract.get("operands", []) if contract and contract_type == "numeric" else []
     if contract and contract_type == "numeric":
         for tv in contract.get("target_values", []):
             contract_targets.update(extract_numbers_normalized(str(tv)))
-        for op_val in contract.get("operands", []):
-            contract_operands.update(extract_numbers_normalized(str(op_val)))
 
-    # A derived calculation is legitimate if operands are present in the authoritative context
-    # (or if no explicit operands list is in contract, contract_targets can satisfy calculated answers
-    # if the context contains supporting numbers).
+    # A derived calculation is legitimate only when all necessary operands are present in the authoritative context.
+    # Arbitrary context numbers must not unlock contract targets.
     valid_derived_targets = set()
-    if contract_targets:
-        if contract_operands:
-            if contract_operands & context_nums:
-                valid_derived_targets.update(contract_targets)
-        else:
-            if context_nums:
-                valid_derived_targets.update(contract_targets)
+    if contract_targets and raw_operands:
+        all_operands_present = True
+        for op_item in raw_operands:
+            op_nums = extract_numbers_normalized(str(op_item))
+            if not (op_nums & context_nums):
+                all_operands_present = False
+                break
+        if all_operands_present:
+            valid_derived_targets.update(contract_targets)
 
     ans_years = {n for n in ans_nums if len(n) == 4 and n.isdigit() and 1900 <= int(n) <= 2099}
     ans_amounts = ans_nums - ans_years

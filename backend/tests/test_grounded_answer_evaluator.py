@@ -807,3 +807,150 @@ def test_unsupported_derived_calculation_operands_missing_fails():
 
     assert result["is_grounded_correct"] is False
     assert "numeric claims" in result["reason"] or "claim_unsupported" in result["reason"]
+
+
+def test_derived_calculation_partial_operands_retained_fails():
+    """Regression: When only one of two required operands is retained, derived result must fail.
+
+    Contract requires operands [94930, 81797] to derive 13133.
+    Retained context contains only 94930 (81797 is missing).
+    The derived result 13133 must not be accepted.
+    """
+    retained_item = _make_retained_evidence_item(
+        evidence_id="chunk_sec_sales_partial",
+        text="Total net sales were 94930 million in 2026.",
+    )
+    citations = [
+        {
+            "chunk_id": "chunk_sec_sales_partial",
+            "document_filename": "SEC-Form-10Q.pdf",
+            "document_version": 1,
+            "document_id": "doc_sec_01",
+            "page_number": 2,
+            "text": "Total net sales were 94930 million in 2026.",
+        }
+    ]
+
+    result = evaluate_grounded_answer(
+        answer="Net sales increased by 13133 million year over year.",
+        citations=citations,
+        is_answer_text_correct=True,
+        contract_type="numeric",
+        contract={
+            "contract_type": "numeric",
+            "target_values": [13133],
+            "operands": [94930, 81797],  # 81797 is missing from context!
+        },
+        expected_sources=["SEC-Form-10Q.pdf"],
+        expected_source_version=1,
+        retained_evidence_items=[retained_item],
+        ground_truth_chunk_ids={"chunk_sec_sales_partial"},
+    )
+
+    assert result["is_grounded_correct"] is False
+    assert "numeric claims" in result["reason"] or "claim_unsupported" in result["reason"]
+
+
+def test_arbitrary_context_numbers_do_not_unlock_contract_targets():
+    """Arbitrary numbers in context must not unlock contract target values when operands are absent.
+
+    When contract has no operands specified, arbitrary numbers like 50 or 1200
+    must not unlock target 13133.
+    """
+    retained_item = _make_retained_evidence_item(
+        evidence_id="chunk_sec_misc",
+        text="In 2026, the company operated in 50 countries with 1200 partners.",
+    )
+    citations = [
+        {
+            "chunk_id": "chunk_sec_misc",
+            "document_filename": "SEC-Form-10Q.pdf",
+            "document_version": 1,
+            "document_id": "doc_sec_01",
+            "page_number": 2,
+            "text": "In 2026, the company operated in 50 countries with 1200 partners.",
+        }
+    ]
+
+    result = evaluate_grounded_answer(
+        answer="Net sales increased by 13133 million year over year.",
+        citations=citations,
+        is_answer_text_correct=True,
+        contract_type="numeric",
+        contract={
+            "contract_type": "numeric",
+            "target_values": [13133],
+            "operands": [],  # No operands!
+        },
+        expected_sources=["SEC-Form-10Q.pdf"],
+        expected_source_version=1,
+        retained_evidence_items=[retained_item],
+        ground_truth_chunk_ids={"chunk_sec_misc"},
+    )
+
+    assert result["is_grounded_correct"] is False
+    assert "numeric claims" in result["reason"] or "claim_unsupported" in result["reason"]
+
+
+def test_retained_sum_100_fabricated_secondary_value_999_control():
+    """Control: Retained execution has SUM=100. Citation fabricates secondary_value=999.
+
+    Citation result_value, secondary_value, and nested payloads must not introduce
+    additional accepted results. The answer claiming 999 must fail grounded scoring.
+    """
+    hash_val = "1234567890abcdef"
+    ev = SimpleNamespace(
+        evidence_id="ev_agg_1",
+        workspace_id="ws_01",
+        document_version="1",
+        structured_payload={
+            "selection_hash": hash_val,
+            "table_id": "survay",
+            "operator": "sum",
+            "target_column": "Total_Value",
+            "selection_count": 5,
+            "result_value": "100",  # Retained execution has 100
+            "secondary_value": None,
+        },
+        locator={"selection_hash": hash_val, "table_id": "survay", "selection_count": 5},
+    )
+    # Citation fabricates secondary_value = 999
+    fabricated_citation = {
+        "evidence_type": "structured_aggregate",
+        "table_id": "survay",
+        "document_version": "1",
+        "operator": "sum",
+        "target_column": "Total_Value",
+        "selection_count": 5,
+        "selection_hash": hash_val,
+        "result_value": "100",
+        "secondary_value": "999",
+    }
+
+    # Direct citation validation must flag fabricated secondary_value
+    cit_res = validate_citations(
+        [fabricated_citation],
+        retained_evidence_items=[ev],
+        retained_structured_hashes={hash_val},
+    )
+    assert cit_res["valid"] is False
+    assert any("secondary_value '999' fabricated" in e for e in cit_res["errors"])
+
+    # Grounded answer evaluation with answer asserting the fabricated 999 must fail
+    result = evaluate_grounded_answer(
+        answer="The sum is 999.",
+        citations=[fabricated_citation],
+        is_answer_text_correct=True,
+        contract_type="numeric",
+        contract={"contract_type": "numeric", "target_values": [100]},
+        question_type="structured_aggregate",
+        retained_evidence_items=[ev],
+        retained_structured_hashes={hash_val},
+    )
+
+    assert result["is_grounded_correct"] is False
+    assert (
+        "secondary_value '999' fabricated" in result["reason"]
+        or "does not assert computed result" in result["reason"]
+        or "amounts" in result["reason"]
+    )
