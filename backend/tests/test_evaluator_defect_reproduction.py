@@ -191,3 +191,125 @@ def test_defect_9_locator_resolution_validates_hash_and_all_required_locators():
     )
     assert "Q_MULTI" in unscorable2, "Query with unresolved required locator was not marked unscorable"
     assert len(resolved2.get("Q_MULTI", set())) == 0, "Partial resolution returned chunks when not all locators resolved"
+
+
+# ---------------------------------------------------------------------------
+# Defect 10: Q149 exact row matching for tabular/spreadsheet locators
+# ---------------------------------------------------------------------------
+def test_defect_10_q149_exact_row_matching():
+    """Q149 spreadsheet_row locator '4' must resolve row 4 and reject substring matches 40 and 400."""
+    q149_entry = {
+        "Q149": {
+            "relevant_evidence": [
+                {
+                    "document_sha256": "hash_nfhs",
+                    "source_filename": "NFHS_5_India_Districts_Factsheet_Data.xls",
+                    "locator_type": "spreadsheet_row",
+                    "locator": "4",
+                }
+            ]
+        }
+    }
+    doc_id_map = {"NFHS_5_India_Districts_Factsheet_Data.xls": "doc_nfhs"}
+    file_hashes = {"NFHS_5_India_Districts_Factsheet_Data.xls": "hash_nfhs"}
+
+    # Fixture 1: chunks with explicit metadata for rows 4, 40, and 400
+    chunk_row_4 = Chunk(
+        id="c_row_4",
+        document_id="doc_nfhs",
+        source_format="xls",
+        element_type="table",
+        text="Row 4 data",
+        metadata={"row": 4, "sheet": "Sheet1"},
+        location_reference="Sheet: Sheet1, Row: 4",
+    )
+    chunk_row_40 = Chunk(
+        id="c_row_40",
+        document_id="doc_nfhs",
+        source_format="xls",
+        element_type="table",
+        text="Row 40 data",
+        metadata={"row": 40, "sheet": "Sheet1"},
+        location_reference="Sheet: Sheet1, Row: 40",
+    )
+    chunk_row_400 = Chunk(
+        id="c_row_400",
+        document_id="doc_nfhs",
+        source_format="xls",
+        element_type="table",
+        text="Row 400 data",
+        metadata={"row": 400, "sheet": "Sheet1"},
+        location_reference="Sheet: Sheet1, Row: 400",
+    )
+
+    resolved, unscorable = resolve_ground_truth_chunk_ids(
+        q149_entry,
+        [chunk_row_4, chunk_row_40, chunk_row_400],
+        doc_id_map,
+        doc_hashes=file_hashes,
+    )
+    assert "Q149" not in unscorable
+    assert resolved["Q149"] == {"c_row_4"}
+    assert "c_row_40" not in resolved["Q149"]
+    assert "c_row_400" not in resolved["Q149"]
+
+    # Fixture 2: containing ONLY rows 40 and 400 must report Q149 as unscorable
+    resolved_only_40_400, unscorable_only_40_400 = resolve_ground_truth_chunk_ids(
+        q149_entry,
+        [chunk_row_40, chunk_row_400],
+        doc_id_map,
+        doc_hashes=file_hashes,
+    )
+    assert "Q149" in unscorable_only_40_400
+    assert len(resolved_only_40_400.get("Q149", set())) == 0
+
+    # Fixture 3: chunks without explicit metadata (testing location_reference exact row extraction)
+    chunk_loc_4 = Chunk(
+        id="c_loc_4",
+        document_id="doc_nfhs",
+        source_format="xls",
+        element_type="table",
+        text="Row 4 data without meta",
+        metadata=None,
+        location_reference="Sheet: Sheet1, Row: 4",
+    )
+    chunk_loc_40 = Chunk(
+        id="c_loc_40",
+        document_id="doc_nfhs",
+        source_format="xls",
+        element_type="table",
+        text="Row 40 data without meta",
+        metadata=None,
+        location_reference="Sheet: Sheet1, Row: 40",
+    )
+    chunk_loc_400 = Chunk(
+        id="c_loc_400",
+        document_id="doc_nfhs",
+        source_format="xls",
+        element_type="table",
+        text="Row 400 data without meta",
+        metadata=None,
+        location_reference="Sheet: Sheet1, Row: 400",
+    )
+
+    resolved_loc, unscorable_loc = resolve_ground_truth_chunk_ids(
+        q149_entry,
+        [chunk_loc_4, chunk_loc_40, chunk_loc_400],
+        doc_id_map,
+        doc_hashes=file_hashes,
+    )
+    assert "Q149" not in unscorable_loc
+    assert resolved_loc["Q149"] == {"c_loc_4"}
+    assert "c_loc_40" not in resolved_loc["Q149"]
+    assert "c_loc_400" not in resolved_loc["Q149"]
+
+    # Fixture 4: without explicit metadata, containing ONLY rows 40 and 400 -> unscorable
+    resolved_loc_unscorable, unscorable_loc_unscorable = resolve_ground_truth_chunk_ids(
+        q149_entry,
+        [chunk_loc_40, chunk_loc_400],
+        doc_id_map,
+        doc_hashes=file_hashes,
+    )
+    assert "Q149" in unscorable_loc_unscorable
+    assert len(resolved_loc_unscorable.get("Q149", set())) == 0
+

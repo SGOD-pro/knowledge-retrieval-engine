@@ -148,6 +148,7 @@ def compute_corpus_manifest_hash(documents_meta: list[dict]) -> tuple[str, dict[
 
 
 GROUND_TRUTH_FILE = BACKEND_DIR / "evaluation_assets" / "canonical_60_ground_truth.json"
+_ROW_LOC_PATTERN = re.compile(r"(?i)\bRow\s*:?\s*(\d+)\b")
 
 
 def resolve_ground_truth_chunk_ids(
@@ -220,16 +221,40 @@ def resolve_ground_truth_chunk_ids(
                         pass
                 elif loc_type in ("csv_row", "spreadsheet_row"):
                     try:
-                        meta_row = (c.metadata or {}).get("row")
-                        if meta_row is not None and meta_row == int(loc_val):
-                            locator_matched.add(str(c.id))
-                        elif c.location_reference and (
-                            f"Row: {loc_val}" in c.location_reference
-                            or f"Row {loc_val}" in c.location_reference
-                        ):
-                            locator_matched.add(str(c.id))
+                        target_row = int(loc_val)
                     except (ValueError, TypeError):
                         pass
+                    else:
+                        meta = getattr(c, "metadata", None)
+                        if isinstance(meta, str):
+                            try:
+                                meta = json.loads(meta)
+                            except Exception:
+                                meta = None
+
+                        matched = False
+                        if isinstance(meta, dict):
+                            for k in ("row", "row_number", "row_idx", "row_id"):
+                                val = meta.get(k)
+                                if val is not None:
+                                    try:
+                                        if int(val) == target_row:
+                                            locator_matched.add(str(c.id))
+                                        matched = True
+                                        break
+                                    except (ValueError, TypeError):
+                                        pass
+
+                        if not matched:
+                            loc_ref = getattr(c, "location_reference", None)
+                            if loc_ref:
+                                for m in _ROW_LOC_PATTERN.findall(loc_ref):
+                                    try:
+                                        if int(m) == target_row:
+                                            locator_matched.add(str(c.id))
+                                            break
+                                    except (ValueError, TypeError):
+                                        pass
 
             if not locator_matched:
                 any_locator_unresolved = True
