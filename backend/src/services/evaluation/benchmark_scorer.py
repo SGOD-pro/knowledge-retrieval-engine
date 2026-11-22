@@ -1156,6 +1156,130 @@ def validate_citations(
     }
 
 
+_NEGATION_WORDS = {
+    "not", "never", "no", "neither", "nor", "none",
+    "cannot", "cant", "can't", "wont", "won't",
+    "incorrect", "wrong", "false", "untrue", "inaccurate",
+    "denies", "denied", "denying", "rejects", "rejected", "rejecting",
+    "refutes", "refuted", "refuting", "disputes", "disputed", "disputing",
+}
+
+_CONTRAST_PATTERN = re.compile(
+    r"\b(?:but|however|instead\s+of|instead|rather\s+than|rather|although|whereas|while|yet)\b",
+    re.IGNORECASE,
+)
+_CLAUSE_SPLIT_PATTERN = re.compile(r"(?:(?<!\d)\.|\.(?!\d)|[!?;:\n|]|(?<!\d),|,(?!\d))+")
+
+
+def _normalize_text_for_negation(text: str) -> str:
+    """Strip thousands separators so numbers like 157,000 remain atomic."""
+    return re.sub(r"(?<=\d),(?=\d)", "", text)
+
+
+def _split_into_clauses(text: str) -> list[str]:
+    """Split text into clauses by contrast conjunctions and non-numeric punctuation."""
+    text = _normalize_text_for_negation(text)
+    t = _CONTRAST_PATTERN.sub(" | ", text)
+    parts = _CLAUSE_SPLIT_PATTERN.split(t)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _tokenize(text: str) -> list[str]:
+    """Tokenize text into words, alphanumeric identifiers, and numbers."""
+    return re.findall(r"\b[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*(?:\.[0-9]+)?%?\b", text)
+
+
+def _target_in_token(target: str, token: str) -> bool:
+    """Check if target matches token by exact string or numeric equivalence."""
+    t_clean = target.lower().strip("$% ")
+    tok_clean = token.lower().strip("$% ")
+    if t_clean == tok_clean:
+        return True
+    try:
+        if float(t_clean) == float(tok_clean):
+            return True
+    except ValueError:
+        pass
+    return False
+
+
+def _is_target_negated_in_clause(target: str, clause: str) -> bool:
+    """Check if a specific target is in the scope of negation within a clause."""
+    tokens = _tokenize(clause)
+    target_indices = [i for i, tok in enumerate(tokens) if _target_in_token(target, tok)]
+    if not target_indices:
+        return False
+
+    for idx in target_indices:
+        preceding = [tokens[j].lower() for j in range(max(0, idx - 6), idx)]
+        for tok in preceding:
+            if tok in _NEGATION_WORDS:
+                return True
+        following = [tokens[j].lower() for j in range(idx + 1, min(len(tokens), idx + 5))]
+        for tok in following:
+            if tok in _NEGATION_WORDS:
+                return True
+    return False
+
+
+def _is_entity_negated_in_text(target: str, text: str) -> bool:
+    """Check if target is negated in any clause of text."""
+    clauses = _split_into_clauses(text)
+    for c in clauses:
+        if _is_target_negated_in_clause(target, c):
+            return True
+    return False
+
+
+def detect_contradiction_against_evidence(
+    answer: str,
+    context: str = "",
+    computed_results: set[str] | None = None,
+    contract: dict[str, Any] | None = None,
+) -> str | None:
+    """Detects claim-level contradiction between answer and authoritative evidence.
+
+    Returns an error reason if a contradiction is detected, or None if sound.
+    """
+    if not answer:
+        return None
+
+    candidates = set()
+    if computed_results:
+        candidates.update(str(r).strip() for r in computed_results if str(r).strip())
+
+    if contract and contract.get("target_values"):
+        for tv in contract.get("target_values", []):
+            candidates.update(extract_numbers_normalized(str(tv)))
+
+    if context:
+        ids = re.findall(r"\b[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+\b", context)
+        candidates.update(ids)
+        c_nums = extract_numbers_normalized(context)
+        candidates.update(c_nums)
+
+    candidates = {c for c in candidates if c and len(c) > 0}
+
+    for cand in candidates:
+        ans_negated = _is_entity_negated_in_text(cand, answer)
+
+        if computed_results and cand in computed_results:
+            if ans_negated:
+                return f"claim_contradicts_evidence: answer negates computed result '{cand}'"
+            continue
+
+        if context:
+            ctx_negated = _is_entity_negated_in_text(cand, context)
+            if not ctx_negated and ans_negated:
+                return f"claim_contradicts_evidence: answer negates evidence-affirmed entity '{cand}'"
+            if ctx_negated and not ans_negated:
+                ans_tokens = _tokenize(answer)
+                if any(_target_in_token(cand, tok) for tok in ans_tokens):
+                    return f"claim_contradicts_evidence: answer affirms entity '{cand}' which evidence negates"
+
+    return None
+
+
 def evaluate_grounded_answer(
     answer: str,
     citations: list[dict[str, Any]],
@@ -1186,6 +1310,7 @@ def evaluate_grounded_answer(
       4. Answerable queries:
          - Missing citations fails grounded scoring.
          - Invalid citations (missing fields, wrong source, wrong version, altered retained fields) fails.
+         - Claim-level contradiction against authoritative evidence fails grounded scoring.
          - Matching citation IDs alone must not establish claim support:
            - For structured aggregate: answer must assert the operation-specific result_value
              (and not merely metadata like selection_count or total_rows).
@@ -1369,6 +1494,22 @@ def evaluate_grounded_answer(
                 "faithfulness": None,
             }
 
+        # Check claim-level contradiction against computed results
+        contra = detect_contradiction_against_evidence(
+            answer=str(answer),
+            context="",
+            computed_results=computed_results,
+            contract=contract,
+        )
+        if contra:
+            return {
+                "is_grounded_correct": False,
+                "grounded_correct": False,
+                "reason": contra,
+                "citation_validation": cit_val,
+                "faithfulness": None,
+            }
+
         ans_nums = extract_numbers_normalized(str(answer))
         ans_years = {n for n in ans_nums if len(n) == 4 and n.isdigit() and 1900 <= int(n) <= 2099}
         ans_amounts = ans_nums - ans_years
@@ -1436,6 +1577,21 @@ def evaluate_grounded_answer(
             "faithfulness": faith_score,
         }
 
+    # Check claim-level contradiction against authoritative retained context
+    contra = detect_contradiction_against_evidence(
+        answer=str(answer),
+        context=joined_context,
+        contract=contract,
+    )
+    if contra:
+        return {
+            "is_grounded_correct": False,
+            "grounded_correct": False,
+            "reason": contra,
+            "citation_validation": cit_val,
+            "faithfulness": faith_score,
+        }
+
     # Verify numeric claims against context snippets or legitimate derived calculation targets
     ans_nums = extract_numbers_normalized(str(answer))
     context_nums = extract_numbers_normalized(joined_context)
@@ -1461,8 +1617,12 @@ def evaluate_grounded_answer(
     ans_years = {n for n in ans_nums if len(n) == 4 and n.isdigit() and 1900 <= int(n) <= 2099}
     ans_amounts = ans_nums - ans_years
 
-    if ans_amounts:
-        unsupported = ans_amounts - context_nums - valid_derived_targets
+    # Filter out amounts that are explicitly negated in the answer (e.g. in legitimate premise refutations)
+    asserted_amounts = {n for n in ans_amounts if not _is_entity_negated_in_text(n, str(answer))}
+    asserted_years = {n for n in ans_years if not _is_entity_negated_in_text(n, str(answer))}
+
+    if asserted_amounts:
+        unsupported = asserted_amounts - context_nums - valid_derived_targets
         if unsupported:
             return {
                 "is_grounded_correct": False,
@@ -1471,12 +1631,12 @@ def evaluate_grounded_answer(
                 "citation_validation": cit_val,
                 "faithfulness": faith_score,
             }
-    if ans_years and context_nums:
-        if not (ans_years & (context_nums | valid_derived_targets)):
+    if asserted_years and context_nums:
+        if not (asserted_years & (context_nums | valid_derived_targets)):
             return {
                 "is_grounded_correct": False,
                 "grounded_correct": False,
-                "reason": f"claim_unsupported: year claims {ans_years} not supported by cited snippets",
+                "reason": f"claim_unsupported: year claims {asserted_years} not supported by cited snippets",
                 "citation_validation": cit_val,
                 "faithfulness": faith_score,
             }

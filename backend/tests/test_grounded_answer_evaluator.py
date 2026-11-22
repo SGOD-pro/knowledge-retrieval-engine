@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from services.evaluation.benchmark_scorer import (
     validate_citations,
     evaluate_grounded_answer,
+    detect_contradiction_against_evidence,
     content_match,
     compute_answer_relevancy,
     extract_numbers_normalized,
@@ -473,6 +474,273 @@ def test_contradictory_answer_defect_remains_open_in_text_scoring():
     assert is_text_correct is True, (
         "Expected contradictory answer to score True in legacy text scoring due to token overlap defect."
     )
+
+
+# ===========================================================================
+# Controls: Contradictory Claims Rejected in Grounded-Answer Scoring
+# ===========================================================================
+
+def test_control_1_supported_assertion_passes_grounded_scoring():
+    """Control 1: Supported assertion affirming evidence filing number passes grounded scoring.
+
+    Evidence asserts 001-36743. Answer asserts 001-36743 without contradiction.
+    """
+    retained_item = _make_retained_evidence_item(
+        evidence_id="chunk_sec_001",
+        text="Apple Inc. Commission File Number: 001-36743. Form 10-Q.",
+    )
+    citations = [
+        {
+            "chunk_id": "chunk_sec_001",
+            "document_filename": "SEC-Form-10Q.pdf",
+            "document_version": 1,
+            "document_id": "doc_sec_01",
+            "page_number": 1,
+            "text": "Commission File Number: 001-36743. Apple Inc. Quarterly Report.",
+        }
+    ]
+
+    result = evaluate_grounded_answer(
+        answer="Apple's Commission File Number is 001-36743.",
+        citations=citations,
+        is_answer_text_correct=True,
+        contract_type="semantic",
+        expected_sources=["SEC-Form-10Q.pdf"],
+        expected_source_version=1,
+        retained_evidence_items=[retained_item],
+        ground_truth_chunk_ids={"chunk_sec_001"},
+    )
+
+    assert result["is_grounded_correct"] is True
+    assert result["grounded_correct"] is True
+    assert result["reason"] == "grounded_and_verified"
+    assert result["citation_validation"]["valid"] is True
+
+
+def test_control_2_explicit_denial_reproduction_fails_grounded_scoring():
+    """Control 2: Explicit denial of evidence filing number fails grounded scoring.
+
+    Reproduces Q136: Retained evidence asserts filing number 001-36743 while
+    the answer explicitly denies that number ('definitely NOT 001-36743').
+    While legacy text scoring marks this correct due to token overlap,
+    grounded scoring must fail due to claim-level contradiction.
+    """
+    retained_item = _make_retained_evidence_item(
+        evidence_id="chunk_sec_001",
+        text="Apple Inc. Commission File Number: 001-36743. Form 10-Q.",
+    )
+    citations = [
+        {
+            "chunk_id": "chunk_sec_001",
+            "document_filename": "SEC-Form-10Q.pdf",
+            "document_version": 1,
+            "document_id": "doc_sec_01",
+            "page_number": 1,
+            "text": "Commission File Number: 001-36743. Apple Inc. Quarterly Report.",
+        }
+    ]
+    contradictory_answer = (
+        "According to the SEC filing, Apple's Commission File Number is definitely NOT 001-36743."
+    )
+
+    # Legacy text scoring marks it correct (preserved separately)
+    gold_answer = "001-36743"
+    c_match = content_match(contradictory_answer, gold_answer)
+    relevancy = compute_answer_relevancy(contradictory_answer, gold_answer)
+    is_text_correct = c_match and relevancy >= 0.40
+    assert is_text_correct is True
+
+    # Grounded scoring must fail
+    result = evaluate_grounded_answer(
+        answer=contradictory_answer,
+        citations=citations,
+        is_answer_text_correct=is_text_correct,
+        contract_type="semantic",
+        expected_sources=["SEC-Form-10Q.pdf"],
+        expected_source_version=1,
+        retained_evidence_items=[retained_item],
+        ground_truth_chunk_ids={"chunk_sec_001"},
+    )
+
+    assert result["is_grounded_correct"] is False
+    assert result["grounded_correct"] is False
+    assert "claim_contradicts_evidence" in result["reason"]
+    assert "001-36743" in result["reason"]
+
+
+def test_control_3_conflicting_assertions_fails_grounded_scoring():
+    """Control 3: Conflicting assertions denying evidence facts fail grounded scoring.
+
+    Case A: Answer contains conflicting clauses, affirming then denying the evidence fact:
+            'Apple's Commission File Number is 001-36743, but it is not 001-36743.'
+    Case B: Answer asserts a conflicting value while denying the evidence value:
+            'The Commission File Number is 001-99999, not 001-36743.'
+    Both cases must fail grounded scoring.
+    """
+    retained_item = _make_retained_evidence_item(
+        evidence_id="chunk_sec_001",
+        text="Apple Inc. Commission File Number: 001-36743. Form 10-Q.",
+    )
+    citations = [
+        {
+            "chunk_id": "chunk_sec_001",
+            "document_filename": "SEC-Form-10Q.pdf",
+            "document_version": 1,
+            "document_id": "doc_sec_01",
+            "page_number": 1,
+            "text": "Commission File Number: 001-36743. Apple Inc. Quarterly Report.",
+        }
+    ]
+
+    # Case A: affirms then denies
+    ans_a = "Apple's Commission File Number is 001-36743, but it is not 001-36743."
+    res_a = evaluate_grounded_answer(
+        answer=ans_a,
+        citations=citations,
+        is_answer_text_correct=True,
+        contract_type="semantic",
+        expected_sources=["SEC-Form-10Q.pdf"],
+        expected_source_version=1,
+        retained_evidence_items=[retained_item],
+        ground_truth_chunk_ids={"chunk_sec_001"},
+    )
+    assert res_a["is_grounded_correct"] is False
+    assert "claim_contradicts_evidence" in res_a["reason"]
+
+    # Case B: denies evidence value while asserting alternative
+    ans_b = "The Commission File Number is 001-99999, not 001-36743."
+    res_b = evaluate_grounded_answer(
+        answer=ans_b,
+        citations=citations,
+        is_answer_text_correct=True,
+        contract_type="semantic",
+        expected_sources=["SEC-Form-10Q.pdf"],
+        expected_source_version=1,
+        retained_evidence_items=[retained_item],
+        ground_truth_chunk_ids={"chunk_sec_001"},
+    )
+    assert res_b["is_grounded_correct"] is False
+    assert "claim_contradicts_evidence" in res_b["reason"]
+
+
+def test_control_4_valid_premise_correction_passes_grounded_scoring():
+    """Control 4: Valid premise corrections pass grounded scoring without false rejection.
+
+    Blanket rejection of 'not' or 'no' must be avoided so legitimate premise corrections
+    that correct false question premises while affirming true evidence facts pass.
+
+    Case A: Answer begins with 'No.' and affirms the reported basic EPS of $2.03.
+    Case B: Answer explicitly denies the false premise ('not $5.00') and affirms $2.03.
+    """
+    retained_item = _make_retained_evidence_item(
+        evidence_id="chunk_sec_eps",
+        text="Basic earnings per share was $2.03 for the three months ended June 27, 2026.",
+    )
+    citations = [
+        {
+            "chunk_id": "chunk_sec_eps",
+            "document_filename": "SEC-Form-10Q.pdf",
+            "document_version": 1,
+            "document_id": "doc_sec_01",
+            "page_number": 4,
+            "text": "Basic earnings per share was $2.03 for the three months ended June 27, 2026.",
+        }
+    ]
+
+    # Case A: 'No. Basic EPS is $2.03 per share...'
+    ans_a = "No. Basic EPS is $2.03 per share for the three months ended June 27, 2026."
+    res_a = evaluate_grounded_answer(
+        answer=ans_a,
+        citations=citations,
+        is_answer_text_correct=True,
+        contract_type="premise_correction",
+        expected_sources=["SEC-Form-10Q.pdf"],
+        expected_source_version=1,
+        retained_evidence_items=[retained_item],
+        ground_truth_chunk_ids={"chunk_sec_eps"},
+    )
+    assert res_a["is_grounded_correct"] is True
+    assert res_a["reason"] == "grounded_and_verified"
+
+    # Case B: 'No, basic EPS is not $5.00, it is $2.03 per share.'
+    ans_b = "No, basic EPS is not $5.00, it is $2.03 per share."
+    res_b = evaluate_grounded_answer(
+        answer=ans_b,
+        citations=citations,
+        is_answer_text_correct=True,
+        contract_type="premise_correction",
+        expected_sources=["SEC-Form-10Q.pdf"],
+        expected_source_version=1,
+        retained_evidence_items=[retained_item],
+        ground_truth_chunk_ids={"chunk_sec_eps"},
+    )
+    assert res_b["is_grounded_correct"] is True
+    assert res_b["reason"] == "grounded_and_verified"
+
+
+def test_control_5_valid_refusal_passes_grounded_scoring():
+    """Control 5: Clean refusal with zero citations passes grounded scoring.
+
+    Refusal contracts requiring refusal must pass when 0 citations are provided,
+    unaffected by contradiction logic.
+    """
+    result = evaluate_grounded_answer(
+        answer="I couldn't find any relevant passages in the workspace documents matching your query.",
+        citations=[],
+        is_answer_text_correct=True,
+        contract_type="refusal",
+        contract={"contract_type": "refusal", "is_refusal_required": True},
+        ans_is_refusal=True,
+    )
+
+    assert result["is_grounded_correct"] is True
+    assert result["reason"] == "valid_unsupported_refusal"
+    assert result["citation_validation"]["valid"] is True
+
+
+def test_control_6_structured_aggregate_denial_fails_grounded_scoring():
+    """Control 6: Explicit denial of retained computed structured result fails grounded scoring."""
+    hash_val = "1234567890abcdef"
+    ev = SimpleNamespace(
+        evidence_id="ev_agg_1",
+        workspace_id="ws_01",
+        document_version="1",
+        structured_payload={
+            "selection_hash": hash_val,
+            "table_id": "survay",
+            "operator": "sum",
+            "target_column": "Total_Value",
+            "selection_count": 5,
+            "result_value": "157000",
+        },
+        locator={"selection_hash": hash_val, "table_id": "survay", "selection_count": 5},
+    )
+    citations = [
+        {
+            "evidence_type": "structured_aggregate",
+            "table_id": "survay",
+            "document_version": "1",
+            "operator": "sum",
+            "target_column": "Total_Value",
+            "selection_count": 5,
+            "selection_hash": hash_val,
+            "result_value": "157000",
+        }
+    ]
+
+    result = evaluate_grounded_answer(
+        answer="The total sum is definitely not 157,000.",
+        citations=citations,
+        is_answer_text_correct=True,
+        contract_type="numeric",
+        contract={"contract_type": "numeric", "target_values": [157000]},
+        question_type="structured_aggregate",
+        retained_evidence_items=[ev],
+        retained_structured_hashes={hash_val},
+    )
+
+    assert result["is_grounded_correct"] is False
+    assert "claim_contradicts_evidence" in result["reason"]
 
 
 # ===========================================================================
