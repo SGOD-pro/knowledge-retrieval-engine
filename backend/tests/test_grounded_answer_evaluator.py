@@ -473,3 +473,337 @@ def test_contradictory_answer_defect_remains_open_in_text_scoring():
     assert is_text_correct is True, (
         "Expected contradictory answer to score True in legacy text scoring due to token overlap defect."
     )
+
+
+# ===========================================================================
+# Regressions for Three Reproduced False Passes & Evidence Authority Repairs
+# ===========================================================================
+
+def test_false_pass_1_fabricated_citation_snippet_fails():
+    """False Pass 1 Regression: Text answer with fabricated citation snippet must fail grounded scoring.
+
+    The model cites a retained chunk whose actual text does not contain the answer,
+    but fabricates the answer inside the citation dictionary's text snippet.
+    Grounded scoring must reject the fabricated snippet and evaluate claims
+    strictly against authoritative retained evidence text.
+    """
+    retained_item = _make_retained_evidence_item(
+        evidence_id="chunk_sec_001",
+        text="The Commission regulates corporate financial disclosure filings under the Securities Act.",
+    )
+    # Adversarial citation: claims the chunk contains the Commission File Number
+    citations = [
+        {
+            "chunk_id": "chunk_sec_001",
+            "document_filename": "SEC-Form-10Q.pdf",
+            "document_version": 1,
+            "document_id": "doc_sec_01",
+            "page_number": 1,
+            "text": "Commission File Number: 001-36743. Apple Inc. Quarterly Report.",
+        }
+    ]
+
+    result = evaluate_grounded_answer(
+        answer="Apple's Commission File Number is 001-36743.",
+        citations=citations,
+        is_answer_text_correct=True,
+        contract_type="semantic",
+        expected_sources=["SEC-Form-10Q.pdf"],
+        expected_source_version=1,
+        retained_evidence_items=[retained_item],
+        ground_truth_chunk_ids={"chunk_sec_001"},
+    )
+
+    assert result["is_grounded_correct"] is False
+    assert (
+        "fabricates supporting content" in result["reason"]
+        or "claim_unsupported" in result["reason"]
+    )
+
+
+def test_false_pass_2_structured_aggregate_ground_truth_target_substitution_fails():
+    """False Pass 2 Regression: Structured aggregate must not substitute contract target_values for missing result_value.
+
+    When the retained evidence for a structured query has selection_count but NO result_value,
+    the evaluator must not substitute the evaluator contract's target_values to grant a pass.
+    """
+    hash_val = "1234567890abcdef"
+    ev = SimpleNamespace(
+        evidence_id="ev_agg_1",
+        workspace_id="ws_01",
+        document_version="1",
+        structured_payload={
+            "selection_hash": hash_val,
+            "table_id": "survay",
+            "operator": "sum",
+            "target_column": "Total_Value",
+            "selection_count": 14,
+            "result_value": None,  # Missing execution result!
+        },
+        locator={"selection_hash": hash_val, "table_id": "survay", "selection_count": 14},
+    )
+    citations = [
+        {
+            "evidence_type": "structured_aggregate",
+            "table_id": "survay",
+            "document_version": "1",
+            "operator": "sum",
+            "target_column": "Total_Value",
+            "selection_count": 14,
+            "selection_hash": hash_val,
+            "result_value": None,
+        }
+    ]
+
+    result = evaluate_grounded_answer(
+        answer="The total sum of Total_Value is 500,000.",
+        citations=citations,
+        is_answer_text_correct=True,
+        contract_type="numeric",
+        contract={"contract_type": "numeric", "target_values": [500000]},  # Ground-truth target
+        question_type="structured_aggregate",
+        retained_evidence_items=[ev],
+        retained_structured_hashes={hash_val},
+    )
+
+    assert result["is_grounded_correct"] is False
+    assert result["reason"] == "missing_retained_result_value"
+
+
+def test_false_pass_3_structured_aggregate_missing_result_fallback_fails():
+    """False Pass 3 Regression: Missing-result fallback must be removed.
+
+    When a structured aggregate execution has no computed result, it must not pass
+    via grounded_structured_aggregate_fallback.
+    """
+    hash_val = "1234567890abcdef"
+    ev = SimpleNamespace(
+        evidence_id="ev_agg_1",
+        workspace_id="ws_01",
+        document_version="1",
+        structured_payload={
+            "selection_hash": hash_val,
+            "table_id": "survay",
+            "operator": "sum",
+            "target_column": "Total_Value",
+            "selection_count": 14,
+            "result_value": None,
+        },
+        locator={"selection_hash": hash_val, "table_id": "survay", "selection_count": 14},
+    )
+    citations = [
+        {
+            "evidence_type": "structured_aggregate",
+            "table_id": "survay",
+            "document_version": "1",
+            "operator": "sum",
+            "target_column": "Total_Value",
+            "selection_count": 14,
+            "selection_hash": hash_val,
+            "result_value": None,
+        }
+    ]
+
+    result = evaluate_grounded_answer(
+        answer="The total sum is 500,000.",
+        citations=citations,
+        is_answer_text_correct=True,
+        contract_type="semantic",
+        question_type="structured_aggregate",
+        retained_evidence_items=[ev],
+        retained_structured_hashes={hash_val},
+    )
+
+    assert result["is_grounded_correct"] is False
+    assert result["reason"] == "missing_retained_result_value"
+
+
+def test_missing_authoritative_evidence_fails_grounded_scoring():
+    """Answerable queries with missing authoritative retained evidence must fail grounded scoring."""
+    citations = [
+        {
+            "chunk_id": "chunk_sec_001",
+            "document_filename": "SEC-Form-10Q.pdf",
+            "document_version": 1,
+            "document_id": "doc_sec_01",
+            "page_number": 1,
+            "text": "Commission File Number: 001-36743.",
+        }
+    ]
+
+    result = evaluate_grounded_answer(
+        answer="Apple's Commission File Number is 001-36743.",
+        citations=citations,
+        is_answer_text_correct=True,
+        contract_type="semantic",
+        expected_sources=["SEC-Form-10Q.pdf"],
+        expected_source_version=1,
+        retained_evidence_items=None,  # Missing!
+    )
+
+    assert result["is_grounded_correct"] is False
+    assert result["reason"] == "missing_authoritative_evidence"
+
+
+def test_legitimate_count_operation_positive_control():
+    """For COUNT operations, selection_count is legitimately preserved as the count result."""
+    hash_val = "1234567890abcdef"
+    ev = SimpleNamespace(
+        evidence_id="ev_agg_1",
+        workspace_id="ws_01",
+        document_version="1",
+        structured_payload={
+            "selection_hash": hash_val,
+            "table_id": "survay",
+            "operator": "count",
+            "target_column": "*",
+            "selection_count": 25,
+            "result_value": None,  # No separate result_value, selection_count is count
+        },
+        locator={"selection_hash": hash_val, "table_id": "survay", "selection_count": 25},
+    )
+    citations = [
+        {
+            "evidence_type": "structured_aggregate",
+            "table_id": "survay",
+            "document_version": "1",
+            "operator": "count",
+            "target_column": "*",
+            "selection_count": 25,
+            "selection_hash": hash_val,
+        }
+    ]
+
+    result = evaluate_grounded_answer(
+        answer="There are 25 records matching the criteria.",
+        citations=citations,
+        is_answer_text_correct=True,
+        contract_type="numeric",
+        contract={"contract_type": "numeric", "operator": "count"},
+        question_type="structured_aggregate",
+        retained_evidence_items=[ev],
+        retained_structured_hashes={hash_val},
+    )
+
+    assert result["is_grounded_correct"] is True
+    assert result["reason"] == "grounded_structured_aggregate"
+
+
+def test_legitimate_zero_result_positive_control():
+    """Zero-result answers asserting 0 or zero match 0 computed result and pass."""
+    hash_val = "1234567890abcdef"
+    ev = SimpleNamespace(
+        evidence_id="ev_agg_1",
+        workspace_id="ws_01",
+        document_version="1",
+        structured_payload={
+            "selection_hash": hash_val,
+            "table_id": "survay",
+            "operator": "count",
+            "target_column": "*",
+            "selection_count": 1,
+            "result_value": "0",
+        },
+        locator={"selection_hash": hash_val, "table_id": "survay", "selection_count": 1},
+    )
+    citations = [
+        {
+            "evidence_type": "structured_aggregate",
+            "table_id": "survay",
+            "document_version": "1",
+            "operator": "count",
+            "target_column": "*",
+            "selection_count": 1,
+            "selection_hash": hash_val,
+            "result_value": "0",
+        }
+    ]
+
+    result = evaluate_grounded_answer(
+        answer="There are zero records found matching the query.",
+        citations=citations,
+        is_answer_text_correct=True,
+        contract_type="numeric",
+        contract={"contract_type": "numeric", "operator": "count"},
+        question_type="structured_aggregate",
+        retained_evidence_items=[ev],
+        retained_structured_hashes={hash_val},
+    )
+
+    assert result["is_grounded_correct"] is True
+    assert result["reason"] == "grounded_structured_aggregate"
+
+
+def test_legitimate_derived_calculation_positive_control():
+    """Text retrieval questions with numeric derived calculations pass when operands appear in context."""
+    retained_item = _make_retained_evidence_item(
+        evidence_id="chunk_sec_sales",
+        text="Total net sales were 94930 million in 2026 compared to 81797 million in 2025.",
+    )
+    citations = [
+        {
+            "chunk_id": "chunk_sec_sales",
+            "document_filename": "SEC-Form-10Q.pdf",
+            "document_version": 1,
+            "document_id": "doc_sec_01",
+            "page_number": 2,
+            "text": "Total net sales were 94930 million in 2026 compared to 81797 million in 2025.",
+        }
+    ]
+
+    # The calculated growth is 13133 (94930 - 81797), which is not literally in the text chunk
+    result = evaluate_grounded_answer(
+        answer="Net sales increased by 13133 million year over year.",
+        citations=citations,
+        is_answer_text_correct=True,
+        contract_type="numeric",
+        contract={
+            "contract_type": "numeric",
+            "target_values": [13133],
+            "operands": [94930, 81797],
+        },
+        expected_sources=["SEC-Form-10Q.pdf"],
+        expected_source_version=1,
+        retained_evidence_items=[retained_item],
+        ground_truth_chunk_ids={"chunk_sec_sales"},
+    )
+
+    assert result["is_grounded_correct"] is True
+    assert result["reason"] == "grounded_and_verified"
+
+
+def test_unsupported_derived_calculation_operands_missing_fails():
+    """Numeric derived calculations fail when operands are missing from authoritative context."""
+    retained_item = _make_retained_evidence_item(
+        evidence_id="chunk_sec_sales",
+        text="Total units shipped were 500 in 2026.",
+    )
+    citations = [
+        {
+            "chunk_id": "chunk_sec_sales",
+            "document_filename": "SEC-Form-10Q.pdf",
+            "document_version": 1,
+            "document_id": "doc_sec_01",
+            "page_number": 2,
+            "text": "Total units shipped were 500 in 2026.",
+        }
+    ]
+
+    result = evaluate_grounded_answer(
+        answer="Net sales increased by 13133 million year over year.",
+        citations=citations,
+        is_answer_text_correct=True,
+        contract_type="numeric",
+        contract={
+            "contract_type": "numeric",
+            "target_values": [13133],
+            "operands": [94930, 81797],  # Neither 94930 nor 81797 is in retained text!
+        },
+        expected_sources=["SEC-Form-10Q.pdf"],
+        expected_source_version=1,
+        retained_evidence_items=[retained_item],
+        ground_truth_chunk_ids={"chunk_sec_sales"},
+    )
+
+    assert result["is_grounded_correct"] is False
+    assert "numeric claims" in result["reason"] or "claim_unsupported" in result["reason"]

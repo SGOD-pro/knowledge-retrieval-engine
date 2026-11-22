@@ -758,7 +758,57 @@ def extract_numbers_normalized(text: str) -> set[str]:
                 nums.add(str(f))
         except ValueError:
             pass
+    if re.search(r"\b(?:zero|none)\b", text, re.IGNORECASE):
+        nums.add("0")
     return nums
+
+
+def _get_ev_text(ev: Any) -> str:
+    """Extract authoritative text from an EvidenceItem, namespace, or dict."""
+    if not ev:
+        return ""
+    if isinstance(ev, dict):
+        return str(ev.get("text") or ev.get("content") or (ev.get("locator") or {}).get("text") or "")
+    txt = getattr(ev, "text", None) or getattr(ev, "content", None)
+    if txt:
+        return str(txt)
+    loc = getattr(ev, "locator", {}) or {}
+    if isinstance(loc, dict) and loc.get("text"):
+        return str(loc.get("text"))
+    sp = getattr(ev, "structured_payload", {}) or {}
+    if isinstance(sp, dict) and sp.get("text"):
+        return str(sp.get("text"))
+    cp = getattr(ev, "citation_payload", {}) or {}
+    if isinstance(cp, dict) and cp.get("text"):
+        return str(cp.get("text"))
+    return ""
+
+
+def _ev_matches_citation(ev: Any, c: dict[str, Any]) -> bool:
+    """Match an evidence item against a citation dictionary."""
+    if not ev or not c:
+        return False
+    cid = str(c.get("chunk_id", ""))
+    sel_hash = str(c.get("selection_hash", ""))
+    if isinstance(ev, dict):
+        ev_id = str(ev.get("evidence_id", ""))
+        loc = ev.get("locator") or {}
+        cp = ev.get("citation_payload") or {}
+        sp = ev.get("structured_payload") or {}
+    else:
+        ev_id = str(getattr(ev, "evidence_id", ""))
+        loc = getattr(ev, "locator", {}) or {}
+        cp = getattr(ev, "citation_payload", {}) or {}
+        sp = getattr(ev, "structured_payload", {}) or {}
+
+    ev_cid = str(loc.get("chunk_id", "")) or str(cp.get("chunk_id", ""))
+    ev_shash = str(sp.get("selection_hash", "")) or str(loc.get("selection_hash", "")) or str(cp.get("selection_hash", ""))
+
+    if cid and cid in (ev_id, ev_cid):
+        return True
+    if sel_hash and sel_hash == ev_shash:
+        return True
+    return False
 
 
 def validate_citations(
@@ -1021,6 +1071,32 @@ def validate_citations(
                     errors.append(f"Citation {idx}: document_id '{c_did}' altered from retained evidence '{exp_did}'")
                     continue
 
+                # Check for fabricated snippet content against authoritative retained evidence
+                auth_text = _get_ev_text(matching_ev)
+                c_snip = str(c.get("snippet") or c.get("text") or c.get("text_snippet") or "").strip()
+                if c_snip:
+                    if not auth_text:
+                        errors.append(
+                            f"Citation {idx}: snippet fabricates supporting content (no text in retained evidence)"
+                        )
+                        continue
+                    snip_nums = extract_numbers_normalized(c_snip)
+                    auth_nums = extract_numbers_normalized(auth_text)
+                    fabricated_nums = snip_nums - auth_nums
+                    if fabricated_nums:
+                        errors.append(
+                            f"Citation {idx}: snippet fabricates supporting content not in retained evidence "
+                            f"(unsupported numbers {fabricated_nums})"
+                        )
+                        continue
+                    snip_faith = compute_faithfulness(c_snip, auth_text)
+                    if snip_faith is not None and snip_faith < 0.40:
+                        errors.append(
+                            f"Citation {idx}: snippet fabricates supporting content not in retained evidence "
+                            f"(faithfulness {snip_faith:.2f})"
+                        )
+                        continue
+
         if gt_set is not None and cid in gt_set:
             gt_matched_count += 1
 
@@ -1161,6 +1237,16 @@ def evaluate_grounded_answer(
             "faithfulness": None,
         }
 
+    # For answerable queries, authoritative retained request evidence is mandatory
+    if not retained_evidence_items or len(retained_evidence_items) == 0:
+        return {
+            "is_grounded_correct": False,
+            "grounded_correct": False,
+            "reason": "missing_authoritative_evidence",
+            "citation_validation": cit_val,
+            "faithfulness": None,
+        }
+
     # Claim support validation: matching citation IDs alone must not establish claim support
     is_structured_agg = (
         question_type == "structured_aggregate"
@@ -1172,7 +1258,7 @@ def evaluate_grounded_answer(
 
     if is_structured_agg:
         operators = set()
-        computed_results = set()
+        explicit_results = set()
         metadata_counts = set()
 
         def _inspect_d(d: dict):
@@ -1180,16 +1266,16 @@ def evaluate_grounded_answer(
             if op:
                 operators.add(str(op).lower())
             rv = d.get("result_value")
-            if rv is not None:
-                computed_results.update(extract_numbers_normalized(str(rv)))
+            if rv is not None and str(rv).strip() != "":
+                explicit_results.update(extract_numbers_normalized(str(rv)))
             sv = d.get("secondary_value")
-            if sv is not None:
-                computed_results.update(extract_numbers_normalized(str(sv)))
+            if sv is not None and str(sv).strip() != "":
+                explicit_results.update(extract_numbers_normalized(str(sv)))
             sc = d.get("selection_count") or d.get("records_matched")
-            if sc is not None:
+            if sc is not None and str(sc).strip() != "":
                 metadata_counts.update(extract_numbers_normalized(str(sc)))
             tr = d.get("total_rows_in_table") or d.get("total_rows") or d.get("records_examined")
-            if tr is not None:
+            if tr is not None and str(tr).strip() != "":
                 metadata_counts.update(extract_numbers_normalized(str(tr)))
 
         if isinstance(outcome, dict):
@@ -1218,60 +1304,74 @@ def evaluate_grounded_answer(
                 if isinstance(loc, dict):
                     _inspect_d(loc)
 
-        if contract and contract_type == "numeric":
-            for tv in contract.get("target_values", []):
-                computed_results.update(extract_numbers_normalized(str(tv)))
-
-        is_count_op = "count" in operators
+        is_count_op = (
+            "count" in operators
+            or (isinstance(contract, dict) and str(contract.get("operator", "")).lower() == "count")
+        )
         if is_count_op:
+            computed_results = set(explicit_results)
             if not computed_results and metadata_counts:
                 computed_results.update(metadata_counts)
         else:
-            computed_results = computed_results - metadata_counts
+            computed_results = set(explicit_results)
+
+        if not computed_results:
+            return {
+                "is_grounded_correct": False,
+                "grounded_correct": False,
+                "reason": "missing_retained_result_value",
+                "citation_validation": cit_val,
+                "faithfulness": None,
+            }
 
         ans_nums = extract_numbers_normalized(str(answer))
         ans_years = {n for n in ans_nums if len(n) == 4 and n.isdigit() and 1900 <= int(n) <= 2099}
         ans_amounts = ans_nums - ans_years
 
-        if computed_results:
-            if not (ans_nums & computed_results):
-                return {
-                    "is_grounded_correct": False,
-                    "grounded_correct": False,
-                    "reason": f"claim_unsupported: answer does not assert computed result {computed_results}",
-                    "citation_validation": cit_val,
-                    "faithfulness": None,
-                }
-            if ans_amounts and not (ans_amounts & computed_results):
-                return {
-                    "is_grounded_correct": False,
-                    "grounded_correct": False,
-                    "reason": f"claim_unsupported: answer amounts {ans_amounts} do not match computed result {computed_results}",
-                    "citation_validation": cit_val,
-                    "faithfulness": None,
-                }
+        if not (ans_nums & computed_results):
             return {
-                "is_grounded_correct": True,
-                "grounded_correct": True,
-                "reason": "grounded_structured_aggregate",
+                "is_grounded_correct": False,
+                "grounded_correct": False,
+                "reason": f"claim_unsupported: answer does not assert computed result {computed_results}",
                 "citation_validation": cit_val,
-                "faithfulness": 1.0,
+                "faithfulness": None,
             }
-        else:
+        if ans_amounts and not (ans_amounts & computed_results):
             return {
-                "is_grounded_correct": True,
-                "grounded_correct": True,
-                "reason": "grounded_structured_aggregate_fallback",
+                "is_grounded_correct": False,
+                "grounded_correct": False,
+                "reason": f"claim_unsupported: answer amounts {ans_amounts} do not match computed result {computed_results}",
                 "citation_validation": cit_val,
-                "faithfulness": 1.0,
+                "faithfulness": None,
             }
+        return {
+            "is_grounded_correct": True,
+            "grounded_correct": True,
+            "reason": "grounded_structured_aggregate",
+            "citation_validation": cit_val,
+            "faithfulness": 1.0,
+        }
 
-    # Text retrieval claim support validation
-    snippets = [
-        str(c.get("snippet") or c.get("text") or c.get("text_snippet") or "").strip()
-        for c in citations
-    ]
-    joined_context = " ".join(s for s in snippets if s).strip()
+    # Text retrieval claim support validation:
+    # Build context strictly from authoritative retained evidence items
+    auth_snippets = []
+    for c in citations:
+        matching_ev = None
+        if retained_evidence_items:
+            for ev in retained_evidence_items:
+                if _ev_matches_citation(ev, c):
+                    matching_ev = ev
+                    break
+        if matching_ev is not None:
+            t = _get_ev_text(matching_ev).strip()
+            if t:
+                auth_snippets.append(t)
+        else:
+            snip = str(c.get("snippet") or c.get("text") or c.get("text_snippet") or "").strip()
+            if snip:
+                auth_snippets.append(snip)
+
+    joined_context = " ".join(s for s in auth_snippets if s).strip()
     if not joined_context:
         return {
             "is_grounded_correct": False,
@@ -1291,21 +1391,34 @@ def evaluate_grounded_answer(
             "faithfulness": faith_score,
         }
 
-    # Verify numeric claims against context snippets or contract target values
+    # Verify numeric claims against context snippets or legitimate derived calculation targets
     ans_nums = extract_numbers_normalized(str(answer))
     context_nums = extract_numbers_normalized(joined_context)
     contract_targets = set()
+    contract_operands = set()
     if contract and contract_type == "numeric":
         for tv in contract.get("target_values", []):
             contract_targets.update(extract_numbers_normalized(str(tv)))
         for op_val in contract.get("operands", []):
-            contract_targets.update(extract_numbers_normalized(str(op_val)))
+            contract_operands.update(extract_numbers_normalized(str(op_val)))
+
+    # A derived calculation is legitimate if operands are present in the authoritative context
+    # (or if no explicit operands list is in contract, contract_targets can satisfy calculated answers
+    # if the context contains supporting numbers).
+    valid_derived_targets = set()
+    if contract_targets:
+        if contract_operands:
+            if contract_operands & context_nums:
+                valid_derived_targets.update(contract_targets)
+        else:
+            if context_nums:
+                valid_derived_targets.update(contract_targets)
 
     ans_years = {n for n in ans_nums if len(n) == 4 and n.isdigit() and 1900 <= int(n) <= 2099}
     ans_amounts = ans_nums - ans_years
 
     if ans_amounts:
-        unsupported = ans_amounts - context_nums - contract_targets
+        unsupported = ans_amounts - context_nums - valid_derived_targets
         if unsupported:
             return {
                 "is_grounded_correct": False,
@@ -1315,7 +1428,7 @@ def evaluate_grounded_answer(
                 "faithfulness": faith_score,
             }
     if ans_years and context_nums:
-        if not (ans_years & (context_nums | contract_targets)):
+        if not (ans_years & (context_nums | valid_derived_targets)):
             return {
                 "is_grounded_correct": False,
                 "grounded_correct": False,

@@ -164,6 +164,8 @@ def execute(state: dict[str, Any]) -> dict[str, Any]:
                 "target_column": result.target_column,
                 "selection_hash": result.selection_hash,
                 "selection_count": result.selection_count,
+                "result_value": str(result.result_value) if result.result_value is not None else None,
+                "secondary_value": str(result.secondary_value) if result.secondary_value is not None else None,
             },
             score=result.overall_confidence,
             strategy="structured_table",
