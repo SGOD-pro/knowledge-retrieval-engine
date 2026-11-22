@@ -77,7 +77,7 @@ uv run pytest tests/test_contracts_and_identity.py
 * Bedrock token limits enforce per call caps (inputTokens <= 2000, outputTokens <= 800) and cumulative document ceilings (4000 prompt, 1600 output, 5600 total), failing closed and retaining spend durably in the budget ledger on overruns.
 * TableStore evidence hydration enforces an inner deadline check halting table row hydration immediately on deadline overrun.
 * Graph retrieval exception fallback in run_graph catches expand failures fail closed, sets graph_execution_status to storage_failed with zero graph candidates, and preserves baseline retrieval.
-* Canonical benchmark evaluation distinguishes legacy answer text accuracy from grounded correctness. Answerable responses require non-empty citations, expected source and version matching, authoritative request-retained evidence without citation snippet fabrication, and claim support verification requiring actual retained aggregate execution results without ground-truth target substitution.
+* Canonical benchmark evaluation distinguishes legacy answer text accuracy from grounded correctness. Answerable responses require non-empty citations, expected source and version matching, authoritative request retained evidence without citation snippet fabrication, all necessary calculation operands before accepting derived results, and structured results obtained strictly from matching retained executions without citation result expansion.
 
 ## Gotchas
 * Local development defaults to SQLite or in memory TableStore and LocalStack DynamoDB, while Qdrant runs via local container or cloud.
