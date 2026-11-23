@@ -1128,3 +1128,279 @@ def test_authorized_cache_hit_delivers_payload(monkeypatch, boundary_repo: InMem
     assert len(res["retained_evidence_items"]) == 1
     assert res["retrieval_incomplete"] is False
     assert res["confidence"] == 0.98
+
+
+def test_dynamodb_has_tombstone_sets_consistent_read():
+    """Verify DynamoDB has_tombstone and get_tombstone execute strongly consistent reads."""
+    from db.workspace_boundary_repo import DynamoDBWorkspaceBoundaryRepository
+
+    mock_table = MagicMock()
+    mock_table.get_item.return_value = {
+        "Item": {
+            "workspace_id": "ws_ddb_test",
+            "resource_type": "source",
+            "resource_id": "doc_ddb_1",
+            "manifest_generation": "2",
+            "tombstoned_at": "2026-11-23T00:00:00Z",
+            "deleted_by_principal_id": "admin_1",
+            "reason": "revoked",
+        }
+    }
+    mock_res = MagicMock()
+    mock_res.Table.return_value = mock_table
+
+    repo = DynamoDBWorkspaceBoundaryRepository(table_name="kre_boundaries", dynamodb_resource=mock_res)
+    repo._table = mock_table
+
+    # 1. Test has_tombstone
+    is_tombstoned = repo.has_tombstone("ws_ddb_test", "source", "doc_ddb_1")
+    assert is_tombstoned is True
+    assert mock_table.get_item.call_count == 1
+    call_kwargs = mock_table.get_item.call_args.kwargs
+    assert call_kwargs.get("ConsistentRead") is True
+    assert call_kwargs.get("Key") == {
+        "PK": "WORKSPACE#ws_ddb_test",
+        "SK": "TOMBSTONE#source#doc_ddb_1",
+    }
+
+    # 2. Test get_tombstone
+    tombstone = repo.get_tombstone("ws_ddb_test", "source", "doc_ddb_1")
+    assert tombstone is not None
+    assert tombstone.resource_id == "doc_ddb_1"
+    assert mock_table.get_item.call_count == 2
+    call_kwargs_2 = mock_table.get_item.call_args.kwargs
+    assert call_kwargs_2.get("ConsistentRead") is True
+    assert call_kwargs_2.get("Key") == {
+        "PK": "WORKSPACE#ws_ddb_test",
+        "SK": "TOMBSTONE#source#doc_ddb_1",
+    }
+
+
+def test_fresh_query_refuses_when_boundary_authority_missing(monkeypatch):
+    """Confirm fresh query fails closed with safe refusal when boundary authority is missing."""
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    ws_id = "ws_missing_authority_fresh"
+    doc_id = "doc_fresh_1"
+
+    repo = CloudRepository()
+    query_text = "What is the secret data?"
+    _setup_synthetic_doc(repo, ws_id, doc_id, "The secret data is TOP_SECRET.")
+
+    qs = QueryService()
+    req = QueryRequest(
+        workspace_id=ws_id,
+        query=query_text,
+        cache=False,
+    )
+
+    with patch("src.db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=None), \
+         patch("db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=None):
+        res = qs.execute_query(req)
+
+    assert "couldn't find any relevant" in res["answer"].lower()
+    assert "TOP_SECRET" not in res["answer"]
+    assert res["citations"] == []
+    assert res["retained_evidence_items"] == []
+    assert res["retrieval_incomplete"] is True
+    assert res["confidence"] == 0.0
+
+
+def test_fresh_query_refuses_when_boundary_authority_incompatible(monkeypatch):
+    """Confirm fresh query fails closed with safe refusal when boundary authority is incompatible."""
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    ws_id = "ws_incompatible_authority_fresh"
+    doc_id = "doc_fresh_2"
+
+    repo = CloudRepository()
+    query_text = "What is the secret data?"
+    _setup_synthetic_doc(repo, ws_id, doc_id, "The secret data is TOP_SECRET.")
+
+    class IncompatibleRepo:
+        pass
+
+    incompatible_repo = IncompatibleRepo()
+
+    qs = QueryService()
+    req = QueryRequest(
+        workspace_id=ws_id,
+        query=query_text,
+        cache=False,
+    )
+
+    with patch("src.db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=incompatible_repo), \
+         patch("db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=incompatible_repo):
+        res = qs.execute_query(req)
+
+    assert "couldn't find any relevant" in res["answer"].lower()
+    assert "TOP_SECRET" not in res["answer"]
+    assert res["citations"] == []
+    assert res["retained_evidence_items"] == []
+    assert res["retrieval_incomplete"] is True
+    assert res["confidence"] == 0.0
+
+
+def test_exact_cache_refuses_when_boundary_authority_missing(monkeypatch):
+    """Confirm exact cache fails closed with safe refusal when boundary authority is missing."""
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    ws_id = "ws_exact_cache_missing_auth"
+    doc_id = "doc_exact_ma_1"
+
+    repo = CloudRepository()
+    query_text = "What is the cached figure under missing authority?"
+    doc = _setup_synthetic_doc(repo, ws_id, doc_id, "The cached figure is 50 million.")
+    chunk = doc.chunks[0]
+
+    cached_payload = {
+        "answer": "The cached figure is 50 million.",
+        "citations": [{"id": 1, "document_id": doc_id, "chunk_id": chunk.id, "text": "50 million"}],
+        "retained_evidence_items": [{"document_id": doc_id, "text": "50 million"}],
+        "confidence": 0.95,
+        "confidence_score": 0.95,
+        "latency_ms": 10.0,
+        "fast_path": True,
+        "retrieval_path": "fast",
+        "status": "success",
+        "retrieval_incomplete": False,
+        "cached": False,
+    }
+
+    cache_key = _compute_exact_cache_key(query_text, [doc_id])
+    cache.set_cache(cache_key, cached_payload, ttl=3600)
+
+    qs = QueryService()
+    req = QueryRequest(
+        workspace_id=ws_id,
+        query=query_text,
+        cache=True,
+    )
+
+    with patch("src.db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=None), \
+         patch("db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=None):
+        res = qs.execute_query(req)
+
+    assert res["cached"] is True
+    assert "couldn't find any relevant" in res["answer"].lower()
+    assert "50 million" not in res["answer"]
+    assert res["citations"] == []
+    assert res["retained_evidence_items"] == []
+    assert res["retrieval_incomplete"] is True
+    assert res["confidence"] == 0.0
+
+
+def test_exact_cache_refuses_when_boundary_authority_incompatible(monkeypatch):
+    """Confirm exact cache fails closed with safe refusal when boundary authority is incompatible."""
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    ws_id = "ws_exact_cache_incompatible_auth"
+    doc_id = "doc_exact_ia_1"
+
+    repo = CloudRepository()
+    query_text = "What is the cached figure under incompatible authority?"
+    doc = _setup_synthetic_doc(repo, ws_id, doc_id, "The cached figure is 50 million.")
+    chunk = doc.chunks[0]
+
+    cached_payload = {
+        "answer": "The cached figure is 50 million.",
+        "citations": [{"id": 1, "document_id": doc_id, "chunk_id": chunk.id, "text": "50 million"}],
+        "retained_evidence_items": [{"document_id": doc_id, "text": "50 million"}],
+        "confidence": 0.95,
+        "confidence_score": 0.95,
+        "latency_ms": 10.0,
+        "fast_path": True,
+        "retrieval_path": "fast",
+        "status": "success",
+        "retrieval_incomplete": False,
+        "cached": False,
+    }
+
+    cache_key = _compute_exact_cache_key(query_text, [doc_id])
+    cache.set_cache(cache_key, cached_payload, ttl=3600)
+
+    class IncompatibleRepo:
+        pass
+
+    qs = QueryService()
+    req = QueryRequest(
+        workspace_id=ws_id,
+        query=query_text,
+        cache=True,
+    )
+
+    with patch("src.db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=IncompatibleRepo()), \
+         patch("db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=IncompatibleRepo()):
+        res = qs.execute_query(req)
+
+    assert res["cached"] is True
+    assert "couldn't find any relevant" in res["answer"].lower()
+    assert "50 million" not in res["answer"]
+    assert res["citations"] == []
+    assert res["retained_evidence_items"] == []
+    assert res["retrieval_incomplete"] is True
+    assert res["confidence"] == 0.0
+
+
+def test_semantic_cache_refuses_when_boundary_authority_missing_or_incompatible(monkeypatch):
+    """Confirm semantic cache fails closed with safe refusal when boundary authority is missing or incompatible."""
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    ws_id = "ws_sem_cache_auth_test"
+    doc_id = "doc_sem_auth_1"
+
+    repo = CloudRepository()
+    query_text = "What is the semantic figure under missing authority?"
+    doc = _setup_synthetic_doc(repo, ws_id, doc_id, "The semantic figure is 77 million.")
+    chunk = doc.chunks[0]
+
+    cached_payload = {
+        "answer": "The semantic figure is 77 million.",
+        "citations": [{"id": 1, "document_id": doc_id, "chunk_id": chunk.id, "text": "77 million"}],
+        "retained_evidence_items": [{"document_id": doc_id, "text": "77 million"}],
+        "confidence": 0.92,
+        "confidence_score": 0.92,
+        "latency_ms": 20.0,
+        "fast_path": False,
+        "retrieval_path": "full",
+        "status": "success",
+        "retrieval_incomplete": False,
+        "cached": False,
+    }
+
+    semantic_key = f"semantic:{ws_id}:auth_test"
+    cache.set_cache(semantic_key, cached_payload, ttl=3600)
+
+    qs = QueryService()
+    req = QueryRequest(
+        workspace_id=ws_id,
+        query=query_text,
+        cache=True,
+        force_full_path=True,
+    )
+
+    # 1. Missing authority
+    with patch.object(qs.repo, "check_semantic_cache", return_value=semantic_key), \
+         patch("src.db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=None), \
+         patch("db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=None):
+        res1 = qs.execute_query(req)
+
+    assert res1["cached"] is True
+    assert "couldn't find any relevant" in res1["answer"].lower()
+    assert "77 million" not in res1["answer"]
+    assert res1["citations"] == []
+    assert res1["retained_evidence_items"] == []
+    assert res1["retrieval_incomplete"] is True
+    assert res1["confidence"] == 0.0
+
+    # 2. Incompatible authority
+    class IncompatibleRepo:
+        pass
+
+    with patch.object(qs.repo, "check_semantic_cache", return_value=semantic_key), \
+         patch("src.db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=IncompatibleRepo()), \
+         patch("db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=IncompatibleRepo()):
+        res2 = qs.execute_query(req)
+
+    assert res2["cached"] is True
+    assert "couldn't find any relevant" in res2["answer"].lower()
+    assert "77 million" not in res2["answer"]
+    assert res2["citations"] == []
+    assert res2["retained_evidence_items"] == []
+    assert res2["retrieval_incomplete"] is True
+    assert res2["confidence"] == 0.0

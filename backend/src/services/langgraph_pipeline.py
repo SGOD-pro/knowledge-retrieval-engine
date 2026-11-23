@@ -1947,45 +1947,20 @@ def delivery_gate(state: PipelineState) -> dict[str, Any]:
             return False
         return True
 
-    # 1. Dynamic tombstone check before delivery (fail closed on tombstone or error)
-    if boundary_repo is not None and hasattr(boundary_repo, "has_tombstone"):
-        try:
-            if boundary_repo.has_tombstone(ws_id, "workspace", ws_id):
-                logger.warning("delivery_gate.workspace_tombstoned ws_id=%s (delivery blocked)", ws_id)
-                return {
-                    "final_answer": "NOT_FOUND",
-                    "citations": [],
-                    "confidence_score": 0.0,
-                    "retrieval_incomplete": True,
-                    "retained_evidence_items": [],
-                    "top_chunks": [],
-                }
-            for cit in state.get("citations", []):
-                doc_id = cit.get("document_id") if isinstance(cit, dict) else getattr(cit, "document_id", None)
-                if doc_id and boundary_repo.has_tombstone(ws_id, "source", str(doc_id)):
-                    logger.warning("delivery_gate.source_tombstoned doc_id=%s (delivery blocked)", doc_id)
-                    return {
-                        "final_answer": "NOT_FOUND",
-                        "citations": [],
-                        "confidence_score": 0.0,
-                        "retrieval_incomplete": True,
-                        "retained_evidence_items": [],
-                        "top_chunks": [],
-                    }
-            for ev in state.get("retained_evidence_items", []):
-                doc_id = getattr(ev, "document_id", None) or (getattr(ev, "locator", {}) or {}).get("document_id")
-                if doc_id and boundary_repo.has_tombstone(ws_id, "source", str(doc_id)):
-                    logger.warning("delivery_gate.source_tombstoned doc_id=%s (delivery blocked)", doc_id)
-                    return {
-                        "final_answer": "NOT_FOUND",
-                        "citations": [],
-                        "confidence_score": 0.0,
-                        "retrieval_incomplete": True,
-                        "retained_evidence_items": [],
-                        "top_chunks": [],
-                    }
-        except Exception as te:
-            logger.error("delivery_gate.tombstone_check_error: %s (delivery blocked)", te)
+    # 1. Dynamic tombstone check before delivery (fail closed on tombstone, lookup error, or missing/incompatible authority)
+    if boundary_repo is None or not hasattr(boundary_repo, "has_tombstone") or not callable(getattr(boundary_repo, "has_tombstone", None)):
+        logger.warning("delivery_gate.boundary_repo_unavailable_or_incompatible (delivery blocked)")
+        return {
+            "final_answer": "NOT_FOUND",
+            "citations": [],
+            "confidence_score": 0.0,
+            "retrieval_incomplete": True,
+            "retained_evidence_items": [],
+            "top_chunks": [],
+        }
+    try:
+        if boundary_repo.has_tombstone(ws_id, "workspace", ws_id):
+            logger.warning("delivery_gate.workspace_tombstoned ws_id=%s (delivery blocked)", ws_id)
             return {
                 "final_answer": "NOT_FOUND",
                 "citations": [],
@@ -1994,6 +1969,40 @@ def delivery_gate(state: PipelineState) -> dict[str, Any]:
                 "retained_evidence_items": [],
                 "top_chunks": [],
             }
+        for cit in state.get("citations", []):
+            doc_id = cit.get("document_id") if isinstance(cit, dict) else getattr(cit, "document_id", None)
+            if doc_id and boundary_repo.has_tombstone(ws_id, "source", str(doc_id)):
+                logger.warning("delivery_gate.source_tombstoned doc_id=%s (delivery blocked)", doc_id)
+                return {
+                    "final_answer": "NOT_FOUND",
+                    "citations": [],
+                    "confidence_score": 0.0,
+                    "retrieval_incomplete": True,
+                    "retained_evidence_items": [],
+                    "top_chunks": [],
+                }
+        for ev in state.get("retained_evidence_items", []):
+            doc_id = getattr(ev, "document_id", None) or (getattr(ev, "locator", {}) or {}).get("document_id")
+            if doc_id and boundary_repo.has_tombstone(ws_id, "source", str(doc_id)):
+                logger.warning("delivery_gate.source_tombstoned doc_id=%s (delivery blocked)", doc_id)
+                return {
+                    "final_answer": "NOT_FOUND",
+                    "citations": [],
+                    "confidence_score": 0.0,
+                    "retrieval_incomplete": True,
+                    "retained_evidence_items": [],
+                    "top_chunks": [],
+                }
+    except Exception as te:
+        logger.error("delivery_gate.tombstone_check_error: %s (delivery blocked)", te)
+        return {
+            "final_answer": "NOT_FOUND",
+            "citations": [],
+            "confidence_score": 0.0,
+            "retrieval_incomplete": True,
+            "retained_evidence_items": [],
+            "top_chunks": [],
+        }
 
     # 2. Delivery gate blocking rule under ADR-004
     if state.get("escalation_executed") or state.get("require_delivery_gate"):
@@ -2598,11 +2607,21 @@ class ResponseObject:
 
         ws_id = state.get("workspace_id", "")
         b_repo = state.get("boundary_repo")
+        if b_repo is None:
+            try:
+                from src.db.workspace_boundary_repo import get_workspace_boundary_repo
+                b_repo = get_workspace_boundary_repo()
+            except Exception as e:
+                logger.error("ResponseObject.boundary_repo_resolution_error: %s (failing closed)", e)
+                b_repo = None
 
         # Final boundary check: verify workspace and document sources are not tombstoned
-        # Any tombstone or lookup error fails closed: prevents delivery of answer, citations, and evidence
+        # Any tombstone, lookup error, or missing/incompatible authority fails closed
         blocked = False
-        if b_repo and hasattr(b_repo, "has_tombstone") and ws_id:
+        if not b_repo or not hasattr(b_repo, "has_tombstone") or not callable(getattr(b_repo, "has_tombstone", None)):
+            logger.warning("ResponseObject.boundary_repo_unavailable_or_incompatible (failing closed)")
+            blocked = True
+        elif ws_id:
             try:
                 if b_repo.has_tombstone(ws_id, "workspace", ws_id):
                     blocked = True

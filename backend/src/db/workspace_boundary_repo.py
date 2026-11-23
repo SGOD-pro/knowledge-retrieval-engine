@@ -1550,7 +1550,8 @@ class DynamoDBWorkspaceBoundaryRepository:
                 Key={
                     "PK": f"WORKSPACE#{workspace_id}",
                     "SK": f"TOMBSTONE#{resource_type}#{resource_id}",
-                }
+                },
+                ConsistentRead=True,
             )
             return "Item" in resp
         except Exception as err:
@@ -1567,7 +1568,8 @@ class DynamoDBWorkspaceBoundaryRepository:
                 Key={
                     "PK": f"WORKSPACE#{workspace_id}",
                     "SK": f"TOMBSTONE#{resource_type}#{resource_id}",
-                }
+                },
+                ConsistentRead=True,
             )
             item = resp.get("Item")
             if not item:

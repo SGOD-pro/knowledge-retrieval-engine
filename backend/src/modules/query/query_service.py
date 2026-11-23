@@ -33,8 +33,9 @@ class QueryService:
                 logger.error("query_service.boundary_repo_resolution_error: %s (failing closed)", e)
                 return True
 
-        if b_repo is None or not hasattr(b_repo, "has_tombstone"):
-            return False
+        if b_repo is None or not hasattr(b_repo, "has_tombstone") or not callable(getattr(b_repo, "has_tombstone", None)):
+            logger.warning("query_service.boundary_repo_unavailable_or_incompatible (failing closed)")
+            return True
 
         try:
             # 1. Check workspace tombstone
