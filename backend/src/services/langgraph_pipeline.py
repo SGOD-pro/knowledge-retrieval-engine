@@ -167,6 +167,7 @@ class PipelineState(TypedDict):
     _escalation_start_time: float
     _escalation_deadline_t: float | None
     escalation_deadline_t: float | None
+    financial_binding: Any | None
 
 
 # ---------------------------------------------------------------------------
@@ -256,6 +257,15 @@ def route_query(state: PipelineState):
     else:
         planned = "fast" if plan.fast_path else "full"
 
+    fin_binding = state.get("financial_binding")
+    if fin_binding is None:
+        try:
+            from services.retrieval.table_metric_binding import bind_financial_query
+            fin_binding = bind_financial_query(state["query"])
+        except Exception as fbe:
+            logger.warning("route_query.bind_financial_query_failed: %s", fbe)
+            fin_binding = None
+
     logger.info("route_query.latency_ms=%.2f fast_path=%s planned=%s primary_strategies=%s", latency_ms, plan.fast_path, planned, selected_strategies.primary)
     return {
         "query_embedding": query_embedding,
@@ -264,6 +274,7 @@ def route_query(state: PipelineState):
         "planned_path": planned,
         "executed_path": planned,
         "selected_strategies": selected_strategies.to_dict(),
+        "financial_binding": fin_binding,
         "stage_timings": {"route_query_ms": latency_ms},
     }
 
@@ -941,6 +952,18 @@ def run_reranker(state: PipelineState):
         })
         return {"top_chunks": [], "retrieval_candidates": cands, "reranker_mode": RerankerMode.BYPASSED.value}
 
+    fin_binding = state.get("financial_binding")
+    if fin_binding and getattr(fin_binding, "is_active", False) and merged:
+        try:
+            from services.retrieval.table_metric_binding import score_table_chunk_metric_affinity
+            merged = sorted(
+                merged,
+                key=lambda c: score_table_chunk_metric_affinity(getattr(c, "text", ""), fin_binding),
+                reverse=True,
+            )
+        except Exception as sae:
+            logger.warning("run_reranker.score_merged_chunks_failed: %s", sae)
+
     rerank_res = rerank(state["query"], merged, top_k=6, return_mode=True)
     if isinstance(rerank_res, tuple) and len(rerank_res) == 2:
         top_chunks, reranker_mode = rerank_res
@@ -948,6 +971,17 @@ def run_reranker(state: PipelineState):
         # Accommodate test doubles in legacy phase tests returning bare chunk list
         top_chunks = rerank_res
         reranker_mode = getattr(rerank_res, "reranker_mode", RerankerMode.BYPASSED.value)
+
+    if fin_binding and getattr(fin_binding, "is_active", False) and top_chunks:
+        try:
+            from services.retrieval.table_metric_binding import score_table_chunk_metric_affinity
+            top_chunks = sorted(
+                top_chunks,
+                key=lambda c: score_table_chunk_metric_affinity(getattr(c, "text", ""), fin_binding),
+                reverse=True,
+            )
+        except Exception as sae:
+            logger.warning("run_reranker.score_top_chunks_failed: %s", sae)
     latency_ms = (time.perf_counter() - t0) * 1000.0
     logger.info(
         "reranker.latency_ms=%.2f reranker.input_count=%d reranker.output_count=%d mode=%s",
@@ -2004,7 +2038,58 @@ def delivery_gate(state: PipelineState) -> dict[str, Any]:
             "top_chunks": [],
         }
 
-    # 2. Delivery gate blocking rule under ADR-004
+    # 2. Financial table metric binding verification (Spec 0004 / Q193)
+    fin_binding = state.get("financial_binding")
+    ans = state.get("final_answer", "")
+    if fin_binding and getattr(fin_binding, "is_active", False) and ans and ans != "NOT_FOUND":
+        from services.retrieval.table_metric_binding import verify_financial_cell_binding
+
+        citations = state.get("citations", [])
+        top_chunks = state.get("top_chunks", [])
+        chunk_by_id = {str(getattr(c, "id", "")): c for c in top_chunks}
+
+        verified = False
+        rejection_reason = "no_cited_cells_verified"
+
+        if citations:
+            for cit in citations:
+                cid = cit.get("chunk_id") if isinstance(cit, dict) else (getattr(cit, "chunk_id", None) or getattr(cit, "id", None))
+                c_chunk = chunk_by_id.get(str(cid)) if cid else None
+                c_text = getattr(c_chunk, "text", "") if c_chunk else ""
+                if not c_text and isinstance(cit, dict):
+                    c_text = cit.get("text") or cit.get("text_snippet") or ""
+                if c_text:
+                    is_v, reason = verify_financial_cell_binding(c_text, ans, fin_binding)
+                    if is_v:
+                        verified = True
+                        break
+                    else:
+                        rejection_reason = reason
+        else:
+            for c in top_chunks:
+                is_v, reason = verify_financial_cell_binding(getattr(c, "text", ""), ans, fin_binding)
+                if is_v:
+                    verified = True
+                    break
+                else:
+                    rejection_reason = reason
+
+        if not verified:
+            logger.warning(
+                "delivery_gate.financial_metric_binding_rejected reason=%s answer=%s (delivery blocked)",
+                rejection_reason,
+                ans,
+            )
+            return {
+                "final_answer": "NOT_FOUND",
+                "citations": [],
+                "confidence_score": 0.0,
+                "retrieval_incomplete": True,
+                "retained_evidence_items": [],
+                "top_chunks": [],
+            }
+
+    # 3. Delivery gate blocking rule under ADR-004
     if state.get("escalation_executed") or state.get("require_delivery_gate"):
         # Missing boundary authority must fail closed under escalation
         if boundary_repo is None:
@@ -2856,6 +2941,7 @@ class Pipeline:
             "_escalation_start_time": time.perf_counter(),
             "_escalation_deadline_t": kwargs.get("_escalation_deadline_t"),
             "escalation_deadline_t": kwargs.get("escalation_deadline_t"),
+            "financial_binding": kwargs.get("financial_binding"),
         }
 
         if table_store is not None:
