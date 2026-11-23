@@ -2097,18 +2097,7 @@ def delivery_gate(state: PipelineState) -> dict[str, Any]:
                 }
             cited_chunks.append(auth_chunk_by_id[str(cid)])
 
-        verified = False
-        rejection_reason = "no_cited_cells_verified"
-
-        for c_chunk in cited_chunks:
-            c_text = getattr(c_chunk, "text", "")
-            if c_text:
-                is_v, reason = verify_financial_cell_binding(c_text, ans, fin_binding)
-                if is_v:
-                    verified = True
-                    break
-                else:
-                    rejection_reason = reason
+        verified, rejection_reason = verify_financial_cell_binding(cited_chunks, ans, fin_binding)
 
         if not verified:
             logger.warning(

@@ -298,20 +298,36 @@ This milestone records the full completion and acceptance of specification 0007 
 
 * **Date**: November 23 2026
 * **Branch**: `re-factor`
-* **Status**: Four financial table binding review blockers resolved and verified offline.
+* **Status**: Financial table binding review blockers, multi chunk verification, and multi metric binding resolved and verified offline.
 
 ### Overview
 
-This milestone resolves the four review blockers identified during financial table metric binding reviews:
+This milestone resolves the review blockers, multi chunk verification defect, and multi metric binding findings:
 1. Complete claim verification: Every required financial claim is parsed and verified using exact decimal arithmetic. Accounting parentheses and negative signs are preserved. Scale multipliers distinguish millions, billions, thousands, and dollars. Valid unit conversions (such as 30,739 million converted to 30.739 billion) are accepted, whereas invalid conversions (such as 30,739 billion) are rejected. Monetary amounts and percentages remain strictly separated. Secondary comparison values cannot validate an unsupported primary claim.
 2. Complete period evidence: When a query requests a date or duration, cited tables lacking period metadata strictly fail verification. Date comparison extracts exact integer components (year, month, and day), proving that June 27 strictly fails a June 7 request. Supported duration expressions normalize to canonical categories.
 3. Citation resolution to authoritative evidence: Non empty citations are required for delivered financial answers. Citation identifiers must resolve to authoritative pipeline chunks and retained evidence items. Plausible citation supplied text cannot establish evidence independently.
-4. Metric affinity in top k evidence selection: Reranking incorporates metric affinity directly into candidate scoring and threshold filtering. When more than six candidates compete, the metric aligned table survives top k selection, while relevance ordering among equal affinity candidates is preserved.
+4. Metric affinity in top k evidence selection: Reranking incorporates metric affinity directly into candidate scoring and threshold filtering across all requested metrics without mutual penalty. When more than six candidates compete, the metric aligned table survives top k selection, while relevance ordering among equal affinity candidates is preserved.
+5. Multi chunk claim verification: Claims supported across separately cited tables are verified against the full set of resolved cited evidence. Each cited chunk is parsed independently, preserving its own table headers, units scale, period, and section context, preventing one chunk from completing an incomplete cell in another chunk.
+6. Multi metric query binding and classification precedence: The pipeline binds every explicitly requested metric and entity pairing while preserving single metric callers. Specific phrases like `cost of sales` and `cost of revenue` take precedence over generic `sales` and `revenue` across query binding and answer claim extraction. An answer omitting any requested metric or presenting unsupported claims produces a safe refusal.
+7. Senior code review fixes:
+   * Competing entity claims in sentence form cannot satisfy requested entity requirements.
+   * Unentitied claims in mixed entity queries resolve expected entities per metric without false inheritance.
+   * Multi sentence answers and bullet lists segment entity clauses cleanly.
+   * Duration and date column pairing handles 1:1 and multiple spans correctly.
+   * Row labels containing numbers do not truncate labels or shift column cells.
+   * Conjoined query metrics inherit shared entity prefixes.
+   * Operating income and net income row labels verify in addition to section headers.
+   * Multi metric query activation evaluates entity presence across all requirements regardless of clause ordering.
+   * Affinity scoring boosts candidate relevance for operating income and net income tables.
+   * Comparison claims are evaluated locally using clause separators so subsequent primary claims are never dropped.
+   * Total and unentitied metric requirements reject segment entity rows, preventing hallucinated segment numbers from satisfying total company requirements.
+   * Sentence segmentation splits on periods followed by whitespace and numbers or capital letters.
+   * Footnote markers attached to row labels are excluded from data columns.
 
 ### Verification Evidence
 
-* Test command: `cd backend && uv run pytest tests/test_financial_table_metric_binding.py -v` (19 passed in 3.06s).
-* Regression suite: `cd backend && uv run pytest tests/test_financial_table_metric_binding.py tests/test_canonical_percentage_grading.py tests/test_offline_benchmark_artifact_reproducibility.py tests/test_grounded_answer_evaluator.py tests/test_benchmark_guard.py tests/test_benchmark_integrity_defects.py tests/test_citation_retained_evidence.py tests/test_evidence_providers.py tests/test_fast_path_fallback_regressions.py tests/test_chunk_citation_provenance_repair.py -rs` (145 passed in 9.53s).
+* Focused suite: `cd backend && uv run pytest tests/test_financial_table_metric_binding.py -v` (50 passed in 3.90s).
+* Regression suite: `cd backend && uv run pytest tests/test_financial_table_metric_binding.py tests/test_canonical_percentage_grading.py tests/test_offline_benchmark_artifact_reproducibility.py tests/test_grounded_answer_evaluator.py tests/test_benchmark_guard.py tests/test_benchmark_integrity_defects.py tests/test_citation_retained_evidence.py tests/test_evidence_providers.py tests/test_fast_path_fallback_regressions.py tests/test_chunk_citation_provenance_repair.py -rs` (176 passed in 9.22s).
 
 ### Operational Boundaries and Limitations
 

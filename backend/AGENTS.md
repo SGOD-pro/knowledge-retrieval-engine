@@ -11,6 +11,7 @@ FastAPI service providing parsing, structural indexing, retrieval orchestration,
 | `src/api/routes.py` | Central API router mounting modules for auth, workspaces, documents, query, chat, and graph |
 | `src/security/auth.py` | Workspace authentication context and test principal provider |
 | `src/services/langgraph_pipeline.py` | LangGraph query execution graph orchestrating planning, retrieval, and evidence verification |
+| `src/services/retrieval/table_metric_binding.py` | Financial table metric binding, candidate affinity scoring, and delivery gate cell verification |
 | `src/services/retrieval/deterministic_executor.py` | Deterministic structured data executor for tabular queries |
 | `src/services/retrieval/strategy_router.py` | Strategy router directing retrieval across evidence sources |
 | `src/ingestion/parse_service.py` | Document parser routing files to specialized format adapters |
@@ -79,6 +80,7 @@ uv run pytest tests/test_contracts_and_identity.py
 * Graph retrieval exception fallback in run_graph catches expand failures fail closed, sets graph_execution_status to storage_failed with zero graph candidates, and preserves baseline retrieval.
 * Canonical benchmark evaluation distinguishes legacy answer text accuracy from grounded correctness with distinct scorer version 2.2.0. Answerable responses require non-empty citations, expected source and version matching, authoritative request retained evidence serialized via EvidenceItem to_dict and restored typed representation for offline scoring without citation snippet fabrication, all necessary calculation operands before accepting derived results, structured results obtained strictly from matching retained executions without citation result expansion, and rejection of claim-level contradictions with negation bound strictly to its target claim without overriding legacy numeric clause helpers.
 * Chunk backed query citations and retained evidence items resolve canonical document filename and version through request authorized workspace boundary snapshots. An unbound chunk stays unversioned after the snapshot advances, while verified chunk bindings carry matching filename and version through actual query paths, rejecting cross workspace borrowing and unverified version relabeling while preserving tombstone enforcement.
+* Financial table query verification enforces exact metric, entity, period, sign, and unit matching against cited table cells across independently parsed chunks, rejecting segment row values for total company metrics and unverified or ungrounded claims fail closed.
 
 ## Gotchas
 * Local development defaults to SQLite or in memory TableStore and LocalStack DynamoDB, while Qdrant runs via local container or cloud.
