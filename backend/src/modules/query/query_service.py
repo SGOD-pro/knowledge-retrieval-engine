@@ -14,6 +14,110 @@ class QueryService:
     def __init__(self, repo: QueryRepository | None = None):
         self.repo = repo or QueryRepository()
 
+    def _is_revoked_by_boundary(
+        self,
+        workspace_id: str,
+        citations: list[Any],
+        retained_evidence_items: list[Any],
+        boundary_repo: Any | None = None,
+    ) -> bool:
+        if not workspace_id:
+            return False
+
+        b_repo = boundary_repo
+        if b_repo is None:
+            try:
+                from src.db.workspace_boundary_repo import get_workspace_boundary_repo
+                b_repo = get_workspace_boundary_repo()
+            except Exception as e:
+                logger.error("query_service.boundary_repo_resolution_error: %s (failing closed)", e)
+                return True
+
+        if b_repo is None or not hasattr(b_repo, "has_tombstone"):
+            return False
+
+        try:
+            # 1. Check workspace tombstone
+            if b_repo.has_tombstone(workspace_id, "workspace", workspace_id):
+                return True
+
+            # 2. Check citations
+            for c in citations:
+                c_ws = c.get("workspace_id") if isinstance(c, dict) else getattr(c, "workspace_id", None)
+                if c_ws and c_ws != workspace_id:
+                    return True
+                doc_id = c.get("document_id") if isinstance(c, dict) else getattr(c, "document_id", None)
+                if doc_id and b_repo.has_tombstone(workspace_id, "source", str(doc_id)):
+                    return True
+
+            # 3. Check retained evidence items (serialized dicts or typed objects)
+            for ev in retained_evidence_items:
+                if isinstance(ev, dict):
+                    loc = ev.get("locator") or {}
+                    ev_ws = ev.get("workspace_id") or loc.get("workspace_id")
+                    if ev_ws and ev_ws != workspace_id:
+                        return True
+                    doc_id = ev.get("document_id") or loc.get("document_id")
+                    table_id = loc.get("table_id")
+                else:
+                    loc = getattr(ev, "locator", {}) or {}
+                    ev_ws = getattr(ev, "workspace_id", None) or loc.get("workspace_id")
+                    if ev_ws and ev_ws != workspace_id:
+                        return True
+                    doc_id = getattr(ev, "document_id", None) or loc.get("document_id")
+                    table_id = loc.get("table_id")
+
+                if doc_id and b_repo.has_tombstone(workspace_id, "source", str(doc_id)):
+                    return True
+                if table_id and b_repo.has_tombstone(workspace_id, "source", str(table_id)):
+                    return True
+
+        except Exception as e:
+            logger.error("query_service.boundary_check_error: %s (failing closed)", e)
+            return True
+
+        return False
+
+    def _apply_cached_safe_refusal(self, cached_response: dict) -> dict:
+        out = dict(cached_response)
+        err_code = out.get("error_code")
+        if err_code == "incomplete_data":
+            out["answer"] = "Table data is incomplete: required records are missing from table storage."
+        else:
+            out["answer"] = "I couldn't find any relevant passages in the workspace documents matching your query."
+        out["citations"] = []
+        out["retained_evidence_items"] = []
+        out["confidence"] = 0.0
+        out["confidence_score"] = 0.0
+        out["faithfulness"] = None
+        out["citation_utilization_rate"] = None
+        out["retrieval_incomplete"] = True
+        out["cached"] = True
+        return out
+
+    def _validate_cached_response(
+        self,
+        cached_response: dict,
+        workspace_id: str,
+        boundary_repo: Any | None = None,
+    ) -> dict:
+        ans = cached_response.get("answer", "")
+        retrieval_incomplete = cached_response.get("retrieval_incomplete", False)
+        is_refusal = (ans == "NOT_FOUND" or not ans or retrieval_incomplete)
+
+        if not is_refusal:
+            citations = cached_response.get("citations", [])
+            evidence = cached_response.get("retained_evidence_items", [])
+            if self._is_revoked_by_boundary(workspace_id, citations, evidence, boundary_repo):
+                is_refusal = True
+
+        if is_refusal:
+            return self._apply_cached_safe_refusal(cached_response)
+
+        out = dict(cached_response)
+        out["cached"] = True
+        return out
+
     def execute_query(self, req: QueryRequest) -> dict:
         from services.telemetry import init_request_telemetry
         req_telemetry = init_request_telemetry()
@@ -32,6 +136,7 @@ class QueryService:
             ws_chunks = self.repo.get_all_chunks(workspace_id=req.workspace_id)
             ws_doc_ids = list({str(c.document_id) for c in ws_chunks if str(c.document_id)})
 
+        boundary_repo = None
         # Also include document IDs for structured tables and boundary sources in workspace
         try:
             from db.table_store import get_shared_table_store
@@ -104,15 +209,18 @@ class QueryService:
         # 1. Check Exact Match Cache (Layer 2) — bypassed in benchmark_mode or cache=False
         use_cache = req.cache and not getattr(req, "benchmark_mode", False)
         if use_cache:
+            cached_response = None
             try:
                 from db.redis_cache import cache
 
                 cached_response = cache.get_cache(cache_key)
-                if cached_response:
-                    cached_response["cached"] = True
-                    return cached_response
             except Exception:
-                pass
+                cached_response = None
+
+            if cached_response is not None:
+                return self._validate_cached_response(
+                    cached_response, req.workspace_id, boundary_repo
+                )
 
         # 2. Check Semantic Cache (Layer 1) — bypassed in benchmark_mode or cache=False
         # Also bypassed for structured-aggregate queries: route is resolved first;
@@ -137,13 +245,19 @@ class QueryService:
                         query_embedding, doc_scope_hash, provider
                     )
 
+                    semantic_response = None
                     if semantic_key:
-                        from db.redis_cache import cache
+                        try:
+                            from db.redis_cache import cache
 
-                        cached_response = cache.get_cache(semantic_key)
-                        if cached_response:
-                            cached_response["cached"] = True
-                            return cached_response
+                            semantic_response = cache.get_cache(semantic_key)
+                        except Exception:
+                            semantic_response = None
+
+                    if semantic_response is not None:
+                        return self._validate_cached_response(
+                            semantic_response, req.workspace_id, boundary_repo
+                        )
             except Exception:
                 pass
 
@@ -277,24 +391,13 @@ class QueryService:
 
         is_refusal = (answer_text == "NOT_FOUND" or not answer_text or retrieval_incomplete)
 
-        if not is_refusal and b_repo and hasattr(b_repo, "has_tombstone") and req.workspace_id:
-            try:
-                if b_repo.has_tombstone(req.workspace_id, "workspace", req.workspace_id):
-                    is_refusal = True
-                if not is_refusal:
-                    for c in formatted_citations:
-                        d_id = c.get("document_id")
-                        if d_id and b_repo.has_tombstone(req.workspace_id, "source", str(d_id)):
-                            is_refusal = True
-                            break
-                if not is_refusal:
-                    for ev in getattr(response, "retained_evidence_items", []):
-                        d_id = getattr(ev, "document_id", None) or (getattr(ev, "locator", {}) or {}).get("document_id")
-                        if d_id and b_repo.has_tombstone(req.workspace_id, "source", str(d_id)):
-                            is_refusal = True
-                            break
-            except Exception as be:
-                logger.error("query_service.final_boundary_check_error: %s (failing closed)", be)
+        if not is_refusal and req.workspace_id:
+            if self._is_revoked_by_boundary(
+                req.workspace_id,
+                formatted_citations,
+                getattr(response, "retained_evidence_items", []),
+                b_repo,
+            ):
                 is_refusal = True
 
         if is_refusal:

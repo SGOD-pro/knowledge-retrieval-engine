@@ -15,12 +15,14 @@ Validates:
 """
 
 from datetime import datetime, timezone
+import hashlib
 import json
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 import pytest
 
 from db.database import CloudRepository
+from db.redis_cache import cache
 from db.workspace_boundary_repo import InMemoryWorkspaceBoundaryRepository
 from ingestion.embed_service import embed_fast_local, _deterministic_vector
 from modules.query.query_service import QueryService
@@ -821,3 +823,308 @@ def test_real_query_response_path_boundary_lookup_error(monkeypatch, boundary_re
     assert res["retrieval_incomplete"] is True
     assert res["confidence"] == 0.0
     assert res["cached"] is False
+
+
+def _compute_exact_cache_key(query: str, doc_ids: list[str]) -> str:
+    query_norm = query.strip().lower()
+    doc_scope_hash = ""
+    if doc_ids:
+        sorted_ids = sorted(doc_ids)
+        doc_scope_hash = hashlib.sha256(",".join(sorted_ids).encode("utf-8")).hexdigest()
+    raw_key = (query_norm + doc_scope_hash).encode("utf-8")
+    return f"query:{hashlib.sha256(raw_key).hexdigest()}"
+
+
+def test_exact_cache_hit_revoked_source_after_scope_resolution(monkeypatch, boundary_repo: InMemoryWorkspaceBoundaryRepository):
+    """Confirm exact cache hit enforces safe refusal when source is revoked after scope resolution."""
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    ws_id = "ws_exact_cache_revocation"
+    doc_id = "doc_exact_revoked_1"
+    boundary_repo.create_workspace("Exact Cache Revocation", "owner_1", ws_id)
+    boundary_repo.save_document_snapshot(
+        DocumentSnapshot(
+            workspace_id=ws_id,
+            document_id=doc_id,
+            source="exact_record.pdf",
+            version="v_exact_1",
+            format="pdf",
+            created_at=_now_utc(),
+        )
+    )
+
+    repo = CloudRepository()
+    query_text = "What is the exact cached revenue figure?"
+    doc = _setup_synthetic_doc(repo, ws_id, doc_id, "The exact cached revenue figure is 99 million.")
+    chunk = doc.chunks[0]
+
+    cit = build_citation(chunk, workspace_id=ws_id, boundary_repo=boundary_repo).to_dict()
+    ev = evidence_item_from_chunk(chunk, workspace_id=ws_id, strategy="fast_path", boundary_repo=boundary_repo)
+
+    cached_payload = {
+        "answer": "The exact cached revenue figure is 99 million.",
+        "citations": [cit],
+        "retained_evidence_items": [ev.to_dict()],
+        "confidence": 0.95,
+        "confidence_score": 0.95,
+        "latency_ms": 10.0,
+        "fast_path": True,
+        "retrieval_path": "fast",
+        "status": "success",
+        "retrieval_incomplete": False,
+        "cached": False,
+    }
+
+    cache_key = _compute_exact_cache_key(query_text, [doc_id])
+    cache.set_cache(cache_key, cached_payload, ttl=3600)
+
+    qs = QueryService()
+    req = QueryRequest(
+        workspace_id=ws_id,
+        query=query_text,
+        cache=True,
+    )
+
+    real_get_cache = cache.get_cache
+
+    def get_cache_and_revoke(key):
+        # Revoke source after scope resolution has already evaluated target_doc_ids
+        boundary_repo.record_source_tombstone(
+            workspace_id=ws_id,
+            source_id=doc_id,
+            caller_principal_id="admin_1",
+            reason="revoked_after_scope_resolution",
+        )
+        return real_get_cache(key)
+
+    with patch.object(cache, "get_cache", side_effect=get_cache_and_revoke), \
+         patch("src.db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=boundary_repo), \
+         patch("db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=boundary_repo):
+        res = qs.execute_query(req)
+
+    # Must return safe refusal with no citations or evidence and retrieval_incomplete=True
+    assert res["cached"] is True
+    assert "couldn't find any relevant" in res["answer"].lower()
+    assert "99 million" not in res["answer"]
+    assert res["citations"] == []
+    assert res["retained_evidence_items"] == []
+    assert res["retrieval_incomplete"] is True
+    assert res["confidence"] == 0.0
+
+
+def test_semantic_cache_hit_revoked_source_after_scope_resolution(monkeypatch, boundary_repo: InMemoryWorkspaceBoundaryRepository):
+    """Confirm semantic cache hit enforces safe refusal when source is revoked after scope resolution."""
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    ws_id = "ws_semantic_cache_revocation"
+    doc_id = "doc_semantic_revoked_1"
+    boundary_repo.create_workspace("Semantic Cache Revocation", "owner_1", ws_id)
+    boundary_repo.save_document_snapshot(
+        DocumentSnapshot(
+            workspace_id=ws_id,
+            document_id=doc_id,
+            source="semantic_record.pdf",
+            version="v_sem_1",
+            format="pdf",
+            created_at=_now_utc(),
+        )
+    )
+
+    repo = CloudRepository()
+    query_text = "What is the semantic forecast total?"
+    doc = _setup_synthetic_doc(repo, ws_id, doc_id, "The semantic forecast total is 120 million.")
+    chunk = doc.chunks[0]
+
+    cit = build_citation(chunk, workspace_id=ws_id, boundary_repo=boundary_repo).to_dict()
+    ev = evidence_item_from_chunk(chunk, workspace_id=ws_id, strategy="vector_rerank", boundary_repo=boundary_repo)
+
+    cached_payload = {
+        "answer": "The semantic forecast total is 120 million.",
+        "citations": [cit],
+        "retained_evidence_items": [ev.to_dict()],
+        "confidence": 0.92,
+        "confidence_score": 0.92,
+        "latency_ms": 25.0,
+        "fast_path": False,
+        "retrieval_path": "full",
+        "status": "success",
+        "retrieval_incomplete": False,
+        "cached": False,
+    }
+
+    semantic_key = f"semantic:{ws_id}:forecast"
+    cache.set_cache(semantic_key, cached_payload, ttl=3600)
+
+    qs = QueryService()
+    req = QueryRequest(
+        workspace_id=ws_id,
+        query=query_text,
+        cache=True,
+        force_full_path=True,
+    )
+
+    real_get_cache = cache.get_cache
+
+    def get_cache_and_revoke(key):
+        if key == semantic_key:
+            # Revoke source after scope resolution
+            boundary_repo.record_source_tombstone(
+                workspace_id=ws_id,
+                source_id=doc_id,
+                caller_principal_id="admin_1",
+                reason="revoked_after_scope_resolution",
+            )
+        return real_get_cache(key)
+
+    with patch.object(cache, "get_cache", side_effect=get_cache_and_revoke), \
+         patch.object(qs.repo, "check_semantic_cache", return_value=semantic_key), \
+         patch("src.db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=boundary_repo), \
+         patch("db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=boundary_repo):
+        res = qs.execute_query(req)
+
+    # Must return safe refusal with no citations or evidence and retrieval_incomplete=True
+    assert res["cached"] is True
+    assert "couldn't find any relevant" in res["answer"].lower()
+    assert "120 million" not in res["answer"]
+    assert res["citations"] == []
+    assert res["retained_evidence_items"] == []
+    assert res["retrieval_incomplete"] is True
+    assert res["confidence"] == 0.0
+
+
+def test_cached_query_boundary_lookup_error_returns_safe_refusal(monkeypatch, boundary_repo: InMemoryWorkspaceBoundaryRepository):
+    """Confirm cached query fails closed with safe refusal when boundary lookup encounters an error."""
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    ws_id = "ws_cache_lookup_err"
+    doc_id = "doc_cache_err_1"
+    boundary_repo.create_workspace("Cache Error Test", "owner_1", ws_id)
+    boundary_repo.save_document_snapshot(
+        DocumentSnapshot(
+            workspace_id=ws_id,
+            document_id=doc_id,
+            source="err_cache_record.pdf",
+            version="v_ce_1",
+            format="pdf",
+            created_at=_now_utc(),
+        )
+    )
+
+    repo = CloudRepository()
+    query_text = "What is the confidential cache item?"
+    doc = _setup_synthetic_doc(repo, ws_id, doc_id, "The confidential cache item is TOP-SECRET-42.")
+    chunk = doc.chunks[0]
+
+    cit = build_citation(chunk, workspace_id=ws_id, boundary_repo=boundary_repo).to_dict()
+    ev = evidence_item_from_chunk(chunk, workspace_id=ws_id, strategy="fast_path", boundary_repo=boundary_repo)
+
+    cached_payload = {
+        "answer": "The confidential cache item is TOP-SECRET-42.",
+        "citations": [cit],
+        "retained_evidence_items": [ev.to_dict()],
+        "confidence": 0.95,
+        "confidence_score": 0.95,
+        "latency_ms": 10.0,
+        "fast_path": True,
+        "retrieval_path": "fast",
+        "status": "success",
+        "retrieval_incomplete": False,
+        "cached": False,
+    }
+
+    cache_key = _compute_exact_cache_key(query_text, [doc_id])
+    cache.set_cache(cache_key, cached_payload, ttl=3600)
+
+    qs = QueryService()
+    req = QueryRequest(
+        workspace_id=ws_id,
+        query=query_text,
+        cache=True,
+    )
+
+    real_has_tombstone = boundary_repo.has_tombstone
+
+    def error_on_cache_check(workspace_id, entity_type, entity_id):
+        # Allow scope resolution to pass, but fail on cache hit boundary check
+        if entity_type == "workspace" or entity_id == doc_id:
+            raise RuntimeError("DynamoDB boundary table outage during cache check")
+        return real_has_tombstone(workspace_id, entity_type, entity_id)
+
+    # Hook has_tombstone to simulate lookup failure during cache validation
+    def get_cache_and_set_error(key):
+        boundary_repo.has_tombstone = error_on_cache_check
+        return cache._mem_cache.get(key)
+
+    with patch.object(cache, "get_cache", side_effect=get_cache_and_set_error), \
+         patch("src.db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=boundary_repo), \
+         patch("db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=boundary_repo):
+        res = qs.execute_query(req)
+
+    # Must fail closed with safe refusal, no citations, no evidence, and retrieval_incomplete=True
+    assert res["cached"] is True
+    assert "couldn't find any relevant" in res["answer"].lower()
+    assert "TOP-SECRET-42" not in res["answer"]
+    assert res["citations"] == []
+    assert res["retained_evidence_items"] == []
+    assert res["retrieval_incomplete"] is True
+    assert res["confidence"] == 0.0
+
+
+def test_authorized_cache_hit_delivers_payload(monkeypatch, boundary_repo: InMemoryWorkspaceBoundaryRepository):
+    """Confirm authorized cache hit delivers full answer, citations, and evidence with cached=True."""
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    ws_id = "ws_authorized_cache"
+    doc_id = "doc_auth_1"
+    boundary_repo.create_workspace("Authorized Cache Test", "owner_1", ws_id)
+    boundary_repo.save_document_snapshot(
+        DocumentSnapshot(
+            workspace_id=ws_id,
+            document_id=doc_id,
+            source="authorized_record.pdf",
+            version="v_auth_1",
+            format="pdf",
+            created_at=_now_utc(),
+        )
+    )
+
+    repo = CloudRepository()
+    query_text = "What is the confirmed delivery date?"
+    doc = _setup_synthetic_doc(repo, ws_id, doc_id, "The confirmed delivery date is October 15, 2026.")
+    chunk = doc.chunks[0]
+
+    cit = build_citation(chunk, workspace_id=ws_id, boundary_repo=boundary_repo).to_dict()
+    ev = evidence_item_from_chunk(chunk, workspace_id=ws_id, strategy="fast_path", boundary_repo=boundary_repo)
+
+    cached_payload = {
+        "answer": "The confirmed delivery date is October 15, 2026.",
+        "citations": [cit],
+        "retained_evidence_items": [ev.to_dict()],
+        "confidence": 0.98,
+        "confidence_score": 0.98,
+        "latency_ms": 8.0,
+        "fast_path": True,
+        "retrieval_path": "fast",
+        "status": "success",
+        "retrieval_incomplete": False,
+        "cached": False,
+    }
+
+    cache_key = _compute_exact_cache_key(query_text, [doc_id])
+    cache.set_cache(cache_key, cached_payload, ttl=3600)
+
+    qs = QueryService()
+    req = QueryRequest(
+        workspace_id=ws_id,
+        query=query_text,
+        cache=True,
+    )
+
+    with patch("src.db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=boundary_repo), \
+         patch("db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=boundary_repo):
+        res = qs.execute_query(req)
+
+    # Must deliver authorized response
+    assert res["cached"] is True
+    assert "October 15, 2026" in res["answer"]
+    assert len(res["citations"]) == 1
+    assert res["citations"][0]["document_id"] == doc_id
+    assert len(res["retained_evidence_items"]) == 1
+    assert res["retrieval_incomplete"] is False
+    assert res["confidence"] == 0.98
