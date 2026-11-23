@@ -62,7 +62,6 @@ class QueryService:
         except Exception:
             pass
 
-
         if req.document_ids is not None:
             # req.document_ids is an optional additional filter on top of workspace scope, not a replacement
             target_doc_ids = [d_id for d_id in req.document_ids if d_id in set(ws_doc_ids)]
@@ -85,7 +84,9 @@ class QueryService:
                 "citation_utilization_rate": None,
                 "token_usage": {"input_tokens": 0, "output_tokens": 0},
                 "cached": False,
+                "retained_evidence_items": [],
                 "document_ids": [],
+                "retrieval_incomplete": True,
             }
 
         # Compute cache key per MEMORY.md specification
@@ -169,6 +170,8 @@ class QueryService:
                 kwargs["query_embedding"] = query_embedding
             if accepts_var_kwargs or "benchmark_mode" in params:
                 kwargs["benchmark_mode"] = getattr(req, "benchmark_mode", False)
+            if boundary_repo is not None:
+                kwargs["boundary_repo"] = boundary_repo
 
             response = pipeline.run(**kwargs)
         except Exception as e:
@@ -218,6 +221,7 @@ class QueryService:
                 "document_ids": target_doc_ids or [],
                 "retrieval_candidates": {},
                 "reranker_mode": RerankerMode.BYPASSED.value,
+                "retrieval_incomplete": True,
             }
 
         t1 = time.perf_counter()
@@ -260,17 +264,56 @@ class QueryService:
         status = getattr(response, "status", "success")
         error_code = getattr(response, "error_code", None)
         answer_text = response.answer
-        if answer_text == "NOT_FOUND" or not answer_text:
+        retrieval_incomplete = getattr(response, "retrieval_incomplete", False)
+
+        # Final boundary check in QueryService before delivery
+        b_repo = boundary_repo
+        if b_repo is None:
+            try:
+                from src.db.workspace_boundary_repo import get_workspace_boundary_repo
+                b_repo = get_workspace_boundary_repo()
+            except Exception:
+                b_repo = None
+
+        is_refusal = (answer_text == "NOT_FOUND" or not answer_text or retrieval_incomplete)
+
+        if not is_refusal and b_repo and hasattr(b_repo, "has_tombstone") and req.workspace_id:
+            try:
+                if b_repo.has_tombstone(req.workspace_id, "workspace", req.workspace_id):
+                    is_refusal = True
+                if not is_refusal:
+                    for c in formatted_citations:
+                        d_id = c.get("document_id")
+                        if d_id and b_repo.has_tombstone(req.workspace_id, "source", str(d_id)):
+                            is_refusal = True
+                            break
+                if not is_refusal:
+                    for ev in getattr(response, "retained_evidence_items", []):
+                        d_id = getattr(ev, "document_id", None) or (getattr(ev, "locator", {}) or {}).get("document_id")
+                        if d_id and b_repo.has_tombstone(req.workspace_id, "source", str(d_id)):
+                            is_refusal = True
+                            break
+            except Exception as be:
+                logger.error("query_service.final_boundary_check_error: %s (failing closed)", be)
+                is_refusal = True
+
+        if is_refusal:
             if error_code == "incomplete_data":
                 answer_text = "Table data is incomplete: required records are missing from table storage."
             else:
                 answer_text = "I couldn't find any relevant passages in the workspace documents matching your query."
-
-        faithfulness = getattr(response, "faithfulness", None)
-        if response.answer == "NOT_FOUND" or not response.answer or error_code == "incomplete_data":
+            formatted_citations = []
+            retained_ev_items = []
+            confidence = 0.0
             faithfulness = None
+            citation_util = None
+            retrieval_incomplete = True
+        else:
+            retained_ev_items = getattr(response, "retained_evidence_items", [])
+            confidence = response.confidence_score
+            faithfulness = getattr(response, "faithfulness", None)
+            citation_util = getattr(response, "citation_utilization_rate", None)
 
-        citation_util = getattr(response, "citation_utilization_rate", None)
         usage = getattr(response, "usage", {"input_tokens": 0, "output_tokens": 0})
 
         planned_path = getattr(response, "planned_path", "fast" if fast_path else "full")
@@ -311,8 +354,8 @@ class QueryService:
         response_dict = {
             "answer": answer_text,
             "citations": formatted_citations,
-            "confidence": response.confidence_score,
-            "confidence_score": response.confidence_score,
+            "confidence": confidence,
+            "confidence_score": confidence,
             "latency_ms": total_ms,
             "latency_breakdown": latency_breakdown,
             "fast_path": fast_path,
@@ -326,7 +369,7 @@ class QueryService:
             "citation_utilization_rate": citation_util,
             "token_usage": usage,
             "cached": False,
-            "retained_evidence_items": getattr(response, "retained_evidence_items", []),
+            "retained_evidence_items": retained_ev_items,
             "document_ids": req.document_ids or [],
             "retrieval_candidates": retrieval_candidates,
             "structural_candidate_ids": retrieval_candidates.get("structural_candidate_ids", []),
@@ -348,7 +391,7 @@ class QueryService:
             "graph_entity_state": retrieval_candidates.get("graph_entity_state", "none"),
             "graph_relationship_state": retrieval_candidates.get("graph_relationship_state", "none"),
             "reranker_mode": reranker_mode,
-            "retrieval_incomplete": getattr(response, "retrieval_incomplete", False),
+            "retrieval_incomplete": retrieval_incomplete,
             "laya_calls": getattr(response, "laya_calls", 0),
             "expansion_steps": getattr(response, "expansion_steps", 0),
             "synthesis_calls": getattr(response, "synthesis_calls", 0),
@@ -371,6 +414,7 @@ class QueryService:
         # 4. Write Cache (ONLY if cache enabled and not in benchmark_mode)
         if (
             use_cache
+            and not is_refusal
             and (response.confidence_score >= CACHE_MIN_CONFIDENCE or response.fast_path)
             and response.answer != "NOT_FOUND"
         ):

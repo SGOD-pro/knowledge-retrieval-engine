@@ -1957,6 +1957,8 @@ def delivery_gate(state: PipelineState) -> dict[str, Any]:
                     "citations": [],
                     "confidence_score": 0.0,
                     "retrieval_incomplete": True,
+                    "retained_evidence_items": [],
+                    "top_chunks": [],
                 }
             for cit in state.get("citations", []):
                 doc_id = cit.get("document_id") if isinstance(cit, dict) else getattr(cit, "document_id", None)
@@ -1967,6 +1969,20 @@ def delivery_gate(state: PipelineState) -> dict[str, Any]:
                         "citations": [],
                         "confidence_score": 0.0,
                         "retrieval_incomplete": True,
+                        "retained_evidence_items": [],
+                        "top_chunks": [],
+                    }
+            for ev in state.get("retained_evidence_items", []):
+                doc_id = getattr(ev, "document_id", None) or (getattr(ev, "locator", {}) or {}).get("document_id")
+                if doc_id and boundary_repo.has_tombstone(ws_id, "source", str(doc_id)):
+                    logger.warning("delivery_gate.source_tombstoned doc_id=%s (delivery blocked)", doc_id)
+                    return {
+                        "final_answer": "NOT_FOUND",
+                        "citations": [],
+                        "confidence_score": 0.0,
+                        "retrieval_incomplete": True,
+                        "retained_evidence_items": [],
+                        "top_chunks": [],
                     }
         except Exception as te:
             logger.error("delivery_gate.tombstone_check_error: %s (delivery blocked)", te)
@@ -1975,6 +1991,8 @@ def delivery_gate(state: PipelineState) -> dict[str, Any]:
                 "citations": [],
                 "confidence_score": 0.0,
                 "retrieval_incomplete": True,
+                "retained_evidence_items": [],
+                "top_chunks": [],
             }
 
     # 2. Delivery gate blocking rule under ADR-004
@@ -1987,6 +2005,8 @@ def delivery_gate(state: PipelineState) -> dict[str, Any]:
                 "citations": [],
                 "confidence_score": 0.0,
                 "retrieval_incomplete": True,
+                "retained_evidence_items": [],
+                "top_chunks": [],
             }
 
         verifier = state.get("verifier") or state.get("semantic_verifier")
@@ -2011,6 +2031,8 @@ def delivery_gate(state: PipelineState) -> dict[str, Any]:
                     "citations": [],
                     "confidence_score": 0.0,
                     "retrieval_incomplete": True,
+                    "retained_evidence_items": [],
+                    "top_chunks": [],
                 }
             else:
                 # Verifier is present -> verify actual synthesized text under deadline protection
@@ -2052,6 +2074,8 @@ def delivery_gate(state: PipelineState) -> dict[str, Any]:
                         "citations": [],
                         "confidence_score": 0.0,
                         "retrieval_incomplete": True,
+                        "retained_evidence_items": [],
+                        "top_chunks": [],
                     }
 
                 def _do_verify() -> Any:
@@ -2065,6 +2089,8 @@ def delivery_gate(state: PipelineState) -> dict[str, Any]:
                         "citations": [],
                         "confidence_score": 0.0,
                         "retrieval_incomplete": True,
+                        "retained_evidence_items": [],
+                        "top_chunks": [],
                     }
                 elif v_status != "completed" or v_rec is None or isinstance(v_rec, Exception):
                     logger.error("delivery_gate.verifier_failed status=%s", v_status)
@@ -2073,6 +2099,8 @@ def delivery_gate(state: PipelineState) -> dict[str, Any]:
                         "citations": [],
                         "confidence_score": 0.0,
                         "retrieval_incomplete": True,
+                        "retained_evidence_items": [],
+                        "top_chunks": [],
                     }
 
                 status = getattr(v_rec, "support_status", None)
@@ -2094,6 +2122,8 @@ def delivery_gate(state: PipelineState) -> dict[str, Any]:
                         "citations": [],
                         "confidence_score": 0.0,
                         "retrieval_incomplete": True,
+                        "retained_evidence_items": [],
+                        "top_chunks": [],
                     }
 
     return {}
@@ -2549,6 +2579,7 @@ class ResponseObject:
         self.error_code = state.get("error_code")
         self.retained_evidence_items = state.get("retained_evidence_items", [])
         self.selected_strategies = state.get("selected_strategies", {})
+        self.retrieval_incomplete = state.get("retrieval_incomplete", False)
 
         # Ensure every citation carries the strategy of its matched retained evidence item
         retained_map = {str(ev.evidence_id): ev.strategy for ev in self.retained_evidence_items}
@@ -2565,44 +2596,60 @@ class ResponseObject:
                 tid = str(cit.get("table_id", ""))
                 cit["strategy"] = retained_map.get(cid) or retained_map.get(tid) or "vector_rerank"
 
-        # Ensure retained evidence and final citations carry identical canonical filename and version
-        retained_by_cid = {}
-        for ev in self.retained_evidence_items:
-            loc = getattr(ev, "locator", {}) or {}
-            cid = str(getattr(ev, "evidence_id", "") or loc.get("chunk_id", ""))
-            if cid:
-                retained_by_cid[cid] = ev
-
         ws_id = state.get("workspace_id", "")
         b_repo = state.get("boundary_repo")
 
-        for cit in self.citations:
-            if isinstance(cit, dict):
-                cid = str(cit.get("chunk_id", ""))
-                did = str(cit.get("document_id", ""))
+        # Final boundary check: verify workspace and document sources are not tombstoned
+        # Any tombstone or lookup error fails closed: prevents delivery of answer, citations, and evidence
+        blocked = False
+        if b_repo and hasattr(b_repo, "has_tombstone") and ws_id:
+            try:
+                if b_repo.has_tombstone(ws_id, "workspace", ws_id):
+                    blocked = True
+                if not blocked:
+                    for cit in self.citations:
+                        did = cit.get("document_id") if isinstance(cit, dict) else getattr(cit, "document_id", None)
+                        if did and b_repo.has_tombstone(ws_id, "source", str(did)):
+                            blocked = True
+                            break
+                if not blocked:
+                    for ev in self.retained_evidence_items:
+                        did = getattr(ev, "document_id", None) or (getattr(ev, "locator", {}) or {}).get("document_id")
+                        if did and b_repo.has_tombstone(ws_id, "source", str(did)):
+                            blocked = True
+                            break
+            except Exception as e:
+                logger.error("ResponseObject.final_boundary_check_error: %s (failing closed)", e)
+                blocked = True
 
-                # Dynamic tombstone check before delivery: if tombstoned, block citation
-                is_tombstoned = False
-                if b_repo and hasattr(b_repo, "has_tombstone") and ws_id:
-                    try:
-                        if b_repo.has_tombstone(ws_id, "workspace", ws_id) or (did and b_repo.has_tombstone(ws_id, "source", did)):
-                            is_tombstoned = True
-                    except Exception:
-                        is_tombstoned = False
+        if blocked or self.retrieval_incomplete or self.answer == "NOT_FOUND" or not self.answer:
+            self.answer = "NOT_FOUND"
+            self.citations = []
+            self.retained_evidence_items = []
+            self.top_chunks = []
+            self.confidence_score = 0.0
+            self.retrieval_incomplete = True
+            self.faithfulness = None
+            self.citation_utilization_rate = None
+        else:
+            # Ensure retained evidence and final citations carry identical canonical filename and version
+            retained_by_cid = {}
+            for ev in self.retained_evidence_items:
+                loc = getattr(ev, "locator", {}) or {}
+                cid = str(getattr(ev, "evidence_id", "") or loc.get("chunk_id", ""))
+                if cid:
+                    retained_by_cid[cid] = ev
 
-                if is_tombstoned:
-                    fallback = f"Doc-{did[:8]}" if did else "Doc-unknown"
-                    cit["document_filename"] = fallback
-                    cit["document_version"] = None
-                    continue
-
-                matched_ev = retained_by_cid.get(cid)
-                if matched_ev:
-                    ev_fname = getattr(matched_ev, "document_filename", None) or (getattr(matched_ev, "locator", {}) or {}).get("document_filename")
-                    ev_ver = getattr(matched_ev, "document_version", None) or (getattr(matched_ev, "locator", {}) or {}).get("document_version")
-                    if ev_fname:
-                        cit["document_filename"] = ev_fname
-                    cit["document_version"] = ev_ver
+            for cit in self.citations:
+                if isinstance(cit, dict):
+                    cid = str(cit.get("chunk_id", ""))
+                    matched_ev = retained_by_cid.get(cid)
+                    if matched_ev:
+                        ev_fname = getattr(matched_ev, "document_filename", None) or (getattr(matched_ev, "locator", {}) or {}).get("document_filename")
+                        ev_ver = getattr(matched_ev, "document_version", None) or (getattr(matched_ev, "locator", {}) or {}).get("document_version")
+                        if ev_fname:
+                            cit["document_filename"] = ev_fname
+                        cit["document_version"] = ev_ver
 
         plan = state.get("plan")
         self.executed_path = state.get("executed_path", "full")
@@ -2635,7 +2682,10 @@ class ResponseObject:
         self.graph_relationship_state = state.get("graph_relationship_state", "none")
         self.query_embedding = state.get("query_embedding")
         self.query_embedding_provenance = state.get("query_embedding_provenance")
-        self.retrieval_incomplete = state.get("retrieval_incomplete", False)
+        self.retrieval_incomplete = (
+            True if (blocked or self.retrieval_incomplete or self.answer == "NOT_FOUND" or not self.answer)
+            else state.get("retrieval_incomplete", False)
+        )
         self.laya_calls = state.get("laya_calls", 0)
         self.expansion_steps = state.get("expansion_steps", 0)
         self.synthesis_calls = state.get("synthesis_calls", 0)
@@ -2651,7 +2701,7 @@ class ResponseObject:
 
         self._llm_input = LLMInput(state.get("compressed_text", ""))
 
-        self.top_chunks = state.get("top_chunks", [])
+        self.top_chunks = [] if self.retrieval_incomplete else state.get("top_chunks", [])
         self._reranker_avg = (
             sum(
                 (getattr(c, "reranker_score", 0.0) or 0.0)

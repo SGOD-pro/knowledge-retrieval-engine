@@ -17,11 +17,15 @@ Validates:
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+from unittest.mock import patch, MagicMock
 import pytest
 
-from schemas.contracts.boundary import DocumentSnapshot
-from schemas.models import Chunk
+from db.database import CloudRepository
 from db.workspace_boundary_repo import InMemoryWorkspaceBoundaryRepository
+from ingestion.embed_service import embed_fast_local, _deterministic_vector
+from modules.query.query_service import QueryService
+from schemas.contracts.boundary import DocumentSnapshot
+from schemas.models import Chunk, Document, QueryRequest
 from services.evaluation.benchmark_scorer import rescore_query_record_offline
 from services.langgraph_pipeline import ResponseObject, delivery_gate
 from services.retrieval.evidence_contract import EvidenceItem, evidence_item_from_chunk
@@ -595,11 +599,225 @@ def test_actual_query_path_snapshot_change_and_tombstone_before_delivery(
     assert gate_result["citations"] == []
     assert gate_result["retrieval_incomplete"] is True
 
-    # Confirm ResponseObject delivery also blocks citation certification under active tombstone
+    # Confirm ResponseObject delivery prevents delivery of answer, citations, and retained evidence under active tombstone
     resp_tombstoned = ResponseObject(gate_state)
-    assert resp_tombstoned.citations[0]["document_filename"] != "NFHS_5_India_Districts_Factsheet_Data.xls"
-    assert resp_tombstoned.citations[0]["document_filename"] == "Doc-fcc723b5"
-    assert resp_tombstoned.citations[0]["document_version"] is None
-    assert resp_tombstoned.citations[1]["document_filename"] != "NFHS_5_India_Districts_Factsheet_Data.xls"
-    assert resp_tombstoned.citations[1]["document_filename"] == "Doc-fcc723b5"
-    assert resp_tombstoned.citations[1]["document_version"] is None
+    assert resp_tombstoned.answer == "NOT_FOUND"
+    assert resp_tombstoned.citations == []
+    assert resp_tombstoned.retained_evidence_items == []
+    assert resp_tombstoned.top_chunks == []
+    assert resp_tombstoned.retrieval_incomplete is True
+    assert resp_tombstoned.confidence_score == 0.0
+
+
+def _setup_synthetic_doc(repo: CloudRepository, workspace_id: str, doc_id: str, text: str, format: str = "pdf"):
+    doc = Document(
+        id=doc_id,
+        filename=f"{doc_id}.{format}",
+        source_format=format,
+        chunks=(
+            Chunk(
+                id=f"{doc_id}:c1",
+                document_id=doc_id,
+                text=text,
+                source_format=format,
+                page_number=1,
+                element_type="paragraph" if format == "pdf" else "table_row",
+                section_path=("Main",),
+                embedding_fast=embed_fast_local(text),
+                embedding_full=_deterministic_vector(text, 1024),
+                workspace_id=workspace_id,
+                similarity_score=0.95,
+            ),
+        ),
+        workspace_id=workspace_id,
+    )
+    repo.save(doc)
+    return doc
+
+
+def test_real_query_response_path_tombstone_before_gate(monkeypatch, boundary_repo: InMemoryWorkspaceBoundaryRepository):
+    """Exercise real query response path when a tombstone is recorded before the gate."""
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    ws_id = "ws_tombstone_pre_gate_test"
+    doc_id = "doc_pre_gate_1"
+    boundary_repo.create_workspace("Pre Gate Test", "owner_1", ws_id)
+    boundary_repo.save_document_snapshot(
+        DocumentSnapshot(
+            workspace_id=ws_id,
+            document_id=doc_id,
+            source="pre_gate_record.pdf",
+            version="v_pre_1",
+            format="pdf",
+            created_at=_now_utc(),
+        )
+    )
+
+    repo = CloudRepository()
+    query_text = "What is the secret formula in the pre gate document?"
+    _setup_synthetic_doc(repo, ws_id, doc_id, "The secret formula in the pre gate document is XYZ-99.")
+
+    # Record source tombstone before query execution / before delivery gate
+    boundary_repo.record_source_tombstone(
+        workspace_id=ws_id,
+        source_id=doc_id,
+        caller_principal_id="admin_1",
+        reason="revoked_before_gate",
+    )
+
+    qs = QueryService()
+    req = QueryRequest(
+        workspace_id=ws_id,
+        query=query_text,
+        cache=False,
+    )
+
+    with patch("src.db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=boundary_repo), \
+         patch("db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=boundary_repo):
+        res = qs.execute_query(req)
+
+    # Assert safe refusal, no citations, no retained evidence text, and retrieval_incomplete=True
+    assert "couldn't find any relevant" in res["answer"].lower()
+    assert "XYZ-99" not in res["answer"]
+    assert res["citations"] == []
+    assert res["retained_evidence_items"] == []
+    assert res["retrieval_incomplete"] is True
+    assert res["confidence"] == 0.0
+    assert res["faithfulness"] is None
+    assert res["citation_utilization_rate"] is None
+
+
+def test_real_query_response_path_tombstone_after_gate(monkeypatch, boundary_repo: InMemoryWorkspaceBoundaryRepository):
+    """Exercise real query response path when a tombstone is recorded after the gate."""
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    ws_id = "ws_tombstone_post_gate_test"
+    doc_id = "doc_post_gate_1"
+    boundary_repo.create_workspace("Post Gate Test", "owner_1", ws_id)
+    boundary_repo.save_document_snapshot(
+        DocumentSnapshot(
+            workspace_id=ws_id,
+            document_id=doc_id,
+            source="post_gate_record.pdf",
+            version="v_post_1",
+            format="pdf",
+            created_at=_now_utc(),
+        )
+    )
+
+    repo = CloudRepository()
+    query_text = "What is the revenue target in post gate?"
+    doc = _setup_synthetic_doc(repo, ws_id, doc_id, "The revenue target in post gate is 88 million.")
+    chunk = doc.chunks[0]
+
+    qs = QueryService()
+    req = QueryRequest(
+        workspace_id=ws_id,
+        query=query_text,
+        cache=False,
+    )
+
+    # Synthetic response representing pipeline output before post-gate revocation
+    cit = build_citation(chunk, workspace_id=ws_id, boundary_repo=boundary_repo).to_dict()
+    ev = evidence_item_from_chunk(chunk, workspace_id=ws_id, strategy="fast_path", boundary_repo=boundary_repo)
+
+    mock_resp = ResponseObject({
+        "workspace_id": ws_id,
+        "boundary_repo": boundary_repo,
+        "final_answer": "The revenue target is 88 million.",
+        "citations": [cit],
+        "retained_evidence_items": [ev],
+        "top_chunks": [chunk],
+        "confidence_score": 0.95,
+        "executed_path": "fast",
+        "planned_path": "fast",
+        "retrieval_incomplete": False,
+    })
+
+    def run_pipeline_and_record_tombstone(**kwargs):
+        # Tombstone recorded right after gate execution before QueryService final boundary check
+        boundary_repo.record_source_tombstone(
+            workspace_id=ws_id,
+            source_id=doc_id,
+            caller_principal_id="admin_1",
+            reason="revoked_after_gate",
+        )
+        return mock_resp
+
+    with patch("src.db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=boundary_repo), \
+         patch("db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=boundary_repo), \
+         patch("services.langgraph_pipeline.pipeline.run", side_effect=run_pipeline_and_record_tombstone):
+        res = qs.execute_query(req)
+
+    # Assert safe refusal, no citations, no retained evidence text, and retrieval_incomplete=True
+    assert "couldn't find any relevant" in res["answer"].lower()
+    assert "88 million" not in res["answer"]
+    assert res["citations"] == []
+    assert res["retained_evidence_items"] == []
+    assert res["retrieval_incomplete"] is True
+    assert res["confidence"] == 0.0
+    assert res["cached"] is False
+
+
+def test_real_query_response_path_boundary_lookup_error(monkeypatch, boundary_repo: InMemoryWorkspaceBoundaryRepository):
+    """Exercise real query response path when a boundary check encounters a lookup error."""
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    ws_id = "ws_lookup_err_test"
+    doc_id = "doc_err_1"
+    boundary_repo.create_workspace("Error Test", "owner_1", ws_id)
+    boundary_repo.save_document_snapshot(
+        DocumentSnapshot(
+            workspace_id=ws_id,
+            document_id=doc_id,
+            source="err_record.pdf",
+            version="v_err_1",
+            format="pdf",
+            created_at=_now_utc(),
+        )
+    )
+
+    repo = CloudRepository()
+    query_text = "What is the secret data under lookup failure?"
+    doc = _setup_synthetic_doc(repo, ws_id, doc_id, "The secret data under lookup failure is CLASSIFIED-999.")
+    chunk = doc.chunks[0]
+
+    qs = QueryService()
+    req = QueryRequest(
+        workspace_id=ws_id,
+        query=query_text,
+        cache=False,
+    )
+
+    cit = build_citation(chunk, workspace_id=ws_id, boundary_repo=boundary_repo).to_dict()
+    ev = evidence_item_from_chunk(chunk, workspace_id=ws_id, strategy="fast_path", boundary_repo=boundary_repo)
+
+    mock_resp = ResponseObject({
+        "workspace_id": ws_id,
+        "boundary_repo": boundary_repo,
+        "final_answer": "The secret data is CLASSIFIED-999.",
+        "citations": [cit],
+        "retained_evidence_items": [ev],
+        "top_chunks": [chunk],
+        "confidence_score": 0.95,
+        "executed_path": "fast",
+        "planned_path": "fast",
+        "retrieval_incomplete": False,
+    })
+
+    # Simulate storage lookup failure on boundary check
+    def error_has_tombstone(*args, **kwargs):
+        raise RuntimeError("Boundary storage connection failure")
+
+    boundary_repo.has_tombstone = error_has_tombstone
+
+    with patch("src.db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=boundary_repo), \
+         patch("db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=boundary_repo), \
+         patch("services.langgraph_pipeline.pipeline.run", return_value=mock_resp):
+        res = qs.execute_query(req)
+
+    # Boundary check must fail closed: safe refusal, no citations, no retained evidence text, retrieval_incomplete=True
+    assert "couldn't find any relevant" in res["answer"].lower()
+    assert "CLASSIFIED-999" not in res["answer"]
+    assert res["citations"] == []
+    assert res["retained_evidence_items"] == []
+    assert res["retrieval_incomplete"] is True
+    assert res["confidence"] == 0.0
+    assert res["cached"] is False
