@@ -964,7 +964,7 @@ def run_reranker(state: PipelineState):
         except Exception as sae:
             logger.warning("run_reranker.score_merged_chunks_failed: %s", sae)
 
-    rerank_res = rerank(state["query"], merged, top_k=6, return_mode=True)
+    rerank_res = rerank(state["query"], merged, top_k=6, return_mode=True, financial_binding=fin_binding)
     if isinstance(rerank_res, tuple) and len(rerank_res) == 2:
         top_chunks, reranker_mode = rerank_res
     else:
@@ -1265,6 +1265,9 @@ def run_llm(state: PipelineState):
         cands["compressed_context"] = list(compressed_ids)
 
     # Parse and validate citations directly from the LLM's JSON contract: {"answer": "...", "citations": ["chunk_id"]}
+    fin_binding = state.get("financial_binding")
+    is_financial = bool(fin_binding and getattr(fin_binding, "is_active", False))
+
     raw_citations = response.get("citations", [])
     if isinstance(raw_citations, list):
         valid_llm_citations = [
@@ -1283,7 +1286,8 @@ def run_llm(state: PipelineState):
             final_cited_chunks.append(chunk_by_id[cid])
 
     if not final_cited_chunks and ans != "NOT_FOUND":
-        final_cited_chunks = [c for c in top_chunks if str(c.id) in compressed_ids]
+        if not is_financial:
+            final_cited_chunks = [c for c in top_chunks if str(c.id) in compressed_ids]
 
     if ans == "NOT_FOUND" or not top_chunks:
         citation_utilization_rate = None
@@ -1299,9 +1303,17 @@ def run_llm(state: PipelineState):
     ws_id = state.get("workspace_id", "")
     b_repo = state.get("boundary_repo")
 
+    final_citations = [build_citation(c, workspace_id=ws_id, boundary_repo=b_repo).to_dict() for c in final_cited_chunks]
+    if is_financial and raw_citations and not final_citations:
+        for r_cid in raw_citations:
+            if isinstance(r_cid, dict):
+                final_citations.append(r_cid)
+            else:
+                final_citations.append({"chunk_id": str(r_cid), "document_id": None})
+
     return {
         "final_answer": ans,
-        "citations": [build_citation(c, workspace_id=ws_id, boundary_repo=b_repo).to_dict() for c in final_cited_chunks],
+        "citations": final_citations,
         "confidence_score": confidence,
         "faithfulness": faithfulness,
         "citation_utilization_rate": citation_utilization_rate,
@@ -2045,29 +2057,53 @@ def delivery_gate(state: PipelineState) -> dict[str, Any]:
         from services.retrieval.table_metric_binding import verify_financial_cell_binding
 
         citations = state.get("citations", [])
+        if not citations:
+            logger.warning("delivery_gate.financial_metric_binding_rejected reason=empty_citations (delivery blocked)")
+            return {
+                "final_answer": "NOT_FOUND",
+                "citations": [],
+                "confidence_score": 0.0,
+                "retrieval_incomplete": True,
+                "retained_evidence_items": [],
+                "top_chunks": [],
+            }
+
         top_chunks = state.get("top_chunks", [])
-        chunk_by_id = {str(getattr(c, "id", "")): c for c in top_chunks}
+        retained_items = state.get("retained_evidence_items", [])
+        auth_chunk_by_id = {str(getattr(c, "id", "")): c for c in top_chunks}
+        for ev in retained_items:
+            loc = getattr(ev, "locator", {}) or {}
+            loc_cid = loc.get("chunk_id")
+            if loc_cid and str(loc_cid) not in auth_chunk_by_id and hasattr(ev, "chunk") and getattr(ev, "chunk", None):
+                auth_chunk_by_id[str(loc_cid)] = ev.chunk
+
+        # Every citation MUST resolve to authoritative retained evidence.
+        # Citation-supplied text must not establish evidence independently.
+        cited_chunks = []
+        for cit in citations:
+            cid = cit.get("chunk_id") if isinstance(cit, dict) else (getattr(cit, "chunk_id", None) or getattr(cit, "id", None))
+            if not cid or str(cid) not in auth_chunk_by_id:
+                logger.warning(
+                    "delivery_gate.financial_metric_binding_rejected reason=unresolved_citation_id cid=%s (delivery blocked)",
+                    cid,
+                )
+                return {
+                    "final_answer": "NOT_FOUND",
+                    "citations": [],
+                    "confidence_score": 0.0,
+                    "retrieval_incomplete": True,
+                    "retained_evidence_items": [],
+                    "top_chunks": [],
+                }
+            cited_chunks.append(auth_chunk_by_id[str(cid)])
 
         verified = False
         rejection_reason = "no_cited_cells_verified"
 
-        if citations:
-            for cit in citations:
-                cid = cit.get("chunk_id") if isinstance(cit, dict) else (getattr(cit, "chunk_id", None) or getattr(cit, "id", None))
-                c_chunk = chunk_by_id.get(str(cid)) if cid else None
-                c_text = getattr(c_chunk, "text", "") if c_chunk else ""
-                if not c_text and isinstance(cit, dict):
-                    c_text = cit.get("text") or cit.get("text_snippet") or ""
-                if c_text:
-                    is_v, reason = verify_financial_cell_binding(c_text, ans, fin_binding)
-                    if is_v:
-                        verified = True
-                        break
-                    else:
-                        rejection_reason = reason
-        else:
-            for c in top_chunks:
-                is_v, reason = verify_financial_cell_binding(getattr(c, "text", ""), ans, fin_binding)
+        for c_chunk in cited_chunks:
+            c_text = getattr(c_chunk, "text", "")
+            if c_text:
+                is_v, reason = verify_financial_cell_binding(c_text, ans, fin_binding)
                 if is_v:
                     verified = True
                     break

@@ -292,3 +292,29 @@ This milestone records the full completion and acceptance of specification 0007 
 3. **Deferred Specifications**: Specification 0003 (Snapshot registry, publication, and atomic deletion) remains Proposed and deferred.
 4. **Preserved Artifacts**: Historical benchmark workspaces (`ws_fresh_benchmark`), ground truth, and comparison artifacts preserved untouched. Zero paid provider calls, zero corpus re ingestion, zero re embedding.
 
+
+
+## Financial Table Binding Review Blockers Resolution (0004 Verification and Hardening)
+
+* **Date**: November 23 2026
+* **Branch**: `re-factor`
+* **Status**: Four financial table binding review blockers resolved and verified offline.
+
+### Overview
+
+This milestone resolves the four review blockers identified during financial table metric binding reviews:
+1. Complete claim verification: Every required financial claim is parsed and verified using exact decimal arithmetic. Accounting parentheses and negative signs are preserved. Scale multipliers distinguish millions, billions, thousands, and dollars. Valid unit conversions (such as 30,739 million converted to 30.739 billion) are accepted, whereas invalid conversions (such as 30,739 billion) are rejected. Monetary amounts and percentages remain strictly separated. Secondary comparison values cannot validate an unsupported primary claim.
+2. Complete period evidence: When a query requests a date or duration, cited tables lacking period metadata strictly fail verification. Date comparison extracts exact integer components (year, month, and day), proving that June 27 strictly fails a June 7 request. Supported duration expressions normalize to canonical categories.
+3. Citation resolution to authoritative evidence: Non empty citations are required for delivered financial answers. Citation identifiers must resolve to authoritative pipeline chunks and retained evidence items. Plausible citation supplied text cannot establish evidence independently.
+4. Metric affinity in top k evidence selection: Reranking incorporates metric affinity directly into candidate scoring and threshold filtering. When more than six candidates compete, the metric aligned table survives top k selection, while relevance ordering among equal affinity candidates is preserved.
+
+### Verification Evidence
+
+* Test command: `cd backend && uv run pytest tests/test_financial_table_metric_binding.py -v` (19 passed in 3.06s).
+* Regression suite: `cd backend && uv run pytest tests/test_financial_table_metric_binding.py tests/test_canonical_percentage_grading.py tests/test_offline_benchmark_artifact_reproducibility.py tests/test_grounded_answer_evaluator.py tests/test_benchmark_guard.py tests/test_benchmark_integrity_defects.py tests/test_citation_retained_evidence.py tests/test_evidence_providers.py tests/test_fast_path_fallback_regressions.py tests/test_chunk_citation_provenance_repair.py -rs` (145 passed in 9.53s).
+
+### Operational Boundaries and Limitations
+
+1. Offline verification only: Zero provider calls, zero paid live benchmark runs, and zero corpus writes.
+2. Scorer issue open: The evaluation scorer issue remains open, and historical benchmark artifacts remain untouched.
+3. Configuration invariant: Default configurations and boundary checks remain preserved.

@@ -13,6 +13,7 @@ def rerank(
     top_k: int = 6,
     provider: str | None = None,
     return_mode: bool = False,
+    financial_binding: Any | None = None,
 ) -> list[Chunk] | tuple[list[Chunk], str]:
     """
     Reranks candidate chunks using the provider layer API.
@@ -22,6 +23,13 @@ def rerank(
     if not candidates:
         return ([], RerankerMode.BYPASSED.value) if return_mode else []
 
+    if financial_binding is None:
+        try:
+            from services.retrieval.table_metric_binding import bind_financial_query
+            financial_binding = bind_financial_query(query)
+        except Exception:
+            financial_binding = None
+
     # Extract text for the API call
     documents = [c.text for c in candidates]
 
@@ -30,22 +38,26 @@ def rerank(
 
     # Assign scores back to chunks immutably
     from dataclasses import replace
-    scored_candidates = [
-        replace(chunk, reranker_score=score)
-        for chunk, score in zip(candidates, scores)
-    ]
-    scored_candidates.sort(key=lambda c: (getattr(c, "reranker_score", 0.0) or 0.0), reverse=True)
-    candidates = scored_candidates
+    from services.retrieval.table_metric_binding import score_table_chunk_metric_affinity
+
+    scored_candidates = []
+    for chunk, score in zip(candidates, scores):
+        aff = 0.0
+        if financial_binding and getattr(financial_binding, "is_active", False):
+            aff = score_table_chunk_metric_affinity(getattr(chunk, "text", ""), financial_binding)
+        scored_chunk = replace(chunk, reranker_score=score)
+        scored_candidates.append((scored_chunk, aff, score or 0.0))
+
+    # Sort candidates by (affinity, base_score) descending
+    # Reuses the existing ranking design and preserves relevance ordering where affinity is equal.
+    scored_candidates.sort(key=lambda item: (item[1], item[2]), reverse=True)
+    candidates = [item[0] for item in scored_candidates]
 
     # Filter by threshold with calibration for low-probability scoring models
     from config import settings
 
     pre_count = len(candidates)
-    max_score = (
-        max((getattr(c, "reranker_score", 0.0) or 0.0) for c in candidates)
-        if candidates
-        else 0.0
-    )
+    max_score = max((item[2] for item in scored_candidates), default=0.0)
     # Calibrate threshold: if scores are on a low absolute probability scale,
     # use relative cutoff (half of max_score) rather than hardcoded threshold.
     effective_threshold = (
@@ -54,9 +66,9 @@ def rerank(
         else settings.RERANKER_THRESHOLD
     )
     filtered = [
-        c
-        for c in candidates
-        if (getattr(c, "reranker_score", 0.0) or 0.0) >= effective_threshold
+        item[0]
+        for item in scored_candidates
+        if item[2] >= effective_threshold or item[1] > 0
     ]
     post_count = len(filtered)
     logger.debug(
