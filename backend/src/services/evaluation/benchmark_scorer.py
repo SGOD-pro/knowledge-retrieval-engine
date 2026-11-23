@@ -26,6 +26,84 @@ def is_concise_percentage_candidate(text: str) -> bool:
     return len(words) <= 6 and bool(pct_or_num)
 
 
+CURRENCY_REGEX = re.compile(r"[$€£¥₹]|\b(?:dollars?|usd|cents?|rupees?|inr)\b", re.IGNORECASE)
+ALTERNATIVE_REGEX = re.compile(r"\b(?:or|either|versus|vs|between)\b", re.IGNORECASE)
+OTHER_METRIC_KEYWORDS = (
+    "sex ratio",
+    "female schooling",
+    "schooling",
+    "attended school",
+    "literacy",
+    "women interviewed",
+    "men interviewed",
+    "households surveyed",
+    "children under",
+    "stunting",
+    "wasting",
+    "mortality",
+    "anemia",
+)
+
+
+def validate_percentage_candidate_controls(
+    candidate_text: str,
+    expected_answer: str,
+    exp_pct_val: Decimal,
+) -> bool:
+    """Validates candidate answer for a single percentage against controls:
+    1. Rejects mixed currency/percentage units when expected answer does not involve currency.
+    2. Rejects conflicting alternatives (multiple distinct percentages or disjunction keywords).
+    3. Rejects another metric (extraneous numbers or distinct demographic/survey metric keywords).
+    """
+    cand_lower = candidate_text.lower()
+    exp_lower = expected_answer.lower()
+
+    # 1. Reject mixed currency / percentage units
+    if not CURRENCY_REGEX.search(expected_answer) and CURRENCY_REGEX.search(candidate_text):
+        return False
+
+    # 2. Reject conflicting alternatives
+    pct_regex = re.compile(r"([-+]?\b\d[\d,]*(?:\.\d+)?)\s*(?:%|percent\b)", re.IGNORECASE)
+    cand_pct_matches = pct_regex.findall(candidate_text)
+    distinct_cand_pcts = set()
+    for m in cand_pct_matches:
+        try:
+            distinct_cand_pcts.add(Decimal(m.replace(",", "")))
+        except InvalidOperation:
+            pass
+    if len(distinct_cand_pcts) > 1:
+        return False
+    if ALTERNATIVE_REGEX.search(candidate_text) and not ALTERNATIVE_REGEX.search(expected_answer):
+        return False
+
+    # 3. Reject another metric: extraneous numbers
+    cleaned_cand = re.sub(r"(?<=\d),(?=\d)", "", candidate_text)
+    cand_nums = re.findall(r"[-+]?\b\d+(?:\.\d+)?\b", cleaned_cand)
+    cleaned_exp = re.sub(r"(?<=\d),(?=\d)", "", expected_answer)
+    exp_nums = re.findall(r"[-+]?\b\d+(?:\.\d+)?\b", cleaned_exp)
+    exp_num_vals = []
+    for n in exp_nums:
+        try:
+            exp_num_vals.append(Decimal(n))
+        except InvalidOperation:
+            pass
+    for n in cand_nums:
+        try:
+            val = Decimal(n)
+            matches_any = any(abs(val - ev) <= Decimal("0.02") for ev in exp_num_vals)
+            if not matches_any:
+                return False
+        except InvalidOperation:
+            pass
+
+    # 3. Reject another metric: metric keywords
+    for kw in OTHER_METRIC_KEYWORDS:
+        if kw in cand_lower and kw not in exp_lower:
+            return False
+
+    return True
+
+
 def is_concise_percentage_match(chunk_text: str, expected_answer: str) -> bool:
     """Evaluates whether candidate answer text satisfies a single percentage request concisely.
 
@@ -39,6 +117,9 @@ def is_concise_percentage_match(chunk_text: str, expected_answer: str) -> bool:
          rejecting wrong values.
       5. Candidate percentage value must not be negated in the candidate answer,
          rejecting negated values (e.g. 'not 99.58%', 'is not 99.58%').
+      6. Reject conflicting alternatives (multiple percentages or disjunctive alternatives).
+      7. Reject another metric (extraneous numbers or distinct demographic/survey metric keywords).
+      8. Reject mixed currency/percentage units when expected answer does not involve currency.
     """
     if not chunk_text or not expected_answer:
         return False
@@ -81,6 +162,10 @@ def is_concise_percentage_match(chunk_text: str, expected_answer: str) -> bool:
         chunk_words = set(w.lower() for w in re.findall(r"\b[A-Za-z]+\b", chunk_text))
         if not (named_entities <= chunk_words):
             return False
+
+    # Enforce percentage candidate controls (conflicting alternatives, another metric, mixed currency)
+    if not validate_percentage_candidate_controls(chunk_text, expected_answer, exp_pct_val):
+        return False
 
     # Candidate must assert percentage with valid percentage unit
     chunk_pct_matches = pct_regex.findall(chunk_text)
@@ -127,11 +212,17 @@ def content_match(chunk_text: str, expected_answer: str) -> bool:
     if is_concise_percentage_candidate(chunk_text) and exp_pct_matches:
         return is_concise_percentage_match(chunk_text, expected_answer)
 
-    # When expected answer requests a single percentage, block fall-through if target percentage is negated in candidate
+    # When expected answer requests a single percentage, block fall-through on negation or control violations
     if len(exp_pct_matches) == 1:
         target_str = exp_pct_matches[0]
         if _is_entity_negated_in_text(target_str, chunk_text):
             return False
+        try:
+            exp_pct_val = Decimal(target_str.replace(",", ""))
+            if not validate_percentage_candidate_controls(chunk_text, expected_answer, exp_pct_val):
+                return False
+        except InvalidOperation:
+            pass
 
     exp_nums = set(re.findall(r"\b\d+(?:\.\d+)?%?\b", expected_answer))
     expected_tokens = set(tokenize(expected_answer))

@@ -20,6 +20,7 @@ from services.evaluation.benchmark_scorer import (
     evaluate_grounded_answer,
     rescore_query_record_offline,
     is_concise_percentage_match,
+    validate_percentage_candidate_controls,
 )
 from services.retrieval.evidence_contract import EvidenceItem
 
@@ -132,7 +133,85 @@ def test_control_omits_other_required_claims_rejected():
     assert grade_canonical_answer_text(ans_multi_omitted, multi_pct_expected, contract_type="semantic") is False
 
 
-# --- 6. Generic Synthetic Single Percentage Questions (No Question-ID Special Cases) ---
+# --- 6. Control 5: Conflicting Alternatives Rejected ---
+
+def test_control_conflicting_alternatives_rejected():
+    """Verify candidate answers with conflicting alternatives or multiple percentages are strictly rejected."""
+    conflicting_answers = [
+        "99.58% or 84.68%",
+        "either 99.58% or 50%",
+        "99.58% vs 84.68%",
+        "between 99.58% and 84.68%",
+        "either 99.58% or 99.58%",
+        "The percentage of households with electricity is either 99.58% or 84.68%.",
+        "South Andaman electricity is 99.58% vs 84.68%.",
+    ]
+    for ans in conflicting_answers:
+        assert content_match(ans, Q149_EXPECTED) is False, (
+            f"content_match accepted conflicting alternatives: {ans}"
+        )
+        assert grade_canonical_answer_text(ans, Q149_EXPECTED, contract_type="semantic") is False, (
+            f"grade_canonical_answer_text accepted conflicting alternatives: {ans}"
+        )
+        if len(ans.split()) <= 6:
+            assert is_concise_percentage_match(ans, Q149_EXPECTED) is False, (
+                f"is_concise_percentage_match accepted conflicting alternatives: {ans}"
+            )
+
+
+# --- 7. Control 6: Another Metric Rejected ---
+
+def test_control_another_metric_rejected():
+    """Verify candidate answers asserting another metric or extraneous survey metrics are strictly rejected."""
+    another_metric_answers = [
+        "84.68%",                                # Female schooling percentage from factsheet
+        "Sex ratio is 967.48",                   # Sex ratio metric from factsheet
+        "99.58% female schooling",               # Correct number attributed to wrong metric
+        "99.58% with 868 households",            # Extraneous household count metric from factsheet
+        "99.58% literacy",                       # Another metric keyword
+        "South Andaman sex ratio is 99.58%",     # Another metric keyword in phrase
+        "99.58% of women have attended school",  # Another metric claim
+    ]
+    for ans in another_metric_answers:
+        assert content_match(ans, Q149_EXPECTED) is False, (
+            f"content_match accepted another metric: {ans}"
+        )
+        assert grade_canonical_answer_text(ans, Q149_EXPECTED, contract_type="semantic") is False, (
+            f"grade_canonical_answer_text accepted another metric: {ans}"
+        )
+        if len(ans.split()) <= 6:
+            assert is_concise_percentage_match(ans, Q149_EXPECTED) is False, (
+                f"is_concise_percentage_match accepted another metric: {ans}"
+            )
+
+
+# --- 8. Control 7: Mixed Currency/Percentage Units Rejected ---
+
+def test_control_mixed_currency_percentage_units_rejected():
+    """Verify candidate answers mixing currency and percentage units are strictly rejected."""
+    mixed_currency_answers = [
+        "$99.58%",
+        "99.58% ($50)",
+        "99.58% dollars",
+        "$99.58 percent",
+        "99.58% or $100",
+        "$99.58% of the population lives in households with electricity",
+        "99.58% of the population lives in households with electricity ($50).",
+    ]
+    for ans in mixed_currency_answers:
+        assert content_match(ans, Q149_EXPECTED) is False, (
+            f"content_match accepted mixed currency units: {ans}"
+        )
+        assert grade_canonical_answer_text(ans, Q149_EXPECTED, contract_type="semantic") is False, (
+            f"grade_canonical_answer_text accepted mixed currency units: {ans}"
+        )
+        if len(ans.split()) <= 6:
+            assert is_concise_percentage_match(ans, Q149_EXPECTED) is False, (
+                f"is_concise_percentage_match accepted mixed currency units: {ans}"
+            )
+
+
+# --- 9. Generic Synthetic Single Percentage Questions (No Question-ID Special Cases) ---
 
 def test_generic_synthetic_single_percentage_questions_without_question_id():
     """Verify grading rules generalize to arbitrary synthetic percentage questions without question-ID dependencies."""
@@ -148,8 +227,14 @@ def test_generic_synthetic_single_percentage_questions_without_question_id():
     assert grade_canonical_answer_text("$73.25", synthetic_expected, contract_type="semantic") is False   # Wrong unit
     assert grade_canonical_answer_text("not 73.25%", synthetic_expected, contract_type="semantic") is False # Negated
 
+    # Tightened controls on synthetic single percentage questions
+    assert grade_canonical_answer_text("73.25% or 50%", synthetic_expected, contract_type="semantic") is False
+    assert grade_canonical_answer_text("73.25% ($50)", synthetic_expected, contract_type="semantic") is False
+    assert grade_canonical_answer_text("73.25% female schooling", synthetic_expected, contract_type="semantic") is False
+    assert grade_canonical_answer_text("73.25% with 500 candidates", synthetic_expected, contract_type="semantic") is False
 
-# --- 7. Grounded Evaluation: Citation and Evidence Checks Intact ---
+
+# --- 10. Grounded Evaluation: Citation and Evidence Checks Intact ---
 
 def test_grounded_evaluation_citations_and_evidence_checks_intact():
     """Verify grounded answer evaluation retains all strict citation and evidence gates for percentage answers."""
@@ -259,7 +344,7 @@ def test_grounded_evaluation_citations_and_evidence_checks_intact():
     assert "claim_contradicts_evidence" in eval_contra["reason"]
 
 
-# --- 8. Historical Artifacts and Offline Rescoring Preservation ---
+# --- 11. Historical Artifacts and Offline Rescoring Preservation ---
 
 def test_historical_q149_record_preserved_offline():
     """Verify saved Q149 record from historical run strictly preserves its original verdict."""
