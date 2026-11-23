@@ -582,45 +582,14 @@ def test_offline_rescore_fails_on_refusal_with_fabricated_citations():
 # --- 6. Scorer Version and Comparator Gates ---
 
 def test_scorer_version_is_distinct():
-    """Verify scorer version is distinctly set to 2.2.0."""
-    assert SCORER_VERSION == "2.2.0"
+    """Verify scorer version is distinctly set to 2.3.0."""
+    assert SCORER_VERSION == "2.3.0"
 
 
 def test_comparator_preserves_strict_gates_against_historical_manifest():
-    """Verify compare_manifests strictly rejects comparisons between 2.2.0 candidate and 2.1.0 baseline."""
-    base_manifest_2_1 = {
-        "commit_sha": "a50c0a4f127c7418ffd79447430a9093d8b37f66",
-        "baseline_commit_sha": "root_commit",
-        "test_suite_sha256": "suite_sha_123",
-        "corpus_manifest_sha256": "corpus_sha_456",
-        "workspace_id": "ws_canonical_comparison_0004",
-        "runner_version": "2.1.0",
-        "scorer_version": "2.1.0",
-        "embedding_model": "amazon.titan-embed-text-v2:0",
-        "llm_model": "apac.amazon.nova-lite-v1:0",
-        "reranker_policy": "openrouter:nvidia/llama-nemotron-rerank-vl-1b-v2:free (fallback: lexical_bm25_plus)",
-        "cache_mode": "bypass_exact_and_semantic",
-        "benchmark_type": "cold",
-        "metrics": {"overall_accuracy": 0.5333},
-    }
-
-    cand_manifest_2_2 = dict(base_manifest_2_1)
-    cand_manifest_2_2["commit_sha"] = "cand_commit_888"
-    cand_manifest_2_2["baseline_commit_sha"] = "a50c0a4f127c7418ffd79447430a9093d8b37f66"
-    cand_manifest_2_2["runner_version"] = "2.2.0"
-    cand_manifest_2_2["scorer_version"] = "2.2.0"
-
-    res = compare_manifests(cand_manifest_2_2, base_manifest_2_1)
-    assert res["comparable"] is False
-    assert res["status"] == NOT_COMPARABLE_MESSAGE
-    assert any("scorer_version" in m for m in res["mismatches"])
-    assert any("runner_version" in m for m in res["mismatches"])
-
-
-def test_comparator_accepts_matching_2_2_manifests():
-    """Verify compare_manifests accepts comparisons between matching 2.2.0 manifests."""
+    """Verify compare_manifests strictly rejects comparisons between 2.3.0 candidate and historical 2.2.0 / 2.1.0 baselines."""
     base_manifest_2_2 = {
-        "commit_sha": "base_commit_777",
+        "commit_sha": "a50c0a4f127c7418ffd79447430a9093d8b37f66",
         "baseline_commit_sha": "root_commit",
         "test_suite_sha256": "suite_sha_123",
         "corpus_manifest_sha256": "corpus_sha_456",
@@ -632,15 +601,46 @@ def test_comparator_accepts_matching_2_2_manifests():
         "reranker_policy": "openrouter:nvidia/llama-nemotron-rerank-vl-1b-v2:free (fallback: lexical_bm25_plus)",
         "cache_mode": "bypass_exact_and_semantic",
         "benchmark_type": "cold",
+        "metrics": {"overall_accuracy": 0.5333},
+    }
+
+    cand_manifest_2_3 = dict(base_manifest_2_2)
+    cand_manifest_2_3["commit_sha"] = "cand_commit_888"
+    cand_manifest_2_3["baseline_commit_sha"] = "a50c0a4f127c7418ffd79447430a9093d8b37f66"
+    cand_manifest_2_3["runner_version"] = "2.3.0"
+    cand_manifest_2_3["scorer_version"] = "2.3.0"
+
+    res = compare_manifests(cand_manifest_2_3, base_manifest_2_2)
+    assert res["comparable"] is False
+    assert res["status"] == NOT_COMPARABLE_MESSAGE
+    assert any("scorer_version" in m for m in res["mismatches"])
+    assert any("runner_version" in m for m in res["mismatches"])
+
+
+def test_comparator_accepts_matching_2_3_manifests():
+    """Verify compare_manifests accepts comparisons between matching 2.3.0 manifests."""
+    base_manifest_2_3 = {
+        "commit_sha": "base_commit_777",
+        "baseline_commit_sha": "root_commit",
+        "test_suite_sha256": "suite_sha_123",
+        "corpus_manifest_sha256": "corpus_sha_456",
+        "workspace_id": "ws_canonical_comparison_0004",
+        "runner_version": "2.3.0",
+        "scorer_version": "2.3.0",
+        "embedding_model": "amazon.titan-embed-text-v2:0",
+        "llm_model": "apac.amazon.nova-lite-v1:0",
+        "reranker_policy": "openrouter:nvidia/llama-nemotron-rerank-vl-1b-v2:free (fallback: lexical_bm25_plus)",
+        "cache_mode": "bypass_exact_and_semantic",
+        "benchmark_type": "cold",
         "metrics": {"overall_accuracy": 0.5333, "grounded_accuracy": 0.5167},
     }
 
-    cand_manifest_2_2 = dict(base_manifest_2_2)
-    cand_manifest_2_2["commit_sha"] = "cand_commit_888"
-    cand_manifest_2_2["baseline_commit_sha"] = "base_commit_777"
-    cand_manifest_2_2["metrics"] = {"overall_accuracy": 0.5500, "grounded_accuracy": 0.5333}
+    cand_manifest_2_3 = dict(base_manifest_2_3)
+    cand_manifest_2_3["commit_sha"] = "cand_commit_888"
+    cand_manifest_2_3["baseline_commit_sha"] = "base_commit_777"
+    cand_manifest_2_3["metrics"] = {"overall_accuracy": 0.5500, "grounded_accuracy": 0.5333}
 
-    res = compare_manifests(cand_manifest_2_2, base_manifest_2_2)
+    res = compare_manifests(cand_manifest_2_3, base_manifest_2_3)
     assert res["comparable"] is True
     assert res["status"] == "COMPARABLE"
     assert res["deltas"]["overall_accuracy_delta"] == pytest.approx(0.0167, abs=1e-4)

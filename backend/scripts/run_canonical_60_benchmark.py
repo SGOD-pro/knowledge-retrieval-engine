@@ -665,7 +665,7 @@ def run_benchmark(
             "timestamp": timestamp,
             "workspace_id": workspace_id,
             "benchmark_type": benchmark_type,
-            "runner_version": "2.2.0",
+            "runner_version": "2.3.0",
             "scorer_version": SCORER_VERSION,
             "test_suite_name": test_data.get("test_suite_name", "canonical_60"),
             "test_suite_sha256": suite_sha256,

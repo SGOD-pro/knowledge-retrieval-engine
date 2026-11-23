@@ -6,7 +6,7 @@ from typing import Any
 
 from services.retrieval.evidence_contract import EvidenceItem, restore_evidence_item
 
-SCORER_VERSION = "2.2.0"
+SCORER_VERSION = "2.3.0"
 
 
 
@@ -17,16 +17,121 @@ def tokenize(text: str) -> list[str]:
     return [w.lower() for w in re.findall(r"\w+", text) if len(w) > 2]
 
 
-def content_match(chunk_text: str, expected_answer: str) -> bool:
+def is_concise_percentage_candidate(text: str) -> bool:
+    """Returns True if candidate answer is a concise response with percentage or numeric tokens."""
+    if not text:
+        return False
+    pct_or_num = re.findall(r"[-+]?[$]?\b\d[\d,]*(?:\.\d+)?%?\b", text)
+    words = re.findall(r"\b\w+\b", text)
+    return len(words) <= 6 and bool(pct_or_num)
+
+
+def is_concise_percentage_match(chunk_text: str, expected_answer: str) -> bool:
+    """Evaluates whether candidate answer text satisfies a single percentage request concisely.
+
+    Requirements:
+      1. Expected answer must contain exactly one percentage entity.
+      2. Expected answer must not contain other un-matched numeric claims or named entities
+         (rejecting answers that omit other required claims).
+      3. Candidate answer must explicitly assert the percentage with proper unit ('%' or 'percent'),
+         rejecting bare numbers or wrong units (e.g. '$99.58', '99.58').
+      4. Candidate percentage value must match the expected percentage within absolute tolerance 0.02,
+         rejecting wrong values.
+      5. Candidate percentage value must not be negated in the candidate answer,
+         rejecting negated values (e.g. 'not 99.58%', 'is not 99.58%').
     """
-    Canonical benchmark content match scoring function.
+    if not chunk_text or not expected_answer:
+        return False
+
+    pct_regex = re.compile(r"([-+]?\b\d[\d,]*(?:\.\d+)?)\s*(?:%|percent\b)", re.IGNORECASE)
+    exp_pct_matches = pct_regex.findall(expected_answer)
+    if len(exp_pct_matches) != 1:
+        return False
+
+    try:
+        exp_pct_val = Decimal(exp_pct_matches[0].replace(",", ""))
+    except InvalidOperation:
+        return False
+
+    # Check if expected answer requires other numbers (omitted claims control)
+    cleaned_exp = re.sub(r"(?<=\d),(?=\d)", "", expected_answer)
+    all_exp_nums = re.findall(r"[-+]?\b\d+(?:\.\d+)?\b", cleaned_exp)
+    non_pct_nums = []
+    for n in all_exp_nums:
+        try:
+            if abs(Decimal(n) - exp_pct_val) > Decimal("0.001"):
+                non_pct_nums.append(n)
+        except InvalidOperation:
+            pass
+    if non_pct_nums:
+        return False
+
+    # Check if expected answer has named entities / proper nouns
+    sentences = re.split(r"[.!?]\s*", expected_answer.strip())
+    named_entities = set()
+    for s in sentences:
+        words = re.findall(r"\b[A-Za-z]+\b", s)
+        for w in words[1:]:
+            if w[0].isupper() and w.lower() not in (
+                "january", "february", "march", "april", "may", "june",
+                "july", "august", "september", "october", "november", "december"
+            ):
+                named_entities.add(w.lower())
+    if named_entities:
+        chunk_words = set(w.lower() for w in re.findall(r"\b[A-Za-z]+\b", chunk_text))
+        if not (named_entities <= chunk_words):
+            return False
+
+    # Candidate must assert percentage with valid percentage unit
+    chunk_pct_matches = pct_regex.findall(chunk_text)
+    if not chunk_pct_matches:
+        return False
+
+    # Value check within tolerance
+    matched_val = False
+    for m in chunk_pct_matches:
+        try:
+            val = Decimal(m.replace(",", ""))
+            if abs(val - exp_pct_val) <= Decimal("0.02"):
+                matched_val = True
+                break
+        except InvalidOperation:
+            continue
+    if not matched_val:
+        return False
+
+    # Negation check
+    target_str = exp_pct_matches[0]
+    if _is_entity_negated_in_text(target_str, chunk_text):
+        return False
+
+    return True
+
+
+def content_match(chunk_text: str, expected_answer: str) -> bool:
+    """Canonical benchmark content match scoring function.
+
     Returns True if:
       - Asymmetric token recall >= 0.50 (fraction of expected answer tokens present in chunk), OR
-      - When numbers or percentages are in the expected answer, >= 50% numeric overlap with >= 25% token recall.
+      - When numbers or percentages are in the expected answer, >= 50% numeric overlap with >= 25% token recall, OR
+      - When a single percentage is requested, candidate answer satisfies concise percentage matching.
     Also ensures reasonable token precision when chunk text is short.
     """
     if not expected_answer or not chunk_text:
         return False
+
+    pct_regex = re.compile(r"([-+]?\b\d[\d,]*(?:\.\d+)?)\s*(?:%|percent\b)", re.IGNORECASE)
+    exp_pct_matches = pct_regex.findall(expected_answer)
+
+    # When candidate is a concise percentage or numeric response, evaluate via concise percentage matching
+    if is_concise_percentage_candidate(chunk_text) and exp_pct_matches:
+        return is_concise_percentage_match(chunk_text, expected_answer)
+
+    # When expected answer requests a single percentage, block fall-through if target percentage is negated in candidate
+    if len(exp_pct_matches) == 1:
+        target_str = exp_pct_matches[0]
+        if _is_entity_negated_in_text(target_str, chunk_text):
+            return False
 
     exp_nums = set(re.findall(r"\b\d+(?:\.\d+)?%?\b", expected_answer))
     expected_tokens = set(tokenize(expected_answer))
@@ -1702,17 +1807,62 @@ def evaluate_grounded_answer(
     }
 
 
-def rescore_query_record_offline(record: dict[str, Any]) -> dict[str, Any]:
+def grade_canonical_answer_text(
+    answer: str,
+    expected_answer: str,
+    contract_type: str = "semantic",
+    contract: dict[str, Any] | None = None,
+    ans_is_refusal: bool = False,
+) -> bool:
+    """Canonical benchmark answer text grading function.
+
+    Grades text correctness across refusal, structured numeric, JSON schema,
+    premise correction, and semantic contracts.
+    """
+    if contract_type == "refusal":
+        return ans_is_refusal
+    elif contract_type == "numeric":
+        return grade_structured_numeric(answer, contract or {})
+    elif contract_type == "json_schema":
+        return grade_structured_json(answer, contract or {})
+    elif contract_type == "premise_correction":
+        return grade_structured_premise(answer, contract or {})
+    else:
+        if not expected_answer:
+            return False
+        relevancy = compute_answer_relevancy(answer, expected_answer)
+        c_match = content_match(answer, expected_answer)
+        return c_match and relevancy >= 0.40
+
+
+def rescore_query_record_offline(
+    record: dict[str, Any],
+    recompute_text_correctness: bool = False,
+) -> dict[str, Any]:
     """Reproduces grounded answer evaluation directly from a saved query record.
 
     Restores typed EvidenceItem instances from serialized retained_evidence_items,
     and runs evaluate_grounded_answer with all preserved evaluation inputs.
+    When recompute_text_correctness is True, evaluates answer text correctness
+    via the canonical grading path instead of relying on the saved text grade.
     """
     answer_text = str(record.get("answer", ""))
     citations = record.get("citations", [])
-    is_ans_correct = record.get("answer_text_correct", record.get("is_correct", False))
     contract_type = record.get("contract_type", "semantic")
     contract = record.get("contract")
+    ans_is_refusal = bool(record.get("ans_is_refusal", record.get("is_refusal", False)))
+
+    if recompute_text_correctness:
+        expected_ans = record.get("expected_answer", "")
+        is_ans_correct = grade_canonical_answer_text(
+            answer=answer_text,
+            expected_answer=expected_ans,
+            contract_type=contract_type,
+            contract=contract,
+            ans_is_refusal=ans_is_refusal,
+        )
+    else:
+        is_ans_correct = record.get("answer_text_correct", record.get("is_correct", False))
     expected_sources = record.get("expected_sources")
     expected_source_version = record.get("expected_source_version")
 
