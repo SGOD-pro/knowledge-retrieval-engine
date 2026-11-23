@@ -1242,4 +1242,220 @@ def test_sentence_ending_with_digits_segments_cleanly():
     assert claims[1]["value"] == Decimal("78678")
 
 
+# ---------------------------------------------------------------------------
+# Regressions for Three Reproduced Financial Binding Defects
+# ---------------------------------------------------------------------------
+
+CHUNK_COST_OF_REVENUE_TABLE = """Apple Inc.
+CONDENSED CONSOLIDATED STATEMENTS OF OPERATIONS (In millions)
+Three Months Ended
+June 27, 2026
+Cost of revenue:
+   Services $ 30,739"""
+
+CHUNK_COST_OF_SALES_TABLE = """Apple Inc.
+CONDENSED CONSOLIDATED STATEMENTS OF OPERATIONS (In millions)
+Three Months Ended
+June 27, 2026
+Cost of sales:
+   Services $ 30,739"""
+
+
+def test_reproduce_cost_of_revenue_cell_rejected_for_net_sales_claim():
+    """Defect 1: Services net sales answer must reject cost of revenue evidence."""
+    doc_id = "doc_cor_test"
+    ws_id = "ws_cor_test"
+    chunk_cor = Chunk(
+        id=f"{doc_id}:cor:1",
+        document_id=doc_id,
+        text=CHUNK_COST_OF_REVENUE_TABLE,
+        page_number=1,
+        element_type="table",
+        workspace_id=ws_id,
+        metadata={"location_reference": "Page: 1", "document_filename": "SEC-Form-10Q.pdf"},
+        source_format="pdf",
+        similarity_score=0.95,
+    )
+    query = "tell me Apple's Services net sales for the three months ended June 27, 2026"
+    ans = "Services net sales were $30,739 million."
+    mock_llm_response = {
+        "answer": ans,
+        "citations": [chunk_cor.id],
+    }
+    resp, _ = _execute_mocked_pipeline(query, ws_id, [chunk_cor], mock_llm_response)
+    # Must be rejected because evidence is cost of revenue, not net sales
+    assert resp.answer == "NOT_FOUND"
+    assert resp.retrieval_incomplete is True
+    assert resp.citations == []
+
+
+def test_genuine_net_sales_cost_of_sales_and_cost_of_revenue_pass():
+    """Defect 1: Genuine net sales, cost of sales, and cost of revenue queries still pass."""
+    doc_id = "doc_metric_pass"
+    ws_id = "ws_metric_pass"
+
+    chunk_sales = Chunk(
+        id=f"{doc_id}:sales:1",
+        document_id=doc_id,
+        text=CHUNK_SERVICES_ONLY_TABLE,
+        page_number=1,
+        element_type="table",
+        workspace_id=ws_id,
+        metadata={"location_reference": "Page: 1", "document_filename": "SEC-Form-10Q.pdf"},
+        source_format="pdf",
+        similarity_score=0.95,
+    )
+    chunk_cos = Chunk(
+        id=f"{doc_id}:cos:1",
+        document_id=doc_id,
+        text=CHUNK_COST_OF_SALES_TABLE,
+        page_number=1,
+        element_type="table",
+        workspace_id=ws_id,
+        metadata={"location_reference": "Page: 1", "document_filename": "SEC-Form-10Q.pdf"},
+        source_format="pdf",
+        similarity_score=0.95,
+    )
+    chunk_cor = Chunk(
+        id=f"{doc_id}:cor:1",
+        document_id=doc_id,
+        text=CHUNK_COST_OF_REVENUE_TABLE,
+        page_number=1,
+        element_type="table",
+        workspace_id=ws_id,
+        metadata={"location_reference": "Page: 1", "document_filename": "SEC-Form-10Q.pdf"},
+        source_format="pdf",
+        similarity_score=0.95,
+    )
+
+    # 1. Genuine net sales query
+    q1 = "tell me Apple's Services net sales for the three months ended June 27, 2026"
+    a1 = "Services net sales were $30,739 million."
+    r1, _ = _execute_mocked_pipeline(q1, ws_id, [chunk_sales], {"answer": a1, "citations": [chunk_sales.id]})
+    assert r1.answer == a1
+    assert r1.retrieval_incomplete is False
+
+    # 2. Genuine cost of sales query
+    q2 = "tell me Apple's Services cost of sales for the three months ended June 27, 2026"
+    a2 = "Services cost of sales was $30,739 million."
+    r2, _ = _execute_mocked_pipeline(q2, ws_id, [chunk_cos], {"answer": a2, "citations": [chunk_cos.id]})
+    assert r2.answer == a2
+    assert r2.retrieval_incomplete is False
+
+    # 3. Genuine cost of revenue query
+    q3 = "tell me Apple's Services cost of revenue for the three months ended June 27, 2026"
+    a3 = "Services cost of revenue was $30,739 million."
+    r3, _ = _execute_mocked_pipeline(q3, ws_id, [chunk_cor], {"answer": a3, "citations": [chunk_cor.id]})
+    assert r3.answer == a3
+    assert r3.retrieval_incomplete is False
+
+
+def test_reproduce_wrong_date_in_answer_rejected(mock_financial_chunks):
+    """Defect 2: June 7 in answer must fail verification for June 27 query and cell."""
+    chunk_p4, _, ws_id = mock_financial_chunks
+    query = "tell me Apple's Services net sales for the three months ended June 27, 2026"
+    ans = "For the three months ended June 7, 2026, Services net sales was $30,739 million."
+
+    mock_llm_response = {
+        "answer": ans,
+        "citations": [chunk_p4.id],
+    }
+    resp, _ = _execute_mocked_pipeline(query, ws_id, [chunk_p4], mock_llm_response)
+    assert resp.answer == "NOT_FOUND"
+    assert resp.retrieval_incomplete is True
+    assert resp.citations == []
+
+
+def test_wrong_duration_in_answer_rejected(mock_financial_chunks):
+    """Defect 2: Wrong duration stated in answer must fail verification."""
+    chunk_p4, _, ws_id = mock_financial_chunks
+    query = "tell me Apple's Services net sales for the three months ended June 27, 2026"
+    ans = "For the six months ended June 27, 2026, Services net sales was $30,739 million."
+
+    mock_llm_response = {
+        "answer": ans,
+        "citations": [chunk_p4.id],
+    }
+    resp, _ = _execute_mocked_pipeline(query, ws_id, [chunk_p4], mock_llm_response)
+    assert resp.answer == "NOT_FOUND"
+    assert resp.retrieval_incomplete is True
+    assert resp.citations == []
+
+
+def test_correct_explicit_period_and_concise_answer_accepted(mock_financial_chunks):
+    """Defect 2: Correct explicit period and concise answer relying on query period pass."""
+    chunk_p4, _, ws_id = mock_financial_chunks
+    query = "tell me Apple's Services net sales for the three months ended June 27, 2026"
+
+    # Explicit correct period
+    ans_explicit = "For the three months ended June 27, 2026, Services net sales was $30,739 million."
+    resp1, _ = _execute_mocked_pipeline(query, ws_id, [chunk_p4], {"answer": ans_explicit, "citations": [chunk_p4.id]})
+    assert resp1.answer == ans_explicit
+    assert resp1.retrieval_incomplete is False
+
+    # Concise answer relying on query's period
+    ans_concise = "$30,739 million"
+    resp2, _ = _execute_mocked_pipeline(query, ws_id, [chunk_p4], {"answer": ans_concise, "citations": [chunk_p4.id]})
+    assert resp2.answer == ans_concise
+    assert resp2.retrieval_incomplete is False
+
+
+def test_reproduce_shared_trailing_entity_binds_both_metrics():
+    """Defect 3: 'Net sales and gross margin for Services' must bind both metrics to Services."""
+    from services.retrieval.table_metric_binding import parse_query_requirements, bind_financial_query
+    q = "tell me Apple's net sales and gross margin for Services for the three months ended June 27, 2026"
+    reqs = parse_query_requirements(q)
+    assert reqs == [("net_sales", "Services"), ("gross_margin", "Services")]
+
+    binding = bind_financial_query(q)
+    assert binding.entity == "Services"
+    assert binding.target_requirements == (("net_sales", "Services"), ("gross_margin", "Services"))
+
+
+def test_shared_trailing_entity_variations():
+    """Defect 3: Reversed order, explicitly different entities, and explicit total paired with segment."""
+    from services.retrieval.table_metric_binding import parse_query_requirements
+
+    # 1. Reversed metric order with trailing entity
+    q_rev = "tell me Apple's gross margin and net sales for Services for the three months ended June 27, 2026"
+    assert parse_query_requirements(q_rev) == [("gross_margin", "Services"), ("net_sales", "Services")]
+
+    # 2. Explicitly different entities
+    q_diff = "tell me Apple's Services net sales and Products gross margin for the three months ended June 27, 2026"
+    assert parse_query_requirements(q_diff) == [("net_sales", "Services"), ("gross_margin", "Products")]
+
+    # 3. Explicit company-wide total paired with a segment metric
+    q_total = "tell me Apple's total net sales and gross margin for Services for the three months ended June 27, 2026"
+    assert parse_query_requirements(q_total) == [("net_sales", None), ("gross_margin", "Services")]
+
+
+def test_multi_sentence_beginning_with_date_does_not_desynchronize_claims():
+    """Review Blocker: A subsequent sentence beginning with a date must not desynchronize claims."""
+    from services.retrieval.table_metric_binding import extract_financial_claims
+    ans = "In 2026, Services net sales was $30,739 million. 2025 was when Services net sales was $27,423 million."
+    claims = extract_financial_claims(ans)
+    assert len(claims) == 2
+    assert claims[0]["value"] == Decimal("30739")
+    assert claims[0]["date_parsed"] == (2026, None, None)
+    assert claims[1]["value"] == Decimal("27423")
+    assert claims[1]["date_parsed"] == (2025, None, None)
+
+
+def test_prefix_entity_on_subsequent_metric_does_not_bind_backwards():
+    """Review Major: An entity prefix on a second metric must not bind backwards to an unentitied metric."""
+    from services.retrieval.table_metric_binding import parse_query_requirements
+    q = "tell me Apple's net sales and iPhone gross margin for the three months ended June 27, 2026"
+    reqs = parse_query_requirements(q)
+    assert reqs == [("net_sales", None), ("gross_margin", "iPhone")]
+
+
+def test_abbreviated_month_year_parsed_correctly():
+    """Review Minor: Abbreviated month and year without day must parse month integer."""
+    from services.retrieval.table_metric_binding import parse_date_components
+    res = parse_date_components("Jun 2026")
+    assert res == (2026, 6, None)
+
+
+
+
 

@@ -85,6 +85,37 @@ def classify_metric(text: str | None) -> str | None:
     return None
 
 
+def classify_cell_metric(row: str | None, sec: str | None, chunk_text: str | None = None) -> str | None:
+    """Identifies a table cell's financial metric from its row and section.
+
+    Specific cost labels take precedence over generic sales, revenue, and statement headings.
+    """
+    r_str = (row or "").strip()
+    s_str = (sec or "").strip()
+    combined = f"{r_str} {s_str}".strip()
+
+    # 1. Use existing metric classifier on combined row and section
+    # classify_metric checks gross_margin, then cost_of_sales/revenue, then restructuring,
+    # then operating_income, then net_income, then generic net_sales/revenue.
+    m = classify_metric(combined)
+    if m:
+        return m
+
+    r_lower = r_str.lower()
+    s_lower = s_str.lower()
+
+    # 2. Operations statement context check for net sales, scoped to entity or sales rows
+    c_lower = (chunk_text or "").lower()
+    if "operations" in s_lower or "operations" in c_lower:
+        row_is_entity = any(re.search(r"\b" + e + r"\b", r_lower, re.I) for e in ENTITY_NAMES)
+        row_is_sales = bool(re.search(r"\b(?:sales|revenue|total)\b", r_lower))
+        if row_is_entity or row_is_sales:
+            if not ("cost" in r_lower or "expense" in r_lower or "tax" in r_lower or "margin" in r_lower or "cost" in s_lower or "expense" in s_lower or "tax" in s_lower or "margin" in s_lower):
+                return "net_sales"
+
+    return None
+
+
 def extract_entity_from_text(text: str | None) -> str | None:
     """Extracts known business entity or product segment from text."""
     if not text:
@@ -103,7 +134,7 @@ def parse_query_requirements(query: str) -> list[tuple[str, str | None]]:
         return []
     q_lower = query.lower()
     clauses = [c.strip() for c in re.split(r";|\band\b|,", q_lower) if c.strip()]
-    reqs: list[tuple[str, str | None]] = []
+    raw_reqs: list[dict[str, Any]] = []
     pending_entities: list[str] = []
     last_entity: str | None = None
 
@@ -115,34 +146,48 @@ def parse_query_requirements(query: str) -> list[tuple[str, str | None]]:
             last_entity = e
             if pending_entities:
                 for pe in pending_entities:
-                    reqs.append((m, pe))
+                    raw_reqs.append({"metric": m, "entity": pe, "is_total": is_total, "clause": c})
                 pending_entities = []
-            reqs.append((m, e))
+            raw_reqs.append({"metric": m, "entity": e, "is_total": is_total, "clause": c})
         elif m and not e:
             eff_e = None if is_total else last_entity
             if pending_entities:
                 for pe in pending_entities:
-                    reqs.append((m, pe))
+                    raw_reqs.append({"metric": m, "entity": pe, "is_total": is_total, "clause": c})
                 pending_entities = []
-            reqs.append((m, eff_e))
+            raw_reqs.append({"metric": m, "entity": eff_e, "is_total": is_total, "clause": c})
         elif e and not m:
             pending_entities.append(e)
             last_entity = e
 
     if pending_entities:
-        all_m = [r[0] for r in reqs if r[0]]
+        all_m = [r["metric"] for r in raw_reqs if r.get("metric")]
         def_m = all_m[0] if all_m else classify_metric(query)
         if def_m:
             for pe in pending_entities:
-                reqs.append((def_m, pe))
+                raw_reqs.append({"metric": def_m, "entity": pe, "is_total": False, "clause": ""})
+
+    # Backward propagation for shared trailing entity
+    # e.g., "Net sales and gross margin for Services" -> both bind to Services
+    for i in range(len(raw_reqs)):
+        if raw_reqs[i]["entity"] is None and not raw_reqs[i]["is_total"]:
+            for j in range(i + 1, len(raw_reqs)):
+                sub_entity = raw_reqs[j]["entity"]
+                if sub_entity and not raw_reqs[j]["is_total"]:
+                    clause_j = raw_reqs[j].get("clause", "")
+                    # Check if sub_entity is trailing or introduced with for/of/in
+                    if re.search(r"\b(?:for|of|in)\s+" + re.escape(sub_entity) + r"\b", q_lower, re.I) or re.search(r"\b(?:for|of|in)\s+" + re.escape(sub_entity) + r"\b", clause_j, re.I) or re.search(r"\b" + re.escape(sub_entity) + r"\s*$", clause_j, re.I):
+                        raw_reqs[i]["entity"] = sub_entity
+                        break
 
     # Deduplicate while preserving order
     seen: set[tuple[str, str | None]] = set()
     unique_reqs: list[tuple[str, str | None]] = []
-    for r in reqs:
-        if r not in seen and r[0] is not None:
-            seen.add(r)
-            unique_reqs.append(r)
+    for r in raw_reqs:
+        pair = (r["metric"], r["entity"])
+        if pair not in seen and pair[0] is not None:
+            seen.add(pair)
+            unique_reqs.append(pair)
 
     if not unique_reqs:
         m = classify_metric(query)
@@ -167,7 +212,7 @@ def parse_date_components(text: str | None) -> tuple[int | None, int | None, int
         return int(y_str), MONTH_MAP[m_name], int(d_str)
 
     m_my = re.search(
-        r"\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{4})\b",
+        r"\b(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\s+(\d{4})\b",
         t_lower,
     )
     if m_my:
@@ -370,11 +415,13 @@ def parse_financial_table_cells(text: str) -> list[dict[str, Any]]:
             row_label = line[:idx_tok].replace("$", "").strip()
             if row_label:
                 effective_section = current_section or top_header
+                cell_metric = classify_cell_metric(row_label, effective_section, text)
                 for c_idx, (d_val, is_neg, is_pct, raw_tok, _) in enumerate(parsed_tokens):
                     col_info = col_headers[c_idx] if c_idx < len(col_headers) else {}
                     cells.append({
                         "section": effective_section,
                         "row": row_label,
+                        "metric": cell_metric,
                         "value": d_val,
                         "sign": -1 if is_neg else 1,
                         "is_percentage": is_pct,
@@ -396,20 +443,19 @@ def extract_financial_claims(text: str) -> list[dict[str, Any]]:
     if not text:
         return []
 
-    # Mask period dates and durations so date numbers do not get treated as financial quantities
+    clause_delims = (
+        r";|\band\b|\bcompared\s+to\b|\brather\s+than\b|\bversus\b|\bvs\.?\b|\bup\s+from\b|\bdown\s+from\b|\bincrease\s+from\b|\bdecrease\s+from\b|[\r\n]+|\.(?=\s+[A-Z0-9]|\s*$)|(?<=\s)[•\-\*]\s+"
+    )
+
+    # Mask period dates and durations inside each clause so date numbers do not get treated as financial quantities
     period_pattern = re.compile(
         r"\b(?:january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\s+\d{1,2}(?:\s*,\s*\d{4})?\b"
         r"|\b(?:three|six|nine|twelve|\d+)\s+months?\b"
         r"|\b20\d{2}\b",
         re.I,
     )
-    masked_text = period_pattern.sub(" [PERIOD] ", text)
 
-    clauses = re.split(
-        r";|\band\b|\bcompared\s+to\b|\brather\s+than\b|\bversus\b|\bvs\.?\b|\bup\s+from\b|\bdown\s+from\b|\bincrease\s+from\b|\bdecrease\s+from\b|[\r\n]+|\.(?=\s+[A-Z0-9]|\s*$)|(?<=\s)[•\-\*]\s+",
-        masked_text,
-        flags=re.I,
-    )
+    unmasked_clauses = [c.strip() for c in re.split(clause_delims, text, flags=re.I) if c.strip()]
     claims: list[dict[str, Any]] = []
 
     token_pattern = re.compile(
@@ -423,20 +469,24 @@ def extract_financial_claims(text: str) -> list[dict[str, Any]]:
     )
 
     last_pos = 0
-    for idx, clause in enumerate(clauses):
-        c_stripped = clause.strip()
-        if not c_stripped:
-            continue
-        c_pos = masked_text.find(clause, last_pos)
-        separator = masked_text[last_pos:c_pos] if c_pos != -1 else ""
+    for idx, unmasked_clause in enumerate(unmasked_clauses):
+        c_pos = text.find(unmasked_clause, last_pos)
+        separator = text[last_pos:c_pos] if c_pos != -1 else ""
         if c_pos != -1:
-            last_pos = c_pos + len(clause)
+            last_pos = c_pos + len(unmasked_clause)
 
         is_comp = False
         if idx > 0:
-            if comp_keywords.search(separator) or comp_keywords.search(clause[:30]):
+            if comp_keywords.search(separator) or comp_keywords.search(unmasked_clause[:30]):
                 is_comp = True
-        for m in token_pattern.finditer(clause):
+
+        claim_date_parsed = parse_date_components(unmasked_clause)
+        claim_duration = normalize_duration(unmasked_clause)
+
+        # Mask period numbers within this clause before locating numeric financial quantities
+        masked_clause = period_pattern.sub(" [PERIOD] ", unmasked_clause)
+
+        for m in token_pattern.finditer(masked_clause):
             raw = m.group(1).strip()
             unit_str = m.group(2)
             if not re.search(r"\d", raw):
@@ -474,8 +524,8 @@ def extract_financial_claims(text: str) -> list[dict[str, Any]]:
                 elif "dollar" in u_low:
                     unit = "dollars"
 
-            ent = extract_entity_from_text(clause)
-            met = classify_metric(clause)
+            ent = extract_entity_from_text(unmasked_clause)
+            met = classify_metric(unmasked_clause)
 
             claims.append({
                 "value": dec_val,
@@ -486,7 +536,9 @@ def extract_financial_claims(text: str) -> list[dict[str, Any]]:
                 "metric": met,
                 "is_comparison": is_comp,
                 "raw": raw,
-                "clause": clause.strip(),
+                "clause": unmasked_clause.strip(),
+                "date_parsed": claim_date_parsed,
+                "duration_norm": claim_duration,
             })
 
     return claims
@@ -620,45 +672,34 @@ def verify_financial_cell_binding(
             )
             return False, "claim_metric_contradicts_binding"
 
+        # Check explicit claim period against query binding
+        if claim.get("date_parsed") and binding.date_parsed:
+            req_y, req_m, req_d = binding.date_parsed
+            c_y, c_m, c_d = claim["date_parsed"]
+            if req_y is not None and c_y is not None and c_y != req_y:
+                logger.warning("verify_financial_cell_binding: claim year %s contradicts query year %s", c_y, req_y)
+                return False, "claim_date_contradicts_query"
+            if req_m is not None and c_m is not None and c_m != req_m:
+                logger.warning("verify_financial_cell_binding: claim month %s contradicts query month %s", c_m, req_m)
+                return False, "claim_date_contradicts_query"
+            if req_d is not None and c_d is not None and c_d != req_d:
+                logger.warning("verify_financial_cell_binding: claim day %s contradicts query day %s", c_d, req_d)
+                return False, "claim_date_contradicts_query"
+
+        if claim.get("duration_norm") and binding.duration_norm:
+            if claim["duration_norm"] != binding.duration_norm:
+                logger.warning("verify_financial_cell_binding: claim duration %s contradicts query duration %s", claim["duration_norm"], binding.duration_norm)
+                return False, "claim_duration_contradicts_query"
+
         for cell in cells:
             sec = (cell.get("section") or "").lower()
             row = (cell.get("row") or "").lower()
 
             # A. Metric category check
             chunk_context = cell.get("chunk_text") or (chunk_or_chunks if isinstance(chunk_or_chunks, str) else "")
-            c_text_lower = chunk_context.lower() if chunk_context else ""
-            if target_metric == "net_sales":
-                if "gross margin" in sec or "cost of sales" in sec or "operating expenses" in sec:
-                    continue
-                if not ("sales" in sec or "revenue" in sec or "operations" in c_text_lower):
-                    continue
-            elif target_metric == "gross_margin":
-                if not ("gross margin" in sec or "gross profit" in sec or "gross margin" in row):
-                    continue
-            elif target_metric == "cost_of_sales":
-                if not ("cost of sales" in sec or "cost of revenue" in sec or "cogs" in sec or "cost of sales" in row or "cost of revenue" in row):
-                    continue
-            elif target_metric == "restructuring_costs":
-                if not ("restructuring" in row or "restructuring" in sec or "operating income" in sec):
-                    continue
-            elif target_metric == "operating_income":
-                if not (
-                    "operating income" in sec
-                    or "operating profit" in sec
-                    or "operating income" in row
-                    or "operating profit" in row
-                    or "operating loss" in row
-                ):
-                    continue
-            elif target_metric == "net_income":
-                if not (
-                    "net income" in sec
-                    or "net earnings" in sec
-                    or "net income" in row
-                    or "net earnings" in row
-                    or "net loss" in row
-                ):
-                    continue
+            cell_metric = cell.get("metric") or classify_cell_metric(row, sec, chunk_context)
+            if cell_metric != target_metric:
+                continue
 
             # B. Entity check
             if target_entity:
@@ -674,6 +715,10 @@ def verify_financial_cell_binding(
                 cell_dur = cell.get("duration_norm")
                 if cell_dur is None or cell_dur != binding.duration_norm:
                     continue
+            if claim.get("duration_norm"):
+                cell_dur = cell.get("duration_norm")
+                if cell_dur is None or cell_dur != claim["duration_norm"]:
+                    continue
 
             # D. Date check (exact day, month, year)
             if binding.date_parsed:
@@ -687,6 +732,18 @@ def verify_financial_cell_binding(
                 if req_m is not None and cell_m != req_m:
                     continue
                 if req_d is not None and cell_d != req_d:
+                    continue
+            if claim.get("date_parsed"):
+                c_dt = cell.get("date_parsed")
+                if c_dt is None:
+                    continue
+                c_y, c_m, c_d = claim["date_parsed"]
+                cell_y, cell_m, cell_d = c_dt
+                if c_y is not None and cell_y != c_y:
+                    continue
+                if c_m is not None and cell_m != c_m:
+                    continue
+                if c_d is not None and cell_d != c_d:
                     continue
 
             # E. Sign check

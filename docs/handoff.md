@@ -326,8 +326,25 @@ This milestone resolves the review blockers, multi chunk verification defect, an
 
 ### Verification Evidence
 
-* Focused suite: `cd backend && uv run pytest tests/test_financial_table_metric_binding.py -v` (50 passed in 3.90s).
-* Regression suite: `cd backend && uv run pytest tests/test_financial_table_metric_binding.py tests/test_canonical_percentage_grading.py tests/test_offline_benchmark_artifact_reproducibility.py tests/test_grounded_answer_evaluator.py tests/test_benchmark_guard.py tests/test_benchmark_integrity_defects.py tests/test_citation_retained_evidence.py tests/test_evidence_providers.py tests/test_fast_path_fallback_regressions.py tests/test_chunk_citation_provenance_repair.py -rs` (176 passed in 9.22s).
+* Focused suite: `cd backend && uv run pytest tests/test_financial_table_metric_binding.py -v` (60 passed in 4.04s).
+* Regression suite: `cd backend && uv run pytest tests/test_financial_table_metric_binding.py tests/test_canonical_percentage_grading.py tests/test_offline_benchmark_artifact_reproducibility.py tests/test_grounded_answer_evaluator.py tests/test_benchmark_guard.py tests/test_benchmark_integrity_defects.py tests/test_citation_retained_evidence.py tests/test_evidence_providers.py tests/test_fast_path_fallback_regressions.py tests/test_chunk_citation_provenance_repair.py -rs` (186 passed in 10.19s).
+
+### Three Reproduced Financial Binding Defects Resolution
+
+* **Date**: November 24 2026
+* **Status**: Resolved three financial table binding defects across cost of revenue evidence rejection, answer period verification, and shared trailing entity binding.
+
+1. Rejection of cost of revenue evidence for net sales claims:
+   * Used the metric classifier to identify the cell metric from its row and section.
+   * Specific cost labels (cost of sales, cost of revenue, cogs) take precedence over generic sales, revenue, and statement headings.
+   * Proven that genuine net sales, cost of sales, and cost of revenue queries still pass.
+2. Period verification for stated answer claims:
+   * Preserved explicit dates and durations as claim metadata prior to numeric masking.
+   * Validated stated dates and durations against the query and supporting table cells.
+   * Proven that wrong dates (June 7 for June 27) and wrong durations (six months for three months) fail verification, while correct explicit periods and concise answers relying on query periods pass.
+3. Shared trailing entity binding for coordinated metrics:
+   * Coordinated metrics paired with a trailing entity (such as "net sales and gross margin for Services") bind both metrics to Services via backward propagation.
+   * Proven that reversed metric order binds both metrics, explicitly different entities remain separate, and explicit company-wide totals paired with segment metrics preserve unentitied total status.
 
 ### Operational Boundaries and Limitations
 
