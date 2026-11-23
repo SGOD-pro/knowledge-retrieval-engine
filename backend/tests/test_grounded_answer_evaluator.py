@@ -20,6 +20,9 @@ from services.evaluation.benchmark_scorer import (
     content_match,
     compute_answer_relevancy,
     extract_numbers_normalized,
+    grade_structured_numeric,
+    _split_into_clauses,
+    _split_into_contradiction_clauses,
 )
 
 
@@ -517,13 +520,15 @@ def test_control_1_supported_assertion_passes_grounded_scoring():
     assert result["citation_validation"]["valid"] is True
 
 
-def test_control_2_explicit_denial_reproduction_fails_grounded_scoring():
-    """Control 2: Explicit denial of evidence filing number fails grounded scoring.
+def test_control_1b_valid_correction_both_orders_pass_grounded_scoring():
+    """Valid correction control: Proves both orders of a valid correction pass grounded scoring.
 
-    Reproduces Q136: Retained evidence asserts filing number 001-36743 while
-    the answer explicitly denies that number ('definitely NOT 001-36743').
-    While legacy text scoring marks this correct due to token overlap,
-    grounded scoring must fail due to claim-level contradiction.
+    Evidence asserts 001-36743.
+    Order 1: 'Apple Commission File Number is 001-36743 and not 999-99999.'
+    Order 2A: 'Apple Commission File Number is not 999-99999 and is 001-36743.'
+    Order 2B: 'Apple Commission File Number is not 999-99999, it is 001-36743.'
+    Negation is bound to 999-99999 rather than nearby numbers indiscriminately.
+    All cases must pass grounded scoring.
     """
     retained_item = _make_retained_evidence_item(
         evidence_id="chunk_sec_001",
@@ -539,20 +544,88 @@ def test_control_2_explicit_denial_reproduction_fails_grounded_scoring():
             "text": "Commission File Number: 001-36743. Apple Inc. Quarterly Report.",
         }
     ]
-    contradictory_answer = (
+
+    # Order 1: affirmed evidence fact first, negated claim second
+    ans_order_1 = "Apple Commission File Number is 001-36743 and not 999-99999."
+    res_1 = evaluate_grounded_answer(
+        answer=ans_order_1,
+        citations=citations,
+        is_answer_text_correct=True,
+        contract_type="semantic",
+        expected_sources=["SEC-Form-10Q.pdf"],
+        expected_source_version=1,
+        retained_evidence_items=[retained_item],
+        ground_truth_chunk_ids={"chunk_sec_001"},
+    )
+    assert res_1["is_grounded_correct"] is True
+    assert res_1["reason"] == "grounded_and_verified"
+
+    # Order 2A: negated claim first with 'and is', affirmed evidence fact second
+    ans_order_2a = "Apple Commission File Number is not 999-99999 and is 001-36743."
+    res_2a = evaluate_grounded_answer(
+        answer=ans_order_2a,
+        citations=citations,
+        is_answer_text_correct=True,
+        contract_type="semantic",
+        expected_sources=["SEC-Form-10Q.pdf"],
+        expected_source_version=1,
+        retained_evidence_items=[retained_item],
+        ground_truth_chunk_ids={"chunk_sec_001"},
+    )
+    assert res_2a["is_grounded_correct"] is True
+    assert res_2a["reason"] == "grounded_and_verified"
+
+    # Order 2B: negated claim first with comma, affirmed evidence fact second
+    ans_order_2b = "Apple Commission File Number is not 999-99999, it is 001-36743."
+    res_2b = evaluate_grounded_answer(
+        answer=ans_order_2b,
+        citations=citations,
+        is_answer_text_correct=True,
+        contract_type="semantic",
+        expected_sources=["SEC-Form-10Q.pdf"],
+        expected_source_version=1,
+        retained_evidence_items=[retained_item],
+        ground_truth_chunk_ids={"chunk_sec_001"},
+    )
+    assert res_2b["is_grounded_correct"] is True
+    assert res_2b["reason"] == "grounded_and_verified"
+
+
+def test_control_2_explicit_denial_reproduction_fails_grounded_scoring():
+    """Control 2: Explicit denial of evidence filing number fails grounded scoring.
+
+    Reproduces Q136: Retained evidence asserts filing number 001-36743 while
+    the answer explicitly denies that number.
+    Covers preceding negation, copular negation, and predicate adjective negation.
+    Grounded scoring must fail with claim_contradicts_evidence.
+    """
+    retained_item = _make_retained_evidence_item(
+        evidence_id="chunk_sec_001",
+        text="Apple Inc. Commission File Number: 001-36743. Form 10-Q.",
+    )
+    citations = [
+        {
+            "chunk_id": "chunk_sec_001",
+            "document_filename": "SEC-Form-10Q.pdf",
+            "document_version": 1,
+            "document_id": "doc_sec_01",
+            "page_number": 1,
+            "text": "Commission File Number: 001-36743. Apple Inc. Quarterly Report.",
+        }
+    ]
+
+    # Subcase A: Preceding denial ('definitely NOT 001-36743')
+    contradictory_answer_a = (
         "According to the SEC filing, Apple's Commission File Number is definitely NOT 001-36743."
     )
-
-    # Legacy text scoring marks it correct (preserved separately)
     gold_answer = "001-36743"
-    c_match = content_match(contradictory_answer, gold_answer)
-    relevancy = compute_answer_relevancy(contradictory_answer, gold_answer)
+    c_match = content_match(contradictory_answer_a, gold_answer)
+    relevancy = compute_answer_relevancy(contradictory_answer_a, gold_answer)
     is_text_correct = c_match and relevancy >= 0.40
     assert is_text_correct is True
 
-    # Grounded scoring must fail
-    result = evaluate_grounded_answer(
-        answer=contradictory_answer,
+    result_a = evaluate_grounded_answer(
+        answer=contradictory_answer_a,
         citations=citations,
         is_answer_text_correct=is_text_correct,
         contract_type="semantic",
@@ -561,21 +634,53 @@ def test_control_2_explicit_denial_reproduction_fails_grounded_scoring():
         retained_evidence_items=[retained_item],
         ground_truth_chunk_ids={"chunk_sec_001"},
     )
+    assert result_a["is_grounded_correct"] is False
+    assert result_a["grounded_correct"] is False
+    assert "claim_contradicts_evidence" in result_a["reason"]
 
-    assert result["is_grounded_correct"] is False
-    assert result["grounded_correct"] is False
-    assert "claim_contradicts_evidence" in result["reason"]
-    assert "001-36743" in result["reason"]
+    # Subcase B: Copular negation ('001-36743 is not Apple Commission File Number')
+    contradictory_answer_b = "001-36743 is not Apple Commission File Number."
+    result_b = evaluate_grounded_answer(
+        answer=contradictory_answer_b,
+        citations=citations,
+        is_answer_text_correct=True,
+        contract_type="semantic",
+        expected_sources=["SEC-Form-10Q.pdf"],
+        expected_source_version=1,
+        retained_evidence_items=[retained_item],
+        ground_truth_chunk_ids={"chunk_sec_001"},
+    )
+    assert result_b["is_grounded_correct"] is False
+    assert "claim_contradicts_evidence" in result_b["reason"]
+
+    # Subcase C: Predicate adjective negation ('001-36743 is incorrect')
+    contradictory_answer_c = "001-36743 is incorrect according to the quarterly filing."
+    result_c = evaluate_grounded_answer(
+        answer=contradictory_answer_c,
+        citations=citations,
+        is_answer_text_correct=True,
+        contract_type="semantic",
+        expected_sources=["SEC-Form-10Q.pdf"],
+        expected_source_version=1,
+        retained_evidence_items=[retained_item],
+        ground_truth_chunk_ids={"chunk_sec_001"},
+    )
+    assert result_c["is_grounded_correct"] is False
+    assert "claim_contradicts_evidence" in result_c["reason"]
 
 
 def test_control_3_conflicting_assertions_fails_grounded_scoring():
     """Control 3: Conflicting assertions denying evidence facts fail grounded scoring.
 
-    Case A: Answer contains conflicting clauses, affirming then denying the evidence fact:
-            'Apple's Commission File Number is 001-36743, but it is not 001-36743.'
-    Case B: Answer asserts a conflicting value while denying the evidence value:
-            'The Commission File Number is 001-99999, not 001-36743.'
-    Both cases must fail grounded scoring.
+    Case A: Answer contains conflicting clauses, affirming then denying the evidence fact with 'and':
+            'Apple Commission File Number is 001-36743 and not 001-36743.'
+    Case B: Answer contains conflicting clauses, affirming then denying the evidence fact with 'but':
+            'Apple Commission File Number is 001-36743, but it is not 001-36743.'
+    Case C: Answer asserts an alternative value while denying the evidence value:
+            'Apple Commission File Number is 999-99999 and not 001-36743.'
+    Case D: Answer denies the evidence value then asserts an alternative value:
+            'Apple Commission File Number is not 001-36743 and is 999-99999.'
+    All cases must fail grounded scoring with claim_contradicts_evidence.
     """
     retained_item = _make_retained_evidence_item(
         evidence_id="chunk_sec_001",
@@ -592,8 +697,8 @@ def test_control_3_conflicting_assertions_fails_grounded_scoring():
         }
     ]
 
-    # Case A: affirms then denies
-    ans_a = "Apple's Commission File Number is 001-36743, but it is not 001-36743."
+    # Case A: affirms then denies with 'and'
+    ans_a = "Apple Commission File Number is 001-36743 and not 001-36743."
     res_a = evaluate_grounded_answer(
         answer=ans_a,
         citations=citations,
@@ -607,8 +712,8 @@ def test_control_3_conflicting_assertions_fails_grounded_scoring():
     assert res_a["is_grounded_correct"] is False
     assert "claim_contradicts_evidence" in res_a["reason"]
 
-    # Case B: denies evidence value while asserting alternative
-    ans_b = "The Commission File Number is 001-99999, not 001-36743."
+    # Case B: affirms then denies with 'but'
+    ans_b = "Apple Commission File Number is 001-36743, but it is not 001-36743."
     res_b = evaluate_grounded_answer(
         answer=ans_b,
         citations=citations,
@@ -621,6 +726,36 @@ def test_control_3_conflicting_assertions_fails_grounded_scoring():
     )
     assert res_b["is_grounded_correct"] is False
     assert "claim_contradicts_evidence" in res_b["reason"]
+
+    # Case C: asserts alternative value, denies evidence value
+    ans_c = "Apple Commission File Number is 999-99999 and not 001-36743."
+    res_c = evaluate_grounded_answer(
+        answer=ans_c,
+        citations=citations,
+        is_answer_text_correct=True,
+        contract_type="semantic",
+        expected_sources=["SEC-Form-10Q.pdf"],
+        expected_source_version=1,
+        retained_evidence_items=[retained_item],
+        ground_truth_chunk_ids={"chunk_sec_001"},
+    )
+    assert res_c["is_grounded_correct"] is False
+    assert "claim_contradicts_evidence" in res_c["reason"]
+
+    # Case D: denies evidence value, asserts alternative value
+    ans_d = "Apple Commission File Number is not 001-36743 and is 999-99999."
+    res_d = evaluate_grounded_answer(
+        answer=ans_d,
+        citations=citations,
+        is_answer_text_correct=True,
+        contract_type="semantic",
+        expected_sources=["SEC-Form-10Q.pdf"],
+        expected_source_version=1,
+        retained_evidence_items=[retained_item],
+        ground_truth_chunk_ids={"chunk_sec_001"},
+    )
+    assert res_d["is_grounded_correct"] is False
+    assert "claim_contradicts_evidence" in res_d["reason"]
 
 
 def test_control_4_valid_premise_correction_passes_grounded_scoring():
@@ -741,6 +876,38 @@ def test_control_6_structured_aggregate_denial_fails_grounded_scoring():
 
     assert result["is_grounded_correct"] is False
     assert "claim_contradicts_evidence" in result["reason"]
+
+
+def test_control_7_legacy_numeric_clause_splitter_is_not_overridden():
+    """Control 7: Verifies the legacy numeric clause splitter is not overridden.
+
+    _split_into_clauses is preserved at its original line 373 definition
+    for role-based numeric evaluation, while contradiction evaluation uses
+    the distinctly named _split_into_contradiction_clauses helper.
+    """
+    # Test line 373 _split_into_clauses preserves numbers with commas and splits on and/but/;
+    text = "Total income increased by 4,191 million; representing a growth of 0.43% and 512 annotation vectors"
+    clauses = _split_into_clauses(text)
+    assert any("4,191" in c for c in clauses)
+    assert len(clauses) >= 3
+
+    # Test distinct contradiction clause splitter
+    contra_clauses = _split_into_contradiction_clauses(
+        "Apple Commission File Number is 001-36743 and not 999-99999."
+    )
+    assert len(contra_clauses) == 2
+    assert contra_clauses[0] == "Apple Commission File Number is 001-36743"
+    assert contra_clauses[1] == "not 999-99999"
+
+    # Test grade_structured_numeric legacy behavior
+    contract = {
+        "contract_type": "numeric",
+        "target_values": [4191],
+        "tolerance": 0.05,
+        "direction": "increase",
+    }
+    ans = "Total income increased by 4,191 million dollars."
+    assert grade_structured_numeric(ans, contract) is True
 
 
 # ===========================================================================

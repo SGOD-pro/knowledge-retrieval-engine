@@ -1164,8 +1164,19 @@ _NEGATION_WORDS = {
     "refutes", "refuted", "refuting", "disputes", "disputed", "disputing",
 }
 
+_COPULAR_AND_ADVERB_TOKENS = {
+    "is", "was", "are", "were", "seems", "seemed", "appears", "appeared",
+    "be", "been", "being", "definitely", "certainly", "clearly", "really",
+    "actually", "surely", "reported", "stated",
+}
+
+_CONJUNCTION_AND_BOUNDARY_TOKENS = {
+    "and", "but", "or", "however", "instead", "rather", "although", "whereas",
+    "while", "yet", ",", ";", ":",
+}
+
 _CONTRAST_PATTERN = re.compile(
-    r"\b(?:but|however|instead\s+of|instead|rather\s+than|rather|although|whereas|while|yet)\b",
+    r"\b(?:but|however|instead\s+of|instead|rather\s+than|rather|although|whereas|while|yet|\band\b)\b",
     re.IGNORECASE,
 )
 _CLAUSE_SPLIT_PATTERN = re.compile(r"(?:(?<!\d)\.|\.(?!\d)|[!?;:\n|]|(?<!\d),|,(?!\d))+")
@@ -1176,8 +1187,8 @@ def _normalize_text_for_negation(text: str) -> str:
     return re.sub(r"(?<=\d),(?=\d)", "", text)
 
 
-def _split_into_clauses(text: str) -> list[str]:
-    """Split text into clauses by contrast conjunctions and non-numeric punctuation."""
+def _split_into_contradiction_clauses(text: str) -> list[str]:
+    """Split text into contradiction clauses by contrast conjunctions and non-numeric punctuation."""
     text = _normalize_text_for_negation(text)
     t = _CONTRAST_PATTERN.sub(" | ", text)
     parts = _CLAUSE_SPLIT_PATTERN.split(t)
@@ -1190,41 +1201,73 @@ def _tokenize(text: str) -> list[str]:
 
 
 def _target_in_token(target: str, token: str) -> bool:
-    """Check if target matches token by exact string or numeric equivalence."""
+    """Check if target matches token by exact string, hyphenated part, or numeric equivalence."""
     t_clean = target.lower().strip("$% ")
     tok_clean = token.lower().strip("$% ")
     if t_clean == tok_clean:
+        return True
+    parts = tok_clean.split("-")
+    if t_clean in parts:
         return True
     try:
         if float(t_clean) == float(tok_clean):
             return True
     except ValueError:
         pass
+    for p in parts:
+        try:
+            if float(t_clean) == float(p):
+                return True
+        except ValueError:
+            pass
     return False
 
 
+def _is_numeric_or_entity_token(token: str) -> bool:
+    """Return True if token contains any digits or numbers."""
+    tok_clean = token.lower().strip("$% ")
+    return bool(re.search(r"\d", tok_clean))
+
+
 def _is_target_negated_in_clause(target: str, clause: str) -> bool:
-    """Check if a specific target is in the scope of negation within a clause."""
+    """Check if a specific target is in the scope of negation within a clause.
+
+    Binds negation to its claim rather than nearby numbers indiscriminately:
+    1. Preceding negation: governs target only when at most 4 tokens away with
+       no intervening entity or coordinating conjunction.
+    2. Following negation: governs target only in copular predicate constructions
+       (e.g. 'T is not', 'T is incorrect') where all intervening tokens are copulas or adverbs.
+    """
     tokens = _tokenize(clause)
     target_indices = [i for i, tok in enumerate(tokens) if _target_in_token(target, tok)]
     if not target_indices:
         return False
 
     for idx in target_indices:
-        preceding = [tokens[j].lower() for j in range(max(0, idx - 6), idx)]
-        for tok in preceding:
+        # Preceding negation check
+        for j in range(max(0, idx - 4), idx):
+            tok = tokens[j].lower()
             if tok in _NEGATION_WORDS:
-                return True
-        following = [tokens[j].lower() for j in range(idx + 1, min(len(tokens), idx + 5))]
-        for tok in following:
+                intervening = [tokens[k].lower() for k in range(j + 1, idx)]
+                has_intervening_number = any(_is_numeric_or_entity_token(t) for t in intervening)
+                has_intervening_conjunction = any(t in _CONJUNCTION_AND_BOUNDARY_TOKENS for t in intervening)
+                if not has_intervening_number and not has_intervening_conjunction:
+                    return True
+
+        # Following negation check (copular predicate only)
+        for j in range(idx + 1, min(len(tokens), idx + 4)):
+            tok = tokens[j].lower()
             if tok in _NEGATION_WORDS:
-                return True
+                intervening = [tokens[k].lower() for k in range(idx + 1, j)]
+                if intervening and all(t in _COPULAR_AND_ADVERB_TOKENS for t in intervening):
+                    return True
+
     return False
 
 
 def _is_entity_negated_in_text(target: str, text: str) -> bool:
-    """Check if target is negated in any clause of text."""
-    clauses = _split_into_clauses(text)
+    """Check if target is negated in any contradiction clause of text."""
+    clauses = _split_into_contradiction_clauses(text)
     for c in clauses:
         if _is_target_negated_in_clause(target, c):
             return True
