@@ -161,17 +161,17 @@ def resolve_chunk_provenance(
         if document_version is not None and str(document_version).strip():
             cand_ver = str(document_version).strip()
 
-        if cand_ver is not None and snap_ver_str is not None:
-            if cand_ver != snap_ver_str:
-                # Version mismatch: NEVER relabel unverified chunk as current version
-                return fallback_fname, cand_ver
-            # Declared version verified against snapshot
-            return snap_source or fallback_fname, snap_ver_str
+        if cand_ver is not None:
+            if snap_ver_str is not None and cand_ver == snap_ver_str:
+                # Declared version verified against snapshot
+                return snap_source or fallback_fname, snap_ver_str
+            # Version mismatch or unverified snapshot: NEVER relabel unverified chunk
+            return fallback_fname, cand_ver
 
-        # Chunk is unversioned (e.g. tabular/XLS) or snapshot has version
+        # Chunk is unversioned: a document snapshot alone cannot supply a version for an unversioned chunk.
+        # An unbound chunk resolves canonical filename from the snapshot, but stays unversioned.
         resolved_fname = snap_source or fallback_fname
-        resolved_ver = snap_ver_str or fallback_ver
-        return resolved_fname, resolved_ver
+        return resolved_fname, None
 
     # 4. Fallback to CloudRepository / cache if no snapshot found
     doc_fname = document_filename or getattr(chunk, "document_filename", "") or ""

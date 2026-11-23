@@ -2528,11 +2528,157 @@ app = workflow.compile()
 
 
 # ---------------------------------------------------------------------------
+# Pipeline response object
+# ---------------------------------------------------------------------------
+
+
+class ResponseObject:
+    def __init__(self, state: dict[str, Any]):
+        self.answer = state.get("final_answer", "")
+        self.citations = state.get("citations", [])
+        self.confidence_score = state.get("confidence_score", 0.0)
+        self.stage_timings = state.get("stage_timings", {})
+        self.context_snippet = state.get(
+            "context_snippet", ""
+        )  # for faithfulness judge
+        self.faithfulness = state.get("faithfulness", None)
+        self.citation_utilization_rate = state.get("citation_utilization_rate", None)
+        self.usage = state.get("usage", {"input_tokens": 0, "output_tokens": 0})
+        self.execution_result = state.get("execution_result", None)
+        self.status = state.get("status", "success")
+        self.error_code = state.get("error_code")
+        self.retained_evidence_items = state.get("retained_evidence_items", [])
+        self.selected_strategies = state.get("selected_strategies", {})
+
+        # Ensure every citation carries the strategy of its matched retained evidence item
+        retained_map = {str(ev.evidence_id): ev.strategy for ev in self.retained_evidence_items}
+        for ev in self.retained_evidence_items:
+            loc_cid = ev.locator.get("chunk_id")
+            if loc_cid:
+                retained_map[str(loc_cid)] = ev.strategy
+            tbl_id = ev.locator.get("table_id")
+            if tbl_id:
+                retained_map[str(tbl_id)] = ev.strategy
+        for cit in self.citations:
+            if isinstance(cit, dict) and not cit.get("strategy"):
+                cid = str(cit.get("chunk_id", ""))
+                tid = str(cit.get("table_id", ""))
+                cit["strategy"] = retained_map.get(cid) or retained_map.get(tid) or "vector_rerank"
+
+        # Ensure retained evidence and final citations carry identical canonical filename and version
+        retained_by_cid = {}
+        for ev in self.retained_evidence_items:
+            loc = getattr(ev, "locator", {}) or {}
+            cid = str(getattr(ev, "evidence_id", "") or loc.get("chunk_id", ""))
+            if cid:
+                retained_by_cid[cid] = ev
+
+        ws_id = state.get("workspace_id", "")
+        b_repo = state.get("boundary_repo")
+
+        for cit in self.citations:
+            if isinstance(cit, dict):
+                cid = str(cit.get("chunk_id", ""))
+                did = str(cit.get("document_id", ""))
+
+                # Dynamic tombstone check before delivery: if tombstoned, block citation
+                is_tombstoned = False
+                if b_repo and hasattr(b_repo, "has_tombstone") and ws_id:
+                    try:
+                        if b_repo.has_tombstone(ws_id, "workspace", ws_id) or (did and b_repo.has_tombstone(ws_id, "source", did)):
+                            is_tombstoned = True
+                    except Exception:
+                        is_tombstoned = False
+
+                if is_tombstoned:
+                    fallback = f"Doc-{did[:8]}" if did else "Doc-unknown"
+                    cit["document_filename"] = fallback
+                    cit["document_version"] = None
+                    continue
+
+                matched_ev = retained_by_cid.get(cid)
+                if matched_ev:
+                    ev_fname = getattr(matched_ev, "document_filename", None) or (getattr(matched_ev, "locator", {}) or {}).get("document_filename")
+                    ev_ver = getattr(matched_ev, "document_version", None) or (getattr(matched_ev, "locator", {}) or {}).get("document_version")
+                    if ev_fname:
+                        cit["document_filename"] = ev_fname
+                    cit["document_version"] = ev_ver
+
+        plan = state.get("plan")
+        self.executed_path = state.get("executed_path", "full")
+        self.fast_path = (self.executed_path == "fast")
+        self.stages = plan.stages if plan else []
+        self.planned_path = state.get("planned_path", "fast" if (plan and plan.fast_path) else "full")
+        self.structured_aggregate = (self.executed_path == "structured_aggregate")
+        self.reranker_mode = state.get("reranker_mode", RerankerMode.BYPASSED.value)
+        self.retrieval_candidates = state.get("retrieval_candidates", {})
+        self.structural_candidates = state.get("structural_candidates", [])
+        self.structural_candidate_ids = state.get("structural_candidate_ids", [])
+        self.structural_match_count = state.get("structural_match_count", 0)
+        self.page_index_latency_ms = state.get("page_index_latency_ms", 0.0)
+        self.structural_target_state = state.get("structural_target_state", "none")
+        self.okf_candidates = state.get("okf_candidates", [])
+        self.okf_candidate_ids = state.get("okf_candidate_ids", [])
+        self.okf_match_count = state.get("okf_match_count", 0)
+        self.okf_latency_ms = state.get("okf_latency_ms", 0.0)
+        self.okf_entity_state = state.get("okf_entity_state", "none")
+        self.okf_property_state = state.get("okf_property_state", "none")
+        self.graph_candidates = state.get("graph_chunks", [])
+        self.graph_candidate_ids = state.get("graph_candidate_ids", [])
+        self.graph_match_count = state.get("graph_match_count", 0)
+        self.graph_latency_ms = state.get("graph_latency_ms", 0.0)
+        self.graph_traversed_nodes = state.get("graph_traversed_nodes", 0)
+        self.graph_matched_edges = state.get("graph_matched_edges", 0)
+        self.graph_was_truncated = state.get("graph_was_truncated", False)
+        self.graph_truncation_reason = state.get("graph_truncation_reason", None)
+        self.graph_entity_state = state.get("graph_entity_state", "none")
+        self.graph_relationship_state = state.get("graph_relationship_state", "none")
+        self.query_embedding = state.get("query_embedding")
+        self.query_embedding_provenance = state.get("query_embedding_provenance")
+        self.retrieval_incomplete = state.get("retrieval_incomplete", False)
+        self.laya_calls = state.get("laya_calls", 0)
+        self.expansion_steps = state.get("expansion_steps", 0)
+        self.synthesis_calls = state.get("synthesis_calls", 0)
+        self.laya_decision = state.get("laya_decision")
+        self.laya_status = state.get("laya_status", "none")
+        self.laya_latency_ms = state.get("laya_latency_ms", 0.0)
+        self.laya_tokens = state.get("laya_tokens", {"input_tokens": 0, "output_tokens": 0})
+
+        # Expose internal state for tests
+        class LLMInput:
+            def __init__(self, ctx):
+                self.context = ctx
+
+        self._llm_input = LLMInput(state.get("compressed_text", ""))
+
+        self.top_chunks = state.get("top_chunks", [])
+        self._reranker_avg = (
+            sum(
+                (getattr(c, "reranker_score", 0.0) or 0.0)
+                for c in self.top_chunks
+            )
+            / len(self.top_chunks)
+            if self.top_chunks
+            else 0.0
+        )
+
+        self._coverage = 1.0
+
+    def __getitem__(self, item: str) -> Any:
+        if item == "final_answer":
+            return self.answer
+        if hasattr(self, item):
+            return getattr(self, item)
+        raise KeyError(item)
+
+
+# ---------------------------------------------------------------------------
 # Pipeline entry point
 # ---------------------------------------------------------------------------
 
 
 class Pipeline:
+    ResponseObject = ResponseObject
     def run(
         self,
         query: str,
@@ -2664,126 +2810,6 @@ class Pipeline:
                 initial_state[k] = v
 
         final_state = app.invoke(initial_state)
-
-        class ResponseObject:
-            def __init__(self, state):
-                self.answer = state.get("final_answer", "")
-                self.citations = state.get("citations", [])
-                self.confidence_score = state.get("confidence_score", 0.0)
-                self.stage_timings = state.get("stage_timings", {})
-                self.context_snippet = state.get(
-                    "context_snippet", ""
-                )  # for faithfulness judge
-                self.faithfulness = state.get("faithfulness", None)
-                self.citation_utilization_rate = state.get("citation_utilization_rate", None)
-                self.usage = state.get("usage", {"input_tokens": 0, "output_tokens": 0})
-                self.execution_result = state.get("execution_result", None)
-                self.status = state.get("status", "success")
-                self.error_code = state.get("error_code")
-                self.retained_evidence_items = state.get("retained_evidence_items", [])
-                self.selected_strategies = state.get("selected_strategies", {})
-
-                # Ensure every citation carries the strategy of its matched retained evidence item
-                retained_map = {str(ev.evidence_id): ev.strategy for ev in self.retained_evidence_items}
-                for ev in self.retained_evidence_items:
-                    loc_cid = ev.locator.get("chunk_id")
-                    if loc_cid:
-                        retained_map[str(loc_cid)] = ev.strategy
-                    tbl_id = ev.locator.get("table_id")
-                    if tbl_id:
-                        retained_map[str(tbl_id)] = ev.strategy
-                for cit in self.citations:
-                    if isinstance(cit, dict) and not cit.get("strategy"):
-                        cid = str(cit.get("chunk_id", ""))
-                        tid = str(cit.get("table_id", ""))
-                        cit["strategy"] = retained_map.get(cid) or retained_map.get(tid) or "vector_rerank"
-
-                # Ensure retained evidence and final citations carry identical canonical filename and version
-                retained_by_cid = {}
-                for ev in self.retained_evidence_items:
-                    loc = getattr(ev, "locator", {}) or {}
-                    cid = str(getattr(ev, "evidence_id", "") or loc.get("chunk_id", ""))
-                    if cid:
-                        retained_by_cid[cid] = ev
-
-                for cit in self.citations:
-                    if isinstance(cit, dict):
-                        cid = str(cit.get("chunk_id", ""))
-                        matched_ev = retained_by_cid.get(cid)
-                        if matched_ev:
-                            ev_fname = getattr(matched_ev, "document_filename", None) or (getattr(matched_ev, "locator", {}) or {}).get("document_filename")
-                            ev_ver = getattr(matched_ev, "document_version", None) or (getattr(matched_ev, "locator", {}) or {}).get("document_version")
-                            if ev_fname and (not cit.get("document_filename") or cit.get("document_filename", "").startswith("Doc-")):
-                                cit["document_filename"] = ev_fname
-                            if ev_ver and not cit.get("document_version"):
-                                cit["document_version"] = ev_ver
-
-                plan = state.get("plan")
-                self.executed_path = state.get("executed_path", "full")
-                self.fast_path = (self.executed_path == "fast")
-                self.stages = plan.stages if plan else []
-                self.planned_path = state.get("planned_path", "fast" if (plan and plan.fast_path) else "full")
-                self.structured_aggregate = (self.executed_path == "structured_aggregate")
-                self.reranker_mode = state.get("reranker_mode", RerankerMode.BYPASSED.value)
-                self.retrieval_candidates = state.get("retrieval_candidates", {})
-                self.structural_candidates = state.get("structural_candidates", [])
-                self.structural_candidate_ids = state.get("structural_candidate_ids", [])
-                self.structural_match_count = state.get("structural_match_count", 0)
-                self.page_index_latency_ms = state.get("page_index_latency_ms", 0.0)
-                self.structural_target_state = state.get("structural_target_state", "none")
-                self.okf_candidates = state.get("okf_candidates", [])
-                self.okf_candidate_ids = state.get("okf_candidate_ids", [])
-                self.okf_match_count = state.get("okf_match_count", 0)
-                self.okf_latency_ms = state.get("okf_latency_ms", 0.0)
-                self.okf_entity_state = state.get("okf_entity_state", "none")
-                self.okf_property_state = state.get("okf_property_state", "none")
-                self.graph_candidates = state.get("graph_chunks", [])
-                self.graph_candidate_ids = state.get("graph_candidate_ids", [])
-                self.graph_match_count = state.get("graph_match_count", 0)
-                self.graph_latency_ms = state.get("graph_latency_ms", 0.0)
-                self.graph_traversed_nodes = state.get("graph_traversed_nodes", 0)
-                self.graph_matched_edges = state.get("graph_matched_edges", 0)
-                self.graph_was_truncated = state.get("graph_was_truncated", False)
-                self.graph_truncation_reason = state.get("graph_truncation_reason", None)
-                self.graph_entity_state = state.get("graph_entity_state", "none")
-                self.graph_relationship_state = state.get("graph_relationship_state", "none")
-                self.query_embedding = state.get("query_embedding")
-                self.query_embedding_provenance = state.get("query_embedding_provenance")
-                self.retrieval_incomplete = state.get("retrieval_incomplete", False)
-                self.laya_calls = state.get("laya_calls", 0)
-                self.expansion_steps = state.get("expansion_steps", 0)
-                self.synthesis_calls = state.get("synthesis_calls", 0)
-                self.laya_decision = state.get("laya_decision")
-                self.laya_status = state.get("laya_status", "none")
-                self.laya_latency_ms = state.get("laya_latency_ms", 0.0)
-                self.laya_tokens = state.get("laya_tokens", {"input_tokens": 0, "output_tokens": 0})
-
-                # Expose internal state for tests
-                class LLMInput:
-                    def __init__(self, ctx):
-                        self.context = ctx
-
-                self._llm_input = LLMInput(state.get("compressed_text", ""))
-
-                self.top_chunks = state.get("top_chunks", [])
-                self._reranker_avg = (
-                    sum(
-                        (getattr(c, "reranker_score", 0.0) or 0.0)
-                        for c in self.top_chunks
-                    )
-                    / len(self.top_chunks)
-                    if self.top_chunks
-                    else 0.0
-                )
-
-                self._coverage = 1.0
-
-            def __getitem__(self, item: str) -> Any:
-                if item == "final_answer":
-                    return self.answer
-                if hasattr(self, item):
-                    return getattr(self, item)
-                raise KeyError(item)
 
         return ResponseObject(final_state)
 
