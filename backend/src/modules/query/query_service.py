@@ -245,6 +245,8 @@ class QueryService:
                         "document_filename": getattr(
                             c, "document_filename", "document.pdf"
                         ),
+                        "document_version": getattr(c, "document_version", None),
+                        "strategy": getattr(c, "strategy", ""),
                         "source_format": getattr(c, "source_format", "pdf"),
                         "text": getattr(c, "text", ""),
                         "page_number": getattr(c, "page_number", 1),

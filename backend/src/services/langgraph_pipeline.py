@@ -991,6 +991,13 @@ def run_reranker(state: PipelineState):
     from services.retrieval.evidence_contract import evidence_item_from_chunk
     retained_evidence_items = []
     ws_id = state.get("workspace_id", "")
+    b_repo = state.get("boundary_repo")
+    if b_repo is None:
+        try:
+            from db.workspace_boundary_repo import get_workspace_boundary_repo
+            b_repo = get_workspace_boundary_repo()
+        except Exception:
+            b_repo = None
     okf_ids = {str(getattr(x, "id", "")) for x in okf_candidates}
     structural_ids = {str(getattr(x, "id", "")) for x in structural}
     graph_ids = {str(getattr(x, "id", "")) for x in graph}
@@ -1020,6 +1027,7 @@ def run_reranker(state: PipelineState):
             workspace_id=ws_id,
             strategy=strat,
             score=getattr(c, "reranker_score", 0.0),
+            boundary_repo=b_repo,
         )
         retained_evidence_items.append(ev)
 
@@ -1066,13 +1074,15 @@ def run_deterministic_math(state: PipelineState):
 
     # Map provenance citations to response builder citations from chunks
     citations = []
+    ws_id = state.get("workspace_id", "")
+    b_repo = state.get("boundary_repo")
     chunk_by_id = {getattr(c, "id", ""): c for c in chunks}
     for prov in res.provenance_citations:
         cid = prov.get("chunk_id") if isinstance(prov, dict) else getattr(prov, "chunk_id", "")
         if cid and cid in chunk_by_id:
-            citations.append(build_citation(chunk_by_id[cid]).to_dict())
+            citations.append(build_citation(chunk_by_id[cid], workspace_id=ws_id, boundary_repo=b_repo).to_dict())
     if not citations and chunks:
-        citations = [build_citation(chunks[0]).to_dict()]
+        citations = [build_citation(chunks[0], workspace_id=ws_id, boundary_repo=b_repo).to_dict()]
 
     logger.info(
         "deterministic_math.resolved query='%s' answer='%s' latency_ms=%.2f",
@@ -1252,9 +1262,12 @@ def run_llm(state: PipelineState):
         ans_str = json.dumps(ans) if isinstance(ans, (dict, list)) else str(ans)
         faithfulness = compute_faithfulness(ans_str, compressed)
 
+    ws_id = state.get("workspace_id", "")
+    b_repo = state.get("boundary_repo")
+
     return {
         "final_answer": ans,
-        "citations": [build_citation(c).to_dict() for c in final_cited_chunks],
+        "citations": [build_citation(c, workspace_id=ws_id, boundary_repo=b_repo).to_dict() for c in final_cited_chunks],
         "confidence_score": confidence,
         "faithfulness": faithfulness,
         "citation_utilization_rate": citation_utilization_rate,
@@ -1874,7 +1887,7 @@ def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
 
                 if v_ans and v_chunk and not tombstoned:
                     updated_state["final_answer"] = v_ans
-                    updated_state["citations"] = [build_citation(v_chunk).to_dict()]
+                    updated_state["citations"] = [build_citation(v_chunk, workspace_id=ws_id, boundary_repo=boundary_repo).to_dict()]
                     updated_state["executed_path"] = "deterministic_excerpt"
                     updated_state["confidence_score"] = 0.8
                 else:
@@ -1989,7 +2002,7 @@ def delivery_gate(state: PipelineState) -> dict[str, Any]:
                 if v_ans and v_chunk and _validate_replacement_excerpt(v_chunk, ws_id, boundary_repo, state.get("snapshot_context")):
                     return {
                         "final_answer": v_ans,
-                        "citations": [build_citation(v_chunk).to_dict()],
+                        "citations": [build_citation(v_chunk, workspace_id=ws_id, boundary_repo=boundary_repo).to_dict()],
                         "executed_path": "deterministic_excerpt",
                         "confidence_score": 0.8,
                     }
@@ -2072,7 +2085,7 @@ def delivery_gate(state: PipelineState) -> dict[str, Any]:
                     if v_ans and v_chunk and _validate_replacement_excerpt(v_chunk, ws_id, boundary_repo, state.get("snapshot_context")):
                         return {
                             "final_answer": v_ans,
-                            "citations": [build_citation(v_chunk).to_dict()],
+                            "citations": [build_citation(v_chunk, workspace_id=ws_id, boundary_repo=boundary_repo).to_dict()],
                             "executed_path": "deterministic_excerpt",
                             "confidence_score": 0.8,
                         }
@@ -2131,9 +2144,18 @@ def end_fast_path(state: PipelineState):
         }
 
     if verified_ans and verified_chunk:
+        ws_id = state.get("workspace_id", "")
+        b_repo = state.get("boundary_repo")
+        if b_repo is None:
+            try:
+                from db.workspace_boundary_repo import get_workspace_boundary_repo
+                b_repo = get_workspace_boundary_repo()
+            except Exception:
+                b_repo = None
+
         answer = verified_ans
         top_chunks = [verified_chunk]
-        citation = build_citation(verified_chunk).to_dict()
+        citation = build_citation(verified_chunk, workspace_id=ws_id, boundary_repo=b_repo).to_dict()
         util_rate = round(1.0 / max(1, len(all_top)), 4) if all_top else 1.0
         conf = getattr(verified_chunk, "similarity_score", None)
         if conf is None:
@@ -2143,7 +2165,7 @@ def end_fast_path(state: PipelineState):
         logger.info("fast_path.verified_factual answer='%s' latency_ms=%.2f", answer[:50], latency_ms)
         from services.retrieval.evidence_contract import evidence_item_from_chunk
         retained_evidence_items = [
-            evidence_item_from_chunk(c, workspace_id=state.get("workspace_id", ""), strategy="vector_rerank")
+            evidence_item_from_chunk(c, workspace_id=ws_id, strategy="vector_rerank", boundary_repo=b_repo)
             for c in top_chunks
         ]
         return {
@@ -2625,6 +2647,12 @@ class Pipeline:
             initial_state["table_store"] = table_store
         if knowledge_graph_repo is not None:
             initial_state["knowledge_graph_repo"] = knowledge_graph_repo
+        if boundary_repo is None:
+            try:
+                from db.workspace_boundary_repo import get_workspace_boundary_repo
+                boundary_repo = get_workspace_boundary_repo()
+            except Exception:
+                boundary_repo = None
         if boundary_repo is not None:
             initial_state["boundary_repo"] = boundary_repo
         if doc_repo is not None:
@@ -2669,6 +2697,26 @@ class Pipeline:
                         cid = str(cit.get("chunk_id", ""))
                         tid = str(cit.get("table_id", ""))
                         cit["strategy"] = retained_map.get(cid) or retained_map.get(tid) or "vector_rerank"
+
+                # Ensure retained evidence and final citations carry identical canonical filename and version
+                retained_by_cid = {}
+                for ev in self.retained_evidence_items:
+                    loc = getattr(ev, "locator", {}) or {}
+                    cid = str(getattr(ev, "evidence_id", "") or loc.get("chunk_id", ""))
+                    if cid:
+                        retained_by_cid[cid] = ev
+
+                for cit in self.citations:
+                    if isinstance(cit, dict):
+                        cid = str(cit.get("chunk_id", ""))
+                        matched_ev = retained_by_cid.get(cid)
+                        if matched_ev:
+                            ev_fname = getattr(matched_ev, "document_filename", None) or (getattr(matched_ev, "locator", {}) or {}).get("document_filename")
+                            ev_ver = getattr(matched_ev, "document_version", None) or (getattr(matched_ev, "locator", {}) or {}).get("document_version")
+                            if ev_fname and (not cit.get("document_filename") or cit.get("document_filename", "").startswith("Doc-")):
+                                cit["document_filename"] = ev_fname
+                            if ev_ver and not cit.get("document_version"):
+                                cit["document_version"] = ev_ver
 
                 plan = state.get("plan")
                 self.executed_path = state.get("executed_path", "full")
