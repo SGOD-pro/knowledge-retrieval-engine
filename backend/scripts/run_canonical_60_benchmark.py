@@ -43,6 +43,7 @@ from modules.query.query_service import QueryService
 from modules.query.query_repository import QueryRepository
 from schemas.models import QueryRequest
 from services.evaluation.benchmark_scorer import (
+    SCORER_VERSION,
     compute_retrieval_metrics,
     grade_premise_correction,
     grade_arithmetic_answer,
@@ -52,6 +53,7 @@ from services.evaluation.benchmark_scorer import (
     grade_structured_premise,
     validate_citations,
     evaluate_grounded_answer,
+    rescore_query_record_offline,
     content_match,
     compute_answer_relevancy,
     compute_faithfulness,
@@ -571,6 +573,15 @@ def run_benchmark(
             if gen_calls > 0:
                 llm_call_count += 1
 
+            # Serialize retained evidence items using EvidenceItem.to_dict()
+            serialized_retained_evidence = []
+            if retained_ev_items:
+                for ev in retained_ev_items:
+                    if hasattr(ev, "to_dict"):
+                        serialized_retained_evidence.append(ev.to_dict())
+                    elif isinstance(ev, dict):
+                        serialized_retained_evidence.append(ev)
+
             res_entry = {
                 "id": qid,
                 "category": category,
@@ -598,6 +609,23 @@ def run_benchmark(
                 "reranker_remote_calls": resp.get("reranker_remote_calls", 0),
                 "generation_calls": gen_calls,
                 "citations": top_citations,
+                # Offline evaluation inputs
+                "retained_evidence_items": serialized_retained_evidence,
+                "contract_type": contract_type,
+                "contract": contract,
+                "question_type": question_type,
+                "expected_sources": expected_sources,
+                "expected_source_version": expected_version,
+                "ground_truth_chunk_ids": sorted(list(rel_ids)) if rel_ids else [],
+                "is_infra_error": is_infra_error,
+                "ans_is_refusal": ans_is_refusal,
+                "structured_aggregate": (
+                    question_type == "structured_aggregate"
+                    or contract_type == "structured_aggregate"
+                    or bool(resp.get("structured_aggregate"))
+                    or resp.get("execution_type") == "deterministic"
+                ),
+                "execution_type": resp.get("execution_type", ""),
             }
             query_results.append(res_entry)
 
@@ -637,8 +665,8 @@ def run_benchmark(
             "timestamp": timestamp,
             "workspace_id": workspace_id,
             "benchmark_type": benchmark_type,
-            "runner_version": "2.1.0",
-            "scorer_version": "2.1.0",
+            "runner_version": "2.2.0",
+            "scorer_version": SCORER_VERSION,
             "test_suite_name": test_data.get("test_suite_name", "canonical_60"),
             "test_suite_sha256": suite_sha256,
             "corpus_manifest_sha256": corpus_manifest_sha256,

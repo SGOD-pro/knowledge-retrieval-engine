@@ -43,20 +43,21 @@ The current tree is clean at commit `5dc1895d36837a78da018c250f347f805ea08335`. 
    * Structural retrieval flags `--page-index` and `--okf` enabled, soft pooling candidate chunks into reciprocal rank fusion with weights 1.10 and 1.15 respectively.
 
 5. **Reranker Configuration and Policy Reconciliation**:
-   * OpenRouter model configuration `nvidia/llama-nemotron-rerank-vl-1b-v2:free` returned HTTP 404 in historical run `20261122_182354` because the free model endpoint was no longer hosted on OpenRouter.
-   * Per architecture design in `reranker_provider.py`, client errors trip the circuit breaker and route execution fail safe to deterministic BM25Plus lexical scoring (`_term_coverage_fallback`).
-   * Effective reranking mode: `circuit_open_lexical_fallback` across retrieval queries, and `bypassed` for structured aggregate, fast path, and refusal queries.
+   * The runtime operates remote first. On every retrieval query, the runner dispatches an HTTP request to OpenRouter for model `nvidia/llama-nemotron-rerank-vl-1b-v2:free`.
+   * Because OpenRouter returns an HTTP 404 client error (endpoint not found for this free model), the call fails fast on that query. The daily quota circuit breaker (`_trip_circuit`) only trips for HTTP 429 quota exhaustion; for HTTP 404 client errors, each retrieval query executes remote first, records 1 remote reranker call, and immediately falls back to deterministic BM25Plus lexical scoring (`_term_coverage_fallback`), logging reranker mode `circuit_open_lexical_fallback`.
+   * Effective reranking mode: `circuit_open_lexical_fallback` across retrieval queries (42 remote calls attempted, falling back to BM25Plus), and `bypassed` for structured aggregate, fast path, and refusal queries (18 queries).
    * Remote endpoint availability remains unresolved (HTTP 404), ensuring consistent and deterministic local lexical scoring across all queries without network latency variance.
 
-6. **Artifact Request-Retained Evidence Serialization Finding**:
-   * Audit of `scripts/run_canonical_60_benchmark.py` (lines 574 to 601) revealed that while `resp.get("retained_evidence_items")` is evaluated online during query execution, the array of `retained_evidence_items` is not saved into `query_details.json`.
-   * Severity: Low for online evaluation, Moderate for offline rescoring.
-   * Detail: Because `evaluate_grounded_answer` requires authoritative retained request evidence to validate claim support and structured result values, an offline evaluator reading only `query_details.json` would fail answerable queries with `missing_authoritative_evidence` unless evidence items are serialized.
-   * Recommendation: Include `retained_evidence_items` in the query result dictionary when serializing `query_details.json`.
+6. **Artifact Request-Retained Evidence Serialization (Resolved)**:
+   * The runner in `scripts/run_canonical_60_benchmark.py` has been updated to serialize `retained_evidence_items` via `to_dict()`, along with all required evaluation inputs (`contract_type`, `contract`, `question_type`, `expected_sources`, `expected_source_version`, `ground_truth_chunk_ids`, `is_infra_error`, `ans_is_refusal`, `structured_aggregate`, and `execution_type`).
+   * In `services/retrieval/evidence_contract.py`, `EvidenceItem.from_dict` and `restore_evidence_item` restore typed instances from serialized dictionaries.
+   * Offline rescoring function `rescore_query_record_offline` reproduces identical grounded evaluations directly from saved JSON artifacts without live database or model access.
 
-7. **Evaluator Revision and Comparison Limits Against Run 20261122_182354**:
+7. **Evaluator Revision 2.2.0 and Comparison Limits Against Run 20261122_182354**:
+   * Scorer version is distinctly set to `2.2.0` (runner version `2.2.0`). This distinctly identifies the grounded evaluator with offline artifact reproducibility.
+   * Strict comparator gates in `compare_manifests` preserve equality requirements: comparing candidate manifests against historical `2.1.0` manifests strictly emits `NOT COMPARABLE` due to the distinct `scorer_version` and `runner_version`, protecting benchmark integrity while allowing controlled comparison runs against matching `2.2.0` baselines.
    * Historical run `20261122_182354` recorded only legacy answer text accuracy (`overall_accuracy`: 32/60 correct, 53.33%). It had 1,697 unverified model provenance points in Qdrant and suffered from substring row matching, loose calculation tolerances, and unvalidated citation support.
-   * Current evaluator revision `f630ab9` enforces:
+   * Current evaluator revision `2.2.0` enforces:
      * Grounded correctness requiring answer text correctness plus verified request retained evidence.
      * Rejection of fabricated citation snippets and arbitrary number targets.
      * Verification of all necessary operands in derived calculations.
@@ -67,7 +68,7 @@ The current tree is clean at commit `5dc1895d36837a78da018c250f347f805ea08335`. 
 
 ## Test Verification
 
-All focused evaluator regressions passed cleanly (104 passed in 7.93s):
+All focused evaluator regressions passed cleanly (115 passed in 5.84s):
 * [test_evaluator_defect_reproduction.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/tests/test_evaluator_defect_reproduction.py): 15 passed
 * [test_canonical_benchmark_runner_settings.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/tests/test_canonical_benchmark_runner_settings.py): 6 passed
 * [test_grounded_answer_evaluator.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/tests/test_grounded_answer_evaluator.py): 35 passed
@@ -75,13 +76,14 @@ All focused evaluator regressions passed cleanly (104 passed in 7.93s):
 * [test_citation_retained_evidence.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/tests/test_citation_retained_evidence.py): 10 passed
 * [test_mandatory_audit_guards.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/tests/test_mandatory_audit_guards.py): 10 passed
 * [test_benchmark_runner_and_persistence_0004.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/tests/test_benchmark_runner_and_persistence_0004.py): 18 passed
+* [test_offline_benchmark_artifact_reproducibility.py](file:///home/swyra/projects/knowledge-retrieval-engine/backend/tests/test_offline_benchmark_artifact_reproducibility.py): 11 passed
 
 ## Provider Call and Cost Estimate
 
 For a full 60 question cold canonical run:
 * Remote Bedrock Titan V2 embeddings (`amazon.titan-embed-text-v2:0`): ~42 calls (1 per retrieval question)
 * Remote Bedrock Nova Lite V1 text completions (`apac.amazon.nova-lite-v1:0`): ~38 to 45 calls (1 per non refusal synthesis question, adhering to `MAX_SYNTHESIS_CALLS = 1`)
-* Remote OpenRouter reranker calls: 0 (deterministic lexical BM25Plus fallback active)
+* Remote OpenRouter reranker calls: 42 remote calls attempted (remote first on each retrieval question, failing fast on 404 with 0 financial cost)
 * Local BGE fast embeddings: ~42 calls (in process, zero external cost)
 * Total estimated cloud cost: less than $0.05
 
@@ -101,4 +103,4 @@ cd backend && \
 
 ## Readiness Verdict
 
-**READY**. All operational prerequisites, configuration settings, boundary registries, corpus checksums, and evaluator regression suites are verified and ready for execution.
+**READY**. All operational prerequisites, configuration settings, boundary registries, corpus checksums, offline artifact persistence, and evaluator regression suites are verified and ready for execution. Benchmark execution remains strictly pending user authorization.

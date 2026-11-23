@@ -4,6 +4,11 @@ import re
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from services.retrieval.evidence_contract import EvidenceItem, restore_evidence_item
+
+SCORER_VERSION = "2.2.0"
+
+
 
 def tokenize(text: str) -> list[str]:
     """Tokenizes text into lowercase alphanumeric tokens of length > 2."""
@@ -847,6 +852,7 @@ def validate_citations(
     all_retained_hashes: set[str] | None = set(retained_structured_hashes) if retained_structured_hashes is not None else None
 
     if retained_evidence_items is not None:
+        retained_evidence_items = [restore_evidence_item(it) for it in retained_evidence_items]
         retained_chunk_ids = set()
         if all_retained_hashes is None:
             all_retained_hashes = set()
@@ -1361,6 +1367,9 @@ def evaluate_grounded_answer(
              (compute_faithfulness >= 0.25 and numeric claims in the answer must appear in context snippets
              or valid contract target values).
     """
+    if retained_evidence_items is not None:
+        retained_evidence_items = [restore_evidence_item(it) for it in retained_evidence_items]
+
     cit_val = validate_citations(
         citations=citations,
         context_chunk_ids=context_chunk_ids,
@@ -1691,4 +1700,63 @@ def evaluate_grounded_answer(
         "citation_validation": cit_val,
         "faithfulness": faith_score,
     }
+
+
+def rescore_query_record_offline(record: dict[str, Any]) -> dict[str, Any]:
+    """Reproduces grounded answer evaluation directly from a saved query record.
+
+    Restores typed EvidenceItem instances from serialized retained_evidence_items,
+    and runs evaluate_grounded_answer with all preserved evaluation inputs.
+    """
+    answer_text = str(record.get("answer", ""))
+    citations = record.get("citations", [])
+    is_ans_correct = record.get("answer_text_correct", record.get("is_correct", False))
+    contract_type = record.get("contract_type", "semantic")
+    contract = record.get("contract")
+    expected_sources = record.get("expected_sources")
+    expected_source_version = record.get("expected_source_version")
+
+    # Restore typed EvidenceItem instances from serialized dictionaries
+    raw_ev_items = record.get("retained_evidence_items")
+    retained_evidence_items = (
+        [restore_evidence_item(it) for it in raw_ev_items]
+        if raw_ev_items is not None
+        else None
+    )
+
+    context_chunk_ids = (
+        record.get("compressed_context_chunk_ids")
+        or record.get("context_chunk_ids")
+    )
+    ground_truth_chunk_ids = record.get("ground_truth_chunk_ids")
+    is_infra_error = bool(record.get("is_infra_error", False))
+    ans_is_refusal = bool(record.get("ans_is_refusal", record.get("is_refusal", False)))
+    question_type = str(record.get("question_type", "retrieval"))
+
+    outcome = {
+        "structured_aggregate": bool(
+            record.get("structured_aggregate")
+            or question_type == "structured_aggregate"
+            or contract_type == "structured_aggregate"
+        ),
+        "execution_type": record.get("execution_type", ""),
+    }
+
+    return evaluate_grounded_answer(
+        answer=answer_text,
+        citations=citations,
+        is_answer_text_correct=is_ans_correct,
+        contract_type=contract_type,
+        contract=contract,
+        expected_sources=expected_sources,
+        expected_source_version=expected_source_version,
+        retained_evidence_items=retained_evidence_items,
+        context_chunk_ids=context_chunk_ids,
+        ground_truth_chunk_ids=ground_truth_chunk_ids,
+        is_infra_error=is_infra_error,
+        ans_is_refusal=ans_is_refusal,
+        question_type=question_type,
+        outcome=outcome,
+    )
+
 

@@ -39,6 +39,32 @@ class EvidenceItem:
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> EvidenceItem:
+        return cls(
+            evidence_id=str(data.get("evidence_id", "")),
+            workspace_id=str(data.get("workspace_id", "")),
+            document_id=str(data.get("document_id", "")),
+            document_version=data.get("document_version"),
+            source_type=data.get("source_type", "chunk"),
+            locator=dict(data.get("locator") or {}),
+            text=data.get("text"),
+            structured_payload=data.get("structured_payload"),
+            score=float(data.get("score", 0.0)),
+            strategy=str(data.get("strategy", "")),
+            provenance=dict(data.get("provenance") or {}),
+            citation_payload=dict(data.get("citation_payload") or {}),
+        )
+
+
+def restore_evidence_item(item: Any) -> Any:
+    """Restore an EvidenceItem from either an existing instance or serialized dictionary."""
+    if isinstance(item, EvidenceItem):
+        return item
+    if isinstance(item, dict):
+        return EvidenceItem.from_dict(item)
+    return item
+
 
 @dataclass
 class RetrievalLimits:
