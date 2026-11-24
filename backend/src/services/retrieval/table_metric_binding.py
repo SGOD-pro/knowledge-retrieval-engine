@@ -88,15 +88,24 @@ def classify_metric(text: str | None) -> str | None:
 def classify_cell_metric(row: str | None, sec: str | None, chunk_text: str | None = None) -> str | None:
     """Identifies a table cell's financial metric from its row and section.
 
+    Explicit row metrics take precedence over inherited table sections.
     Specific cost labels take precedence over generic sales, revenue, and statement headings.
     """
     r_str = (row or "").strip()
     s_str = (sec or "").strip()
-    combined = f"{r_str} {s_str}".strip()
 
-    # 1. Use existing metric classifier on combined row and section
-    # classify_metric checks gross_margin, then cost_of_sales/revenue, then restructuring,
-    # then operating_income, then net_income, then generic net_sales/revenue.
+    # 1. Explicit row metric takes precedence when present
+    r_metric = classify_metric(r_str)
+    if r_metric:
+        return r_metric
+
+    # 2. Inherit section metric for unlabeled rows (e.g. Services under Cost of sales)
+    s_metric = classify_metric(s_str)
+    if s_metric:
+        return s_metric
+
+    # 3. Check combined row and section
+    combined = f"{r_str} {s_str}".strip()
     m = classify_metric(combined)
     if m:
         return m
@@ -104,7 +113,7 @@ def classify_cell_metric(row: str | None, sec: str | None, chunk_text: str | Non
     r_lower = r_str.lower()
     s_lower = s_str.lower()
 
-    # 2. Operations statement context check for net sales, scoped to entity or sales rows
+    # 4. Operations statement context check for net sales, scoped to entity or sales rows
     c_lower = (chunk_text or "").lower()
     if "operations" in s_lower or "operations" in c_lower:
         row_is_entity = any(re.search(r"\b" + e + r"\b", r_lower, re.I) for e in ENTITY_NAMES)
@@ -416,6 +425,9 @@ def parse_financial_table_cells(text: str) -> list[dict[str, Any]]:
             if row_label:
                 effective_section = current_section or top_header
                 cell_metric = classify_cell_metric(row_label, effective_section, text)
+                row_m = classify_metric(row_label)
+                if row_m and current_section and classify_metric(current_section) != row_m:
+                    current_section = None
                 for c_idx, (d_val, is_neg, is_pct, raw_tok, _) in enumerate(parsed_tokens):
                     col_info = col_headers[c_idx] if c_idx < len(col_headers) else {}
                     cells.append({
@@ -438,6 +450,42 @@ def parse_financial_table_cells(text: str) -> list[dict[str, Any]]:
     return cells
 
 
+def _is_period_heading(clause: str, period_pattern: re.Pattern) -> tuple[bool, tuple[int | None, int | None, int | None] | None, str | None]:
+    """Checks if a clause represents a period heading and extracts its date and duration."""
+    c = clause.strip()
+    if not c:
+        return False, None, None
+    dt = parse_date_components(c)
+    dur = normalize_duration(c)
+    if not dt and not dur:
+        return False, None, None
+    masked = period_pattern.sub(" [PERIOD] ", c)
+    if re.search(r"\d", masked):
+        return False, None, None
+    if c.endswith(":") or c.startswith("#") or (c.startswith("**") and c.endswith("**")) or len(c) < 60:
+        return True, dt, dur
+    return False, None, None
+
+
+def _is_unrelated_section_heading(clause: str, period_pattern: re.Pattern) -> bool:
+    """Checks if a clause is an unrelated section heading that resets active period context."""
+    c = clause.strip()
+    if not c:
+        return False
+    if not (c.endswith(":") or c.startswith("#") or (c.startswith("**") and c.endswith("**"))):
+        return False
+    if normalize_duration(c) or parse_date_components(c):
+        return False
+    if classify_metric(c):
+        return False
+    if extract_entity_from_text(c):
+        return False
+    masked = period_pattern.sub(" [PERIOD] ", c)
+    if re.search(r"\d", masked):
+        return False
+    return True
+
+
 def extract_financial_claims(text: str) -> list[dict[str, Any]]:
     """Extracts structured financial claims from an answer, distinguishing primary from comparison claims."""
     if not text:
@@ -455,7 +503,23 @@ def extract_financial_claims(text: str) -> list[dict[str, Any]]:
         re.I,
     )
 
-    unmasked_clauses = [c.strip() for c in re.split(clause_delims, text, flags=re.I) if c.strip()]
+    # Normalize inline headings followed by colon so they are isolated from governed clauses
+    lines = text.split("\n")
+    processed_lines = []
+    for line in lines:
+        m_hd = re.match(r"^(\s*(?:#{1,6}\s*)?[^:\n]+:)\s+(.+)$", line)
+        if m_hd:
+            prefix, rest = m_hd.group(1), m_hd.group(2)
+            is_p_hd, _, _ = _is_period_heading(prefix, period_pattern)
+            is_u_hd = _is_unrelated_section_heading(prefix, period_pattern)
+            if is_p_hd or is_u_hd:
+                processed_lines.append(prefix)
+                processed_lines.append(rest)
+                continue
+        processed_lines.append(line)
+    normalized_text = "\n".join(processed_lines)
+
+    unmasked_clauses = [c.strip() for c in re.split(clause_delims, normalized_text, flags=re.I) if c.strip()]
     claims: list[dict[str, Any]] = []
 
     token_pattern = re.compile(
@@ -469,19 +533,47 @@ def extract_financial_claims(text: str) -> list[dict[str, Any]]:
     )
 
     last_pos = 0
+    active_heading_date: tuple[int | None, int | None, int | None] | None = None
+    active_heading_duration: str | None = None
+    active_heading_is_comp: bool = False
+
     for idx, unmasked_clause in enumerate(unmasked_clauses):
-        c_pos = text.find(unmasked_clause, last_pos)
-        separator = text[last_pos:c_pos] if c_pos != -1 else ""
+        c_pos = normalized_text.find(unmasked_clause, last_pos)
+        separator = normalized_text[last_pos:c_pos] if c_pos != -1 else ""
         if c_pos != -1:
             last_pos = c_pos + len(unmasked_clause)
 
-        is_comp = False
-        if idx > 0:
+        is_p_hd, hd_dt, hd_dur = _is_period_heading(unmasked_clause, period_pattern)
+        if is_p_hd:
+            active_heading_date = hd_dt
+            active_heading_duration = hd_dur
+            active_heading_is_comp = bool(comp_keywords.search(unmasked_clause) or comp_keywords.search(separator))
+            continue
+
+        if _is_unrelated_section_heading(unmasked_clause, period_pattern):
+            active_heading_date = None
+            active_heading_duration = None
+            active_heading_is_comp = False
+            continue
+
+        is_comp = active_heading_is_comp
+        if idx > 0 and not is_comp:
             if comp_keywords.search(separator) or comp_keywords.search(unmasked_clause[:30]):
                 is_comp = True
 
         claim_date_parsed = parse_date_components(unmasked_clause)
         claim_duration = normalize_duration(unmasked_clause)
+
+        eff_date = claim_date_parsed
+        if eff_date is None:
+            eff_date = active_heading_date
+        elif active_heading_date is not None:
+            c_y, c_m, c_d = eff_date
+            h_y, h_m, h_d = active_heading_date
+            if (c_y is None or c_y == h_y) and c_m is None and h_m is not None:
+                eff_date = (h_y, h_m, h_d)
+
+        eff_duration = claim_duration if claim_duration is not None else active_heading_duration
 
         # Mask period numbers within this clause before locating numeric financial quantities
         masked_clause = period_pattern.sub(" [PERIOD] ", unmasked_clause)
@@ -537,8 +629,8 @@ def extract_financial_claims(text: str) -> list[dict[str, Any]]:
                 "is_comparison": is_comp,
                 "raw": raw,
                 "clause": unmasked_clause.strip(),
-                "date_parsed": claim_date_parsed,
-                "duration_norm": claim_duration,
+                "date_parsed": eff_date,
+                "duration_norm": eff_duration,
             })
 
     return claims

@@ -1456,6 +1456,171 @@ def test_abbreviated_month_year_parsed_correctly():
     assert res == (2026, 6, None)
 
 
+CHUNK_INCOME_AFTER_COST_TEXT = """Apple Inc.
+CONDENSED CONSOLIDATED STATEMENTS OF OPERATIONS (In millions)
+Three Months Ended
+June 27, 2026
+Cost of sales:
+   Services $ 7,494
+Net income $ 12,345"""
+
+
+def test_reproduce_heading_wrong_date_rejected(mock_financial_chunks):
+    """Defect 1: Correct amount under 'Three months ended June 7, 2026:' heading must fail."""
+    chunk_p4, _, ws_id = mock_financial_chunks
+    query = "tell me Apple's Services net sales for the three months ended June 27, 2026"
+    ans = "Three months ended June 7, 2026:\nServices net sales was $30,739 million."
+
+    mock_llm_response = {
+        "answer": ans,
+        "citations": [chunk_p4.id],
+    }
+    resp, call_count = _execute_mocked_pipeline(query, ws_id, [chunk_p4], mock_llm_response)
+    assert resp.answer == "NOT_FOUND"
+    assert resp.retrieval_incomplete is True
+    assert resp.citations == []
+    assert call_count == 1
+
+
+def test_reproduce_heading_wrong_duration_rejected(mock_financial_chunks):
+    """Defect 1: Correct amount under 'Nine months ended June 27, 2026:' heading must fail."""
+    chunk_p4, _, ws_id = mock_financial_chunks
+    query = "tell me Apple's Services net sales for the three months ended June 27, 2026"
+    ans = "Nine months ended June 27, 2026:\nServices net sales was $30,739 million."
+
+    mock_llm_response = {
+        "answer": ans,
+        "citations": [chunk_p4.id],
+    }
+    resp, call_count = _execute_mocked_pipeline(query, ws_id, [chunk_p4], mock_llm_response)
+    assert resp.answer == "NOT_FOUND"
+    assert resp.retrieval_incomplete is True
+    assert resp.citations == []
+    assert call_count == 1
+
+
+def test_heading_period_governance_and_isolation(mock_financial_chunks):
+    """Defect 1: Correct heading passes, subsequent heading takes effect, and period does not leak to unrelated sections."""
+    chunk_p4, _, ws_id = mock_financial_chunks
+    query = "tell me Apple's Services net sales for the three months ended June 27, 2026"
+
+    # 1. Correct heading passes
+    ans_correct = "Three months ended June 27, 2026:\nServices net sales was $30,739 million."
+    resp1, call_count1 = _execute_mocked_pipeline(query, ws_id, [chunk_p4], {"answer": ans_correct, "citations": [chunk_p4.id]})
+    assert resp1.answer == ans_correct
+    assert resp1.retrieval_incomplete is False
+    assert any(c.get("chunk_id") == chunk_p4.id for c in resp1.citations)
+    assert call_count1 == 1
+
+    # 2. Subsequent heading takes effect for its own claims
+    ans_subsequent = (
+        "Three months ended June 27, 2026:\n"
+        "Services net sales was $30,739 million.\n\n"
+        "Compared to three months ended June 28, 2025:\n"
+        "Services net sales was $27,423 million."
+    )
+    resp2, call_count2 = _execute_mocked_pipeline(query, ws_id, [chunk_p4], {"answer": ans_subsequent, "citations": [chunk_p4.id]})
+    assert resp2.answer == ans_subsequent
+    assert resp2.retrieval_incomplete is False
+    assert any(c.get("chunk_id") == chunk_p4.id for c in resp2.citations)
+    assert call_count2 == 1
+
+    # Also verify claim extraction directly for distinct duration headings
+    from services.retrieval.table_metric_binding import extract_financial_claims
+    ans_two_durations = (
+        "Nine months ended June 27, 2026:\n"
+        "Services net sales was $91,728 million.\n\n"
+        "Three months ended June 27, 2026:\n"
+        "Services net sales was $30,739 million."
+    )
+    claims_two = extract_financial_claims(ans_two_durations)
+    assert len(claims_two) == 2
+    assert claims_two[0]["duration_norm"] == "nine_months"
+    assert claims_two[0]["date_parsed"] == (2026, 6, 27)
+    assert claims_two[1]["duration_norm"] == "three_months"
+    assert claims_two[1]["date_parsed"] == (2026, 6, 27)
+
+    # 3. Period context does not leak into unrelated sections
+    ans_unrelated = (
+        "Three months ended June 7, 2026:\n"
+        "The period reflected seasonal supply chain variations.\n\n"
+        "Executive Summary:\n"
+        "Services net sales was $30,739 million."
+    )
+    resp3, call_count3 = _execute_mocked_pipeline(query, ws_id, [chunk_p4], {"answer": ans_unrelated, "citations": [chunk_p4.id]})
+    assert resp3.answer == ans_unrelated
+    assert resp3.retrieval_incomplete is False
+    assert any(c.get("chunk_id") == chunk_p4.id for c in resp3.citations)
+    assert call_count3 == 1
+
+    # 4. Same-sentence and concise answer behavior preserved
+    ans_same_sentence = "For the three months ended June 27, 2026, Services net sales was $30,739 million."
+    resp4, call_count4 = _execute_mocked_pipeline(query, ws_id, [chunk_p4], {"answer": ans_same_sentence, "citations": [chunk_p4.id]})
+    assert resp4.answer == ans_same_sentence
+    assert resp4.retrieval_incomplete is False
+    assert call_count4 == 1
+
+    ans_concise = "$30,739 million"
+    resp5, call_count5 = _execute_mocked_pipeline(query, ws_id, [chunk_p4], {"answer": ans_concise, "citations": [chunk_p4.id]})
+    assert resp5.answer == ans_concise
+    assert resp5.retrieval_incomplete is False
+    assert call_count5 == 1
+
+
+def test_reproduce_explicit_row_metric_precedence_over_inherited_section():
+    """Defect 2: Explicit row metric must take precedence over inherited table section."""
+    ws_id = "ws_financial_test_0004"
+    doc_id = "492ccb2d-0d0d-5022-8a7b-e3f87df8befd"
+    chunk_inc = Chunk(
+        id=f"{doc_id}:page:5:element:1",
+        document_id=doc_id,
+        text=CHUNK_INCOME_AFTER_COST_TEXT,
+        page_number=5,
+        element_type="table",
+        workspace_id=ws_id,
+        metadata={"location_reference": "Page: 5", "document_filename": "SEC-Form-10Q.pdf"},
+        source_format="pdf",
+        similarity_score=0.95,
+    )
+
+    # 1. Net income query must accept $12,345
+    q_net_inc = "tell me Apple's net income for the three months ended June 27, 2026"
+    ans_net_inc = "Net income was $12,345 million."
+    resp1, call_count1 = _execute_mocked_pipeline(q_net_inc, ws_id, [chunk_inc], {"answer": ans_net_inc, "citations": [chunk_inc.id]})
+    assert resp1.answer == ans_net_inc
+    assert resp1.retrieval_incomplete is False
+    assert any(c.get("chunk_id") == chunk_inc.id for c in resp1.citations)
+    assert call_count1 == 1
+
+    # 2. Cost of sales query using $12,345 must be rejected
+    q_cost = "tell me Apple's cost of sales for the three months ended June 27, 2026"
+    ans_cost = "Cost of sales was $12,345 million."
+    resp2, call_count2 = _execute_mocked_pipeline(q_cost, ws_id, [chunk_inc], {"answer": ans_cost, "citations": [chunk_inc.id]})
+    assert resp2.answer == "NOT_FOUND"
+    assert resp2.retrieval_incomplete is True
+    assert resp2.citations == []
+    assert call_count2 == 1
+
+    # 3. Inherit section metric for unlabeled segment rows (Services $7,494 is cost of sales)
+    q_serv_cost = "tell me Apple's Services cost of sales for the three months ended June 27, 2026"
+    ans_serv_cost = "Services cost of sales was $7,494 million."
+    resp3, call_count3 = _execute_mocked_pipeline(q_serv_cost, ws_id, [chunk_inc], {"answer": ans_serv_cost, "citations": [chunk_inc.id]})
+    assert resp3.answer == ans_serv_cost
+    assert resp3.retrieval_incomplete is False
+    assert any(c.get("chunk_id") == chunk_inc.id for c in resp3.citations)
+    assert call_count3 == 1
+
+    # 4. Reject cost of sales ($7,494) as net sales evidence
+    q_serv_sales = "tell me Apple's Services net sales for the three months ended June 27, 2026"
+    ans_serv_sales = "Services net sales was $7,494 million."
+    resp4, call_count4 = _execute_mocked_pipeline(q_serv_sales, ws_id, [chunk_inc], {"answer": ans_serv_sales, "citations": [chunk_inc.id]})
+    assert resp4.answer == "NOT_FOUND"
+    assert resp4.retrieval_incomplete is True
+    assert resp4.citations == []
+    assert call_count4 == 1
+
+
+
 
 
 

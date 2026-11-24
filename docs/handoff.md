@@ -326,8 +326,24 @@ This milestone resolves the review blockers, multi chunk verification defect, an
 
 ### Verification Evidence
 
-* Focused suite: `cd backend && uv run pytest tests/test_financial_table_metric_binding.py -v` (60 passed in 4.04s).
-* Regression suite: `cd backend && uv run pytest tests/test_financial_table_metric_binding.py tests/test_canonical_percentage_grading.py tests/test_offline_benchmark_artifact_reproducibility.py tests/test_grounded_answer_evaluator.py tests/test_benchmark_guard.py tests/test_benchmark_integrity_defects.py tests/test_citation_retained_evidence.py tests/test_evidence_providers.py tests/test_fast_path_fallback_regressions.py tests/test_chunk_citation_provenance_repair.py -rs` (186 passed in 10.19s).
+* Focused suite: `cd backend && uv run pytest tests/test_financial_table_metric_binding.py -v` (64 passed in 4.20s).
+* Regression suite: `cd backend && uv run pytest tests/test_financial_table_metric_binding.py tests/test_canonical_percentage_grading.py tests/test_offline_benchmark_artifact_reproducibility.py tests/test_grounded_answer_evaluator.py tests/test_benchmark_guard.py tests/test_benchmark_integrity_defects.py tests/test_citation_retained_evidence.py tests/test_evidence_providers.py tests/test_fast_path_fallback_regressions.py tests/test_chunk_citation_provenance_repair.py -rs` (190 passed in 9.99s).
+
+### Financial Verification Blockers Resolution
+
+* **Date**: November 24 2026
+* **Status**: Resolved two remaining financial verification blockers across answer heading period context governance and explicit row metric precedence over table sections.
+
+1. Heading period context preservation and section isolation:
+   * Parsed answer headings for duration and date metadata, governing their subsequent claims.
+   * Proved that correct amounts under wrong date headings (Three months ended June 7, 2026) or wrong duration headings (Nine months ended June 27, 2026) are rejected fail closed for a three month query ending June 27, 2026.
+   * Confirmed that subsequent headings take effect for their own claims and unrelated sections do not leak period context.
+   * Preserved same sentence period and concise answer behavior.
+2. Explicit row metric precedence over inherited table sections:
+   * Explicit row metrics in `classify_cell_metric` take precedence over active table section headers.
+   * Verified that a `Net income $12,345` row immediately following a `Cost of sales:` section is accepted for net income requests and rejected for cost of sales requests.
+   * Unlabeled segment rows (such as Services $7,494) inherit the active section metric.
+   * Preserved genuine cost of sales and cost of revenue matches and their rejection as net sales evidence.
 
 ### Three Reproduced Financial Binding Defects Resolution
 
