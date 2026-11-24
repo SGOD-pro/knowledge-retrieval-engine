@@ -362,6 +362,32 @@ This milestone resolves the review blockers, multi chunk verification defect, an
    * Coordinated metrics paired with a trailing entity (such as "net sales and gross margin for Services") bind both metrics to Services via backward propagation.
    * Proven that reversed metric order binds both metrics, explicitly different entities remain separate, and explicit company-wide totals paired with segment metrics preserve unentitied total status.
 
+### Heading Scope Blockers Resolution
+
+* **Date**: November 24 2026
+* **Status**: Resolved heading scope blockers and senior review findings across comparison scope termination, wrapped heading period binding, markdown hash claim preservation, heading fragment boundaries, and peer heading period restoration.
+
+1. Comparison scope termination at peer or higher-level headings:
+   * Terminated active comparison scope when a peer or higher-level heading arrives (such as `# Services net sales` after `# Compared to three months ended June 28, 2025`).
+   * Terminated the comparison section's period context so prior year dates do not leak into subsequent primary sections.
+   * Proved that an unsupported claim ($99,999 million) under a peer `# Services net sales` heading is treated as primary and refused fail closed.
+   * Proved that a genuine comparison section followed by a supported primary claim ($30,739 million) passes verification.
+2. Wrapped heading period binding:
+   * Joined adjacent date and duration fragments forming a single wrapped heading before clause splitting.
+   * Proved that a correct amount under a wrapped `Nine months ended \n June 27, 2026:` heading is rejected fail closed for a three month query.
+   * Proved that a matching wrapped heading (`Three months ended \n June 27, 2026:`) passes verification.
+   * Proved that subsequent headings start fresh scopes and isolate their claims.
+3. Senior review findings resolution:
+   * Preserved claims formatted with markdown headers or colon prefixes (`_get_heading_info` checks for non period numbers and verbs; inline colon normalization includes `_is_financial_heading`).
+   * Enabled financial section headings to propagate metric and entity to governed claims (`active_heading_metric`, `active_heading_entity`).
+   * Enforced length and format boundaries in `_is_heading_fragment` (`len(s) < 60` or heading format).
+   * Restored enclosing primary period context when peer headings terminate comparison sections.
+
+### Verification Evidence
+
+* Focused suite: `cd backend && uv run pytest tests/test_financial_table_metric_binding.py -v` (72 passed in 4.33s).
+* Full regression suite: `cd backend && uv run pytest tests/test_financial_table_metric_binding.py tests/test_canonical_percentage_grading.py tests/test_offline_benchmark_artifact_reproducibility.py tests/test_grounded_answer_evaluator.py tests/test_benchmark_guard.py tests/test_benchmark_integrity_defects.py tests/test_citation_retained_evidence.py tests/test_evidence_providers.py tests/test_fast_path_fallback_regressions.py tests/test_chunk_citation_provenance_repair.py -rs` (198 passed in 9.83s).
+
 ### Operational Boundaries and Limitations
 
 1. Offline verification only: Zero provider calls, zero paid live benchmark runs, and zero corpus writes.

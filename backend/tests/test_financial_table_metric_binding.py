@@ -1620,6 +1620,199 @@ def test_reproduce_explicit_row_metric_precedence_over_inherited_section():
     assert call_count4 == 1
 
 
+def test_reproduce_comparison_scope_ends_at_peer_heading(mock_financial_chunks):
+    """Defect 1: End comparison scope at the next peer or higher-level heading."""
+    chunk_p4, _, ws_id = mock_financial_chunks
+    query = "tell me Apple's Services net sales for the three months ended June 27, 2026"
+    ans = (
+        "# Three months ended June 27, 2026\n"
+        "Services net sales were $30,739 million.\n"
+        "# Compared to three months ended June 28, 2025\n"
+        "Some context.\n"
+        "# Services net sales\n"
+        "Services net sales were $99,999 million."
+    )
+    mock_llm_response = {
+        "answer": ans,
+        "citations": [chunk_p4.id],
+    }
+    resp, call_count = _execute_mocked_pipeline(query, ws_id, [chunk_p4], mock_llm_response)
+    # The last claim is primary and unsupported, so the pipeline must refuse.
+    assert resp.answer == "NOT_FOUND"
+    assert resp.retrieval_incomplete is True
+    assert resp.citations == []
+    assert call_count == 1
+
+
+def test_comparison_scope_supported_primary_claim_after_comparison(mock_financial_chunks):
+    """Defect 1: Genuine comparison section followed by supported primary claim must pass."""
+    chunk_p4, _, ws_id = mock_financial_chunks
+    query = "tell me Apple's Services net sales for the three months ended June 27, 2026"
+    ans = (
+        "# Three months ended June 27, 2026\n"
+        "Services net sales were $30,739 million.\n"
+        "# Compared to three months ended June 28, 2025\n"
+        "Services net sales were $27,423 million.\n"
+        "# Services net sales\n"
+        "Services net sales were $30,739 million."
+    )
+    mock_llm_response = {
+        "answer": ans,
+        "citations": [chunk_p4.id],
+    }
+    resp, call_count = _execute_mocked_pipeline(query, ws_id, [chunk_p4], mock_llm_response)
+    assert resp.answer == ans
+    assert resp.retrieval_incomplete is False
+    assert any(c.get("chunk_id") == chunk_p4.id for c in resp.citations)
+    assert call_count == 1
+
+
+def test_reproduce_wrapped_heading_wrong_duration_rejected(mock_financial_chunks):
+    """Defect 2: Keep date and duration together when a single heading wraps (wrong duration rejected)."""
+    chunk_p4, _, ws_id = mock_financial_chunks
+    query = "tell me Apple's Services net sales for the three months ended June 27, 2026"
+    ans = (
+        "Nine months ended\n"
+        "June 27, 2026:\n"
+        "Services net sales were $30,739 million."
+    )
+    mock_llm_response = {
+        "answer": ans,
+        "citations": [chunk_p4.id],
+    }
+    resp, call_count = _execute_mocked_pipeline(query, ws_id, [chunk_p4], mock_llm_response)
+    # Correct amount under wrapped nine months heading must be rejected for three months query
+    assert resp.answer == "NOT_FOUND"
+    assert resp.retrieval_incomplete is True
+    assert resp.citations == []
+    assert call_count == 1
+
+
+def test_wrapped_heading_matching_period_accepted(mock_financial_chunks):
+    """Defect 2: Matching wrapped heading passes verification."""
+    chunk_p4, _, ws_id = mock_financial_chunks
+    query = "tell me Apple's Services net sales for the three months ended June 27, 2026"
+    ans = (
+        "Three months ended\n"
+        "June 27, 2026:\n"
+        "Services net sales were $30,739 million."
+    )
+    mock_llm_response = {
+        "answer": ans,
+        "citations": [chunk_p4.id],
+    }
+    resp, call_count = _execute_mocked_pipeline(query, ws_id, [chunk_p4], mock_llm_response)
+    assert resp.answer == ans
+    assert resp.retrieval_incomplete is False
+    assert any(c.get("chunk_id") == chunk_p4.id for c in resp.citations)
+    assert call_count == 1
+
+
+def test_wrapped_heading_and_subsequent_heading_scope_isolation():
+    """Defect 2: A genuinely new heading starts a new scope and applies only to its own claims."""
+    from services.retrieval.table_metric_binding import extract_financial_claims
+    ans = (
+        "Nine months ended\n"
+        "June 27, 2026:\n"
+        "Services net sales was $91,728 million.\n\n"
+        "Three months ended\n"
+        "June 27, 2026:\n"
+        "Services net sales was $30,739 million."
+    )
+    claims = extract_financial_claims(ans)
+    assert len(claims) == 2
+    assert claims[0]["duration_norm"] == "nine_months"
+    assert claims[0]["date_parsed"] == (2026, 6, 27)
+    assert claims[0]["value"] == Decimal("91728")
+    assert claims[1]["duration_norm"] == "three_months"
+    assert claims[1]["date_parsed"] == (2026, 6, 27)
+    assert claims[1]["value"] == Decimal("30739")
+
+
+def test_reproduce_markdown_hash_with_claim_not_dropped(mock_financial_chunks):
+    """Review Major: Markdown heading lines containing financial claims must not be dropped."""
+    from services.retrieval.table_metric_binding import extract_financial_claims
+
+    # Directly verify claim extraction does not drop claims on heading lines
+    claims1 = extract_financial_claims("# Services net sales: $30,739 million")
+    assert len(claims1) == 1
+    assert claims1[0]["value"] == Decimal("30739")
+    assert claims1[0]["metric"] == "net_sales"
+    assert claims1[0]["entity"] == "Services"
+
+    claims2 = extract_financial_claims("# Apple Services net sales were $30,739 million")
+    assert len(claims2) == 1
+    assert claims2[0]["value"] == Decimal("30739")
+    assert claims2[0]["metric"] == "net_sales"
+    assert claims2[0]["entity"] == "Services"
+
+    # Multi-claim answer where dropping a heading would fail verification
+    ans_multi = (
+        "# Services net sales: $30,739 million\n"
+        "Products net sales were $78,678 million."
+    )
+    claims_multi = extract_financial_claims(ans_multi)
+    assert len(claims_multi) == 2
+    assert claims_multi[0]["value"] == Decimal("30739")
+    assert claims_multi[1]["value"] == Decimal("78678")
+
+    chunk_p4, _, ws_id = mock_financial_chunks
+    query = "tell me Apple's Services net sales for the three months ended June 27, 2026"
+
+    # 1. Inline colon under markdown header
+    ans1 = "# Services net sales: $30,739 million"
+    resp1, call_count1 = _execute_mocked_pipeline(query, ws_id, [chunk_p4], {"answer": ans1, "citations": [chunk_p4.id]})
+    assert resp1.answer == ans1
+    assert resp1.retrieval_incomplete is False
+    assert call_count1 == 1
+
+    # 2. Markdown header sentence with verb and amount
+    ans2 = "# Apple Services net sales were $30,739 million"
+    resp2, call_count2 = _execute_mocked_pipeline(query, ws_id, [chunk_p4], {"answer": ans2, "citations": [chunk_p4.id]})
+    assert resp2.answer == ans2
+    assert resp2.retrieval_incomplete is False
+    assert call_count2 == 1
+
+
+def test_heading_fragment_length_boundary():
+    """Review Minor 1: Long narrative sentences mentioning periods must not be heading fragments."""
+    from services.retrieval.table_metric_binding import _is_heading_fragment, PERIOD_PATTERN
+    long_narrative = (
+        "During the three months period the operating environment reflected substantial changes across product categories"
+    )
+    is_frag, _, _ = _is_heading_fragment(long_narrative, PERIOD_PATTERN)
+    assert is_frag is False
+
+
+def test_peer_heading_restores_primary_period_context(mock_financial_chunks):
+    """Review Minor 2: Peer heading terminating comparison restores primary period context."""
+    from services.retrieval.table_metric_binding import extract_financial_claims
+    ans = (
+        "# Three months ended June 27, 2026\n"
+        "Services net sales were $30,739 million.\n"
+        "# Compared to three months ended June 28, 2025\n"
+        "Services net sales were $27,423 million.\n"
+        "# Services net sales\n"
+        "Services net sales were $30,739 million."
+    )
+    claims = extract_financial_claims(ans)
+    assert len(claims) == 3
+    # First claim: primary 2026
+    assert claims[0]["is_comparison"] is False
+    assert claims[0]["date_parsed"] == (2026, 6, 27)
+    assert claims[0]["duration_norm"] == "three_months"
+    # Second claim: comparison 2025
+    assert claims[1]["is_comparison"] is True
+    assert claims[1]["date_parsed"] == (2025, 6, 28)
+    assert claims[1]["duration_norm"] == "three_months"
+    # Third claim: primary, restored 2026 period!
+    assert claims[2]["is_comparison"] is False
+    assert claims[2]["date_parsed"] == (2026, 6, 27)
+    assert claims[2]["duration_norm"] == "three_months"
+
+
+
+
 
 
 

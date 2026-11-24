@@ -450,7 +450,15 @@ def parse_financial_table_cells(text: str) -> list[dict[str, Any]]:
     return cells
 
 
-def _is_period_heading(clause: str, period_pattern: re.Pattern) -> tuple[bool, tuple[int | None, int | None, int | None] | None, str | None]:
+PERIOD_PATTERN = re.compile(
+    r"\b(?:january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\s+\d{1,2}(?:\s*,\s*\d{4})?\b"
+    r"|\b(?:three|six|nine|twelve|\d+)\s+months?\b"
+    r"|\b20\d{2}\b",
+    re.I,
+)
+
+
+def _is_period_heading(clause: str, period_pattern: re.Pattern = PERIOD_PATTERN) -> tuple[bool, tuple[int | None, int | None, int | None] | None, str | None]:
     """Checks if a clause represents a period heading and extracts its date and duration."""
     c = clause.strip()
     if not c:
@@ -462,12 +470,14 @@ def _is_period_heading(clause: str, period_pattern: re.Pattern) -> tuple[bool, t
     masked = period_pattern.sub(" [PERIOD] ", c)
     if re.search(r"\d", masked):
         return False, None, None
+    if re.search(r"\b(?:were|was|is|are|totaled|totalled|increased|decreased|grew|fell|dropped)\b", c, re.I):
+        return False, None, None
     if c.endswith(":") or c.startswith("#") or (c.startswith("**") and c.endswith("**")) or len(c) < 60:
         return True, dt, dur
     return False, None, None
 
 
-def _is_unrelated_section_heading(clause: str, period_pattern: re.Pattern) -> bool:
+def _is_unrelated_section_heading(clause: str, period_pattern: re.Pattern = PERIOD_PATTERN) -> bool:
     """Checks if a clause is an unrelated section heading that resets active period context."""
     c = clause.strip()
     if not c:
@@ -486,6 +496,69 @@ def _is_unrelated_section_heading(clause: str, period_pattern: re.Pattern) -> bo
     return True
 
 
+def _is_financial_heading(clause: str, period_pattern: re.Pattern = PERIOD_PATTERN) -> bool:
+    """Checks if a clause is a financial metric or entity section heading."""
+    c = clause.strip()
+    if not c:
+        return False
+    c_clean = re.sub(r"^#{1,6}\s*", "", c).rstrip(":").strip()
+    if not c_clean:
+        return False
+    masked = period_pattern.sub(" [PERIOD] ", c_clean)
+    if re.search(r"\d", masked):
+        return False
+    if re.search(r"\b(?:were|was|is|are|totaled|totalled|increased|decreased|grew|fell|dropped)\b", c_clean, re.I):
+        return False
+    is_hd_format = c.startswith("#") or c.endswith(":") or (c.startswith("**") and c.endswith("**")) or len(c_clean) < 60
+    if not is_hd_format:
+        return False
+    return bool(classify_metric(c_clean) or extract_entity_from_text(c_clean))
+
+
+def _is_heading_fragment(line: str, period_pattern: re.Pattern = PERIOD_PATTERN) -> tuple[bool, tuple[int | None, int | None, int | None] | None, str | None]:
+    """Checks if a line is a period heading fragment (has date or duration, but not both, and no claim text)."""
+    s = line.strip()
+    if not s:
+        return False, None, None
+    is_hd_format = s.startswith("#") or s.endswith(":") or (s.startswith("**") and s.endswith("**")) or len(s) < 60
+    if not is_hd_format:
+        return False, None, None
+    masked = period_pattern.sub(" [PERIOD] ", s)
+    if re.search(r"\d", masked):
+        return False, None, None
+    if re.search(r"\b(?:were|was|is|are|totaled|totalled|increased|decreased|grew|fell|dropped)\b", s, re.I):
+        return False, None, None
+    dt = parse_date_components(s)
+    dur = normalize_duration(s)
+    if (dur and not dt) or (dt and not dur):
+        return True, dt, dur
+    return False, None, None
+
+
+def _get_heading_info(clause: str, period_pattern: re.Pattern = PERIOD_PATTERN) -> tuple[bool, int, bool]:
+    """Returns (is_heading, heading_level, has_markdown_hash)."""
+    c = clause.strip()
+    if not c:
+        return False, 999, False
+    m_hash = re.match(r"^(#{1,6})\s*", c)
+    has_hash = bool(m_hash)
+    lvl = len(m_hash.group(1)) if m_hash else 2
+
+    # A clause with financial values or action verbs is a claim line, not a structural heading
+    masked = period_pattern.sub(" [PERIOD] ", c)
+    if re.search(r"\d", masked) or re.search(
+        r"\b(?:were|was|is|are|totaled|totalled|increased|decreased|grew|fell|dropped)\b", c, re.I
+    ):
+        return False, lvl, has_hash
+
+    is_p_hd, _, _ = _is_period_heading(c, period_pattern)
+    is_u_hd = _is_unrelated_section_heading(c, period_pattern)
+    is_f_hd = _is_financial_heading(c, period_pattern)
+    if has_hash or is_p_hd or is_u_hd or is_f_hd or c.endswith(":") or (c.startswith("**") and c.endswith("**")):
+        return True, lvl, has_hash
+    return False, 999, False
+
+
 def extract_financial_claims(text: str) -> list[dict[str, Any]]:
     """Extracts structured financial claims from an answer, distinguishing primary from comparison claims."""
     if not text:
@@ -495,13 +568,7 @@ def extract_financial_claims(text: str) -> list[dict[str, Any]]:
         r";|\band\b|\bcompared\s+to\b|\brather\s+than\b|\bversus\b|\bvs\.?\b|\bup\s+from\b|\bdown\s+from\b|\bincrease\s+from\b|\bdecrease\s+from\b|[\r\n]+|\.(?=\s+[A-Z0-9]|\s*$)|(?<=\s)[•\-\*]\s+"
     )
 
-    # Mask period dates and durations inside each clause so date numbers do not get treated as financial quantities
-    period_pattern = re.compile(
-        r"\b(?:january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\s+\d{1,2}(?:\s*,\s*\d{4})?\b"
-        r"|\b(?:three|six|nine|twelve|\d+)\s+months?\b"
-        r"|\b20\d{2}\b",
-        re.I,
-    )
+    period_pattern = PERIOD_PATTERN
 
     # Normalize inline headings followed by colon so they are isolated from governed clauses
     lines = text.split("\n")
@@ -512,14 +579,55 @@ def extract_financial_claims(text: str) -> list[dict[str, Any]]:
             prefix, rest = m_hd.group(1), m_hd.group(2)
             is_p_hd, _, _ = _is_period_heading(prefix, period_pattern)
             is_u_hd = _is_unrelated_section_heading(prefix, period_pattern)
-            if is_p_hd or is_u_hd:
+            is_f_hd = _is_financial_heading(prefix, period_pattern)
+            if is_p_hd or is_u_hd or is_f_hd:
                 processed_lines.append(prefix)
                 processed_lines.append(rest)
                 continue
         processed_lines.append(line)
-    normalized_text = "\n".join(processed_lines)
 
-    unmasked_clauses = [c.strip() for c in re.split(clause_delims, normalized_text, flags=re.I) if c.strip()]
+    # Join adjacent wrapped heading lines
+    joined_lines = []
+    i = 0
+    while i < len(processed_lines):
+        line = processed_lines[i]
+        s_line = line.strip()
+        is_frag, f_dt, f_dur = _is_heading_fragment(s_line, period_pattern)
+        if is_frag and i + 1 < len(processed_lines):
+            j = i + 1
+            while j < len(processed_lines) and not processed_lines[j].strip():
+                j += 1
+            if j < len(processed_lines):
+                next_line = processed_lines[j]
+                next_s = next_line.strip()
+                next_frag, n_dt, n_dur = _is_heading_fragment(next_s, period_pattern)
+                if next_frag and ((f_dur and n_dt) or (f_dt and n_dur)):
+                    clean_next = re.sub(r"^#{1,6}\s*", "", next_s)
+                    merged = f"{s_line.rstrip(':')} {clean_next}"
+                    joined_lines.append(merged)
+                    i = j + 1
+                    continue
+        joined_lines.append(line)
+        i += 1
+
+    normalized_text = "\n".join(joined_lines)
+
+    unmasked_clauses = []
+    for pline in joined_lines:
+        sline = pline.strip()
+        if not sline:
+            continue
+        is_p_hd, _, _ = _is_period_heading(sline, period_pattern)
+        is_f_hd = _is_financial_heading(sline, period_pattern)
+        is_u_hd = _is_unrelated_section_heading(sline, period_pattern)
+        is_hd_info, _, _ = _get_heading_info(sline, period_pattern)
+
+        if is_p_hd or is_f_hd or is_u_hd or is_hd_info:
+            unmasked_clauses.append(sline)
+        else:
+            parts = [c.strip() for c in re.split(clause_delims, sline, flags=re.I) if c.strip()]
+            unmasked_clauses.extend(parts)
+
     claims: list[dict[str, Any]] = []
 
     token_pattern = re.compile(
@@ -536,6 +644,13 @@ def extract_financial_claims(text: str) -> list[dict[str, Any]]:
     active_heading_date: tuple[int | None, int | None, int | None] | None = None
     active_heading_duration: str | None = None
     active_heading_is_comp: bool = False
+    comp_heading_level: int | None = None
+    comp_heading_has_hash: bool = False
+    primary_heading_date: tuple[int | None, int | None, int | None] | None = None
+    primary_heading_duration: str | None = None
+    primary_heading_level: int | None = None
+    active_heading_metric: str | None = None
+    active_heading_entity: str | None = None
 
     for idx, unmasked_clause in enumerate(unmasked_clauses):
         c_pos = normalized_text.find(unmasked_clause, last_pos)
@@ -543,17 +658,62 @@ def extract_financial_claims(text: str) -> list[dict[str, Any]]:
         if c_pos != -1:
             last_pos = c_pos + len(unmasked_clause)
 
+        is_hd, hd_lvl, hd_has_hash = _get_heading_info(unmasked_clause, period_pattern)
         is_p_hd, hd_dt, hd_dur = _is_period_heading(unmasked_clause, period_pattern)
+        is_u_hd = _is_unrelated_section_heading(unmasked_clause, period_pattern)
+        is_f_hd = _is_financial_heading(unmasked_clause, period_pattern)
+
+        # Check if a peer or higher-level heading terminates active comparison scope
+        if active_heading_is_comp and (is_hd or is_p_hd or is_u_hd or is_f_hd):
+            is_peer_or_higher = False
+            if comp_heading_level is not None:
+                if comp_heading_has_hash:
+                    if hd_has_hash and hd_lvl <= comp_heading_level:
+                        is_peer_or_higher = True
+                else:
+                    if hd_has_hash or hd_lvl <= comp_heading_level:
+                        is_peer_or_higher = True
+            if is_peer_or_higher:
+                active_heading_is_comp = False
+                comp_heading_level = None
+                comp_heading_has_hash = False
+                # End comparison period context and restore primary period
+                active_heading_date = primary_heading_date
+                active_heading_duration = primary_heading_duration
+
         if is_p_hd:
-            active_heading_date = hd_dt
-            active_heading_duration = hd_dur
-            active_heading_is_comp = bool(comp_keywords.search(unmasked_clause) or comp_keywords.search(separator))
+            is_comp_hd = bool(comp_keywords.search(unmasked_clause) or comp_keywords.search(separator))
+            if is_comp_hd:
+                active_heading_is_comp = True
+                comp_heading_level = hd_lvl
+                comp_heading_has_hash = hd_has_hash
+                active_heading_date = hd_dt
+                active_heading_duration = hd_dur
+            else:
+                active_heading_is_comp = False
+                comp_heading_level = None
+                comp_heading_has_hash = False
+                active_heading_date = hd_dt
+                active_heading_duration = hd_dur
+                primary_heading_date = hd_dt
+                primary_heading_duration = hd_dur
+                primary_heading_level = hd_lvl
             continue
 
-        if _is_unrelated_section_heading(unmasked_clause, period_pattern):
+        if is_u_hd:
             active_heading_date = None
             active_heading_duration = None
             active_heading_is_comp = False
+            comp_heading_level = None
+            comp_heading_has_hash = False
+            active_heading_metric = None
+            active_heading_entity = None
+            continue
+
+        if is_f_hd or (is_hd and not is_p_hd and not is_u_hd):
+            clean_hd = re.sub(r"^#{1,6}\s*", "", unmasked_clause).rstrip(":").strip()
+            active_heading_metric = classify_metric(clean_hd)
+            active_heading_entity = extract_entity_from_text(clean_hd)
             continue
 
         is_comp = active_heading_is_comp
@@ -616,8 +776,8 @@ def extract_financial_claims(text: str) -> list[dict[str, Any]]:
                 elif "dollar" in u_low:
                     unit = "dollars"
 
-            ent = extract_entity_from_text(unmasked_clause)
-            met = classify_metric(unmasked_clause)
+            ent = extract_entity_from_text(unmasked_clause) or active_heading_entity
+            met = classify_metric(unmasked_clause) or active_heading_metric
 
             claims.append({
                 "value": dec_val,
