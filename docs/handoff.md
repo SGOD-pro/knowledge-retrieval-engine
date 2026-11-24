@@ -383,10 +383,25 @@ This milestone resolves the review blockers, multi chunk verification defect, an
    * Enforced length and format boundaries in `_is_heading_fragment` (`len(s) < 60` or heading format).
    * Restored enclosing primary period context when peer headings terminate comparison sections.
 
+### Heading Boundary Defects Resolution
+
+* **Date**: November 24 2026
+* **Status**: Resolved heading boundary defects across separate markdown heading independence and comparison scope retention under nested date headings.
+
+1. Separate Markdown headings independence:
+   * Joined line preprocessing in `extract_financial_claims` checks that heading fragments are on immediately adjacent lines and do not start with markdown hashes (`#{1,6}`).
+   * Proved that `# Nine months ended` followed by `# June 27, 2026` across an empty line or separate hashes remain independent headings.
+   * Proved that the second heading does not inherit the nine month duration and passes for a three month query.
+   * Preserved original wrapped heading refusal for `Nine months ended\nJune 27, 2026:` and acceptance for the equivalent three month heading.
+2. Comparison scope retention under nested date headings:
+   * Nested date headings (`hd_lvl > comp_heading_level`) under active comparison sections retain parent comparison scope instead of resetting to primary.
+   * Proved that an answer citing primary $30,739 million under `## Three months ended June 27, 2026` and comparison $27,423 million under `### June 28, 2025` beneath `## Compared to three months ended June 28, 2025` passes verification.
+   * Proved that peer or higher level headings (`hd_lvl <= comp_heading_level`) terminate comparison scope, restore primary dates, and cause unsupported claims ($99,999 million) to refuse fail closed.
+
 ### Verification Evidence
 
-* Focused suite: `cd backend && uv run pytest tests/test_financial_table_metric_binding.py -v` (72 passed in 4.33s).
-* Full regression suite: `cd backend && uv run pytest tests/test_financial_table_metric_binding.py tests/test_canonical_percentage_grading.py tests/test_offline_benchmark_artifact_reproducibility.py tests/test_grounded_answer_evaluator.py tests/test_benchmark_guard.py tests/test_benchmark_integrity_defects.py tests/test_citation_retained_evidence.py tests/test_evidence_providers.py tests/test_fast_path_fallback_regressions.py tests/test_chunk_citation_provenance_repair.py -rs` (198 passed in 9.83s).
+* Focused suite: `cd backend && uv run pytest tests/test_financial_table_metric_binding.py -v` (75 passed in 4.24s).
+* Full regression suite: `cd backend && uv run pytest tests/test_financial_table_metric_binding.py tests/test_canonical_percentage_grading.py tests/test_offline_benchmark_artifact_reproducibility.py tests/test_grounded_answer_evaluator.py tests/test_benchmark_guard.py tests/test_benchmark_integrity_defects.py tests/test_citation_retained_evidence.py tests/test_evidence_providers.py tests/test_fast_path_fallback_regressions.py tests/test_chunk_citation_provenance_repair.py -rs` (201 passed in 10.35s).
 
 ### Operational Boundaries and Limitations
 

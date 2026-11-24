@@ -594,18 +594,15 @@ def extract_financial_claims(text: str) -> list[dict[str, Any]]:
         s_line = line.strip()
         is_frag, f_dt, f_dur = _is_heading_fragment(s_line, period_pattern)
         if is_frag and i + 1 < len(processed_lines):
-            j = i + 1
-            while j < len(processed_lines) and not processed_lines[j].strip():
-                j += 1
-            if j < len(processed_lines):
-                next_line = processed_lines[j]
-                next_s = next_line.strip()
+            next_line = processed_lines[i + 1]
+            next_s = next_line.strip()
+            # Continuation fragment must be on the immediately adjacent non-empty line and must not be an explicit markdown heading
+            if next_s and not re.match(r"^#{1,6}\s*", next_s):
                 next_frag, n_dt, n_dur = _is_heading_fragment(next_s, period_pattern)
                 if next_frag and ((f_dur and n_dt) or (f_dt and n_dur)):
-                    clean_next = re.sub(r"^#{1,6}\s*", "", next_s)
-                    merged = f"{s_line.rstrip(':')} {clean_next}"
+                    merged = f"{s_line.rstrip(':')} {next_s}"
                     joined_lines.append(merged)
-                    i = j + 1
+                    i += 2
                     continue
         joined_lines.append(line)
         i += 1
@@ -645,7 +642,6 @@ def extract_financial_claims(text: str) -> list[dict[str, Any]]:
     active_heading_duration: str | None = None
     active_heading_is_comp: bool = False
     comp_heading_level: int | None = None
-    comp_heading_has_hash: bool = False
     primary_heading_date: tuple[int | None, int | None, int | None] | None = None
     primary_heading_duration: str | None = None
     primary_heading_level: int | None = None
@@ -667,32 +663,31 @@ def extract_financial_claims(text: str) -> list[dict[str, Any]]:
         if active_heading_is_comp and (is_hd or is_p_hd or is_u_hd or is_f_hd):
             is_peer_or_higher = False
             if comp_heading_level is not None:
-                if comp_heading_has_hash:
-                    if hd_has_hash and hd_lvl <= comp_heading_level:
-                        is_peer_or_higher = True
-                else:
-                    if hd_has_hash or hd_lvl <= comp_heading_level:
-                        is_peer_or_higher = True
+                if hd_lvl <= comp_heading_level:
+                    is_peer_or_higher = True
             if is_peer_or_higher:
                 active_heading_is_comp = False
                 comp_heading_level = None
-                comp_heading_has_hash = False
                 # End comparison period context and restore primary period
                 active_heading_date = primary_heading_date
                 active_heading_duration = primary_heading_duration
 
         if is_p_hd:
+            if active_heading_is_comp:
+                # Nested heading under active comparison scope retains comparison scope
+                active_heading_date = hd_dt or active_heading_date
+                active_heading_duration = hd_dur or active_heading_duration
+                continue
+
             is_comp_hd = bool(comp_keywords.search(unmasked_clause) or comp_keywords.search(separator))
             if is_comp_hd:
                 active_heading_is_comp = True
                 comp_heading_level = hd_lvl
-                comp_heading_has_hash = hd_has_hash
                 active_heading_date = hd_dt
                 active_heading_duration = hd_dur
             else:
                 active_heading_is_comp = False
                 comp_heading_level = None
-                comp_heading_has_hash = False
                 active_heading_date = hd_dt
                 active_heading_duration = hd_dur
                 primary_heading_date = hd_dt
@@ -701,11 +696,9 @@ def extract_financial_claims(text: str) -> list[dict[str, Any]]:
             continue
 
         if is_u_hd:
-            active_heading_date = None
-            active_heading_duration = None
-            active_heading_is_comp = False
-            comp_heading_level = None
-            comp_heading_has_hash = False
+            if not active_heading_is_comp:
+                active_heading_date = None
+                active_heading_duration = None
             active_heading_metric = None
             active_heading_entity = None
             continue

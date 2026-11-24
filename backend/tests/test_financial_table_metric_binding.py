@@ -1811,6 +1811,92 @@ def test_peer_heading_restores_primary_period_context(mock_financial_chunks):
     assert claims[2]["duration_norm"] == "three_months"
 
 
+def test_reproduce_separate_markdown_headings_independent(mock_financial_chunks):
+    """Defect 1: Separate Markdown headings remain independent and do not inherit duration."""
+    chunk_p4, _, ws_id = mock_financial_chunks
+    query = "tell me Apple's Services net sales for the three months ended June 27, 2026"
+    ans = (
+        "# Nine months ended\n\n"
+        "# June 27, 2026\n"
+        "Services net sales were $30,739 million."
+    )
+    mock_llm_response = {
+        "answer": ans,
+        "citations": [chunk_p4.id],
+    }
+    resp, call_count = _execute_mocked_pipeline(query, ws_id, [chunk_p4], mock_llm_response)
+    # Must pass for three months query; second heading does not inherit nine months duration
+    assert resp.answer == ans
+    assert resp.retrieval_incomplete is False
+    assert any(c.get("chunk_id") == chunk_p4.id for c in resp.citations)
+    assert call_count == 1
+
+    # Adjacent markdown headings without intervening empty line also remain independent
+    ans_adjacent = (
+        "# Nine months ended\n"
+        "# June 27, 2026\n"
+        "Services net sales were $30,739 million."
+    )
+    mock_llm_response_adj = {
+        "answer": ans_adjacent,
+        "citations": [chunk_p4.id],
+    }
+    resp_adj, call_count_adj = _execute_mocked_pipeline(query, ws_id, [chunk_p4], mock_llm_response_adj)
+    assert resp_adj.answer == ans_adjacent
+    assert resp_adj.retrieval_incomplete is False
+    assert any(c.get("chunk_id") == chunk_p4.id for c in resp_adj.citations)
+    assert call_count_adj == 1
+
+
+def test_reproduce_nested_date_heading_retains_comparison_scope(mock_financial_chunks):
+    """Defect 2: Nested date heading under comparison section retains comparison scope."""
+    chunk_p4, _, ws_id = mock_financial_chunks
+    query = "tell me Apple's Services net sales for the three months ended June 27, 2026"
+    ans = (
+        "## Three months ended June 27, 2026\n"
+        "Services net sales were $30,739 million.\n"
+        "## Compared to three months ended June 28, 2025\n"
+        "### June 28, 2025\n"
+        "Services net sales were $27,423 million."
+    )
+    mock_llm_response = {
+        "answer": ans,
+        "citations": [chunk_p4.id],
+    }
+    resp, call_count = _execute_mocked_pipeline(query, ws_id, [chunk_p4], mock_llm_response)
+    # The nested date heading retains comparison scope, both claims supported
+    assert resp.answer == ans
+    assert resp.retrieval_incomplete is False
+    assert any(c.get("chunk_id") == chunk_p4.id for c in resp.citations)
+    assert call_count == 1
+
+
+def test_nested_comparison_scope_peer_heading_terminates_and_refuses(mock_financial_chunks):
+    """Defect 2: Peer heading terminates nested comparison scope; unsupported primary claim refuses."""
+    chunk_p4, _, ws_id = mock_financial_chunks
+    query = "tell me Apple's Services net sales for the three months ended June 27, 2026"
+    ans = (
+        "## Three months ended June 27, 2026\n"
+        "Services net sales were $30,739 million.\n"
+        "## Compared to three months ended June 28, 2025\n"
+        "### June 28, 2025\n"
+        "Services net sales were $27,423 million.\n"
+        "## Services net sales\n"
+        "Services net sales were $99,999 million."
+    )
+    mock_llm_response = {
+        "answer": ans,
+        "citations": [chunk_p4.id],
+    }
+    resp, call_count = _execute_mocked_pipeline(query, ws_id, [chunk_p4], mock_llm_response)
+    # Peer heading ends comparison scope; $99,999 million is primary and unsupported -> refusal
+    assert resp.answer == "NOT_FOUND"
+    assert resp.retrieval_incomplete is True
+    assert resp.citations == []
+    assert call_count == 1
+
+
+
 
 
 
