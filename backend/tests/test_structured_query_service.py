@@ -1101,6 +1101,259 @@ def test_min_max_range_ties_zero_matches_truncation_and_later_page_failure(monke
     assert out_fail["stage_timings"]["dynamodb_request_ms"] >= 0.0
 
 
+def test_metric_delta_compare_single_traversal_three_pages_and_grounded_citation(monkeypatch):
+    import json as _json
+    from db.table_store.dynamodb_store import DynamoDBTableStore
+    from db.workspace_boundary_repo import InMemoryWorkspaceBoundaryRepository
+    from schemas.contracts.boundary import DocumentSnapshot
+    from services.evaluation.benchmark_scorer import evaluate_grounded_answer
+    import services.retrieval.run_structured_aggregate as rsa
+
+    class _ThreePageDeltaTable:
+        def __init__(self):
+            self.query_log: list[dict[str, Any]] = []
+
+        def get_item(self, Key):
+            sk = Key["SK"]
+            if sk == "ACTIVE_VERSION":
+                return {"Item": {"active_version": "v1", "coverage_complete": True}}
+            if sk.startswith("MANIFEST"):
+                return {"Item": {"coverage_complete": True, "persisted_rows": 5, "document_version": "v1"}}
+            if sk == "SCHEMA":
+                schema_json = _json.dumps({
+                    "columns": [
+                        {"col_index": 0, "name": "Year", "inferred_dtype": "integer", "nullable": False, "cardinality": 3, "sample_values": ["2023", "2024", "2025"]},
+                        {"col_index": 1, "name": "Sector", "inferred_dtype": "string", "nullable": False, "cardinality": 2, "sample_values": ["Alpha", "Beta"]},
+                        {"col_index": 2, "name": "Revenue", "inferred_dtype": "decimal", "nullable": False, "cardinality": 5, "sample_values": ["500", "800", "900", "1000", "1250"]},
+                    ],
+                    "header_rows": [0],
+                    "header_topology": "single_row",
+                    "confidence": 1.0,
+                })
+                return {"Item": {"document_id": "doc_delta", "schema_json": schema_json}}
+            return {}
+
+        def query(self, **kwargs):
+            start_key = kwargs.get("ExclusiveStartKey")
+            self.query_log.append({"start_key": start_key})
+            if start_key is None:
+                return {
+                    "Items": [
+                        # Distractor: same shared predicate (Alpha), unrelated year (2023)
+                        {"row_id": "d1", "row_index": 0, "cells_json": _json.dumps([{"row_index": 0, "col_index": 0, "raw_value": "2023", "normalized_value": 2023}, {"row_index": 0, "col_index": 1, "raw_value": "Alpha", "normalized_value": "Alpha"}, {"row_index": 0, "col_index": 2, "raw_value": "500", "normalized_value": "500"}])},
+                        # Distractor: target year (2024), wrong predicate (Beta)
+                        {"row_id": "d2", "row_index": 1, "cells_json": _json.dumps([{"row_index": 1, "col_index": 0, "raw_value": "2024", "normalized_value": 2024}, {"row_index": 1, "col_index": 1, "raw_value": "Beta", "normalized_value": "Beta"}, {"row_index": 1, "col_index": 2, "raw_value": "800", "normalized_value": "800"}])},
+                    ],
+                    "LastEvaluatedKey": {"PK": "p", "SK": "k1"},
+                    "ResponseMetadata": {"RetryAttempts": 0},
+                }
+            if start_key == {"PK": "p", "SK": "k1"}:
+                return {
+                    "Items": [
+                        # Start-year operand (Alpha, 2024, 1000) on page 2
+                        {"row_id": "d3", "row_index": 2, "cells_json": _json.dumps([{"row_index": 2, "col_index": 0, "raw_value": "2024", "normalized_value": 2024}, {"row_index": 2, "col_index": 1, "raw_value": "Alpha", "normalized_value": "Alpha"}, {"row_index": 2, "col_index": 2, "raw_value": "1000", "normalized_value": "1000"}])},
+                        # Distractor: target year (2025), wrong predicate (Beta)
+                        {"row_id": "d4", "row_index": 3, "cells_json": _json.dumps([{"row_index": 3, "col_index": 0, "raw_value": "2025", "normalized_value": 2025}, {"row_index": 3, "col_index": 1, "raw_value": "Beta", "normalized_value": "Beta"}, {"row_index": 3, "col_index": 2, "raw_value": "900", "normalized_value": "900"}])},
+                    ],
+                    "LastEvaluatedKey": {"PK": "p", "SK": "k2"},
+                    "ResponseMetadata": {"RetryAttempts": 0},
+                }
+            return {
+                "Items": [
+                    # End-year operand (Alpha, 2025, 1250) on page 3
+                    {"row_id": "d5", "row_index": 4, "cells_json": _json.dumps([{"row_index": 4, "col_index": 0, "raw_value": "2025", "normalized_value": 2025}, {"row_index": 4, "col_index": 1, "raw_value": "Alpha", "normalized_value": "Alpha"}, {"row_index": 4, "col_index": 2, "raw_value": "1250", "normalized_value": "1250"}])},
+                ],
+                "ResponseMetadata": {"RetryAttempts": 0},
+            }
+
+    class _StubResource:
+        def __init__(self, tbl):
+            self._tbl = tbl
+
+        def Table(self, name):
+            return self._tbl
+
+    raw_tbl = _ThreePageDeltaTable()
+    store = DynamoDBTableStore(table_name="sector_metrics", resource=_StubResource(raw_tbl))
+    monkeypatch.setattr(store, "list_tables", lambda ws: ["sector_metrics"])
+
+    probe_pages: list[Any] = []
+    operand_pages: list[Any] = []
+    orig_query_rows = store.query_rows
+
+    def _spied_query_rows(*args, **kwargs):
+        before = len(raw_tbl.query_log)
+        res = orig_query_rows(*args, **kwargs)
+        added = [entry["start_key"] for entry in raw_tbl.query_log[before:]]
+        if kwargs.get("limit") is not None:
+            probe_pages.extend(added)
+        else:
+            operand_pages.extend(added)
+        return res
+
+    monkeypatch.setattr(store, "query_rows", _spied_query_rows)
+
+    boundary_repo = InMemoryWorkspaceBoundaryRepository()
+    boundary_repo.save_document_snapshot(
+        DocumentSnapshot(
+            workspace_id="ws_delta",
+            document_id="doc_delta",
+            source="sector_metrics.csv",
+            version="v1",
+            format="csv",
+            incomplete_coverage_flag=False,
+            persisted_rows=5,
+            total_rows=5,
+            created_at="2026-11-25T00:00:00Z",
+        )
+    )
+    monkeypatch.setattr(rsa, "get_shared_table_store", lambda: store)
+    monkeypatch.setattr(rsa, "get_workspace_boundary_repo", lambda: boundary_repo)
+
+    out = rsa.execute({
+        "workspace_id": "ws_delta",
+        "query": "For Alpha, how did Revenue change from 2024 to 2025? Give the amount and percentage change in sector_metrics.",
+        "stage_timings": {},
+    })
+    assert out["executed_path"] == "structured_aggregate"
+    assert "250" in out["final_answer"] and "25.00%" in out["final_answer"]
+    assert sorted(out["execution_result"].row_ids) == ["d3", "d5"]
+    # Exactly ONE 3-page operand traversal (down from 2 traversals = 6 operand pages)
+    assert operand_pages == [None, {"PK": "p", "SK": "k1"}, {"PK": "p", "SK": "k2"}]
+    assert out["stage_timings"]["dynamodb_query_pages"] == len(probe_pages) + len(operand_pages)
+
+    grd = evaluate_grounded_answer(
+        answer=out["final_answer"],
+        citations=out["citations"],
+        is_answer_text_correct=True,
+        question_type="structured_aggregate",
+        expected_sources=["sector_metrics.csv"],
+        expected_source_version="v1",
+        retained_evidence_items=out["retained_evidence_items"],
+    )
+    assert grd["is_grounded_correct"] is True
+
+
+def test_metric_delta_missing_operand_duplicate_and_interrupted_traversal(monkeypatch):
+    import json as _json
+    from db.table_store.base import TableRowList
+    from db.table_store.dynamodb_store import DynamoDBTableStore
+    import services.retrieval.run_structured_aggregate as rsa
+
+    class _EdgeDeltaTable:
+        def __init__(self, duplicate_end: bool = False, fail_on_page3: bool = False):
+            self.duplicate_end = duplicate_end
+            self.fail_on_page3 = fail_on_page3
+
+        def get_item(self, Key):
+            sk = Key["SK"]
+            if sk == "ACTIVE_VERSION":
+                return {"Item": {"active_version": "v1", "coverage_complete": True}}
+            if sk.startswith("MANIFEST"):
+                return {"Item": {"coverage_complete": True, "persisted_rows": 4, "document_version": "v1"}}
+            if sk == "SCHEMA":
+                schema_json = _json.dumps({
+                    "columns": [
+                        {"col_index": 0, "name": "Year", "inferred_dtype": "integer", "nullable": False, "cardinality": 2, "sample_values": ["2024", "2025"]},
+                        {"col_index": 1, "name": "Sector", "inferred_dtype": "string", "nullable": False, "cardinality": 1, "sample_values": ["Alpha"]},
+                        {"col_index": 2, "name": "Revenue", "inferred_dtype": "decimal", "nullable": False, "cardinality": 3, "sample_values": ["1000", "1250", "1300"]},
+                    ],
+                    "header_rows": [0],
+                    "header_topology": "single_row",
+                    "confidence": 1.0,
+                })
+                return {"Item": {"document_id": "doc_edge_d", "schema_json": schema_json}}
+            return {}
+
+        def query(self, **kwargs):
+            sk = kwargs.get("ExclusiveStartKey")
+            if sk is None:
+                return {
+                    "Items": [],
+                    "LastEvaluatedKey": {"PK": "p", "SK": "k1"},
+                    "ResponseMetadata": {"RetryAttempts": 0},
+                }
+            if sk == {"PK": "p", "SK": "k1"}:
+                return {
+                    "Items": [
+                        {"row_id": "e1", "row_index": 0, "cells_json": _json.dumps([{"row_index": 0, "col_index": 0, "raw_value": "2024", "normalized_value": 2024}, {"row_index": 0, "col_index": 1, "raw_value": "Alpha", "normalized_value": "Alpha"}, {"row_index": 0, "col_index": 2, "raw_value": "1000", "normalized_value": "1000"}])},
+                    ],
+                    "LastEvaluatedKey": {"PK": "p", "SK": "k2"},
+                    "ResponseMetadata": {"RetryAttempts": 0},
+                }
+            if self.fail_on_page3:
+                raise RuntimeError("ddb page 3 delta failure")
+            items = [
+                {"row_id": "e2", "row_index": 1, "cells_json": _json.dumps([{"row_index": 1, "col_index": 0, "raw_value": "2025", "normalized_value": 2025}, {"row_index": 1, "col_index": 1, "raw_value": "Alpha", "normalized_value": "Alpha"}, {"row_index": 1, "col_index": 2, "raw_value": "1250", "normalized_value": "1250"}])},
+            ]
+            if self.duplicate_end:
+                items.append(
+                    {"row_id": "e3", "row_index": 2, "cells_json": _json.dumps([{"row_index": 2, "col_index": 0, "raw_value": "2025", "normalized_value": 2025}, {"row_index": 2, "col_index": 1, "raw_value": "Alpha", "normalized_value": "Alpha"}, {"row_index": 2, "col_index": 2, "raw_value": "1300", "normalized_value": "1300"}])},
+                )
+            return {"Items": items, "ResponseMetadata": {"RetryAttempts": 0}}
+
+    class _StubResource:
+        def __init__(self, tbl):
+            self._tbl = tbl
+
+        def Table(self, name):
+            return self._tbl
+
+    # 1. Missing operand (2026 not present)
+    store_ok = DynamoDBTableStore(table_name="edge_d_tbl", resource=_StubResource(_EdgeDeltaTable()))
+    monkeypatch.setattr(store_ok, "list_tables", lambda ws: ["edge_d_tbl"])
+    monkeypatch.setattr(rsa, "get_shared_table_store", lambda: store_ok)
+    out_missing = rsa.execute({
+        "workspace_id": "ws_ed",
+        "query": "For Alpha, how did Revenue change from 2024 to 2026? Give the amount and percentage change in edge_d_tbl.",
+        "stage_timings": {},
+    })
+    assert out_missing["executed_path"] == "structured_aggregate"
+    assert out_missing["is_refusal"] is True
+    assert out_missing["citations"] == []
+    assert "No rows matched" in out_missing["final_answer"]
+
+    # 2. Duplicate for end year on page 3 -> AmbiguousBindingError
+    store_dup = DynamoDBTableStore(table_name="edge_d_tbl", resource=_StubResource(_EdgeDeltaTable(duplicate_end=True)))
+    monkeypatch.setattr(store_dup, "list_tables", lambda ws: ["edge_d_tbl"])
+    monkeypatch.setattr(rsa, "get_shared_table_store", lambda: store_dup)
+    out_dup = rsa.execute({
+        "workspace_id": "ws_ed",
+        "query": "For Alpha, how did Revenue change from 2024 to 2025? Give the amount and percentage change in edge_d_tbl.",
+        "stage_timings": {},
+    })
+    assert out_dup["executed_path"] == "structured_aggregate_ambiguous"
+
+    # 3. Truncated traversal -> no partial delta or citation
+    monkeypatch.setattr(rsa, "get_shared_table_store", lambda: store_ok)
+    orig_qr = store_ok.query_rows
+    monkeypatch.setattr(store_ok, "query_rows", lambda *a, **kw: TableRowList([], is_truncated=True, scanned_count=1) if kw.get("limit") is None else orig_qr(*a, **kw))
+    out_trunc = rsa.execute({
+        "workspace_id": "ws_ed",
+        "query": "For Alpha, how did Revenue change from 2024 to 2025? Give the amount and percentage change in edge_d_tbl.",
+        "stage_timings": {},
+    })
+    assert out_trunc["executed_path"] == "structured_aggregate_storage_failure"
+    assert "citations" not in out_trunc or out_trunc["citations"] == []
+
+    # 4. Interrupted traversal on page 3 -> no partial delta, telemetry survives
+    store_fail = DynamoDBTableStore(table_name="edge_d_tbl", resource=_StubResource(_EdgeDeltaTable(fail_on_page3=True)))
+    monkeypatch.setattr(store_fail, "list_tables", lambda ws: ["edge_d_tbl"])
+    monkeypatch.setattr(rsa, "get_shared_table_store", lambda: store_fail)
+    out_fail = rsa.execute({
+        "workspace_id": "ws_ed",
+        "query": "For Alpha, how did Revenue change from 2024 to 2025? Give the amount and percentage change in edge_d_tbl.",
+        "stage_timings": {},
+    })
+    assert out_fail["executed_path"] == "structured_aggregate_storage_failure"
+    assert "citations" not in out_fail or out_fail["citations"] == []
+    assert out_fail["stage_timings"]["table_lookup_ms"] >= 0.0
+    assert out_fail["stage_timings"]["row_reads_ms"] >= 0.0
+    assert out_fail["stage_timings"]["dynamodb_query_pages"] >= 3
+    assert out_fail["stage_timings"]["dynamodb_request_ms"] >= 0.0
+
+
+
 
 
 

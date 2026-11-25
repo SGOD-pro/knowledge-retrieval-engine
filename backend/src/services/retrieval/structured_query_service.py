@@ -1131,12 +1131,39 @@ class StructuredQueryService:
                     was_truncated=has_truncated,
                 )
 
-        # Execute queries for period 1 and period 2 (limit=2 to detect duplicate matches)
+        # Execute a single traversal using shared non-year predicates, then partition by year_start / year_end
+        pred_year_start = predicates_start[0]
+        pred_year_end = predicates_end[0]
+        shared_predicates = predicates_start[1:]
         try:
-            rows_start = self.store.query_rows(table_id, workspace_id, predicates=predicates_start, limit=2, version=version)
-            rows_end = self.store.query_rows(table_id, workspace_id, predicates=predicates_end, limit=2, version=version)
+            all_rows = self.store.query_rows(
+                table_id,
+                workspace_id,
+                predicates=shared_predicates,
+                limit=None,
+                version=version,
+            )
         except Exception as e:
             raise StorageFailureError(f"Failed to query rows: {e}") from e
+
+        if getattr(all_rows, "is_truncated", False):
+            raise StorageFailureError(f"Incomplete table read during metric delta query on '{table_id}'")
+
+        def _row_matches_year(row: Any, col_idx: int, target_val: Any) -> bool:
+            if col_idx < 0 or col_idx >= len(row.cells):
+                return False
+            val = row.cells[col_idx].normalized_value
+            if val is None:
+                return False
+            if val == target_val:
+                return True
+            try:
+                return int(str(val).replace(",", "").strip()) == int(str(target_val).replace(",", "").strip())
+            except Exception:
+                return str(val).strip() == str(target_val).strip()
+
+        rows_start = [r for r in all_rows if _row_matches_year(r, pred_year_start.column_index, pred_year_start.value)]
+        rows_end = [r for r in all_rows if _row_matches_year(r, pred_year_end.column_index, pred_year_end.value)]
 
         if not rows_start or not rows_end:
             missing_period = year_start if not rows_start else year_end
