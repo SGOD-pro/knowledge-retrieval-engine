@@ -65,6 +65,47 @@ class FinancialQueryBinding:
 
 ENTITY_NAMES = ["Services", "Products", "iPhone", "iPad", "Mac", "Wearables"]
 
+PERIOD_PATTERN = re.compile(
+    r"\b(?:for|in|during|as\s+of)?\s*(?:the\s+)?(?:three|six|nine|twelve|\d+)\s+months?(?:\s+ended)?(?:\s+(?:january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\s+\d{1,2}(?:\s*,\s*\d{4})?)?\b"
+    r"|\b(?:january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\s+\d{1,2}(?:\s*,\s*\d{4})?\b"
+    r"|\b20\d{2}\b",
+    re.I,
+)
+
+METRIC_PHRASES = [
+    r"cost\s+of\s+sales",
+    r"cost\s+of\s+revenue",
+    r"operating\s+income",
+    r"operating\s+profit",
+    r"operating\s+loss",
+    r"gross\s+margin",
+    r"gross\s+profit",
+    r"net\s+income",
+    r"net\s+sales",
+    r"revenue",
+    r"sales",
+]
+METRIC_RE = r"(?:" + "|".join(METRIC_PHRASES) + r")"
+
+ENTITY_STOP_WORDS = {
+    "what", "which", "where", "who", "how", "is", "was", "were", "are",
+    "state", "the", "find", "report", "give", "show", "in", "for", "of",
+    "to", "and", "or", "by", "from", "at", "ended", "three", "nine",
+    "six", "twelve", "months", "year", "quarter", "a", "an", "tell",
+    "me", "apple", "apples", "percentage", "percent", "ratio",
+}
+ENTITY_FILTER_WORDS = {
+    "total", "overall", "consolidated", "annual", "quarterly", "net",
+    "gross", "operating", "cost", "sales", "revenue", "income", "margin", "company",
+}
+
+
+def _clean_entity_words(words_list: list[str]) -> str | None:
+    res = [w for w in words_list if re.sub(r"['\u2019]s$", "", w.lower()) not in ENTITY_STOP_WORDS]
+    if res and not all(re.sub(r"['\u2019]s$", "", w.lower()) in ENTITY_FILTER_WORDS for w in res):
+        return " ".join(res)
+    return None
+
 
 def classify_metric(text: str | None) -> str | None:
     """Classifies financial metric with strict precedence for specific phrases."""
@@ -127,7 +168,7 @@ def classify_cell_metric(row: str | None, sec: str | None, chunk_text: str | Non
 
 
 def extract_entity_from_text(text: str | None) -> str | None:
-    """Extracts known business entity or product segment from text."""
+    """Extracts known business entity or product segment from text, supporting both known segments and unseen segments."""
     if not text:
         return None
     for e in ENTITY_NAMES:
@@ -135,6 +176,32 @@ def extract_entity_from_text(text: str | None) -> str | None:
             return e
     if re.search(r"\brestructuring\b", text, re.I):
         return "Restructuring costs"
+
+    masked = PERIOD_PATTERN.sub(" ", text)
+
+    # Prepositional: metric + for/of/in/from + Entity
+    m_prep = re.search(r"\b" + METRIC_RE + r"\s+(?:for|of|in|from)\s+([a-zA-Z0-9_-]+(?:\s+[a-zA-Z0-9_-]+)*)", masked, re.I)
+    if m_prep:
+        cand = _clean_entity_words(m_prep.group(1).split())
+        if cand:
+            return cand
+
+    # Segment keyword: (?:segment|division)\s+(?:for|of|in|named|called)?\s*(Entity)
+    m_seg = re.search(r"\b(?:segment|division|unit|business)\s+(?:for|of|in|named|called)?\s*([a-zA-Z0-9_-]+(?:\s+[a-zA-Z0-9_-]+)*)", masked, re.I)
+    if m_seg:
+        cand = _clean_entity_words(m_seg.group(1).split())
+        if cand:
+            return cand
+
+    # Entity before metric: e.g. "What was Industrial Automation net sales"
+    m_met = re.search(r"\b" + METRIC_RE + r"\b", masked, re.I)
+    if m_met:
+        before_text = masked[:m_met.start()].strip()
+        if before_text:
+            cand = _clean_entity_words(before_text.split())
+            if cand:
+                return cand
+
     return None
 
 
@@ -143,7 +210,7 @@ def parse_query_requirements(query: str) -> list[tuple[str, str | None]]:
     if not query:
         return []
     q_lower = query.lower()
-    clauses = [c.strip() for c in re.split(r";|\band\b|,", q_lower) if c.strip()]
+    clauses = [c.strip() for c in re.split(r";|\band\b|,", query) if c.strip()]
     raw_reqs: list[dict[str, Any]] = []
     pending_entities: list[str] = []
     last_entity: str | None = None
@@ -151,7 +218,9 @@ def parse_query_requirements(query: str) -> list[tuple[str, str | None]]:
     for c in clauses:
         m = classify_metric(c)
         e = extract_entity_from_text(c)
-        is_total = bool(re.search(r"\btotal\b|\boverall\b", c, re.I))
+        is_total = bool(re.search(r"\btotal\b|\boverall\b|\bconsolidated\b", c, re.I))
+        if is_total:
+            e = None
         if m and e:
             last_entity = e
             if pending_entities:
@@ -828,6 +897,13 @@ def cell_matches_financial_claim(
         row_has_segment_entity = any(re.search(r"\b" + e + r"\b", row, re.I) for e in ENTITY_NAMES)
         if row_has_segment_entity and "total" not in row:
             return False
+        if "total" not in row and "consolidated" not in row:
+            if chunk_context and cell_metric:
+                ctx_lines = [l.strip().lower() for l in chunk_context.split("\n") if l.strip()]
+                metric_term = "sales" if "sales" in cell_metric else ("income" if "income" in cell_metric else ("margin" if "margin" in cell_metric else cell_metric))
+                has_total_metric_row = any("total" in l and metric_term in l and ("$" in l or bool(re.search(r"\d", l))) for l in ctx_lines)
+                if has_total_metric_row:
+                    return False
 
     # C. Duration check
     if required_duration:

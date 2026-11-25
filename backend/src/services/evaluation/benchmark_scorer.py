@@ -2079,8 +2079,35 @@ def evaluate_grounded_answer(
                             "citation_validation": cit_val,
                             "faithfulness": faith_score,
                         }
-                    target_metric = cl.get("metric") or (fin_binding.metric if is_query_financial else None)
-                    target_entity = cl.get("entity") or (fin_binding.entity if is_query_financial else None)
+                    if is_query_financial:
+                        expected_entities = set()
+                        if fin_binding.entity:
+                            expected_entities.add(fin_binding.entity.lower())
+                        for _, r_e in getattr(fin_binding, "target_requirements", ()):
+                            if r_e:
+                                expected_entities.add(r_e.lower())
+
+                        cl_entity = cl.get("entity")
+                        if cl_entity and cl_entity.lower() not in ("total", "company", "overall", "consolidated"):
+                            if expected_entities:
+                                if cl_entity.lower() not in expected_entities:
+                                    return {
+                                        "is_grounded_correct": False,
+                                        "grounded_correct": False,
+                                        "reason": f"claim_unsupported: entity '{cl_entity}' contradicts query binding",
+                                        "citation_validation": cit_val,
+                                        "faithfulness": faith_score,
+                                    }
+                            elif fin_binding.entity is None:
+                                return {
+                                    "is_grounded_correct": False,
+                                    "grounded_correct": False,
+                                    "reason": f"claim_unsupported: segment entity '{cl_entity}' contradicts company total query",
+                                    "citation_validation": cit_val,
+                                    "faithfulness": faith_score,
+                                }
+                    target_metric = (fin_binding.metric if is_query_financial and fin_binding.metric else None) or cl.get("metric")
+                    target_entity = (fin_binding.entity if is_query_financial and fin_binding.entity else None) or cl.get("entity")
                     req_duration = cl.get("duration_norm") or (fin_binding.duration_norm if is_query_financial else None)
                     req_date = cl.get("date_parsed") or (fin_binding.date_parsed if is_query_financial else None)
                     binding_units = fin_binding.units if is_query_financial else None

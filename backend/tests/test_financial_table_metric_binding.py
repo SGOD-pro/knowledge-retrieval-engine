@@ -2067,6 +2067,206 @@ def test_verify_financial_cell_binding_multi_metric_query():
     assert bad_reason == "requested_metric_omitted_or_unsupported"
 
 
+def test_unseen_segment_table_metric_binding_and_grounded_scoring():
+    """Defect test: Unseen segment (e.g. Industrial Automation) binding and grounded scoring.
+
+    - Binds explicit unseen segment without silently falling back to company total
+    - Unseen segment correct value ($5,420 million) passes delivery and grounded scoring
+    - Neighboring segment value ($8,150 million) fails delivery and grounded scoring
+    - Company total value ($13,570 million) fails delivery and grounded scoring for segment query
+    - Scoped refusal when support cannot be established
+    - Positive control: explicit company total query accepts total ($13,570 million) and rejects segment ($5,420 million)
+    """
+    from services.evaluation.benchmark_scorer import evaluate_grounded_answer
+    from services.retrieval.evidence_contract import EvidenceItem
+
+    table_text = """Net sales:
+Three Months Ended
+June 30, 2026
+(In millions)
+Industrial Automation $ 5,420
+Building Technologies $ 8,150
+Total net sales $ 13,570"""
+
+    doc_id = "doc_unseen_seg"
+    ws_id = "ws_unseen_seg"
+    chunk_id = f"{doc_id}:table:1"
+    chunk = Chunk(
+        id=chunk_id,
+        document_id=doc_id,
+        text=table_text,
+        page_number=1,
+        element_type="table",
+        workspace_id=ws_id,
+        metadata={"location_reference": "Page: 1", "document_filename": "Quarterly-Report.pdf", "document_version": "1"},
+        source_format="pdf",
+        similarity_score=0.95,
+    )
+
+    ev_item = EvidenceItem(
+        evidence_id="ev_unseen_seg",
+        workspace_id=ws_id,
+        document_id=doc_id,
+        document_version="1",
+        source_type="chunk",
+        locator={"chunk_id": chunk_id, "page_number": 1},
+        text=table_text,
+        structured_payload=None,
+        score=0.95,
+        strategy="table",
+        provenance={},
+        citation_payload={},
+        document_filename="Quarterly-Report.pdf",
+    )
+
+    # 1. Unseen segment query
+    query_seg = "What was Industrial Automation net sales for the three months ended June 30, 2026?"
+    binding_seg = bind_financial_query(query_seg)
+
+    # Check A: Must NOT silently fall back to None/company-total
+    assert binding_seg.entity == "Industrial Automation"
+
+    cit = [{"chunk_id": chunk_id, "document_filename": "Quarterly-Report.pdf", "version": "1", "snippet": table_text, "page_number": 1, "location_reference": "Page: 1"}]
+
+    # Check B: Correct value ($5,420 million) passes delivery and grounded scoring
+    ans_correct = "Industrial Automation net sales were $5,420 million for the three months ended June 30, 2026."
+    ok, reason = verify_financial_cell_binding(table_text, ans_correct, binding_seg)
+    assert ok is True, f"Correct segment answer failed: {reason}"
+    resp_correct, _ = _execute_mocked_pipeline(query_seg, ws_id, [chunk], {"answer": ans_correct, "citations": [chunk.id]})
+    assert resp_correct.answer == ans_correct
+    assert resp_correct.retrieval_incomplete is False
+    score_correct = evaluate_grounded_answer(
+        answer=ans_correct,
+        citations=cit,
+        is_answer_text_correct=True,
+        contract_type="semantic",
+        contract={"contract_type": "semantic", "expected_answer": "5,420 million"},
+        expected_sources=["Quarterly-Report.pdf"],
+        expected_source_version="1",
+        retained_evidence_items=[ev_item],
+        context_chunk_ids=[chunk_id],
+        ground_truth_chunk_ids=[chunk_id],
+        query=query_seg,
+    )
+    assert score_correct["is_grounded_correct"] is True
+
+    # Check C: Neighboring segment value ($8,150 million) fails delivery and grounded scoring
+    ans_neighbor = "Industrial Automation net sales were $8,150 million for the three months ended June 30, 2026."
+    ok_neigh, _ = verify_financial_cell_binding(table_text, ans_neighbor, binding_seg)
+    assert ok_neigh is False
+    resp_neigh, _ = _execute_mocked_pipeline(query_seg, ws_id, [chunk], {"answer": ans_neighbor, "citations": [chunk.id]})
+    assert resp_neigh.answer == "NOT_FOUND"
+    assert resp_neigh.retrieval_incomplete is True
+    score_neigh = evaluate_grounded_answer(
+        answer=ans_neighbor,
+        citations=cit,
+        is_answer_text_correct=True,
+        contract_type="semantic",
+        contract={"contract_type": "semantic", "expected_answer": "5,420 million"},
+        expected_sources=["Quarterly-Report.pdf"],
+        expected_source_version="1",
+        retained_evidence_items=[ev_item],
+        context_chunk_ids=[chunk_id],
+        ground_truth_chunk_ids=[chunk_id],
+        query=query_seg,
+    )
+    assert score_neigh["is_grounded_correct"] is False
+
+    # Check D: Total value ($13,570 million) fails delivery and grounded scoring for segment query
+    ans_total = "Net sales were $13,570 million for the three months ended June 30, 2026."
+    ok_tot, _ = verify_financial_cell_binding(table_text, ans_total, binding_seg)
+    assert ok_tot is False
+    resp_tot, _ = _execute_mocked_pipeline(query_seg, ws_id, [chunk], {"answer": ans_total, "citations": [chunk.id]})
+    assert resp_tot.answer == "NOT_FOUND"
+    assert resp_tot.retrieval_incomplete is True
+    score_tot = evaluate_grounded_answer(
+        answer=ans_total,
+        citations=cit,
+        is_answer_text_correct=True,
+        contract_type="semantic",
+        contract={"contract_type": "semantic", "expected_answer": "5,420 million"},
+        expected_sources=["Quarterly-Report.pdf"],
+        expected_source_version="1",
+        retained_evidence_items=[ev_item],
+        context_chunk_ids=[chunk_id],
+        ground_truth_chunk_ids=[chunk_id],
+        query=query_seg,
+    )
+    assert score_tot["is_grounded_correct"] is False
+
+    # Check E: Scoped refusal when support cannot be established
+    table_unsupported = """Net sales:
+Three Months Ended
+June 30, 2026
+(In millions)
+Building Technologies $ 8,150
+Total net sales $ 13,570"""
+    chunk_unsup = Chunk(
+        id=f"{doc_id}:table:unsup",
+        document_id=doc_id,
+        text=table_unsupported,
+        page_number=1,
+        element_type="table",
+        workspace_id=ws_id,
+        metadata={"location_reference": "Page: 1", "document_filename": "Quarterly-Report.pdf", "document_version": "1"},
+        source_format="pdf",
+        similarity_score=0.95,
+    )
+    ok_unsup, _ = verify_financial_cell_binding(table_unsupported, ans_correct, binding_seg)
+    assert ok_unsup is False
+    resp_unsup, _ = _execute_mocked_pipeline(
+        query_seg, ws_id, [chunk_unsup], {"answer": ans_correct, "citations": [chunk_unsup.id]}
+    )
+    assert resp_unsup.answer == "NOT_FOUND"
+    assert resp_unsup.retrieval_incomplete is True
+
+    # Check F: Positive control - Explicit company total query
+    query_total = "What was total net sales for the three months ended June 30, 2026?"
+    binding_total = bind_financial_query(query_total)
+    assert binding_total.entity is None
+
+    ans_total_ctrl = "Total net sales were $13,570 million for the three months ended June 30, 2026."
+    ok_ctrl, _ = verify_financial_cell_binding(table_text, ans_total_ctrl, binding_total)
+    assert ok_ctrl is True
+    resp_ctrl, _ = _execute_mocked_pipeline(query_total, ws_id, [chunk], {"answer": ans_total_ctrl, "citations": [chunk.id]})
+    assert resp_ctrl.answer == ans_total_ctrl
+    assert resp_ctrl.retrieval_incomplete is False
+    score_ctrl = evaluate_grounded_answer(
+        answer=ans_total_ctrl,
+        citations=cit,
+        is_answer_text_correct=True,
+        contract_type="semantic",
+        contract={"contract_type": "semantic", "expected_answer": "13,570 million"},
+        expected_sources=["Quarterly-Report.pdf"],
+        expected_source_version="1",
+        retained_evidence_items=[ev_item],
+        context_chunk_ids=[chunk_id],
+        ground_truth_chunk_ids=[chunk_id],
+        query=query_total,
+    )
+    assert score_ctrl["is_grounded_correct"] is True
+
+    # Segment value ($5,420 million) must FAIL for the company total query
+    ans_seg_for_total = "Industrial Automation net sales were $5,420 million for the three months ended June 30, 2026."
+    ok_bad_ctrl, _ = verify_financial_cell_binding(table_text, ans_seg_for_total, binding_total)
+    assert ok_bad_ctrl is False
+    score_bad_ctrl = evaluate_grounded_answer(
+        answer=ans_seg_for_total,
+        citations=cit,
+        is_answer_text_correct=True,
+        contract_type="semantic",
+        contract={"contract_type": "semantic", "expected_answer": "13,570 million"},
+        expected_sources=["Quarterly-Report.pdf"],
+        expected_source_version="1",
+        retained_evidence_items=[ev_item],
+        context_chunk_ids=[chunk_id],
+        ground_truth_chunk_ids=[chunk_id],
+        query=query_total,
+    )
+    assert score_bad_ctrl["is_grounded_correct"] is False
+
+
+
 
 
 
