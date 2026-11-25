@@ -246,6 +246,18 @@ class DocumentsRepository:
         # fully re-ingested under the new scheme.
         return None
 
+    @staticmethod
+    def _is_missing_gsi1_error(exc: Exception) -> bool:
+        resp = getattr(exc, "response", None) or {}
+        err_info = resp.get("Error", {}) if isinstance(resp, dict) else {}
+        code = str(err_info.get("Code", "") or "")
+        msg = str(err_info.get("Message", "") or str(exc))
+        if code in ("ValidationException", "ResourceNotFoundException") and (
+            "GSI1" in msg or "specified index" in msg.lower()
+        ):
+            return True
+        return "specified index: gsi1" in msg.lower()
+
     def get_all_chunks(
         self,
         document_ids: list[str] | None = None,
@@ -267,9 +279,9 @@ class DocumentsRepository:
         from boto3.dynamodb.conditions import Key
 
         if workspace_id:
-            from services.retrieval.bm25_retriever import get_cached_chunks
+            from services.retrieval.bm25_retriever import _CHUNK_CACHE, get_cached_chunks
 
-            def _fetch_workspace_chunks() -> list[Chunk]:
+            def _fetch_workspace_chunks(target_doc_ids: list[str] | None = None) -> list[Chunk]:
                 tel: dict[str, object] = {
                     "dynamodb_query_pages": 0,
                     "dynamodb_scan_pages": 0,
@@ -293,54 +305,131 @@ class DocumentsRepository:
                         tel["dynamodb_retry_count"] = int(tel["dynamodb_retry_count"]) + int(meta.get("RetryAttempts", 0) or 0)
                     return resp
 
-                try:
-                    response = _timed_call(
-                        "query",
-                        self.table.query,
-                        IndexName="GSI1",
-                        KeyConditionExpression=Key("GSI1PK").eq(f"WORKSPACE#{workspace_id}")
-                        & Key("GSI1SK").begins_with("CHUNK#"),
-                    )
-                    items = response.get("Items", [])
-                    while "LastEvaluatedKey" in response:
+                if target_doc_ids is None:
+                    try:
                         response = _timed_call(
                             "query",
                             self.table.query,
                             IndexName="GSI1",
                             KeyConditionExpression=Key("GSI1PK").eq(f"WORKSPACE#{workspace_id}")
                             & Key("GSI1SK").begins_with("CHUNK#"),
-                            ExclusiveStartKey=response["LastEvaluatedKey"],
                         )
-                        items.extend(response.get("Items", []))
-                    return [self._parse_chunk(row) for row in items]
-                except Exception as e:
-                    tel["dynamodb_query_pages"] = 0
-                    tel["dynamodb_fallback_reason"] = str(e)
-                    logger.warning("DynamoDB GSI1 query failed for workspace %s: %s", workspace_id, e)
-                    from boto3.dynamodb.conditions import Attr
+                        items = response.get("Items", [])
+                        while "LastEvaluatedKey" in response:
+                            response = _timed_call(
+                                "query",
+                                self.table.query,
+                                IndexName="GSI1",
+                                KeyConditionExpression=Key("GSI1PK").eq(f"WORKSPACE#{workspace_id}")
+                                & Key("GSI1SK").begins_with("CHUNK#"),
+                                ExclusiveStartKey=response["LastEvaluatedKey"],
+                            )
+                            items.extend(response.get("Items", []))
+                        return [self._parse_chunk(row) for row in items]
+                    except Exception as e:
+                        if not self._is_missing_gsi1_error(e):
+                            raise
+                        tel["dynamodb_query_pages"] = 0
+                        tel["dynamodb_fallback_reason"] = str(e)
+                        logger.warning("DynamoDB GSI1 missing for workspace %s; using scoped DOC# queries: %s", workspace_id, e)
 
-                    resp = _timed_call(
-                        "scan",
-                        self.table.scan,
-                        FilterExpression=Attr("workspace_id").eq(workspace_id)
-                        & Attr("SK").begins_with("CHUNK#"),
+                # Scoped DOC# partition fallback (zero table scans)
+                doc_resp = _timed_call(
+                    "query",
+                    self.table.query,
+                    KeyConditionExpression=Key("PK").eq(f"WORKSPACE#{workspace_id}")
+                    & Key("SK").begins_with("DOC#"),
+                )
+                doc_items = list(doc_resp.get("Items", []))
+                while "LastEvaluatedKey" in doc_resp:
+                    doc_resp = _timed_call(
+                        "query",
+                        self.table.query,
+                        KeyConditionExpression=Key("PK").eq(f"WORKSPACE#{workspace_id}")
+                        & Key("SK").begins_with("DOC#"),
+                        ExclusiveStartKey=doc_resp["LastEvaluatedKey"],
                     )
-                    items = resp.get("Items", [])
-                    while "LastEvaluatedKey" in resp:
-                        resp = _timed_call(
-                            "scan",
-                            self.table.scan,
-                            FilterExpression=Attr("workspace_id").eq(workspace_id)
-                            & Attr("SK").begins_with("CHUNK#"),
-                            ExclusiveStartKey=resp["LastEvaluatedKey"],
-                        )
-                        items.extend(resp.get("Items", []))
-                    return [self._parse_chunk(row) for row in items]
+                    doc_items.extend(doc_resp.get("Items", []))
 
-            chunks = get_cached_chunks(workspace_id, _fetch_workspace_chunks)
-            if document_ids is not None:
-                doc_id_set = set(document_ids)
-                chunks = [c for c in chunks if str(c.document_id) in doc_id_set]
+                auth_doc_ids: list[str] = []
+                seen_docs: set[str] = set()
+                for it in doc_items:
+                    did = str(it.get("id") or (it.get("SK", "").removeprefix("DOC#")) or "")
+                    if did and did not in seen_docs:
+                        seen_docs.add(did)
+                        auth_doc_ids.append(did)
+
+                b_repo = None
+                active_versions: dict[str, str] = {}
+                try:
+                    from src.db.workspace_boundary_repo import get_workspace_boundary_repo
+                    b_repo = get_workspace_boundary_repo()
+                except Exception:
+                    b_repo = None
+
+                if b_repo is not None:
+                    if b_repo.has_tombstone(workspace_id, "workspace", workspace_id):
+                        return []
+                    for src in b_repo.list_sources(workspace_id):
+                        sid = str(getattr(src, "source_id", "") or "")
+                        if sid and sid not in seen_docs:
+                            seen_docs.add(sid)
+                            auth_doc_ids.append(sid)
+                    for snap in b_repo.list_document_snapshots(workspace_id):
+                        did = str(getattr(snap, "document_id", "") or "")
+                        if did and did not in seen_docs:
+                            seen_docs.add(did)
+                            auth_doc_ids.append(did)
+                        if did and getattr(snap, "version", None):
+                            active_versions[did] = str(snap.version)
+                    auth_doc_ids = [
+                        did for did in auth_doc_ids
+                        if not b_repo.has_tombstone(workspace_id, "source", did)
+                    ]
+
+                if target_doc_ids is not None:
+                    scope_set = {str(d) for d in target_doc_ids}
+                    auth_doc_ids = [did for did in auth_doc_ids if did in scope_set]
+
+                parsed_chunks: list[Chunk] = []
+                for did in auth_doc_ids:
+                    c_resp = _timed_call(
+                        "query",
+                        self.table.query,
+                        KeyConditionExpression=Key("PK").eq(f"DOC#{did}")
+                        & Key("SK").begins_with("CHUNK#"),
+                    )
+                    c_items = list(c_resp.get("Items", []))
+                    while "LastEvaluatedKey" in c_resp:
+                        c_resp = _timed_call(
+                            "query",
+                            self.table.query,
+                            KeyConditionExpression=Key("PK").eq(f"DOC#{did}")
+                            & Key("SK").begins_with("CHUNK#"),
+                            ExclusiveStartKey=c_resp["LastEvaluatedKey"],
+                        )
+                        c_items.extend(c_resp.get("Items", []))
+                    exp_ver = active_versions.get(did)
+                    for row in c_items:
+                        ch = self._parse_chunk(row)
+                        if str(ch.document_id) != did:
+                            continue
+                        if ch.workspace_id and str(ch.workspace_id) != str(workspace_id):
+                            continue
+                        c_meta = ch.metadata or {}
+                        c_ver = getattr(ch, "document_version", None) or getattr(ch, "version", None) or c_meta.get("document_version") or c_meta.get("version")
+                        if exp_ver and c_ver and str(c_ver) != exp_ver:
+                            continue
+                        parsed_chunks.append(ch)
+                return parsed_chunks
+
+            if document_ids is not None and workspace_id not in _CHUNK_CACHE:
+                chunks = _fetch_workspace_chunks(target_doc_ids=list(document_ids))
+            else:
+                chunks = get_cached_chunks(workspace_id, lambda: _fetch_workspace_chunks(target_doc_ids=None))
+                if document_ids is not None:
+                    doc_id_set = set(document_ids)
+                    chunks = [c for c in chunks if str(c.document_id) in doc_id_set]
             if page_numbers is not None:
                 page_set = set(page_numbers)
                 chunks = [c for c in chunks if c.page_number in page_set]

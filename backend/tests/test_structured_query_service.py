@@ -831,20 +831,10 @@ def test_documents_repository_gsi1_fallback_to_scan_telemetry(monkeypatch):
         def query(self, **kwargs):
             if kwargs.get("IndexName") == "GSI1":
                 raise RuntimeError("ValidationException: The table does not have the specified index: GSI1")
-            return {"Items": []}
+            return {"Items": [], "ResponseMetadata": {"RetryAttempts": 1}}
 
         def scan(self, **kwargs):
-            self.scan_calls += 1
-            if self.scan_calls == 1:
-                return {
-                    "Items": [],
-                    "LastEvaluatedKey": {"PK": "p", "SK": "s1"},
-                    "ResponseMetadata": {"RetryAttempts": 1},
-                }
-            return {
-                "Items": [],
-                "ResponseMetadata": {"RetryAttempts": 0},
-            }
+            raise AssertionError("scan must not be called on missing-GSI1 fallback")
 
     repo = DocumentsRepository.__new__(DocumentsRepository)
     repo.table = _StubDocTable()
@@ -854,8 +844,8 @@ def test_documents_repository_gsi1_fallback_to_scan_telemetry(monkeypatch):
     chunks = repo.get_all_chunks(workspace_id="ws_gsi_test")
     assert chunks == []
     tel = repo.last_query_telemetry
-    assert tel["dynamodb_query_pages"] == 0
-    assert tel["dynamodb_scan_pages"] == 2
+    assert tel["dynamodb_query_pages"] == 1
+    assert tel["dynamodb_scan_pages"] == 0
     assert tel["dynamodb_retry_count"] == 1
     assert tel["dynamodb_request_ms"] >= 0.0
     assert "GSI1" in str(tel["dynamodb_fallback_reason"])
