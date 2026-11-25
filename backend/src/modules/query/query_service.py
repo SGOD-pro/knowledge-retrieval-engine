@@ -8,6 +8,12 @@ from schemas.models import QueryRequest, RerankerMode
 logger = logging.getLogger(__name__)
 
 
+def _default_bypassed_telemetry(mode: str = RerankerMode.BYPASSED.value) -> dict:
+    from providers.reranker_provider import get_bypassed_reranker_telemetry
+
+    return get_bypassed_reranker_telemetry(mode=mode, candidate_count=0)
+
+
 class QueryService:
     """Service orchestrating semantic caching, multi-stage retrieval, and grounded synthesis."""
 
@@ -336,6 +342,7 @@ class QueryService:
                 "document_ids": target_doc_ids or [],
                 "retrieval_candidates": {},
                 "reranker_mode": RerankerMode.BYPASSED.value,
+                "reranker_telemetry": _default_bypassed_telemetry(),
                 "retrieval_incomplete": True,
             }
 
@@ -442,8 +449,14 @@ class QueryService:
         if "okf_property_state" not in retrieval_candidates:
             retrieval_candidates["okf_property_state"] = getattr(response, "okf_property_state", "none")
         reranker_mode = getattr(response, "reranker_mode", RerankerMode.BYPASSED.value)
+        reranker_telemetry = dict(getattr(response, "reranker_telemetry", None) or {})
         if executed_path in ("fast", "structured_aggregate"):
             reranker_mode = RerankerMode.BYPASSED.value
+            reranker_telemetry = _default_bypassed_telemetry(mode=reranker_mode)
+        elif not reranker_telemetry:
+            reranker_telemetry = _default_bypassed_telemetry(mode=reranker_mode)
+        else:
+            reranker_telemetry.setdefault("effective_mode", reranker_mode)
 
         logger.info(
             "query.cost_tracking path=%s input_tokens=%d output_tokens=%d total_tokens=%d latency_ms=%.2f",
@@ -495,6 +508,7 @@ class QueryService:
             "graph_entity_state": retrieval_candidates.get("graph_entity_state", "none"),
             "graph_relationship_state": retrieval_candidates.get("graph_relationship_state", "none"),
             "reranker_mode": reranker_mode,
+            "reranker_telemetry": reranker_telemetry,
             "retrieval_incomplete": retrieval_incomplete,
             "laya_calls": getattr(response, "laya_calls", 0),
             "expansion_steps": getattr(response, "expansion_steps", 0),

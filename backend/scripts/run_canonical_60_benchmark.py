@@ -282,6 +282,20 @@ def get_reranker_policy() -> str:
     if os.environ.get("RERANKER_POLICY"):
         return os.environ["RERANKER_POLICY"]
 
+    bedrock_enabled = (
+        os.environ.get("BEDROCK_RERANKER_ENABLED", "").lower() in ("true", "1")
+        or getattr(settings, "BEDROCK_RERANKER_ENABLED", False)
+        or os.environ.get("RERANKER_PROVIDER") == "bedrock"
+        or getattr(settings, "RERANKER_PROVIDER", "") == "bedrock"
+    )
+    if bedrock_enabled:
+        model = getattr(settings, "BEDROCK_RERANKER_MODEL", "amazon.rerank-v1:0")
+        region = getattr(settings, "BEDROCK_RERANKER_REGION", "us-west-2")
+        return f"bedrock:{model}:{region} (fallback: lexical_bm25_plus)"
+
+    if os.environ.get("RERANKER_PROVIDER") in ("lexical", "bm25", "bm25plus") or getattr(settings, "RERANKER_PROVIDER", "") in ("lexical", "bm25", "bm25plus"):
+        return "lexical_bm25_plus"
+
     model = getattr(
         settings,
         "OPENROUTER_RERANKER_MODEL",
@@ -563,6 +577,7 @@ def run_benchmark(
                 ans_is_refusal=ans_is_refusal,
                 question_type=question_type,
                 outcome=resp,
+                query=q_text,
             )
             is_grounded_correct = grounded_eval["is_grounded_correct"]
             grounded_reason = grounded_eval["reason"]
@@ -597,6 +612,7 @@ def run_benchmark(
                 "executed_path": executed_path,
                 "planned_path": resp.get("planned_path", "full"),
                 "reranker_mode": resp.get("reranker_mode", "remote_success"),
+                "reranker_telemetry": resp.get("reranker_telemetry", {}),
                 "retrieval_metrics": ret_metrics,
                 "citation_validity": cit_val,
                 "latency_ms": round(query_latency_ms, 2),
@@ -657,7 +673,16 @@ def run_benchmark(
         false_answer_rate = round(false_answer_count / max(1, no_evidence_total), 4) if no_evidence_total > 0 else 0.0
         unsupported_cit_rate = round(unsupported_citation_count / max(1, no_evidence_total), 4) if no_evidence_total > 0 else 0.0
 
-        from providers.bedrock_models import get_embedding_model, get_llm_model
+        from providers.bedrock_models import get_embedding_model, get_llm_model, get_reranker_model
+        from providers.reranker_provider import resolve_reranker_config
+
+        reranker_cfg = resolve_reranker_config()
+        reranker_fallback_count = sum(
+            1
+            for r in query_results
+            if r.get("reranker_mode") == "circuit_open_lexical_fallback"
+            or bool((r.get("reranker_telemetry") or {}).get("fallback_reason"))
+        )
 
         manifest = {
             "commit_sha": commit_sha,
@@ -673,7 +698,14 @@ def run_benchmark(
             "corpus_file_hashes": file_hashes,
             "embedding_model": get_embedding_model(),
             "llm_model": get_llm_model(),
+            "reranker_model": get_reranker_model(),
             "reranker_policy": get_reranker_policy(),
+            "reranker_config": {
+                "provider": reranker_cfg["provider"],
+                "model": reranker_cfg["model"],
+                "region": reranker_cfg["region"],
+                "fallback_count": reranker_fallback_count,
+            },
             "strategies": {
                 "page_index_enabled": bool(getattr(settings, "PAGEINDEX_ENABLED", True)),
                 "okf_enabled": bool(getattr(settings, "OKF_ENABLED", True)),

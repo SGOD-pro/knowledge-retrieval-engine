@@ -5,8 +5,65 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from services.retrieval.evidence_contract import EvidenceItem, restore_evidence_item
+from services.retrieval.table_metric_binding import (
+    bind_financial_query,
+    cell_matches_financial_claim,
+    extract_financial_claims,
+    normalize_duration,
+    parse_date_components,
+    parse_financial_table_cells,
+)
 
+# Scorer 2.3.0: adds normalized date comparison, single-cell column binding, and query-forwarded financial constraints.
 SCORER_VERSION = "2.3.0"
+
+_MONTH_NAMES_RE = (
+    r"january|february|march|april|may|june|july|august|september|october|november|december"
+    r"|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec"
+)
+_DATE_SPAN_RE = re.compile(
+    rf"\b(?:{_MONTH_NAMES_RE})(?:\s*\d{{1,2}}\s*,?\s*\d{{4}}|\s*,?\s*\d{{4}})\b",
+    re.IGNORECASE,
+)
+_DURATION_SPAN_RE = re.compile(
+    r"\b(?:(?:three|3|six|6|nine|9|twelve|12)\s*[- ]\s*months?"
+    r"|first\s+quarter|second\s+quarter|third\s+quarter|fourth\s+quarter|quarter|q[1-4]"
+    r"|year\s+ended|full\s+year|annual)\b",
+    re.IGNORECASE,
+)
+
+
+def _extract_dates_and_mask_text(
+    text: str,
+) -> tuple[list[tuple[str, tuple[int | None, int | None, int | None]]], str]:
+    """Extract normalized (year, month, day) dates and mask date spans out of numeric matching."""
+    if not text:
+        return [], ""
+    dates: list[tuple[str, tuple[int | None, int | None, int | None]]] = []
+
+    def _replace(match: re.Match[str]) -> str:
+        raw = match.group(0)
+        parsed = parse_date_components(raw)
+        if parsed is not None:
+            dates.append((raw, parsed))
+            return " "
+        return raw
+
+    masked = _DATE_SPAN_RE.sub(_replace, text)
+    return dates, masked
+
+
+def _extract_durations(text: str) -> list[tuple[str, str]]:
+    """Extract normalized period durations from text."""
+    if not text:
+        return []
+    out: list[tuple[str, str]] = []
+    for match in _DURATION_SPAN_RE.finditer(text):
+        raw = match.group(0)
+        norm = normalize_duration(raw)
+        if norm:
+            out.append((raw, norm))
+    return out
 
 
 
@@ -1541,6 +1598,8 @@ def evaluate_grounded_answer(
     ans_is_refusal: bool = False,
     question_type: str = "retrieval",
     outcome: dict[str, Any] | Any | None = None,
+    query: str | None = None,
+    financial_binding: Any | None = None,
 ) -> dict[str, Any]:
     """Evaluates grounded correctness of an answer requiring text correctness plus
 
@@ -1840,9 +1899,13 @@ def evaluate_grounded_answer(
             "faithfulness": faith_score,
         }
 
+    # Normalize recognized dates and durations so date components stay out of financial amount matching
+    ans_dates, masked_answer = _extract_dates_and_mask_text(str(answer))
+    context_dates, masked_context = _extract_dates_and_mask_text(joined_context)
+
     # Verify numeric claims against context snippets or legitimate derived calculation targets
-    ans_nums = extract_numbers_normalized(str(answer))
-    context_nums = extract_numbers_normalized(joined_context)
+    ans_nums = extract_numbers_normalized(masked_answer)
+    context_nums = extract_numbers_normalized(masked_context)
     contract_targets = set()
     raw_operands = contract.get("operands", []) if contract and contract_type == "numeric" else []
     if contract and contract_type == "numeric":
@@ -1879,8 +1942,14 @@ def evaluate_grounded_answer(
                 "citation_validation": cit_val,
                 "faithfulness": faith_score,
             }
-    if asserted_years and context_nums:
-        if not (asserted_years & (context_nums | valid_derived_targets)):
+
+    context_year_nums = (
+        context_nums
+        | {str(y) for _, (y, _, _) in context_dates if y is not None}
+        | valid_derived_targets
+    )
+    if asserted_years and context_year_nums:
+        if not (asserted_years & context_year_nums):
             return {
                 "is_grounded_correct": False,
                 "grounded_correct": False,
@@ -1888,6 +1957,158 @@ def evaluate_grounded_answer(
                 "citation_validation": cit_val,
                 "faithfulness": faith_score,
             }
+
+    # Require period date and duration support from cited evidence
+    asserted_dates = [
+        (raw, parsed)
+        for raw, parsed in ans_dates
+        if parsed and not _is_entity_negated_in_text(raw, str(answer))
+    ]
+    ctx_date_set = {parsed for _, parsed in context_dates if parsed}
+    for raw_date, parsed_date in asserted_dates:
+        y, m, d = parsed_date
+        if d is not None:
+            date_supported = parsed_date in ctx_date_set
+        elif m is not None:
+            date_supported = any(cy == y and cm == m for cy, cm, _ in ctx_date_set)
+        else:
+            date_supported = any(cy == y for cy, _, _ in ctx_date_set)
+        if not date_supported:
+            return {
+                "is_grounded_correct": False,
+                "grounded_correct": False,
+                "reason": f"claim_unsupported: date claims '{raw_date}' not supported by cited snippets",
+                "citation_validation": cit_val,
+                "faithfulness": faith_score,
+            }
+
+    asserted_durations = [
+        (raw, norm)
+        for raw, norm in _extract_durations(str(answer))
+        if norm and not _is_entity_negated_in_text(raw, str(answer))
+    ]
+    if asserted_durations:
+        ctx_duration_set = {norm for _, norm in _extract_durations(joined_context) if norm}
+        unsupported_durations = {
+            norm for _, norm in asserted_durations if norm not in ctx_duration_set
+        }
+        if unsupported_durations:
+            return {
+                "is_grounded_correct": False,
+                "grounded_correct": False,
+                "reason": f"claim_unsupported: period duration claims {unsupported_durations} not supported by cited snippets",
+                "citation_validation": cit_val,
+                "faithfulness": faith_score,
+            }
+
+    # For direct financial table lookups, bind each non-negated primary claim to a single cell
+    # within an independently parsed validated cited chunk (preserving derived and nonfinancial behavior).
+    # Note: When both query and financial_binding are omitted, query-level constraint enforcement
+    # is skipped for concise bare numeric answers that omit metric and unit keywords.
+    fin_binding = (
+        financial_binding
+        if financial_binding is not None
+        else (bind_financial_query(query) if query else None)
+    )
+    is_query_financial = bool(fin_binding and getattr(fin_binding, "is_active", False))
+    is_derived_calc = bool(
+        (contract_type == "numeric" and (raw_operands or valid_derived_targets or (contract or {}).get("operator")))
+        or valid_derived_targets
+    )
+    if not is_derived_calc and auth_snippets:
+        per_chunk_cells = [(snip, parse_financial_table_cells(snip)) for snip in auth_snippets if snip]
+        has_table_cells = any(cells for _, cells in per_chunk_cells)
+        if has_table_cells:
+            has_pct_cells = any(cell.get("is_percentage") for _, cells in per_chunk_cells for cell in cells)
+            if is_query_financial and getattr(fin_binding, "is_percentage", False) and not has_pct_cells:
+                # Derived percentage question (e.g. ratio computed from monetary cells)
+                fin_claims = []
+            else:
+                fin_claims = extract_financial_claims(str(answer))
+            primary_fin_claims = [
+                cl
+                for cl in fin_claims
+                if not cl.get("is_comparison")
+                and not _is_entity_negated_in_text(str(cl.get("raw", "")), str(answer))
+            ]
+            has_claim_qualifiers = any(
+                cl.get("metric") is not None or cl.get("unit") is not None
+                for cl in primary_fin_claims
+            )
+            if primary_fin_claims and (is_query_financial or has_claim_qualifiers):
+                # Enforce explicit query-level period and metric consistency when query context is supplied
+                expected_metrics = (
+                    set(fin_binding.metrics)
+                    if is_query_financial and getattr(fin_binding, "metrics", None)
+                    else ({fin_binding.metric} if is_query_financial and fin_binding.metric else set())
+                )
+                if is_query_financial and fin_binding.date_parsed:
+                    req_y, req_m, req_d = fin_binding.date_parsed
+                    for raw_d, (a_y, a_m, a_d) in asserted_dates:
+                        if (
+                            (req_y is not None and a_y is not None and a_y != req_y)
+                            or (req_m is not None and a_m is not None and a_m != req_m)
+                            or (req_d is not None and a_d is not None and a_d != req_d)
+                        ):
+                            return {
+                                "is_grounded_correct": False,
+                                "grounded_correct": False,
+                                "reason": f"claim_unsupported: date '{raw_d}' contradicts query period",
+                                "citation_validation": cit_val,
+                                "faithfulness": faith_score,
+                            }
+                if is_query_financial and fin_binding.duration_norm:
+                    for _, a_dur in asserted_durations:
+                        if a_dur != fin_binding.duration_norm:
+                            return {
+                                "is_grounded_correct": False,
+                                "grounded_correct": False,
+                                "reason": f"claim_unsupported: duration '{a_dur}' contradicts query duration",
+                                "citation_validation": cit_val,
+                                "faithfulness": faith_score,
+                            }
+
+                for cl in primary_fin_claims:
+                    if cl.get("is_percentage") and not has_pct_cells:
+                        continue
+                    if is_query_financial and cl.get("metric") and expected_metrics and cl["metric"] not in expected_metrics:
+                        return {
+                            "is_grounded_correct": False,
+                            "grounded_correct": False,
+                            "reason": f"claim_unsupported: metric '{cl['metric']}' contradicts query binding",
+                            "citation_validation": cit_val,
+                            "faithfulness": faith_score,
+                        }
+                    target_metric = cl.get("metric") or (fin_binding.metric if is_query_financial else None)
+                    target_entity = cl.get("entity") or (fin_binding.entity if is_query_financial else None)
+                    req_duration = cl.get("duration_norm") or (fin_binding.duration_norm if is_query_financial else None)
+                    req_date = cl.get("date_parsed") or (fin_binding.date_parsed if is_query_financial else None)
+                    binding_units = fin_binding.units if is_query_financial else None
+                    enforce_non_seg = bool(is_query_financial and target_entity is None)
+
+                    matched_single_cell = any(
+                        cell_matches_financial_claim(
+                            cell,
+                            cl,
+                            target_metric=target_metric,
+                            target_entity=target_entity,
+                            required_duration=req_duration,
+                            required_date=req_date,
+                            binding_units=binding_units,
+                            enforce_non_segment_for_null_entity=enforce_non_seg,
+                            chunk_context=snip,
+                        )
+                        for snip, cells in per_chunk_cells
+                        for cell in cells
+                    )
+                    if not matched_single_cell:
+                        return {
+                            "is_grounded_correct": False,
+                            "grounded_correct": False,
+                            "reason": f"claim_unsupported: financial table claim '{cl.get('raw')}' not supported by any single cited table cell",
+                            "citation_validation": cit_val,
+                            "faithfulness": faith_score,
+                        }
 
     return {
         "is_grounded_correct": True,
@@ -1998,6 +2219,7 @@ def rescore_query_record_offline(
         ans_is_refusal=ans_is_refusal,
         question_type=question_type,
         outcome=outcome,
+        query=record.get("question") or record.get("query"),
     )
 
 

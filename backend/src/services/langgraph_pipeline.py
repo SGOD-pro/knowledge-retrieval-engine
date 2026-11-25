@@ -117,6 +117,7 @@ class PipelineState(TypedDict):
     graph_execution_status: str
     retrieval_candidates: dict[str, list[str]]
     reranker_mode: str
+    reranker_telemetry: dict[str, Any]
     status: str | None
     error_code: str | None
     selected_strategies: dict[str, Any] | None
@@ -950,7 +951,14 @@ def run_reranker(state: PipelineState):
             "graph_entity_state": "none",
             "graph_relationship_state": "none",
         })
-        return {"top_chunks": [], "retrieval_candidates": cands, "reranker_mode": RerankerMode.BYPASSED.value}
+        from providers.reranker_provider import get_bypassed_reranker_telemetry
+
+        return {
+            "top_chunks": [],
+            "retrieval_candidates": cands,
+            "reranker_mode": RerankerMode.BYPASSED.value,
+            "reranker_telemetry": get_bypassed_reranker_telemetry(candidate_count=0),
+        }
 
     fin_binding = state.get("financial_binding")
     if fin_binding and getattr(fin_binding, "is_active", False) and merged:
@@ -964,13 +972,30 @@ def run_reranker(state: PipelineState):
         except Exception as sae:
             logger.warning("run_reranker.score_merged_chunks_failed: %s", sae)
 
-    rerank_res = rerank(state["query"], merged, top_k=6, return_mode=True, financial_binding=fin_binding)
-    if isinstance(rerank_res, tuple) and len(rerank_res) == 2:
+    try:
+        rerank_res = rerank(
+            state["query"],
+            merged,
+            top_k=6,
+            return_mode=True,
+            financial_binding=fin_binding,
+            return_telemetry=True,
+        )
+    except TypeError:
+        rerank_res = rerank(state["query"], merged, top_k=6, return_mode=True, financial_binding=fin_binding)
+
+    from providers.reranker_provider import get_bypassed_reranker_telemetry, get_last_reranker_telemetry
+
+    if isinstance(rerank_res, tuple) and len(rerank_res) == 3:
+        top_chunks, reranker_mode, reranker_telemetry = rerank_res
+    elif isinstance(rerank_res, tuple) and len(rerank_res) == 2:
         top_chunks, reranker_mode = rerank_res
+        reranker_telemetry = dict(get_last_reranker_telemetry() or get_bypassed_reranker_telemetry(mode=reranker_mode, candidate_count=len(merged)))
     else:
         # Accommodate test doubles in legacy phase tests returning bare chunk list
         top_chunks = rerank_res
         reranker_mode = getattr(rerank_res, "reranker_mode", RerankerMode.BYPASSED.value)
+        reranker_telemetry = dict(getattr(rerank_res, "reranker_telemetry", None) or get_bypassed_reranker_telemetry(mode=reranker_mode, candidate_count=len(merged)))
 
     if fin_binding and getattr(fin_binding, "is_active", False) and top_chunks:
         try:
@@ -1070,6 +1095,7 @@ def run_reranker(state: PipelineState):
         "retained_evidence_items": retained_evidence_items,
         "retrieval_candidates": retrieval_candidates,
         "reranker_mode": reranker_mode,
+        "reranker_telemetry": reranker_telemetry,
         "executed_path": "full",
         "stage_timings": {**existing, "reranker_ms": latency_ms},
     }
@@ -2787,6 +2813,7 @@ class ResponseObject:
         self.planned_path = state.get("planned_path", "fast" if (plan and plan.fast_path) else "full")
         self.structured_aggregate = (self.executed_path == "structured_aggregate")
         self.reranker_mode = state.get("reranker_mode", RerankerMode.BYPASSED.value)
+        self.reranker_telemetry = dict(state.get("reranker_telemetry") or {})
         self.retrieval_candidates = state.get("retrieval_candidates", {})
         self.structural_candidates = state.get("structural_candidates", [])
         self.structural_candidate_ids = state.get("structural_candidate_ids", [])
@@ -2899,6 +2926,7 @@ class Pipeline:
             "top_chunks": [],
             "retrieval_candidates": {},
             "reranker_mode": RerankerMode.BYPASSED.value,
+            "reranker_telemetry": {},
             "compressed_text": "",
             "context_snippet": "",
             "final_answer": "",

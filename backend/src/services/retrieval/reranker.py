@@ -1,7 +1,13 @@
 import logging
 import time
+from typing import Any
 
-from providers.reranker_provider import get_last_reranker_mode, rerank_documents
+from providers.reranker_provider import (
+    get_bypassed_reranker_telemetry,
+    get_last_reranker_mode,
+    get_last_reranker_telemetry,
+    rerank_documents,
+)
 from schemas.models import Chunk, RerankerMode
 
 logger = logging.getLogger(__name__)
@@ -14,14 +20,22 @@ def rerank(
     provider: str | None = None,
     return_mode: bool = False,
     financial_binding: Any | None = None,
-) -> list[Chunk] | tuple[list[Chunk], str]:
+    return_telemetry: bool = False,
+) -> list[Chunk] | tuple[list[Chunk], str] | tuple[list[Chunk], str, dict[str, Any]]:
     """
     Reranks candidate chunks using the provider layer API.
-    Returns the top_k chunks, optionally paired with the request-scoped reranker mode.
+    Returns top_k chunks, optionally with reranker mode and explicit telemetry.
     """
     start_time = time.perf_counter()
     if not candidates:
-        return ([], RerankerMode.BYPASSED.value) if return_mode else []
+        telemetry = get_bypassed_reranker_telemetry(provider=provider, candidate_count=0)
+        if return_mode and return_telemetry:
+            return ([], RerankerMode.BYPASSED.value, telemetry)
+        if return_mode:
+            return ([], RerankerMode.BYPASSED.value)
+        if return_telemetry:
+            return ([], telemetry)
+        return []
 
     if financial_binding is None:
         try:
@@ -33,8 +47,18 @@ def rerank(
     # Extract text for the API call
     documents = [c.text for c in candidates]
 
-    # Call the provider
-    scores = rerank_documents(query, documents, provider=provider)
+    # Call the provider and carry telemetry explicitly across thread boundaries
+    try:
+        raw_res = rerank_documents(query, documents, provider=provider, return_telemetry=True)
+    except TypeError:
+        raw_res = rerank_documents(query, documents, provider=provider)
+
+    if isinstance(raw_res, tuple) and len(raw_res) == 2 and isinstance(raw_res[1], dict):
+        scores, provider_telemetry = raw_res
+        telemetry = dict(provider_telemetry)
+    else:
+        scores = raw_res
+        telemetry = dict(get_last_reranker_telemetry() or {})
 
     # Assign scores back to chunks immutably
     from dataclasses import replace
@@ -136,5 +160,21 @@ def rerank(
         "reranker.latency_ms=%.2f reranker.confidence_score=%.2f", latency_ms, avg_score
     )
 
-    mode = get_last_reranker_mode()
-    return (top_chunks, mode) if return_mode else top_chunks
+    mode = telemetry.get("effective_mode") or get_last_reranker_mode()
+    if not telemetry:
+        telemetry = get_bypassed_reranker_telemetry(
+            provider=provider,
+            mode=mode,
+            candidate_count=len(documents),
+        )
+    telemetry["candidate_count"] = telemetry.get("candidate_count") or len(documents)
+    if "latency_ms" not in telemetry or telemetry.get("latency_ms", 0.0) == 0.0:
+        telemetry["latency_ms"] = round(latency_ms, 2)
+
+    if return_mode and return_telemetry:
+        return (top_chunks, mode, telemetry)
+    if return_mode:
+        return (top_chunks, mode)
+    if return_telemetry:
+        return (top_chunks, telemetry)
+    return top_chunks

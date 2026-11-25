@@ -7,6 +7,7 @@ Enforces:
   4. Complete period evidence and exact date/duration comparisons.
   5. Distinction between monetary amounts and percentages.
   6. Scoring and prioritization of metric-aligned tables during evidence selection.
+  7. Single-cell column binding ensuring metric, entity, period, sign, and scale agree on one cell.
 """
 
 from __future__ import annotations
@@ -355,6 +356,15 @@ def parse_financial_table_cells(text: str) -> list[dict[str, Any]]:
     )
 
     for line in lines:
+        # Preserve table-intro/caption metric sections even when the caption includes period dates
+        is_metric_caption = (
+            line.endswith(":")
+            and classify_metric(line) is not None
+            and not re.search(r"\d", PERIOD_PATTERN.sub(" ", line))
+        )
+        if is_metric_caption:
+            current_section = line[:-1].strip().lower()
+
         dur_matches = list(dur_re.finditer(line))
         date_matches = list(date_re.finditer(line))
 
@@ -378,7 +388,7 @@ def parse_financial_table_cells(text: str) -> list[dict[str, Any]]:
         if dur_matches and not date_matches:
             continue
 
-        if line.endswith(":") and not re.search(r"\d", line):
+        if is_metric_caption or (line.endswith(":") and not re.search(r"\d", line)):
             current_section = line[:-1].strip().lower()
             continue
 
@@ -789,6 +799,93 @@ def extract_financial_claims(text: str) -> list[dict[str, Any]]:
     return claims
 
 
+def cell_matches_financial_claim(
+    cell: dict[str, Any],
+    claim: dict[str, Any],
+    *,
+    target_metric: str | None = None,
+    target_entity: str | None = None,
+    required_duration: str | None = None,
+    required_date: tuple[int | None, int | None, int | None] | None = None,
+    binding_units: str | None = None,
+    enforce_non_segment_for_null_entity: bool = True,
+    chunk_context: str = "",
+) -> bool:
+    """Return True when a parsed table cell matches metric, entity, period, sign, scale, and value."""
+    sec = (cell.get("section") or "").lower()
+    row = (cell.get("row") or "").lower()
+
+    # A. Metric category check
+    cell_metric = cell.get("metric") or classify_cell_metric(row, sec, chunk_context)
+    if target_metric is not None and cell_metric != target_metric:
+        return False
+
+    # B. Entity check
+    if target_entity:
+        if target_entity.lower() not in row:
+            return False
+    elif enforce_non_segment_for_null_entity:
+        row_has_segment_entity = any(re.search(r"\b" + e + r"\b", row, re.I) for e in ENTITY_NAMES)
+        if row_has_segment_entity and "total" not in row:
+            return False
+
+    # C. Duration check
+    if required_duration:
+        cell_dur = cell.get("duration_norm")
+        if cell_dur is None or cell_dur != required_duration:
+            return False
+    if claim.get("duration_norm"):
+        cell_dur = cell.get("duration_norm")
+        if cell_dur is None or cell_dur != claim["duration_norm"]:
+            return False
+
+    # D. Date check (exact day, month, year)
+    for dt_constraint in (required_date, claim.get("date_parsed")):
+        if not dt_constraint:
+            continue
+        c_dt = cell.get("date_parsed")
+        if c_dt is None:
+            return False
+        req_y, req_m, req_d = dt_constraint
+        cell_y, cell_m, cell_d = c_dt
+        if req_y is not None and cell_y != req_y:
+            return False
+        if req_m is not None and cell_m != req_m:
+            return False
+        if req_d is not None and cell_d != req_d:
+            return False
+
+    # E. Sign check
+    if claim["sign"] != cell["sign"]:
+        return False
+
+    # F. Percentage versus monetary check
+    if claim["is_percentage"] != cell["is_percentage"]:
+        return False
+    if binding_units == "dollars" and claim["is_percentage"]:
+        return False
+
+    # G. Scale and exact value arithmetic check
+    c_val = cell["value"]
+    q_val = claim["value"]
+    if cell["is_percentage"]:
+        if q_val != c_val:
+            return False
+    else:
+        table_scale = cell.get("scale", Decimal("1"))
+        cell_abs = c_val * table_scale
+        claim_unit = claim.get("unit")
+        if claim_unit:
+            claim_multiplier = SCALE_MULTIPLIERS.get(claim_unit, Decimal("1"))
+            claim_abs = q_val * claim_multiplier
+            if claim_abs != cell_abs:
+                return False
+        elif q_val != c_val and q_val != cell_abs:
+            return False
+
+    return True
+
+
 def verify_financial_cell_binding(
     chunk_or_chunks: str | list[str] | list[Any],
     answer_value: str,
@@ -894,7 +991,10 @@ def verify_financial_cell_binding(
     # 3. Verify EVERY primary claim against table cells
     for claim in primary_claims:
         claim_verified = False
-        target_metric = claim.get("metric") or binding.metric
+        target_metric = claim.get("metric")
+        if not target_metric:
+            unsatisfied = [r_m for r_m, _ in req_pairs if (r_m, _) not in satisfied_reqs]
+            target_metric = unsatisfied[0] if unsatisfied else binding.metric
 
         # Resolve target entity for this claim
         if claim.get("entity"):
@@ -936,90 +1036,21 @@ def verify_financial_cell_binding(
                 logger.warning("verify_financial_cell_binding: claim duration %s contradicts query duration %s", claim["duration_norm"], binding.duration_norm)
                 return False, "claim_duration_contradicts_query"
 
+        fallback_ctx = chunk_or_chunks if isinstance(chunk_or_chunks, str) else ""
         for cell in cells:
-            sec = (cell.get("section") or "").lower()
-            row = (cell.get("row") or "").lower()
-
-            # A. Metric category check
-            chunk_context = cell.get("chunk_text") or (chunk_or_chunks if isinstance(chunk_or_chunks, str) else "")
-            cell_metric = cell.get("metric") or classify_cell_metric(row, sec, chunk_context)
-            if cell_metric != target_metric:
+            chunk_context = cell.get("chunk_text") or fallback_ctx
+            if not cell_matches_financial_claim(
+                cell,
+                claim,
+                target_metric=target_metric,
+                target_entity=target_entity,
+                required_duration=binding.duration_norm,
+                required_date=binding.date_parsed,
+                binding_units=binding.units,
+                enforce_non_segment_for_null_entity=True,
+                chunk_context=chunk_context,
+            ):
                 continue
-
-            # B. Entity check
-            if target_entity:
-                if target_entity.lower() not in row:
-                    continue
-            else:
-                row_has_segment_entity = any(re.search(r"\b" + e + r"\b", row, re.I) for e in ENTITY_NAMES)
-                if row_has_segment_entity and "total" not in row:
-                    continue
-
-            # C. Duration check
-            if binding.duration_norm:
-                cell_dur = cell.get("duration_norm")
-                if cell_dur is None or cell_dur != binding.duration_norm:
-                    continue
-            if claim.get("duration_norm"):
-                cell_dur = cell.get("duration_norm")
-                if cell_dur is None or cell_dur != claim["duration_norm"]:
-                    continue
-
-            # D. Date check (exact day, month, year)
-            if binding.date_parsed:
-                c_dt = cell.get("date_parsed")
-                if c_dt is None:
-                    continue
-                req_y, req_m, req_d = binding.date_parsed
-                cell_y, cell_m, cell_d = c_dt
-                if req_y is not None and cell_y != req_y:
-                    continue
-                if req_m is not None and cell_m != req_m:
-                    continue
-                if req_d is not None and cell_d != req_d:
-                    continue
-            if claim.get("date_parsed"):
-                c_dt = cell.get("date_parsed")
-                if c_dt is None:
-                    continue
-                c_y, c_m, c_d = claim["date_parsed"]
-                cell_y, cell_m, cell_d = c_dt
-                if c_y is not None and cell_y != c_y:
-                    continue
-                if c_m is not None and cell_m != c_m:
-                    continue
-                if c_d is not None and cell_d != c_d:
-                    continue
-
-            # E. Sign check
-            if claim["sign"] != cell["sign"]:
-                continue
-
-            # F. Percentage versus monetary check
-            if claim["is_percentage"] != cell["is_percentage"]:
-                continue
-            if binding.units == "dollars" and claim["is_percentage"]:
-                continue
-
-            # G. Scale and exact value arithmetic check
-            c_val = cell["value"]
-            q_val = claim["value"]
-            if cell["is_percentage"]:
-                if q_val != c_val:
-                    continue
-            else:
-                table_scale = cell.get("scale", Decimal("1"))
-                cell_abs = c_val * table_scale
-                claim_unit = claim.get("unit")
-                if claim_unit:
-                    claim_multiplier = SCALE_MULTIPLIERS.get(claim_unit, Decimal("1"))
-                    claim_abs = q_val * claim_multiplier
-                    if claim_abs != cell_abs:
-                        continue
-                else:
-                    # Raw numeric match without units stated
-                    if q_val != c_val and q_val != cell_abs:
-                        continue
 
             claim_verified = True
             for req in req_pairs:

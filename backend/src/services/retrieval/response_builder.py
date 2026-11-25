@@ -9,11 +9,14 @@ time — because presigned URLs expire.  No public ACLs are used.
 
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
+import logging
 from typing import Any
 
 from aws.infra import get_client
 from config import settings
 from schemas.models import Chunk
+
+logger = logging.getLogger(__name__)
 
 
 def get_signed_image_url(key: str, bucket: str) -> str:
@@ -193,6 +196,26 @@ def resolve_chunk_provenance(
     return doc_fname, fallback_ver
 
 
+def truncate_excerpt_at_token_boundary(text: str, max_chars: int) -> str:
+    """Truncate excerpt to at most max_chars without splitting inside a token."""
+    if not text or max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    if text[max_chars].isspace():
+        return text[:max_chars].rstrip()
+    cut = max_chars
+    while cut > 0 and not text[cut - 1].isspace():
+        cut -= 1
+    if cut == 0:
+        logger.warning(
+            "truncate_excerpt_at_token_boundary: unbroken token exceeds max_chars=%d, returning empty excerpt",
+            max_chars,
+        )
+        return ""
+    return text[:cut].rstrip()
+
+
 def build_citation(
     chunk: Chunk,
     document_filename: str | None = None,
@@ -283,8 +306,8 @@ def build_citation(
         page_number=page_num,
         bounding_box=bbox,
         location_reference=loc_ref,
-        text=chunk.text[:500],
-        text_snippet=chunk.text[:200],
+        text=truncate_excerpt_at_token_boundary(chunk.text, 500),
+        text_snippet=truncate_excerpt_at_token_boundary(chunk.text, 200),
         strategy=strat,
         image_urls=image_urls,
     )
