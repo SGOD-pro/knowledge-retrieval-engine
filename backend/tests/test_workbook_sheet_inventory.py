@@ -918,3 +918,219 @@ def test_workbook_row_survives_competing_pdfs_and_rejects_unrelated_or_missing_c
         query=query,
     )
     assert eval_res["is_grounded_correct"] is True, f"Scorer failed: {eval_res}"
+
+
+def test_delivery_gate_blocks_paraphrased_and_invalid_citation_sheet_status_claims(tmp_path: Path, monkeypatch):
+    """Reproduce probe_q150_verified_pass.json bug: paraphrased claim with empty or invalid citations."""
+    from ingestion.parse_service import parse_file
+    from modules.query.query_service import QueryRequest, QueryService
+    from services.retrieval import bm25_retriever
+
+    monkeypatch.setenv("RERANKER_PROVIDER", "lexical")
+    ws_id = "ws_gate_paraphrase"
+    xls_path = tmp_path / "Survey_Workbook.xls"
+    xls_bytes = b"synthetic-paraphrase-wb"
+    xls_path.write_bytes(xls_bytes)
+    xls_ver = hashlib.sha256(xls_bytes).hexdigest()[:32]
+    fake_wb = _FakeXlsWorkbook(
+        [
+            _FakeXlsSheet("Sheet1", [["District", "Households"], ["Nicobars", 882]]),
+            _FakeXlsSheet("Sheet2", []),
+            _FakeXlsSheet("Sheet3", []),
+        ]
+    )
+    with patch("xlrd.open_workbook", return_value=fake_wb):
+        wb_doc = parse_file(xls_path, document_id="doc-para", workspace_id=ws_id)
+
+    b_repo = InMemoryWorkspaceBoundaryRepository()
+    b_repo.create_workspace("Para WS", "owner-1", workspace_id=ws_id)
+    b_repo.create_source(ws_id, wb_doc.filename, source_id=wb_doc.id)
+    b_repo.save_document_snapshot(
+        DocumentSnapshot(
+            workspace_id=ws_id,
+            document_id=wb_doc.id,
+            source=wb_doc.filename,
+            version=xls_ver,
+            format="xls",
+            created_at="2026-11-26T00:00:00Z",
+            sheet_inventory=wb_doc.sheet_inventory,
+        )
+    )
+
+    class _DocRepo:
+        def get_workspace_documents(self, workspace_id: str, page: int = 1, limit: int = 1000):
+            return {"documents": [{"id": wb_doc.id, "filename": wb_doc.filename}]}
+
+        def get_all_chunks(self, document_ids=None, workspace_id: str = ""):
+            return list(wb_doc.chunks)
+
+        def get(self, doc_id: str):
+            return wb_doc if doc_id == wb_doc.id else None
+
+        def search_vector(self, *args, **kwargs):
+            return []
+
+        def check_semantic_cache(self, *args, **kwargs):
+            return None
+
+    doc_repo = _DocRepo()
+    query = "Are Sheet2 and Sheet3 additional populated district datasets in the Survey_Workbook.xls workbook?"
+    paraphrase_ans = "Sheet2 and Sheet3 are not additional populated district datasets in the Survey_Workbook.xls workbook."
+
+    for raw_cits in ([], ["nonexistent:chunk:999"]):
+        if hasattr(bm25_retriever, "_CHUNK_CACHE"):
+            bm25_retriever._CHUNK_CACHE.clear()
+        qs = QueryService(repo=doc_repo)
+        req = QueryRequest(query=query, workspace_id=ws_id, benchmark_mode=True, cache=False, force_full_path=True)
+        payload = json.dumps({"answer": paraphrase_ans, "citations": raw_cits})
+        with (
+            patch("src.db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+            patch("db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+            patch("services.langgraph_pipeline._get_repo", return_value=doc_repo),
+            patch("services.langgraph_pipeline.check_fidelity", return_value=True),
+            patch("services.llm.llm_service.generate_completion", return_value=(payload, {"input_tokens": 10, "output_tokens": 10})),
+        ):
+            res = qs.execute_query(req)
+        assert res["citations"] == []
+        assert "not additional populated" not in res["answer"].lower()
+
+
+def test_deterministic_sheet_status_path_zero_synthesis_and_strict_scorer(tmp_path: Path, monkeypatch):
+    """Prove deterministic sheet-status path renders answer, emits row+inventory citations, and passes scorer with 0 LLM calls."""
+    from ingestion.parse_service import parse_file
+    from modules.query.query_service import QueryRequest, QueryService
+    from services.retrieval import bm25_retriever
+
+    monkeypatch.setenv("RERANKER_PROVIDER", "lexical")
+    monkeypatch.setenv("ENABLE_DETERMINISTIC_MATH", "1")
+    ws_id = "ws_det_sheet"
+    xls_path = tmp_path / "District_Factsheet.xls"
+    xls_bytes = b"synthetic-det-sheet-wb"
+    xls_path.write_bytes(xls_bytes)
+    xls_ver = hashlib.sha256(xls_bytes).hexdigest()[:32]
+    fake_wb = _FakeXlsWorkbook(
+        [
+            _FakeXlsSheet("Sheet1", [["District", "Households"], ["Nicobars", 882]]),
+            _FakeXlsSheet("Sheet2", []),
+            _FakeXlsSheet("Sheet3", []),
+        ]
+    )
+    with patch("xlrd.open_workbook", return_value=fake_wb):
+        wb_doc = parse_file(xls_path, document_id="doc-det-wb", workspace_id=ws_id)
+
+    row_cid = "doc-det-wb:xls:Sheet1:row1"
+    inv_cid = f"doc-det-wb:sheet_inventory:{xls_ver}"
+
+    b_repo = InMemoryWorkspaceBoundaryRepository()
+    b_repo.create_workspace("Det WS", "owner-1", workspace_id=ws_id)
+    b_repo.create_source(ws_id, wb_doc.filename, source_id=wb_doc.id)
+    valid_snap = DocumentSnapshot(
+        workspace_id=ws_id,
+        document_id=wb_doc.id,
+        source=wb_doc.filename,
+        version=xls_ver,
+        format="xls",
+        created_at="2026-11-26T00:00:00Z",
+        sheet_inventory=wb_doc.sheet_inventory,
+    )
+    b_repo.save_document_snapshot(valid_snap)
+
+    class _DocRepo:
+        def get_workspace_documents(self, workspace_id: str, page: int = 1, limit: int = 1000):
+            return {"documents": [{"id": wb_doc.id, "filename": wb_doc.filename}]}
+
+        def get_all_chunks(self, document_ids=None, workspace_id: str = ""):
+            return list(wb_doc.chunks)
+
+        def get(self, doc_id: str):
+            return wb_doc if doc_id == wb_doc.id else None
+
+        def search_vector(self, *args, **kwargs):
+            return []
+
+        def check_semantic_cache(self, *args, **kwargs):
+            return None
+
+    doc_repo = _DocRepo()
+    query = "Are Sheet2 and Sheet3 additional populated district datasets in the District_Factsheet.xls workbook?"
+
+    if hasattr(bm25_retriever, "_CHUNK_CACHE"):
+        bm25_retriever._CHUNK_CACHE.clear()
+    qs = QueryService(repo=doc_repo)
+    req = QueryRequest(query=query, workspace_id=ws_id, benchmark_mode=True, cache=False, force_full_path=False)
+    with (
+        patch("src.db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+        patch("db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+        patch("services.langgraph_pipeline._get_repo", return_value=doc_repo),
+        patch("providers.reranker_provider._call_openrouter_rerank", side_effect=AssertionError("Remote reranker must not be called in lexical mode"), create=True),
+        patch("services.llm.llm_service.generate_completion", side_effect=AssertionError("LLM must not be called on deterministic sheet-status path")),
+    ):
+        res = qs.execute_query(req)
+
+    ans_lower = res["answer"].lower()
+    assert "sheet2" in ans_lower and "empty" in ans_lower
+    assert "sheet3" in ans_lower
+    assert "sheet1" in ans_lower and "populated" in ans_lower
+    assert set(c["chunk_id"] for c in res["citations"]) == {row_cid, inv_cid}
+    assert res["token_usage"] == {"input_tokens": 0, "output_tokens": 0}
+
+    eval_res = evaluate_grounded_answer(
+        answer=res["answer"],
+        citations=res["citations"],
+        is_answer_text_correct=True,
+        contract_type="semantic",
+        expected_sources=[wb_doc.filename],
+        expected_source_version=xls_ver,
+        retained_evidence_items=res["retained_evidence_items"],
+        context_chunk_ids=(res.get("retrieval_candidates") or {}).get("compressed_context"),
+        ground_truth_chunk_ids=[row_cid],
+        query=query,
+    )
+    assert eval_res["is_grounded_correct"] is True, f"Scorer failed: {eval_res}"
+
+    # Wrong-sheet row citation (Sheet9 row when Sheet1 is populated) must be rejected by verify_sheet_status_claims
+    from services.retrieval.evidence_contract import evidence_item_from_chunk
+    from services.retrieval.sheet_inventory import build_sheet_inventory_chunk_and_evidence, verify_sheet_status_claims
+
+    wrong_sheet_chunk = Chunk(
+        id="doc-det-wb:xls:Sheet9:row1",
+        document_id=wb_doc.id,
+        source_format="xls",
+        text="Sheet9 row 2: something",
+        element_type="row",
+        section_path=("Sheet9",),
+        location_reference="Sheet9 row 2",
+        workspace_id=ws_id,
+        version=xls_ver,
+        document_version=xls_ver,
+        metadata={"sheet": "Sheet9", "row": 2, "document_version": xls_ver},
+    )
+    wrong_ev = evidence_item_from_chunk(wrong_sheet_chunk, workspace_id=ws_id, strategy="bm25", boundary_repo=b_repo)
+    _, inv_ev = build_sheet_inventory_chunk_and_evidence(valid_snap, workspace_id=ws_id, boundary_repo=b_repo)
+    ok_wrong, reason_wrong = verify_sheet_status_claims(
+        res["answer"],
+        [wrong_ev, inv_ev],
+        [{"chunk_id": wrong_sheet_chunk.id}, {"chunk_id": inv_cid}],
+        query=query,
+    )
+    assert ok_wrong is False and reason_wrong == "missing_populated_sheet_row_support"
+
+    # Absent sheet (Sheet4) on deterministic path
+    if hasattr(bm25_retriever, "_CHUNK_CACHE"):
+        bm25_retriever._CHUNK_CACHE.clear()
+    req_absent = QueryRequest(
+        query="Is Sheet4 populated or absent in District_Factsheet.xls?",
+        workspace_id=ws_id,
+        benchmark_mode=True,
+        cache=False,
+        force_full_path=False,
+    )
+    with (
+        patch("src.db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+        patch("db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+        patch("services.langgraph_pipeline._get_repo", return_value=doc_repo),
+        patch("services.llm.llm_service.generate_completion", side_effect=AssertionError("LLM must not be called")),
+    ):
+        res_absent = qs.execute_query(req_absent)
+    assert "sheet4 is absent" in res_absent["answer"].lower()
+    assert set(c["chunk_id"] for c in res_absent["citations"]) == {row_cid, inv_cid}

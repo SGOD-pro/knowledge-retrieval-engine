@@ -12,6 +12,44 @@ _EMPTY_OR_ABSENT_SHEET_RE = re.compile(
     r"\b(sheet\s*[a-z0-9_]+(?:\s*(?:,|and)\s*sheet\s*[a-z0-9_]+)*)\s+(?:is\s+|are\s+)?(?:empty|blank|have\s+0\s+data\s+rows|has\s+0\s+data\s+rows|have\s+no\s+data|has\s+no\s+data|contain\s+no\s+data|contains\s+no\s+data|absent|do\s+not\s+exist|does\s+not\s+exist|missing)\b",
     re.IGNORECASE,
 )
+_SHEET_NAME_RE = re.compile(r"\bsheet\s*[a-z0-9_]+\b", re.IGNORECASE)
+_SHEET_STATUS_QUERY_RE = re.compile(
+    r"\b(?:populated|empty|blank|absent|missing|exist|status|sheets?|datasets?)\b",
+    re.IGNORECASE,
+)
+
+
+def bind_workbook_sheet_query(
+    query: str,
+    retained_evidence_items: list[Any] | None = None,
+) -> dict[str, Any]:
+    """Bind workbook sheet-status intent and requested sheet names from query and retained evidence."""
+    q = str(query or "")
+    requested_sheets: list[str] = []
+    seen: set[str] = set()
+    for m in _SHEET_NAME_RE.finditer(q):
+        norm = re.sub(r"\s+", "", m.group(0)).lower()
+        if norm not in seen:
+            seen.add(norm)
+            requested_sheets.append(re.sub(r"\s+", "", m.group(0)))
+
+    inv_doc_ids: set[str] = set()
+    for ev in retained_evidence_items or []:
+        prov = getattr(ev, "provenance", {}) or {}
+        meta = prov.get("metadata") if isinstance(prov, dict) else {}
+        if getattr(ev, "strategy", "") == "sheet_inventory" or (
+            isinstance(meta, dict) and meta.get("sheet_inventory")
+        ):
+            did = str(getattr(ev, "document_id", "") or "")
+            if did:
+                inv_doc_ids.add(did)
+
+    is_active = bool(requested_sheets and _SHEET_STATUS_QUERY_RE.search(q) and inv_doc_ids)
+    return {
+        "is_active": is_active,
+        "requested_sheets": requested_sheets,
+        "inv_doc_ids": inv_doc_ids,
+    }
 
 
 def _is_snapshot_authorized(
@@ -187,6 +225,7 @@ def verify_sheet_status_claims(
     answer: str,
     retained_evidence_items: list[Any],
     citations: list[dict[str, Any]] | None = None,
+    query: str = "",
 ) -> tuple[bool, str | None]:
     """Verify sheet-status claims against retained sheet_inventory and populated-sheet row evidence."""
     if not answer or answer == "NOT_FOUND":
@@ -211,8 +250,9 @@ def verify_sheet_status_claims(
         ):
             inv_items.append(ev)
 
+    binding = bind_workbook_sheet_query(query, retained_evidence_items)
     matches = list(_EMPTY_OR_ABSENT_SHEET_RE.finditer(answer))
-    if not matches and not inv_items:
+    if not matches and not inv_items and not binding["is_active"]:
         return True, None
 
     if not cited_ids:
@@ -252,7 +292,8 @@ def verify_sheet_status_claims(
             if not supported:
                 return False, f"unsupported_sheet_status_claim:{raw_name}"
 
-    # If the answer also references a populated sheet from the inventory, require a cited row/cell chunk
+    # If the answer references a populated sheet from the inventory, require a cited row/cell chunk
+    # from that same workbook and matching sheet (reject wrong-sheet row citations).
     for ev in inv_items:
         ev_did = str(getattr(ev, "document_id", "") or "")
         inv = ((getattr(ev, "provenance", {}) or {}).get("metadata") or {}).get("sheet_inventory") or {}
@@ -261,13 +302,132 @@ def verify_sheet_status_claims(
             for s in (inv.get("sheets") or [])
             if s.get("status") == "populated" and s.get("name")
         ]
+        pop_norm = {re.sub(r"\s+", "", n).lower() for n in populated_names}
         if any(re.search(rf"\b{re.escape(name)}\b", answer, re.IGNORECASE) for name in populated_names):
-            has_row_cit = any(
-                str(getattr(c_ev, "document_id", "") or "") == ev_did
-                and c_ev not in inv_items
-                for c_ev in cited_ev_items
-            )
+            has_row_cit = False
+            for c_ev in cited_ev_items:
+                if str(getattr(c_ev, "document_id", "") or "") != ev_did or c_ev in inv_items:
+                    continue
+                c_meta = ((getattr(c_ev, "provenance", {}) or {}).get("metadata") or {})
+                c_sheet = re.sub(r"\s+", "", str(c_meta.get("sheet", ""))).lower() if isinstance(c_meta, dict) and c_meta.get("sheet") else ""
+                if c_sheet and c_sheet not in pop_norm:
+                    continue
+                has_row_cit = True
+                break
             if not has_row_cit:
                 return False, "missing_populated_sheet_row_support"
 
     return True, None
+
+
+def resolve_workbook_sheet_status_answer(
+    query: str,
+    chunks: list[Any],
+    *,
+    workspace_id: str,
+    boundary_repo: Any | None = None,
+) -> dict[str, Any] | None:
+    """Deterministically render a grounded sheet-status answer for one unambiguous workbook."""
+    q = str(query or "")
+    q_lower = q.lower()
+    if not _SHEET_NAME_RE.search(q) or not _SHEET_STATUS_QUERY_RE.search(q):
+        return None
+    if re.search(r"\b(?:pdf|paper|10-q|strategy|compare\s+with)\b", q_lower):
+        return None
+
+    inv_chunks = [c for c in chunks if getattr(c, "element_type", "") == "sheet_inventory"]
+    if len(inv_chunks) != 1:
+        return None
+    inv_chunk = inv_chunks[0]
+    inv_did = str(getattr(inv_chunk, "document_id", "") or "")
+    if not inv_did:
+        return None
+
+    if boundary_repo is None and workspace_id:
+        try:
+            from db.workspace_boundary_repo import get_workspace_boundary_repo
+            boundary_repo = get_workspace_boundary_repo()
+        except Exception:
+            boundary_repo = None
+    if boundary_repo is None:
+        return None
+
+    try:
+        if boundary_repo.has_tombstone(workspace_id, "workspace", workspace_id):
+            return None
+        if boundary_repo.has_tombstone(workspace_id, "source", inv_did):
+            return None
+        snap = boundary_repo.get_document_snapshot(workspace_id, inv_did)
+    except Exception:
+        return None
+
+    if snap is None or bool(getattr(snap, "incomplete_coverage_flag", False)):
+        return None
+    snap_inv = getattr(snap, "sheet_inventory", None)
+    if snap_inv is None or not getattr(snap_inv, "complete", False):
+        return None
+    if str(getattr(snap_inv, "version", "")) != str(getattr(snap, "version", "")):
+        return None
+
+    requested: list[str] = []
+    seen_req: set[str] = set()
+    for m in _SHEET_NAME_RE.finditer(q):
+        raw = re.sub(r"\s+", "", m.group(0))
+        if raw.lower() not in seen_req:
+            seen_req.add(raw.lower())
+            requested.append(raw)
+    if not requested:
+        return None
+
+    req_statuses: list[dict[str, Any]] = []
+    for s_name in requested:
+        st = lookup_sheet_status(snap, s_name, workspace_id=workspace_id, boundary_repo=boundary_repo)
+        if st.get("status") == "unknown":
+            return None
+        req_statuses.append(st)
+
+    populated_entries = [s for s in snap_inv.sheets if s.status == "populated"]
+    pop_names_norm = {re.sub(r"\s+", "", s.name).lower() for s in populated_entries}
+
+    row_chunk = None
+    if populated_entries:
+        for c in chunks:
+            if str(getattr(c, "document_id", "") or "") != inv_did:
+                continue
+            if getattr(c, "element_type", "") == "sheet_inventory":
+                continue
+            c_meta = getattr(c, "metadata", None) or {}
+            c_sheet = re.sub(r"\s+", "", str(c_meta.get("sheet", ""))).lower() if c_meta.get("sheet") else ""
+            if c_sheet and c_sheet not in pop_names_norm:
+                continue
+            c_ver = getattr(c, "document_version", None) or getattr(c, "version", None) or c_meta.get("document_version") or c_meta.get("version")
+            if c_ver and str(c_ver) != str(snap.version):
+                continue
+            row_chunk = c
+            break
+        if row_chunk is None:
+            return None
+
+    status_phrases = []
+    for st in req_statuses:
+        s_label = st["sheet_name"]
+        s_val = st["status"]
+        if s_val == "empty":
+            status_phrases.append(f"{s_label} is empty (0 data rows)")
+        elif s_val == "absent":
+            status_phrases.append(f"{s_label} is absent")
+        else:
+            status_phrases.append(f"{s_label} is populated ({st['data_rows']} data rows)")
+
+    all_non_pop = all(st["status"] in ("empty", "absent") for st in req_statuses)
+    prefix = "No. " if (re.match(r"^\s*(?:are|is|do|does)\b", q_lower) and all_non_pop) else ""
+    pop_summary = ""
+    if populated_entries:
+        pop_desc = ", ".join(f"{p.name} is populated ({p.data_rows} data rows)" for p in populated_entries)
+        pop_summary = f"; {pop_desc} and holds the data."
+    else:
+        pop_summary = "."
+
+    ans = prefix + "; ".join(status_phrases) + pop_summary
+    cited_chunks = [row_chunk, inv_chunk] if row_chunk is not None else [inv_chunk]
+    return {"answer": ans, "cited_chunks": cited_chunks}

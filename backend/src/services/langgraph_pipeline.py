@@ -1294,6 +1294,31 @@ def run_deterministic_math(state: PipelineState):
     existing = state.get("stage_timings", {})
 
     if not res:
+        from services.retrieval.sheet_inventory import resolve_workbook_sheet_status_answer
+        ws_id = state.get("workspace_id", "")
+        b_repo = state.get("boundary_repo")
+        sheet_res = resolve_workbook_sheet_status_answer(
+            state["query"], chunks, workspace_id=ws_id, boundary_repo=b_repo
+        )
+        if sheet_res:
+            det_cits = [
+                build_citation(c, workspace_id=ws_id, boundary_repo=b_repo).to_dict()
+                for c in sheet_res["cited_chunks"]
+            ]
+            cands = dict(state.get("retrieval_candidates", {}))
+            cands["compressed_context"] = [str(c.id) for c in chunks]
+            cands["llm_citations"] = [str(c.get("chunk_id")) for c in det_cits if c.get("chunk_id")]
+            return {
+                "final_answer": sheet_res["answer"],
+                "citations": det_cits,
+                "confidence_score": 1.0,
+                "faithfulness": 1.0,
+                "citation_utilization_rate": round(len(det_cits) / max(1, len(chunks)), 4),
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+                "executed_path": "deterministic_sheet_inventory",
+                "retrieval_candidates": cands,
+                "stage_timings": {**existing, "deterministic_math_ms": (time.perf_counter() - t0) * 1000.0},
+            }
         return {
             "stage_timings": {**existing, "deterministic_math_ms": latency_ms},
         }
@@ -2318,6 +2343,7 @@ def delivery_gate(state: PipelineState) -> dict[str, Any]:
             ans,
             state.get("retained_evidence_items", []),
             state.get("citations", []),
+            query=state.get("query", ""),
         )
         if not sheet_ok:
             logger.warning(
