@@ -196,3 +196,209 @@ def test_pipeline_multi_table_workspace_q153_without_document_ids(survay_path: P
     assert len(res["citations"]) >= 1
     assert res["citations"][0]["table_id"] == "survay"
 
+
+def test_structured_aggregate_citation_provenance_resolves_registered_filename(tmp_path, monkeypatch):
+    from db.workspace_boundary_repo import InMemoryWorkspaceBoundaryRepository
+    from schemas.contracts.boundary import DocumentSnapshot
+    from services.evaluation.benchmark_scorer import evaluate_grounded_answer
+    import services.retrieval.run_structured_aggregate as rsa
+
+    csv_path = tmp_path / "sales_metrics_tbl.csv"
+    csv_path.write_text("Year,Region,Revenue\n2024,North,1000\n2025,North,1250\n", encoding="utf-8")
+
+    ws = "ws_synth_prov"
+    doc_id = "doc_synth_01"
+    registered_filename = "annual_metrics_2026.csv"
+    store = get_shared_table_store()
+    ingest_csv_to_table_store(
+        path=csv_path,
+        document_id=doc_id,
+        workspace_id=ws,
+        store=store,
+        batch_size=100,
+    )
+    man = store.get_ingestion_manifest(doc_id, ws)
+    assert man is not None
+    doc_version = man["document_version"]
+    man["coverage_complete"] = True
+    store.publish_active_version("sales_metrics_tbl", ws, doc_id, doc_version, man)
+
+    boundary_repo = InMemoryWorkspaceBoundaryRepository()
+    boundary_repo.save_document_snapshot(
+        DocumentSnapshot(
+            workspace_id=ws,
+            document_id=doc_id,
+            source=registered_filename,
+            version=doc_version,
+            format="csv",
+            incomplete_coverage_flag=False,
+            persisted_rows=2,
+            total_rows=2,
+            created_at="2026-11-25T00:00:00Z",
+        )
+    )
+    monkeypatch.setattr(rsa, "get_workspace_boundary_repo", lambda: boundary_repo, raising=False)
+
+    init_request_telemetry()
+    res = pipeline.run(
+        query="What is the earliest and latest Year in annual_metrics_2026.csv?",
+        workspace_id=ws,
+        document_ids=[doc_id],
+    )
+
+    assert res.executed_path == "structured_aggregate"
+    assert res.citations[0]["table_id"] == "sales_metrics_tbl"
+    assert res.citations[0]["document_filename"] == registered_filename
+    assert res.retained_evidence_items[0].citation_payload["document_filename"] == registered_filename
+    assert res.retained_evidence_items[0].provenance["document_filename"] == registered_filename
+
+    score_ok = evaluate_grounded_answer(
+        answer=res.answer,
+        citations=res.citations,
+        is_answer_text_correct=True,
+        question_type="structured_aggregate",
+        expected_sources=[registered_filename],
+        expected_source_version=doc_version,
+        retained_evidence_items=res.retained_evidence_items,
+    )
+    assert score_ok["is_grounded_correct"] is True
+
+    score_bad_ver = evaluate_grounded_answer(
+        answer=res.answer,
+        citations=res.citations,
+        is_answer_text_correct=True,
+        question_type="structured_aggregate",
+        expected_sources=[registered_filename],
+        expected_source_version="wrong_version",
+        retained_evidence_items=res.retained_evidence_items,
+    )
+    assert score_bad_ver["is_grounded_correct"] is False
+
+    score_bad_src = evaluate_grounded_answer(
+        answer=res.answer,
+        citations=res.citations,
+        is_answer_text_correct=True,
+        question_type="structured_aggregate",
+        expected_sources=["other_file.csv"],
+        expected_source_version=doc_version,
+        retained_evidence_items=res.retained_evidence_items,
+    )
+    assert score_bad_src["is_grounded_correct"] is False
+
+
+def test_structured_aggregate_citation_provenance_missing_and_mismatched_snapshot(tmp_path, monkeypatch):
+    from db.workspace_boundary_repo import InMemoryWorkspaceBoundaryRepository
+    from schemas.contracts.boundary import DocumentSnapshot
+    from services.evaluation.benchmark_scorer import evaluate_grounded_answer
+    import services.retrieval.run_structured_aggregate as rsa
+
+    csv_path = tmp_path / "sales_metrics_tbl.csv"
+    csv_path.write_text("Year,Region,Revenue\n2024,North,1000\n2025,North,1250\n", encoding="utf-8")
+
+    ws = "ws_synth_prov_neg"
+    doc_id = "doc_synth_neg_01"
+    registered_filename = "annual_metrics_2026.csv"
+    store = get_shared_table_store()
+    ingest_csv_to_table_store(
+        path=csv_path,
+        document_id=doc_id,
+        workspace_id=ws,
+        store=store,
+        batch_size=100,
+    )
+    man = store.get_ingestion_manifest(doc_id, ws)
+    assert man is not None
+    doc_version = man["document_version"]
+    man["coverage_complete"] = True
+    store.publish_active_version("sales_metrics_tbl", ws, doc_id, doc_version, man)
+
+    # Case 1: Missing workspace snapshot -> filename must remain absent (not inferred from table_id)
+    empty_repo = InMemoryWorkspaceBoundaryRepository()
+    monkeypatch.setattr(rsa, "get_workspace_boundary_repo", lambda: empty_repo, raising=False)
+
+    init_request_telemetry()
+    res_missing = pipeline.run(
+        query="What is the earliest and latest Year in sales_metrics_tbl?",
+        workspace_id=ws,
+        document_ids=[doc_id],
+    )
+    assert res_missing.executed_path == "structured_aggregate"
+    assert "document_filename" not in res_missing.citations[0]
+    assert "document_filename" not in res_missing.retained_evidence_items[0].citation_payload
+    assert "document_filename" not in res_missing.retained_evidence_items[0].structured_payload
+    assert "document_filename" not in res_missing.retained_evidence_items[0].provenance
+
+    score_missing = evaluate_grounded_answer(
+        answer=res_missing.answer,
+        citations=res_missing.citations,
+        is_answer_text_correct=True,
+        question_type="structured_aggregate",
+        expected_sources=[registered_filename],
+        expected_source_version=doc_version,
+        retained_evidence_items=res_missing.retained_evidence_items,
+    )
+    assert score_missing["is_grounded_correct"] is False
+
+    # Case 2: Snapshot version differs from aggregate result -> filename must remain absent
+    mismatch_repo = InMemoryWorkspaceBoundaryRepository()
+    mismatch_repo.save_document_snapshot(
+        DocumentSnapshot(
+            workspace_id=ws,
+            document_id=doc_id,
+            source=registered_filename,
+            version="stale_version_000",
+            format="csv",
+            incomplete_coverage_flag=False,
+            persisted_rows=2,
+            total_rows=2,
+            created_at="2026-11-25T00:00:00Z",
+        )
+    )
+    monkeypatch.setattr(rsa, "get_workspace_boundary_repo", lambda: mismatch_repo, raising=False)
+
+    init_request_telemetry()
+    res_mismatch = pipeline.run(
+        query="What is the earliest and latest Year in sales_metrics_tbl?",
+        workspace_id=ws,
+        document_ids=[doc_id],
+    )
+    assert res_mismatch.executed_path == "structured_aggregate"
+    assert "document_filename" not in res_mismatch.citations[0]
+    assert "document_filename" not in res_mismatch.retained_evidence_items[0].citation_payload
+    assert "document_filename" not in res_mismatch.retained_evidence_items[0].structured_payload
+    assert "document_filename" not in res_mismatch.retained_evidence_items[0].provenance
+
+    score_mismatch = evaluate_grounded_answer(
+        answer=res_mismatch.answer,
+        citations=res_mismatch.citations,
+        is_answer_text_correct=True,
+        question_type="structured_aggregate",
+        expected_sources=[registered_filename],
+        expected_source_version=doc_version,
+        retained_evidence_items=res_mismatch.retained_evidence_items,
+    )
+    assert score_mismatch["is_grounded_correct"] is False
+
+
+def test_structured_aggregate_stage_timings_recorded(populated_workspace):
+    ws, doc_id = populated_workspace
+    init_request_telemetry()
+    res = pipeline.run(
+        query="What is the earliest and latest Year actually present in survay.csv?",
+        workspace_id=ws,
+        document_ids=[doc_id],
+    )
+    assert res.executed_path == "structured_aggregate"
+    timings = res.stage_timings
+    assert "table_lookup_ms" in timings
+    assert "row_reads_ms" in timings
+    assert "computation_ms" in timings
+    assert "structured_aggregate_ms" in timings
+    assert timings["table_lookup_ms"] >= 0.0
+    assert timings["row_reads_ms"] >= 0.0
+    assert timings["computation_ms"] >= 0.0
+    assert timings["structured_aggregate_ms"] >= 0.0
+
+
+
+

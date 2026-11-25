@@ -644,3 +644,103 @@ def test_comparator_accepts_matching_2_3_manifests():
     assert res["comparable"] is True
     assert res["status"] == "COMPARABLE"
     assert res["deltas"]["overall_accuracy_delta"] == pytest.approx(0.0167, abs=1e-4)
+
+
+def test_benchmark_serialization_preserves_pre_rerank_and_compressed_context_order(tmp_path, monkeypatch):
+    """Verify run_reranker records ordered pre_rerank IDs and run_benchmark preserves compressed_context_chunk_ids order."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+    from schemas.models import Chunk
+    from services.langgraph_pipeline import run_reranker
+    import scripts.run_canonical_60_benchmark as bench_mod
+
+    ordered_pre = ["z_cand_3", "a_cand_1", "m_cand_2"]
+    mock_chunks = [
+        Chunk(id=cid, document_id="doc1", text=f"text for {cid}", page_number=1, element_type="narrative", source_format="pdf", metadata={"strategy": "bm25"})
+        for cid in ordered_pre
+    ]
+    state = {
+        "query": "test query",
+        "workspace_id": "ws_test",
+        "bm25_candidates": mock_chunks,
+        "candidate_chunks": [],
+        "graph_chunks": [],
+        "structural_candidates": [],
+        "okf_candidates": [],
+        "stage_timings": {},
+        "retrieval_candidates": {},
+    }
+    with patch("services.langgraph_pipeline.rerank", return_value=([mock_chunks[1], mock_chunks[0]], "lexical_bm25_plus", {})):
+        rr_out = run_reranker(state)
+    assert rr_out["retrieval_candidates"]["pre_rerank"] == ordered_pre
+
+    ordered_compressed = ["c_last", "a_first", "b_mid"]
+    suite_file = tmp_path / "suite.json"
+    suite_file.write_text(
+        json.dumps({
+            "documents": [],
+            "questions": [{
+                "id": "Q1",
+                "category": "FACTUAL",
+                "question": "What is X?",
+                "expected_answer": "X",
+                "expected_sources": ["doc.pdf"],
+                "ground_truth_chunk_ids": ["a_first"],
+            }],
+        }),
+        encoding="utf-8",
+    )
+
+    mock_service = MagicMock()
+    mock_service.execute_query.return_value = {
+        "answer": "X",
+        "cached": False,
+        "citations": [{"chunk_id": "a_first", "document_id": "doc1", "document_filename": "doc.pdf", "page_number": 1, "location_reference": "Page: 1"}],
+        "executed_path": "full",
+        "planned_path": "full",
+        "reranker_mode": "lexical_bm25_plus",
+        "reranker_telemetry": {},
+        "pre_rerank_chunk_ids": ordered_pre,
+        "reranked_chunk_ids": ["a_cand_1", "z_cand_3"],
+        "compressed_context_chunk_ids": ordered_compressed,
+        "llm_cited_chunk_ids": ["a_first"],
+        "final_citation_chunk_ids": ["a_first"],
+        "retained_evidence_items": [],
+        "latency_breakdown": {"table_lookup_ms": 1.2, "row_reads_ms": 3.4, "computation_ms": 0.5, "total_ms": 10.0},
+    }
+
+    mock_repo = MagicMock()
+    mock_repo.get_all_chunks.return_value = [SimpleNamespace(id="a_first", document_id="doc1", metadata={"document_filename": "doc.pdf"})]
+
+    gt_file = tmp_path / "gt.json"
+    gt_file.write_text(
+        json.dumps({"Q1": {"answer_contract": {"contract_type": "semantic", "expected_answer": "X"}}}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(bench_mod, "ROOT_DIR", tmp_path)
+    monkeypatch.setattr(bench_mod, "BACKEND_DIR", tmp_path / "backend")
+    monkeypatch.setattr(bench_mod, "GROUND_TRUTH_FILE", gt_file)
+    monkeypatch.setattr(bench_mod, "QueryService", lambda **kw: mock_service)
+    monkeypatch.setattr(bench_mod, "QueryRepository", lambda: mock_repo)
+    monkeypatch.setattr(bench_mod, "get_current_commit_sha", lambda: "testsha123")
+    monkeypatch.setattr(bench_mod, "verify_live_providers", lambda: None)
+    monkeypatch.setattr(bench_mod, "invalidate_chunk_cache", lambda: None)
+    monkeypatch.setattr(bench_mod, "compute_corpus_manifest_hash", lambda docs: ("corpus_sha", {}))
+    monkeypatch.setattr("db.table_store.get_shared_table_store", lambda **kw: MagicMock())
+
+    res = bench_mod.run_benchmark(
+        workspace_id="ws_test",
+        benchmark_type="cold",
+        test_path="suite.json",
+        allow_dirty=True,
+    )
+    saved_dirs = list((tmp_path / "backend" / "reports" / "testsha123").iterdir())
+    assert len(saved_dirs) == 1
+    details = json.loads((saved_dirs[0] / "query_details.json").read_text(encoding="utf-8"))
+    assert len(details) == 1
+    assert details[0]["pre_rerank_chunk_ids"] == ordered_pre
+    assert details[0]["compressed_context_chunk_ids"] == ordered_compressed
+    assert details[0]["stage_timings"]["table_lookup_ms"] == 1.2
+    assert res["total_questions"] == 1
+

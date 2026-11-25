@@ -6,6 +6,7 @@ import time
 from typing import Any
 
 from db.table_store import get_shared_table_store
+from db.workspace_boundary_repo import get_workspace_boundary_repo
 from schemas.models import RerankerMode
 from services.retrieval.structured_query_service import (
     AmbiguousBindingError,
@@ -21,9 +22,30 @@ from services.telemetry import record_structured_aggregate
 logger = logging.getLogger(__name__)
 
 
-def build_structured_evidence_ref(result: StructuredQueryResult, workspace_id: str) -> dict[str, Any]:
+def _resolve_document_filename(
+    workspace_id: str,
+    document_id: str,
+    document_version: str | None,
+) -> str | None:
+    """Resolve authoritative registered filename from workspace document metadata."""
+    try:
+        snap = get_workspace_boundary_repo().get_document_snapshot(workspace_id, document_id)
+    except Exception:
+        return None
+    if snap is None or not getattr(snap, "source", None):
+        return None
+    if document_version and getattr(snap, "version", None) and str(snap.version) != str(document_version):
+        return None
+    return str(snap.source)
+
+
+def build_structured_evidence_ref(
+    result: StructuredQueryResult,
+    workspace_id: str,
+    document_filename: str | None = None,
+) -> dict[str, Any]:
     """Build a verifiable structured-evidence reference containing typed predicates and row digest."""
-    return {
+    ref: dict[str, Any] = {
         "evidence_type": "structured_aggregate",
         "document_id": result.document_id,
         "document_version": result.document_version,
@@ -43,6 +65,9 @@ def build_structured_evidence_ref(result: StructuredQueryResult, workspace_id: s
         "text": result.answer_text,
         "text_snippet": result.answer_text[:200],
     }
+    if document_filename:
+        ref["document_filename"] = document_filename
+    return ref
 
 
 def execute(state: dict[str, Any]) -> dict[str, Any]:
@@ -140,8 +165,27 @@ def execute(state: dict[str, Any]) -> dict[str, Any]:
         citations = []
         retained_evidence_items = []
     else:
-        citation = build_structured_evidence_ref(result, workspace_id)
+        doc_filename = _resolve_document_filename(
+            workspace_id, result.document_id, result.document_version
+        )
+        citation = build_structured_evidence_ref(
+            result, workspace_id, document_filename=doc_filename
+        )
         from services.retrieval.evidence_contract import EvidenceItem
+        structured_payload = {
+            "table_id": result.table_id,
+            "document_version": result.document_version,
+            "operator": result.operator,
+            "target_column": result.target_column,
+            "selection_hash": result.selection_hash,
+            "selection_count": result.selection_count,
+            "result_value": str(result.result_value) if result.result_value is not None else None,
+            "secondary_value": str(result.secondary_value) if result.secondary_value is not None else None,
+        }
+        provenance: dict[str, Any] = {"table_id": result.table_id, "row_indices": result.row_indices}
+        if doc_filename:
+            structured_payload["document_filename"] = doc_filename
+            provenance["document_filename"] = doc_filename
         ev_item = EvidenceItem(
             evidence_id=f"table_{result.table_id}_{result.selection_hash}",
             workspace_id=workspace_id,
@@ -157,24 +201,16 @@ def execute(state: dict[str, Any]) -> dict[str, Any]:
                 "location_reference": citation["location_reference"],
             },
             text=result.answer_text,
-            structured_payload={
-                "table_id": result.table_id,
-                "document_version": result.document_version,
-                "operator": result.operator,
-                "target_column": result.target_column,
-                "selection_hash": result.selection_hash,
-                "selection_count": result.selection_count,
-                "result_value": str(result.result_value) if result.result_value is not None else None,
-                "secondary_value": str(result.secondary_value) if result.secondary_value is not None else None,
-            },
+            structured_payload=structured_payload,
             score=result.overall_confidence,
             strategy="structured_table",
-            provenance={"table_id": result.table_id, "row_indices": result.row_indices},
+            provenance=provenance,
             citation_payload=citation,
         )
         citations = [citation]
         retained_evidence_items = [ev_item]
 
+    sub_timings = getattr(result, "stage_timings", None) or {}
     return {
         "final_answer": result.answer_text,
         "citations": citations,
@@ -189,5 +225,9 @@ def execute(state: dict[str, Any]) -> dict[str, Any]:
         "is_refusal": is_refusal,
         "retrieval_candidates": {"structured_rows": result.row_ids},
         "reranker_mode": RerankerMode.BYPASSED.value,
-        "stage_timings": {**existing_timings, "structured_aggregate_ms": latency_ms},
+        "stage_timings": {
+            **existing_timings,
+            **sub_timings,
+            "structured_aggregate_ms": latency_ms,
+        },
     }

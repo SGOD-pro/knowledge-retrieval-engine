@@ -524,6 +524,7 @@ class QueryService:
             "structured_aggregate_calls": getattr(req_telemetry, "structured_aggregate_calls", 0),
             "telemetry": req_telemetry.to_dict(),
             "reranked_chunk_ids": retrieval_candidates.get("reranked", []),
+            "pre_rerank_chunk_ids": retrieval_candidates.get("pre_rerank", retrieval_candidates.get("rrf", [])),
             "compressed_context_chunk_ids": retrieval_candidates.get("compressed_context", []),
             "llm_cited_chunk_ids": retrieval_candidates.get("llm_citations", []),
             "final_citation_chunk_ids": final_cit_ids,

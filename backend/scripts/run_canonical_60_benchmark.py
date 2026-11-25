@@ -463,7 +463,12 @@ def run_benchmark(
                 ans_text = str(ans_raw or "")
             candidates = resp.get("retrieval_candidates", {})
             reranked_ids = resp.get("reranked_chunk_ids") or candidates.get("reranked", [])
-            compressed_ids = set(resp.get("compressed_context_chunk_ids") or candidates.get("compressed_context", []))
+            pre_rerank_ids = list(
+                resp.get("pre_rerank_chunk_ids")
+                or candidates.get("pre_rerank")
+                or candidates.get("rrf", [])
+            )
+            compressed_ids = list(resp.get("compressed_context_chunk_ids") or candidates.get("compressed_context", []))
             llm_cited_ids = resp.get("llm_cited_chunk_ids") or candidates.get("llm_citations", [])
             top_citations = resp.get("citations", [])
             final_citation_ids = resp.get("final_citation_chunk_ids") or [
@@ -617,7 +622,9 @@ def run_benchmark(
                 "citation_validity": cit_val,
                 "latency_ms": round(query_latency_ms, 2),
                 "reranked_chunk_ids": reranked_ids,
-                "compressed_context_chunk_ids": list(compressed_ids),
+                "pre_rerank_chunk_ids": pre_rerank_ids,
+                "compressed_context_chunk_ids": compressed_ids,
+                "stage_timings": resp.get("latency_breakdown") or resp.get("stage_timings", {}),
                 "llm_cited_chunk_ids": llm_cited_ids,
                 "final_citation_chunk_ids": final_citation_ids,
                 "bedrock_embedding_calls": resp.get("bedrock_embedding_calls", 0),

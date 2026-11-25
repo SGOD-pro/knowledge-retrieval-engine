@@ -9,6 +9,7 @@ from decimal import Decimal
 import hashlib
 import logging
 import re
+import time
 from typing import Any
 
 from db.table_store.base import AggregateOp, Predicate, PredicateOp, TableStore
@@ -38,6 +39,32 @@ class StructuredQueryResult:
     document_version: str
     workspace_id: str
     unit: str | None
+    stage_timings: dict[str, float] | None = None
+
+
+class _TimedStoreProxy:
+    """Lightweight TableStore wrapper that accumulates row read and aggregate timings."""
+
+    def __init__(self, store: TableStore) -> None:
+        self._store = store
+        self.row_reads_ms: float = 0.0
+
+    def query_rows(self, *args: Any, **kwargs: Any) -> Any:
+        t0 = time.perf_counter()
+        try:
+            return self._store.query_rows(*args, **kwargs)
+        finally:
+            self.row_reads_ms += (time.perf_counter() - t0) * 1000.0
+
+    def aggregate(self, *args: Any, **kwargs: Any) -> Any:
+        t0 = time.perf_counter()
+        try:
+            return self._store.aggregate(*args, **kwargs)
+        finally:
+            self.row_reads_ms += (time.perf_counter() - t0) * 1000.0
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._store, name)
 
 
 class StructuredExecutionError(Exception):
@@ -101,6 +128,7 @@ class StructuredQueryService:
         if not workspace_id:
             raise ValueError("workspace_id must not be empty")
 
+        t_lookup_start = time.perf_counter()
         q_lower = query.lower()
 
         # 1. Discover authorised candidate tables in workspace
@@ -152,17 +180,35 @@ class StructuredQueryService:
 
         manifest = self.store.get_ingestion_manifest(selected_meta.document_id, workspace_id, selected_ver) or {}
         total_rows_in_table = int(manifest.get("persisted_rows", 0))
+        table_lookup_ms = (time.perf_counter() - t_lookup_start) * 1000.0
 
         # 4. Execute on bound table (never switches to another table)
-        return self._execute_on_table(
-            query=query,
-            table_id=selected_tid,
-            workspace_id=workspace_id,
-            document_id=selected_meta.document_id,
-            version=selected_ver,
-            schema=schema,
-            total_rows=total_rows_in_table,
-        )
+        t_exec_start = time.perf_counter()
+        timed_store = _TimedStoreProxy(self.store)
+        orig_store = self.store
+        self.store = timed_store
+        try:
+            result = self._execute_on_table(
+                query=query,
+                table_id=selected_tid,
+                workspace_id=workspace_id,
+                document_id=selected_meta.document_id,
+                version=selected_ver,
+                schema=schema,
+                total_rows=total_rows_in_table,
+            )
+        finally:
+            self.store = orig_store
+        exec_total_ms = (time.perf_counter() - t_exec_start) * 1000.0
+        if result is not None:
+            row_reads_ms = timed_store.row_reads_ms
+            computation_ms = max(0.0, exec_total_ms - row_reads_ms)
+            result.stage_timings = {
+                "table_lookup_ms": round(table_lookup_ms, 3),
+                "row_reads_ms": round(row_reads_ms, 3),
+                "computation_ms": round(computation_ms, 3),
+            }
+        return result
 
     def _bind_table(
         self,
