@@ -14,8 +14,8 @@ from services.retrieval.table_metric_binding import (
     parse_financial_table_cells,
 )
 
-# Scorer 2.3.0: adds normalized date comparison, single-cell column binding, and query-forwarded financial constraints.
-SCORER_VERSION = "2.3.0"
+# Scorer 2.4.0: independently verifies cited derived arithmetic and date-duration calculations.
+SCORER_VERSION = "2.4.0"
 
 _MONTH_NAMES_RE = (
     r"january|february|march|april|may|june|july|august|september|october|november|december"
@@ -51,6 +51,155 @@ def _extract_dates_and_mask_text(
 
     masked = _DATE_SPAN_RE.sub(_replace, text)
     return dates, masked
+
+
+_FULL_DATE_SPAN_RE = re.compile(
+    rf"\b(?:\d{{1,2}}\s+(?:{_MONTH_NAMES_RE})\s+\d{{4}}|(?:{_MONTH_NAMES_RE})\s+\d{{1,2}},?\s+\d{{4}}|\d{{1,2}}/\d{{1,2}}/\d{{4}}|\d{{4}}-\d{{2}}-\d{{2}})\b",
+    re.IGNORECASE,
+)
+
+
+def _extract_full_dates(text: str) -> list[tuple[int, int, int]]:
+    """Extract normalized (year, month, day) tuples from text."""
+    from datetime import datetime
+
+    if not text:
+        return []
+    month_map = {
+        "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+        "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
+        "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9,
+        "oct": 10, "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
+    }
+    out: list[tuple[int, int, int]] = []
+    for match in _FULL_DATE_SPAN_RE.finditer(text):
+        raw = match.group(0).strip()
+        ymd: tuple[int, int, int] | None = None
+        if "/" in raw:
+            for fmt in ("%d/%m/%Y", "%m/%d/%Y"):
+                try:
+                    dt = datetime.strptime(raw, fmt)
+                    ymd = (dt.year, dt.month, dt.day)
+                    break
+                except ValueError:
+                    continue
+        elif "-" in raw:
+            try:
+                dt = datetime.strptime(raw, "%Y-%m-%d")
+                ymd = (dt.year, dt.month, dt.day)
+            except ValueError:
+                ymd = None
+        else:
+            parts = re.findall(r"[A-Za-z]+|\d+", raw)
+            if len(parts) == 3:
+                if parts[0].isdigit() and parts[1].lower() in month_map:
+                    ymd = (int(parts[2]), month_map[parts[1].lower()], int(parts[0]))
+                elif parts[0].lower() in month_map and parts[1].isdigit():
+                    ymd = (int(parts[2]), month_map[parts[0].lower()], int(parts[1]))
+        if ymd is not None and ymd not in out:
+            out.append(ymd)
+    return out
+
+
+def _norm_decimal(raw: str) -> Decimal | None:
+    try:
+        return Decimal(raw.replace(",", "").strip())
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def _matching_ans_nums(target: Decimal, ans_nums: set[str], tol: Decimal = Decimal("0.02")) -> set[str]:
+    matched: set[str] = set()
+    for n in ans_nums:
+        val = _norm_decimal(n)
+        if val is not None and abs(val - target) <= tol:
+            matched.add(n)
+    return matched
+
+
+def _verify_cited_derived_calculations(
+    answer: str,
+    ans_nums: set[str],
+    context_nums: set[str],
+    joined_context: str,
+    allowed_operands: set[str] | None = None,
+) -> set[str]:
+    """Independently verify explicit arithmetic and date-duration results using cited retained operands."""
+    from datetime import date
+
+    verified: set[str] = set()
+    if not answer or not joined_context:
+        return verified
+
+    eligible_nums = context_nums & allowed_operands if allowed_operands else context_nums
+
+    # 1. Explicit subtraction: A - B, A − B, A minus B
+    for m in re.finditer(r"(\d[\d,]*(?:\.\d+)?)\s*(?:-|−|\bminus\b)\s*(\d[\d,]*(?:\.\d+)?)", answer, re.IGNORECASE):
+        a_norms = extract_numbers_normalized(m.group(1))
+        b_norms = extract_numbers_normalized(m.group(2))
+        if (a_norms & eligible_nums) and (b_norms & eligible_nums):
+            a_val, b_val = _norm_decimal(m.group(1)), _norm_decimal(m.group(2))
+            if a_val is not None and b_val is not None:
+                verified.update(_matching_ans_nums(a_val - b_val, ans_nums))
+                if re.search(r"\b(?:difference|change|increase|decrease)\b", answer, re.IGNORECASE):
+                    verified.update(_matching_ans_nums(abs(a_val - b_val), ans_nums))
+
+    # 2. Explicit division / percentage: A / B (* 100)
+    for m in re.finditer(
+        r"(\d[\d,]*(?:\.\d+)?)\s*(?:/|÷|\bdivided\s+by\b)\s*(\d[\d,]*(?:\.\d+)?)(?:\s*(?:\*|×|x)\s*100\b)?",
+        answer,
+        re.IGNORECASE,
+    ):
+        a_norms = extract_numbers_normalized(m.group(1))
+        b_norms = extract_numbers_normalized(m.group(2))
+        if (a_norms & eligible_nums) and (b_norms & eligible_nums):
+            a_val, b_val = _norm_decimal(m.group(1)), _norm_decimal(m.group(2))
+            if a_val is not None and b_val is not None and b_val != 0:
+                ratio = a_val / b_val
+                if "100" in m.group(0) or "%" in answer:
+                    pct_matched = _matching_ans_nums(ratio * Decimal(100), ans_nums)
+                    if pct_matched:
+                        verified.update(pct_matched)
+                        if "100" in m.group(0):
+                            verified.add("100")
+                verified.update(_matching_ans_nums(ratio, ans_nums))
+
+    # 3. Explicit multiplication: A * B, A × B
+    for m in re.finditer(r"(\d[\d,]*(?:\.\d+)?)\s*(?:\*|×|\btimes\b)\s*(\d[\d,]*(?:\.\d+)?)", answer, re.IGNORECASE):
+        a_norms = extract_numbers_normalized(m.group(1))
+        b_norms = extract_numbers_normalized(m.group(2))
+        if (a_norms & eligible_nums) and (b_norms & eligible_nums):
+            a_val, b_val = _norm_decimal(m.group(1)), _norm_decimal(m.group(2))
+            if a_val is not None and b_val is not None:
+                verified.update(_matching_ans_nums(a_val * b_val, ans_nums))
+
+    # 4. Addition with explicit sum/add cue over cited operands in answer
+    if re.search(r"\b(?:add|adding|sum|total|plus)\b|\+", answer, re.IGNORECASE):
+        grounded_ops = sorted(
+            (n, _norm_decimal(n))
+            for n in (ans_nums & eligible_nums)
+            if _norm_decimal(n) is not None
+        )
+        if len(grounded_ops) >= 2:
+            op_sum = sum(v for _, v in grounded_ops)
+            op_keys = {k for k, _ in grounded_ops}
+            candidates = _matching_ans_nums(op_sum, ans_nums - op_keys)
+            verified.update(candidates)
+
+    # 5. Date-difference duration in days when all dates in answer exist in cited retained context
+    if re.search(r"\bdays?\b", answer, re.IGNORECASE):
+        ans_full_dates = _extract_full_dates(answer)
+        ctx_full_dates = set(_extract_full_dates(joined_context))
+        if len(ans_full_dates) >= 2 and all(d in ctx_full_dates for d in ans_full_dates):
+            for i in range(len(ans_full_dates)):
+                for j in range(i + 1, len(ans_full_dates)):
+                    try:
+                        days_diff = abs((date(*ans_full_dates[j]) - date(*ans_full_dates[i])).days)
+                        verified.update(_matching_ans_nums(Decimal(days_diff), ans_nums, tol=Decimal("0")))
+                    except ValueError:
+                        continue
+
+    return verified
 
 
 def _extract_durations(text: str) -> list[tuple[str, str]]:
@@ -1874,31 +2023,6 @@ def evaluate_grounded_answer(
             "faithfulness": None,
         }
 
-    faith_score = compute_faithfulness(str(answer), joined_context)
-    if faith_score is None or faith_score < 0.25:
-        return {
-            "is_grounded_correct": False,
-            "grounded_correct": False,
-            "reason": f"claim_unsupported: low citation faithfulness ({faith_score})",
-            "citation_validation": cit_val,
-            "faithfulness": faith_score,
-        }
-
-    # Check claim-level contradiction against authoritative retained context
-    contra = detect_contradiction_against_evidence(
-        answer=str(answer),
-        context=joined_context,
-        contract=contract,
-    )
-    if contra:
-        return {
-            "is_grounded_correct": False,
-            "grounded_correct": False,
-            "reason": contra,
-            "citation_validation": cit_val,
-            "faithfulness": faith_score,
-        }
-
     # Normalize recognized dates and durations so date components stay out of financial amount matching
     ans_dates, masked_answer = _extract_dates_and_mask_text(str(answer))
     context_dates, masked_context = _extract_dates_and_mask_text(joined_context)
@@ -1925,6 +2049,20 @@ def evaluate_grounded_answer(
         if all_operands_present:
             valid_derived_targets.update(contract_targets)
 
+    # Independently verify explicit arithmetic and date-difference calculations from cited retained operands
+    allowed_ops: set[str] | None = None
+    if raw_operands:
+        allowed_ops = set()
+        for op_item in raw_operands:
+            allowed_ops.update(extract_numbers_normalized(str(op_item)))
+    verified_derived_results = _verify_cited_derived_calculations(
+        answer=str(answer),
+        ans_nums=ans_nums,
+        context_nums=context_nums,
+        joined_context=joined_context,
+        allowed_operands=allowed_ops,
+    )
+
     ans_years = {n for n in ans_nums if len(n) == 4 and n.isdigit() and 1900 <= int(n) <= 2099}
     ans_amounts = ans_nums - ans_years
 
@@ -1932,8 +2070,39 @@ def evaluate_grounded_answer(
     asserted_amounts = {n for n in ans_amounts if not _is_entity_negated_in_text(n, str(answer))}
     asserted_years = {n for n in ans_years if not _is_entity_negated_in_text(n, str(answer))}
 
+    faith_score = compute_faithfulness(str(answer), joined_context)
+    if faith_score is None or faith_score < 0.25:
+        all_amounts_grounded = not (
+            asserted_amounts - context_nums - valid_derived_targets - verified_derived_results
+        )
+        if not (verified_derived_results and all_amounts_grounded):
+            return {
+                "is_grounded_correct": False,
+                "grounded_correct": False,
+                "reason": f"claim_unsupported: low citation faithfulness ({faith_score})",
+                "citation_validation": cit_val,
+                "faithfulness": faith_score,
+            }
+
+    # Check claim-level contradiction against authoritative retained context
+    contra = detect_contradiction_against_evidence(
+        answer=str(answer),
+        context=joined_context,
+        contract=contract,
+    )
+    if contra:
+        return {
+            "is_grounded_correct": False,
+            "grounded_correct": False,
+            "reason": contra,
+            "citation_validation": cit_val,
+            "faithfulness": faith_score,
+        }
+
     if asserted_amounts:
-        unsupported = asserted_amounts - context_nums - valid_derived_targets
+        unsupported = (
+            asserted_amounts - context_nums - valid_derived_targets - verified_derived_results
+        )
         if unsupported:
             return {
                 "is_grounded_correct": False,
@@ -1964,7 +2133,7 @@ def evaluate_grounded_answer(
         for raw, parsed in ans_dates
         if parsed and not _is_entity_negated_in_text(raw, str(answer))
     ]
-    ctx_date_set = {parsed for _, parsed in context_dates if parsed}
+    ctx_date_set = {parsed for _, parsed in context_dates if parsed} | set(_extract_full_dates(joined_context))
     for raw_date, parsed_date in asserted_dates:
         y, m, d = parsed_date
         if d is not None:

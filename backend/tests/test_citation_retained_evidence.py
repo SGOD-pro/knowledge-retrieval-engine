@@ -162,3 +162,233 @@ def test_mixed_valid_regular_and_fabricated_structured():
         retained_structured_hashes={"abcdef1234567890"},
     )
     assert result["valid"] is False
+
+
+def test_grounded_deterministic_arithmetic_concise_and_derived_with_controls():
+    """Verify concise calculations and derived values from cited retained operands, while rejecting invalid controls."""
+    from services.evaluation.benchmark_scorer import evaluate_grounded_answer
+
+    filler = " ".join(f"Line item {i} value {1000 + i}" for i in range(45))
+
+    # 1. Correct concise subtraction (Q139 pattern: low bag-of-words overlap against verbose table)
+    cid_bs = "doc-fin:page:6:element:5"
+    ev_bs = [
+        {
+            "evidence_id": cid_bs,
+            "document_id": "doc-fin",
+            "document_filename": "report.pdf",
+            "document_version": "v1",
+            "text": f"CONDENSED BALANCE SHEETS Net assets 149,818; Prior 149,326. {filler}",
+            "locator": {"page_number": 6},
+        }
+    ]
+    cit_bs = [{"chunk_id": cid_bs, "document_id": "doc-fin", "document_filename": "report.pdf", "document_version": "v1", "page_number": 6}]
+    res_sub = evaluate_grounded_answer(
+        answer="492 million dollars: 149818 minus 149326",
+        citations=cit_bs,
+        is_answer_text_correct=True,
+        contract_type="numeric",
+        contract={"contract_type": "numeric", "target_values": [492.0], "operands": [149818.0, 149326.0]},
+        expected_sources=["report.pdf"],
+        expected_source_version="v1",
+        retained_evidence_items=ev_bs,
+        context_chunk_ids=[cid_bs],
+        ground_truth_chunk_ids=[cid_bs],
+        outcome={"executed_path": "deterministic_math"},
+    )
+    assert res_sub["is_grounded_correct"] is True, res_sub.get("reason")
+
+    # 2. Correct concise percentage ratio (Q138 pattern)
+    res_pct = evaluate_grounded_answer(
+        answer="28.09%, calculated as 30739 / 109417 × 100",
+        citations=[{"chunk_id": "doc-fin:page:4:element:3", "document_id": "doc-fin", "document_filename": "report.pdf", "document_version": "v1", "page_number": 4}],
+        is_answer_text_correct=True,
+        contract_type="numeric",
+        contract={"contract_type": "numeric", "target_values": [28.09], "operands": [30739.0, 109417.0]},
+        expected_sources=["report.pdf"],
+        expected_source_version="v1",
+        retained_evidence_items=[{
+            "evidence_id": "doc-fin:page:4:element:3",
+            "document_id": "doc-fin",
+            "document_filename": "report.pdf",
+            "document_version": "v1",
+            "text": f"STATEMENTS OF OPERATIONS Services 30,739; Total 109,417. {filler}",
+            "locator": {"page_number": 4},
+        }],
+        context_chunk_ids=["doc-fin:page:4:element:3"],
+        ground_truth_chunk_ids=["doc-fin:page:4:element:3"],
+        outcome={"executed_path": "deterministic_math"},
+    )
+    assert res_pct["is_grounded_correct"] is True, res_pct.get("reason")
+
+    # 3. Valid derived sum absent verbatim from cited sources (Q146 semantic contract pattern)
+    ev_sum = [
+        {"evidence_id": "xls:row1", "document_id": "doc-xls", "document_filename": "survey.xls", "document_version": "v1", "text": "District A Households surveyed: 874.", "locator": {"sheet_name": "Sheet1", "row_index": 1}},
+        {"evidence_id": "xls:row2", "document_id": "doc-xls", "document_filename": "survey.xls", "document_version": "v1", "text": "District B Households surveyed: 882.", "locator": {"sheet_name": "Sheet1", "row_index": 2}},
+        {"evidence_id": "xls:row3", "document_id": "doc-xls", "document_filename": "survey.xls", "document_version": "v1", "text": "District C Households surveyed: 868.", "locator": {"sheet_name": "Sheet1", "row_index": 3}},
+    ]
+    cit_sum = [{"chunk_id": f"xls:row{i}", "document_id": "doc-xls", "document_filename": "survey.xls", "document_version": "v1", "location_reference": f"Sheet1 row {i}"} for i in (1, 2, 3)]
+    res_sum = evaluate_grounded_answer(
+        answer="Total households surveyed is 2624 by adding District A (874), District B (882), and District C (868).",
+        citations=cit_sum,
+        is_answer_text_correct=True,
+        contract_type="semantic",
+        contract={"contract_type": "semantic"},
+        expected_sources=["survey.xls"],
+        expected_source_version="v1",
+        retained_evidence_items=ev_sum,
+        context_chunk_ids=["xls:row1", "xls:row2", "xls:row3"],
+        ground_truth_chunk_ids=["xls:row1", "xls:row2", "xls:row3"],
+    )
+    assert res_sum["is_grounded_correct"] is True, res_sum.get("reason")
+
+    # 4. Valid date-difference duration in days (Q161 pattern)
+    cid_dt = "doc-csv:row2"
+    ev_dt = [{
+        "evidence_id": cid_dt,
+        "document_id": "doc-csv",
+        "document_filename": "bills.csv",
+        "document_version": "v1",
+        "text": "Bill XVII. Passed RS: 16/03/2016. Assent Date: 5/5/2016. Status: Assented.",
+        "locator": {"row_index": 2},
+    }]
+    cit_dt = [{"chunk_id": cid_dt, "document_id": "doc-csv", "document_filename": "bills.csv", "document_version": "v1", "location_reference": "row 2"}]
+    res_dt = evaluate_grounded_answer(
+        answer="50 days, from 16 March 2016 to 5 May 2016",
+        citations=cit_dt,
+        is_answer_text_correct=True,
+        contract_type="numeric",
+        contract={"contract_type": "numeric", "target_values": [50.0], "operands": []},
+        expected_sources=["bills.csv"],
+        expected_source_version="v1",
+        retained_evidence_items=ev_dt,
+        context_chunk_ids=[cid_dt],
+        ground_truth_chunk_ids=[cid_dt],
+        outcome={"executed_path": "deterministic_math"},
+    )
+    assert res_dt["is_grounded_correct"] is True, res_dt.get("reason")
+
+    # --- Negative Controls (all must remain REJECTED) ---
+    # Control A: Wrong arithmetic result (even with executed_path=deterministic_math)
+    res_wrong = evaluate_grounded_answer(
+        answer="500 million dollars: 149818 minus 149326",
+        citations=cit_bs,
+        is_answer_text_correct=True,
+        contract_type="numeric",
+        contract={"contract_type": "numeric", "target_values": [492.0], "operands": [149818.0, 149326.0]},
+        expected_sources=["report.pdf"],
+        expected_source_version="v1",
+        retained_evidence_items=ev_bs,
+        context_chunk_ids=[cid_bs],
+        ground_truth_chunk_ids=[cid_bs],
+        outcome={"executed_path": "deterministic_math"},
+    )
+    assert res_wrong["is_grounded_correct"] is False
+
+    # Control B: Missing / uncited operand (operand 149326 absent from cited evidence)
+    ev_missing_op = [{
+        "evidence_id": cid_bs,
+        "document_id": "doc-fin",
+        "document_filename": "report.pdf",
+        "document_version": "v1",
+        "text": f"CONDENSED BALANCE SHEETS Net assets 149,818 only. {filler}",
+        "locator": {"page_number": 6},
+    }]
+    res_missing = evaluate_grounded_answer(
+        answer="492 million dollars: 149818 minus 149326",
+        citations=cit_bs,
+        is_answer_text_correct=True,
+        contract_type="numeric",
+        expected_sources=["report.pdf"],
+        expected_source_version="v1",
+        retained_evidence_items=ev_missing_op,
+        context_chunk_ids=[cid_bs],
+        ground_truth_chunk_ids=[cid_bs],
+        outcome={"executed_path": "deterministic_math"},
+    )
+    assert res_missing["is_grounded_correct"] is False
+
+    # Control C: Wrong-source evidence
+    res_wrong_src = evaluate_grounded_answer(
+        answer="492 million dollars: 149818 minus 149326",
+        citations=[{"chunk_id": cid_bs, "document_id": "doc-fin", "document_filename": "other.pdf", "document_version": "v1", "page_number": 6}],
+        is_answer_text_correct=True,
+        contract_type="numeric",
+        expected_sources=["report.pdf"],
+        expected_source_version="v1",
+        retained_evidence_items=ev_bs,
+        context_chunk_ids=[cid_bs],
+        ground_truth_chunk_ids=[cid_bs],
+        outcome={"executed_path": "deterministic_math"},
+    )
+    assert res_wrong_src["is_grounded_correct"] is False
+
+    # Control D: Wrong-version evidence
+    res_wrong_ver = evaluate_grounded_answer(
+        answer="492 million dollars: 149818 minus 149326",
+        citations=[{"chunk_id": cid_bs, "document_id": "doc-fin", "document_filename": "report.pdf", "document_version": "v2", "page_number": 6}],
+        is_answer_text_correct=True,
+        contract_type="numeric",
+        expected_sources=["report.pdf"],
+        expected_source_version="v1",
+        retained_evidence_items=ev_bs,
+        context_chunk_ids=[cid_bs],
+        ground_truth_chunk_ids=[cid_bs],
+        outcome={"executed_path": "deterministic_math"},
+    )
+    assert res_wrong_ver["is_grounded_correct"] is False
+
+    # Control E: Wrong date-difference duration
+    res_wrong_dt = evaluate_grounded_answer(
+        answer="45 days, from 16 March 2016 to 5 May 2016",
+        citations=cit_dt,
+        is_answer_text_correct=True,
+        contract_type="numeric",
+        expected_sources=["bills.csv"],
+        expected_source_version="v1",
+        retained_evidence_items=ev_dt,
+        context_chunk_ids=[cid_dt],
+        ground_truth_chunk_ids=[cid_dt],
+        outcome={"executed_path": "deterministic_math"},
+    )
+    assert res_wrong_dt["is_grounded_correct"] is False
+
+    # Control F: Mathematically valid calculation using wrong row/metric operand in the same cited table
+    ev_multi_metric = [{
+        "evidence_id": "doc-fin:page:4:element:3",
+        "document_id": "doc-fin",
+        "document_filename": "report.pdf",
+        "document_version": "v1",
+        "text": f"STATEMENTS OF OPERATIONS Products 78,678; Services 30,739; Total 109,417. {filler}",
+        "locator": {"page_number": 4},
+    }]
+    res_wrong_metric_op = evaluate_grounded_answer(
+        answer="71.91%, calculated as 78678 / 109417 × 100",
+        citations=[{"chunk_id": "doc-fin:page:4:element:3", "document_id": "doc-fin", "document_filename": "report.pdf", "document_version": "v1", "page_number": 4}],
+        is_answer_text_correct=True,
+        contract_type="numeric",
+        contract={"contract_type": "numeric", "target_values": [28.09], "operands": [30739.0, 109417.0]},
+        expected_sources=["report.pdf"],
+        expected_source_version="v1",
+        retained_evidence_items=ev_multi_metric,
+        context_chunk_ids=["doc-fin:page:4:element:3"],
+        ground_truth_chunk_ids=["doc-fin:page:4:element:3"],
+        outcome={"executed_path": "deterministic_math"},
+    )
+    assert res_wrong_metric_op["is_grounded_correct"] is False
+
+    # Control G: Correct calculation accompanied by an unsupported numeric claim
+    res_extra_ungrounded = evaluate_grounded_answer(
+        answer="492 million dollars: 149818 minus 149326, plus 999999 bonus",
+        citations=cit_bs,
+        is_answer_text_correct=True,
+        contract_type="numeric",
+        contract={"contract_type": "numeric", "target_values": [492.0], "operands": [149818.0, 149326.0]},
+        expected_sources=["report.pdf"],
+        expected_source_version="v1",
+        retained_evidence_items=ev_bs,
+        context_chunk_ids=[cid_bs],
+        ground_truth_chunk_ids=[cid_bs],
+        outcome={"executed_path": "deterministic_math"},
+    )
+    assert res_extra_ungrounded["is_grounded_correct"] is False
