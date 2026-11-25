@@ -582,28 +582,28 @@ def test_offline_rescore_fails_on_refusal_with_fabricated_citations():
 # --- 6. Scorer Version and Comparator Gates ---
 
 def test_scorer_version_is_distinct():
-    """Verify scorer version is distinctly set to 2.4.0 and comparator rejects 2.3.0 vs 2.4.0."""
-    assert SCORER_VERSION == "2.4.0"
-    base_2_3 = {
-        "commit_sha": "base_commit_230",
+    """Verify scorer version is distinctly set to 2.5.0 and comparator rejects 2.4.0 vs 2.5.0."""
+    assert SCORER_VERSION == "2.5.0"
+    base_2_4 = {
+        "commit_sha": "base_commit_240",
         "baseline_commit_sha": "root_commit",
         "test_suite_sha256": "suite_sha_123",
         "corpus_manifest_sha256": "corpus_sha_456",
         "workspace_id": "ws_canonical_comparison_0004",
         "runner_version": "2.3.0",
-        "scorer_version": "2.3.0",
+        "scorer_version": "2.4.0",
         "embedding_model": "amazon.titan-embed-text-v2:0",
         "llm_model": "apac.amazon.nova-lite-v1:0",
         "reranker_policy": "lexical_bm25_plus",
         "cache_mode": "bypass_exact_and_semantic",
         "benchmark_type": "cold",
-        "metrics": {"grounded_accuracy": 0.3667},
+        "metrics": {"grounded_accuracy": 0.4333},
     }
-    cand_2_4 = dict(base_2_3)
-    cand_2_4["commit_sha"] = "cand_commit_240"
-    cand_2_4["baseline_commit_sha"] = "base_commit_230"
-    cand_2_4["scorer_version"] = "2.4.0"
-    cmp_res = compare_manifests(cand_2_4, base_2_3)
+    cand_2_5 = dict(base_2_4)
+    cand_2_5["commit_sha"] = "cand_commit_250"
+    cand_2_5["baseline_commit_sha"] = "base_commit_240"
+    cand_2_5["scorer_version"] = "2.5.0"
+    cmp_res = compare_manifests(cand_2_5, base_2_4)
     assert cmp_res["comparable"] is False
     assert cmp_res["status"] == NOT_COMPARABLE_MESSAGE
     assert any("scorer_version" in m for m in cmp_res["mismatches"])

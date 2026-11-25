@@ -14,8 +14,8 @@ from services.retrieval.table_metric_binding import (
     parse_financial_table_cells,
 )
 
-# Scorer 2.4.0: independently verifies cited derived arithmetic and date-duration calculations.
-SCORER_VERSION = "2.4.0"
+# Scorer 2.5.0: excludes validated, cited inline [chunk_id] tags from numeric claim extraction.
+SCORER_VERSION = "2.5.0"
 
 _MONTH_NAMES_RE = (
     r"january|february|march|april|may|june|july|august|september|october|november|december"
@@ -1997,6 +1997,7 @@ def evaluate_grounded_answer(
     # Text retrieval claim support validation:
     # Build context strictly from authoritative retained evidence items
     auth_snippets = []
+    validated_cited_chunk_ids: set[str] = set()
     for c in citations:
         matching_ev = None
         if retained_evidence_items:
@@ -2008,6 +2009,9 @@ def evaluate_grounded_answer(
             t = _get_ev_text(matching_ev).strip()
             if t:
                 auth_snippets.append(t)
+                cid_str = str(c.get("chunk_id") or "").strip()
+                if cid_str:
+                    validated_cited_chunk_ids.add(cid_str)
         else:
             snip = str(c.get("snippet") or c.get("text") or c.get("text_snippet") or "").strip()
             if snip:
@@ -2023,8 +2027,13 @@ def evaluate_grounded_answer(
             "faithfulness": None,
         }
 
+    # Exclude validated, cited inline [chunk_id] tags before numeric claim extraction
+    answer_for_claims = str(answer)
+    for cited_cid in validated_cited_chunk_ids:
+        answer_for_claims = answer_for_claims.replace(f"[{cited_cid}]", " ")
+
     # Normalize recognized dates and durations so date components stay out of financial amount matching
-    ans_dates, masked_answer = _extract_dates_and_mask_text(str(answer))
+    ans_dates, masked_answer = _extract_dates_and_mask_text(answer_for_claims)
     context_dates, masked_context = _extract_dates_and_mask_text(joined_context)
 
     # Verify numeric claims against context snippets or legitimate derived calculation targets

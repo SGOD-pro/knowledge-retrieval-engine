@@ -392,3 +392,108 @@ def test_grounded_deterministic_arithmetic_concise_and_derived_with_controls():
         outcome={"executed_path": "deterministic_math"},
     )
     assert res_extra_ungrounded["is_grounded_correct"] is False
+
+
+def test_inline_citation_ids_excluded_from_numeric_claims_only_when_validated_and_cited():
+    """Exclude inline [chunk_id] tags from numeric claim extraction only when validated and cited."""
+    from services.evaluation.benchmark_scorer import evaluate_grounded_answer
+
+    cid_cited = "b213f371-bf2b-5359-b568-db0ea20a508e:page:1:element:0"
+    cid_uncited = "b213f371-bf2b-5359-b568-db0ea20a508e:page:2:element:1"
+    ev_items = [
+        {
+            "evidence_id": cid_cited,
+            "document_id": "b213f371-bf2b-5359-b568-db0ea20a508e",
+            "document_filename": "retention.pdf",
+            "document_version": "v1",
+            "text": "The four stages of social learning are Attention, Retention, Reproduction, and Motivation.",
+            "locator": {"page_number": 1},
+        },
+        {
+            "evidence_id": cid_uncited,
+            "document_id": "b213f371-bf2b-5359-b568-db0ea20a508e",
+            "document_filename": "retention.pdf",
+            "document_version": "v1",
+            "text": "Additional discussion of social learning stages in retention memory.",
+            "locator": {"page_number": 2},
+        },
+    ]
+    cit_valid = [
+        {
+            "chunk_id": cid_cited,
+            "document_id": "b213f371-bf2b-5359-b568-db0ea20a508e",
+            "document_filename": "retention.pdf",
+            "document_version": "v1",
+            "page_number": 1,
+        }
+    ]
+
+    # 1. Valid inline citation matching cited retained evidence passes without false numeric rejection
+    res_valid = evaluate_grounded_answer(
+        answer=f"The stages are Attention, Retention, Reproduction, and Motivation. [{cid_cited}]",
+        citations=cit_valid,
+        is_answer_text_correct=True,
+        contract_type="semantic",
+        expected_sources=["retention.pdf"],
+        expected_source_version="v1",
+        retained_evidence_items=ev_items,
+        context_chunk_ids=[cid_cited, cid_uncited],
+        ground_truth_chunk_ids=[cid_cited],
+    )
+    assert res_valid["is_grounded_correct"] is True, res_valid.get("reason")
+
+    # 2. Real unsupported number alongside a valid inline citation still fails
+    res_real_num = evaluate_grounded_answer(
+        answer=f"There are 99999 stages: Attention, Retention, Reproduction, and Motivation. [{cid_cited}]",
+        citations=cit_valid,
+        is_answer_text_correct=True,
+        contract_type="semantic",
+        expected_sources=["retention.pdf"],
+        expected_source_version="v1",
+        retained_evidence_items=ev_items,
+        context_chunk_ids=[cid_cited],
+        ground_truth_chunk_ids=[cid_cited],
+    )
+    assert res_real_num["is_grounded_correct"] is False
+
+    # 3. Bracketed numeric value is not treated as a citation ID and still fails
+    res_bracket_num = evaluate_grounded_answer(
+        answer=f"The stages are Attention, Retention, Reproduction, and Motivation [5359]. [{cid_cited}]",
+        citations=cit_valid,
+        is_answer_text_correct=True,
+        contract_type="semantic",
+        expected_sources=["retention.pdf"],
+        expected_source_version="v1",
+        retained_evidence_items=ev_items,
+        context_chunk_ids=[cid_cited],
+        ground_truth_chunk_ids=[cid_cited],
+    )
+    assert res_bracket_num["is_grounded_correct"] is False
+
+    # 4. Unknown or malformed inline citation ID still fails
+    res_unknown_id = evaluate_grounded_answer(
+        answer=f"The stages are Attention, Retention, Reproduction, and Motivation [unknown-bf2b-5359-b568:page:99]. [{cid_cited}]",
+        citations=cit_valid,
+        is_answer_text_correct=True,
+        contract_type="semantic",
+        expected_sources=["retention.pdf"],
+        expected_source_version="v1",
+        retained_evidence_items=ev_items,
+        context_chunk_ids=[cid_cited],
+        ground_truth_chunk_ids=[cid_cited],
+    )
+    assert res_unknown_id["is_grounded_correct"] is False
+
+    # 5. Inline ID present in retained context but never cited in citations still fails
+    res_uncited_id = evaluate_grounded_answer(
+        answer=f"The stages are Attention, Retention, Reproduction, and Motivation [{cid_uncited}]. [{cid_cited}]",
+        citations=cit_valid,
+        is_answer_text_correct=True,
+        contract_type="semantic",
+        expected_sources=["retention.pdf"],
+        expected_source_version="v1",
+        retained_evidence_items=ev_items,
+        context_chunk_ids=[cid_cited, cid_uncited],
+        ground_truth_chunk_ids=[cid_cited],
+    )
+    assert res_uncited_id["is_grounded_correct"] is False
