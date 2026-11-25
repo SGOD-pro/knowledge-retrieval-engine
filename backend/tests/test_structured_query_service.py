@@ -543,6 +543,146 @@ def test_valid_filter_matching_zero_rows_distinguished_from_binding_failure():
     assert "aerospace" in res_ind.predicate_values
 
 
+def test_zero_row_sum_refuses_while_zero_value_row_and_count_zero_succeed(monkeypatch):
+    """Q159 regression: SUM with 0 matching rows must refuse via QueryService; supported 0 value and COUNT=0 succeed."""
+    from db.table_store.memory_store import MemoryTableStore
+    from modules.query.query_service import QueryRequest, QueryService
+    from services.evaluation.benchmark_scorer import evaluate_grounded_answer
+    import services.retrieval.run_structured_aggregate as rsa
+
+    refusal_indicators = [
+        "couldn't find any relevant",
+        "not found",
+        "does not contain",
+        "not mentioned",
+        "no information",
+        "cannot find",
+        "absent",
+        "no positive source",
+    ]
+
+    def _derive_ans_is_refusal(ans_text: str) -> bool:
+        return any(ind in ans_text.lower() for ind in refusal_indicators) or ans_text.strip() == "NOT_FOUND"
+
+    store = MemoryTableStore()
+    ws = "ws_q159_controls"
+    _create_sample_sales_table(store, ws)
+    tbl = store.get_table("sales_data", ws, version="v1")
+
+    monkeypatch.setattr(rsa, "get_shared_table_store", lambda: store)
+    monkeypatch.setattr(rsa, "_resolve_document_filename", lambda *args, **kwargs: "sales_data.csv")
+
+    class _DocRepo:
+        def __init__(self, doc_id: str, filename: str):
+            self._docs = [{"id": doc_id, "filename": filename}]
+        def get_workspace_documents(self, workspace_id: str, page: int = 1, limit: int = 1000):
+            return {"documents": self._docs}
+        def get_all_chunks(self, document_ids=None, workspace_id: str = ""):
+            return []
+        def get(self, doc_id: str):
+            return None
+        def search_vector(self, *args, **kwargs):
+            return []
+        def check_semantic_cache(self, *args, **kwargs):
+            return None
+
+    from unittest.mock import patch
+    doc_repo = _DocRepo(tbl.document_id, "sales_data.csv")
+    qs = QueryService(repo=doc_repo)
+
+    # 1. Q159 case via QueryService: SUM on absent year 2099 (0 matching rows) -> refusal derived by runner logic
+    with patch("services.langgraph_pipeline._get_repo", return_value=doc_repo):
+        resp_refuse = qs.execute_query(
+            QueryRequest(
+                query="What is the 2099 total Amount in sales_data.csv?",
+                workspace_id=ws,
+                document_ids=[tbl.document_id],
+                benchmark_mode=True,
+                cache=False,
+            )
+        )
+    ans_refuse = str(resp_refuse.get("answer") or "")
+    assert "does not contain" in ans_refuse.lower()
+    assert resp_refuse["citations"] == []
+    assert resp_refuse["retained_evidence_items"] == []
+    derived_refusal = _derive_ans_is_refusal(ans_refuse)
+    assert derived_refusal is True
+    ev_ref = evaluate_grounded_answer(
+        answer=ans_refuse,
+        citations=resp_refuse["citations"],
+        is_answer_text_correct=derived_refusal,
+        contract_type="refusal",
+        ans_is_refusal=derived_refusal,
+        outcome=resp_refuse,
+    )
+    assert ev_ref["is_grounded_correct"] is True
+
+    # 2. Control via QueryService: supported SUM whose value is 0 (matching row exists)
+    store_zero = MemoryTableStore()
+    zero_only_tbl = StructuredTable(
+        table_id="zero_val_table",
+        document_id="doc_zero_val",
+        sheet_name=None,
+        page_number=None,
+        schema=tbl.schema,
+        rows=(
+            TableRow(
+                row_index=0,
+                row_id="r_zero_2025",
+                cells=(
+                    TableCell(cell_id="cz_0", row_index=0, col_index=0, coordinate="A1", raw_value="2025", normalized_value=2025),
+                    TableCell(cell_id="cz_1", row_index=0, col_index=1, coordinate="B1", raw_value="Finance", normalized_value="Finance"),
+                    TableCell(cell_id="cz_2", row_index=0, col_index=2, coordinate="C1", raw_value="0", normalized_value=Decimal("0")),
+                ),
+            ),
+        ),
+    )
+    store_zero.store_table(zero_only_tbl, ws)
+    store_zero.publish_active_version("zero_val_table", ws, "doc_zero_val", "v1", {"coverage_complete": True, "source_rows": 1, "persisted_rows": 1, "rejected_rows": 0})
+    monkeypatch.setattr(rsa, "get_shared_table_store", lambda: store_zero)
+    monkeypatch.setattr(rsa, "_resolve_document_filename", lambda *args, **kwargs: "zero_val_table.csv")
+
+    doc_repo_zero = _DocRepo("doc_zero_val", "zero_val_table.csv")
+    qs_zero = QueryService(repo=doc_repo_zero)
+    with patch("services.langgraph_pipeline._get_repo", return_value=doc_repo_zero):
+        resp_zero = qs_zero.execute_query(
+            QueryRequest(
+                query="What is the 2025 total Amount in zero_val_table.csv?",
+                workspace_id=ws,
+                document_ids=["doc_zero_val"],
+                benchmark_mode=True,
+                cache=False,
+            )
+        )
+    ans_zero = str(resp_zero.get("answer") or "")
+    assert "0" in ans_zero
+    assert len(resp_zero["citations"]) == 1
+    assert _derive_ans_is_refusal(ans_zero) is False
+    ev_zero = evaluate_grounded_answer(
+        answer=ans_zero,
+        citations=resp_zero["citations"],
+        is_answer_text_correct=True,
+        contract_type="structured_aggregate",
+        expected_sources=["zero_val_table.csv"],
+        expected_source_version="v1",
+        retained_evidence_items=resp_zero["retained_evidence_items"],
+        question_type="structured_aggregate",
+        outcome=resp_zero,
+    )
+    assert ev_zero["is_grounded_correct"] is True
+
+    # 3. Control: valid COUNT of 0
+    monkeypatch.setattr(rsa, "get_shared_table_store", lambda: store)
+    monkeypatch.setattr(rsa, "_resolve_document_filename", lambda *args, **kwargs: "sales_data.csv")
+    svc_cnt = StructuredQueryService(store)
+    cnt_res = svc_cnt.execute("Count the rows where Year = 2099 in sales_data.csv?", workspace_id=ws)
+    assert cnt_res is not None
+    assert cnt_res.operator == "count"
+    assert cnt_res.selection_count == 0
+    assert cnt_res.result_value == Decimal(0)
+    assert "count is 0" in cnt_res.answer_text.lower()
+
+
 def test_result_evidence_records_applied_predicates_and_selected_rows():
     from services.retrieval.run_structured_aggregate import build_structured_evidence_ref
 

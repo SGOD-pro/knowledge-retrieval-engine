@@ -1134,3 +1134,112 @@ def test_deterministic_sheet_status_path_zero_synthesis_and_strict_scorer(tmp_pa
         res_absent = qs.execute_query(req_absent)
     assert "sheet4 is absent" in res_absent["answer"].lower()
     assert set(c["chunk_id"] for c in res_absent["citations"]) == {row_cid, inv_cid}
+
+
+def test_q194_json_dict_answer_preserves_type_and_enforces_workbook_claims(tmp_path: Path, monkeypatch):
+    """Reproduce Q194 TypeError on dict answers and ensure structured sheet-status claims cannot bypass checks."""
+    from modules.query.query_service import QueryRequest, QueryService
+    from services.retrieval import bm25_retriever
+
+    monkeypatch.setenv("RERANKER_PROVIDER", "lexical")
+    ws_id = "ws_q194_json"
+    c1 = Chunk(
+        id="doc-json:page:1:element:0",
+        document_id="doc-json",
+        source_format="pdf",
+        text="Report status is ok and item count is 5.",
+        element_type="text",
+        page_number=1,
+        workspace_id=ws_id,
+        version="v1",
+        document_version="v1",
+    )
+
+    class _JsonDocRepo:
+        def get_workspace_documents(self, workspace_id: str, page: int = 1, limit: int = 1000):
+            return {"documents": [{"id": "doc-json", "filename": "json_report.pdf"}]}
+
+        def get_all_chunks(self, document_ids=None, workspace_id: str = ""):
+            return [c1]
+
+        def get(self, doc_id: str):
+            return None
+
+        def search_vector(self, *args, **kwargs):
+            return []
+
+        def check_semantic_cache(self, *args, **kwargs):
+            return None
+
+    b_repo = InMemoryWorkspaceBoundaryRepository()
+    b_repo.create_workspace("JSON WS", "owner-1", workspace_id=ws_id)
+    b_repo.create_source(ws_id, "json_report.pdf", source_id="doc-json")
+    b_repo.save_document_snapshot(
+        DocumentSnapshot(
+            workspace_id=ws_id,
+            document_id="doc-json",
+            source="json_report.pdf",
+            version="v1",
+            format="pdf",
+            created_at="2026-11-26T00:00:00Z",
+        )
+    )
+
+    doc_repo = _JsonDocRepo()
+    if hasattr(bm25_retriever, "_CHUNK_CACHE"):
+        bm25_retriever._CHUNK_CACHE.clear()
+
+    qs = QueryService(repo=doc_repo)
+    req = QueryRequest(
+        query="Answer only as a JSON object with keys status and count.",
+        workspace_id=ws_id,
+        benchmark_mode=True,
+        cache=False,
+        force_full_path=True,
+    )
+    good_json = json.dumps({"answer": {"status": "ok", "count": 5}, "citations": [c1.id]})
+    with (
+        patch("src.db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+        patch("db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+        patch("services.langgraph_pipeline._get_repo", return_value=doc_repo),
+        patch("services.langgraph_pipeline.check_fidelity", return_value=True),
+        patch("services.llm.llm_service.generate_completion", return_value=(good_json, {"input_tokens": 10, "output_tokens": 10})),
+    ):
+        res_ok = qs.execute_query(req)
+
+    assert isinstance(res_ok["answer"], dict)
+    assert res_ok["answer"] == {"status": "ok", "count": 5}
+    assert [c["chunk_id"] for c in res_ok["citations"]] == [c1.id]
+
+    from services.evaluation.benchmark_scorer import evaluate_grounded_answer
+
+    ev_q194 = evaluate_grounded_answer(
+        answer=json.dumps(res_ok["answer"]),
+        citations=res_ok["citations"],
+        is_answer_text_correct=True,
+        contract_type="json_schema",
+        contract={"contract_type": "json_schema", "required_keys": ["status", "count"]},
+        expected_sources=["json_report.pdf"],
+        expected_source_version="v1",
+        retained_evidence_items=res_ok.get("retained_evidence_items"),
+        context_chunk_ids=res_ok.get("compressed_context_chunk_ids"),
+        ground_truth_chunk_ids=[c1.id],
+        outcome=res_ok,
+        query=req.query,
+    )
+    assert ev_q194["is_grounded_correct"] is True
+
+    # Negative case: structured dict asserting unsupported sheet status must be blocked
+    if hasattr(bm25_retriever, "_CHUNK_CACHE"):
+        bm25_retriever._CHUNK_CACHE.clear()
+    bad_json = json.dumps({"answer": {"sheet2": "empty", "note": "Sheet2 is empty"}, "citations": [c1.id]})
+    with (
+        patch("src.db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+        patch("db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+        patch("services.langgraph_pipeline._get_repo", return_value=doc_repo),
+        patch("services.langgraph_pipeline.check_fidelity", return_value=True),
+        patch("services.llm.llm_service.generate_completion", return_value=(bad_json, {"input_tokens": 10, "output_tokens": 10})),
+    ):
+        res_bad = qs.execute_query(req)
+
+    assert res_bad["citations"] == []

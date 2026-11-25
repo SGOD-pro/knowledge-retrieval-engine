@@ -1342,8 +1342,10 @@ class StructuredQueryService:
 
         if count == 0:
             res_val = Decimal(0) if op in (AggregateOp.COUNT, AggregateOp.SUM) else None
-            stat_msg = f"{op.value.title()} is {res_val}." if res_val is not None else f"{op.value.title()} is undefined."
-            answer_text = f"No rows matched the requested filters in table '{table_id}' (0 matching rows). {stat_msg}"
+            if op == AggregateOp.COUNT:
+                answer_text = f"No rows matched the requested filters in table '{table_id}' (0 matching rows). Count is 0."
+            else:
+                answer_text = f"The table '{table_id}' does not contain matching rows for the requested filters (0 matching rows)."
         else:
             res_val = val
             answer_text = f"The {op.value} for {col_name} is {res_val}."
