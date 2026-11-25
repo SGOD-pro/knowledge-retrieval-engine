@@ -34,9 +34,19 @@ def _resolve_document_filename(
         return None
     if snap is None or not getattr(snap, "source", None):
         return None
-    if document_version and getattr(snap, "version", None) and str(snap.version) != str(document_version):
+    snap_version = getattr(snap, "version", None)
+    if not document_version or not snap_version or str(snap_version) != str(document_version):
         return None
     return str(snap.source)
+
+
+def _merge_timings(
+    existing_timings: dict[str, float],
+    svc: StructuredQueryService,
+    latency_ms: float,
+) -> dict[str, float]:
+    sub_timings = getattr(svc, "last_stage_timings", None) or {}
+    return {**existing_timings, **sub_timings, "structured_aggregate_ms": latency_ms}
 
 
 def build_structured_evidence_ref(
@@ -92,7 +102,7 @@ def execute(state: dict[str, Any]) -> dict[str, Any]:
             "error_code": "incomplete_data",
             "error": f"Table data is incomplete: {e}",
             "reranker_mode": RerankerMode.BYPASSED.value,
-            "stage_timings": {**existing_timings, "structured_aggregate_ms": latency_ms},
+            "stage_timings": _merge_timings(existing_timings, svc, latency_ms),
         }
     except AmbiguousBindingError as e:
         latency_ms = (time.perf_counter() - t0) * 1000.0
@@ -104,7 +114,7 @@ def execute(state: dict[str, Any]) -> dict[str, Any]:
             "error_code": "ambiguous_binding",
             "error": str(e),
             "reranker_mode": RerankerMode.BYPASSED.value,
-            "stage_timings": {**existing_timings, "structured_aggregate_ms": latency_ms},
+            "stage_timings": _merge_timings(existing_timings, svc, latency_ms),
         }
     except StorageFailureError as e:
         latency_ms = (time.perf_counter() - t0) * 1000.0
@@ -116,7 +126,7 @@ def execute(state: dict[str, Any]) -> dict[str, Any]:
             "error_code": "storage_failure",
             "error": str(e),
             "reranker_mode": RerankerMode.BYPASSED.value,
-            "stage_timings": {**existing_timings, "structured_aggregate_ms": latency_ms},
+            "stage_timings": _merge_timings(existing_timings, svc, latency_ms),
         }
     except UnresolvedFilterError as e:
         latency_ms = (time.perf_counter() - t0) * 1000.0
@@ -128,7 +138,7 @@ def execute(state: dict[str, Any]) -> dict[str, Any]:
             return {
                 "executed_path": "structured_aggregate_fallback",
                 "reranker_mode": RerankerMode.BYPASSED.value,
-                "stage_timings": {**existing_timings, "structured_aggregate_ms": latency_ms},
+                "stage_timings": _merge_timings(existing_timings, svc, latency_ms),
             }
         logger.warning("structured_aggregate.unresolved_filter query='%s' error=%s", query[:60], e)
         return {
@@ -138,7 +148,7 @@ def execute(state: dict[str, Any]) -> dict[str, Any]:
             "error_code": "unresolved_filter",
             "error": f"Required filter could not be resolved: {e}",
             "reranker_mode": RerankerMode.BYPASSED.value,
-            "stage_timings": {**existing_timings, "structured_aggregate_ms": latency_ms},
+            "stage_timings": _merge_timings(existing_timings, svc, latency_ms),
         }
     except UnsupportedQueryError as e:
         latency_ms = (time.perf_counter() - t0) * 1000.0
@@ -146,7 +156,7 @@ def execute(state: dict[str, Any]) -> dict[str, Any]:
         return {
             "executed_path": "structured_aggregate_fallback",
             "reranker_mode": RerankerMode.BYPASSED.value,
-            "stage_timings": {**existing_timings, "structured_aggregate_ms": latency_ms},
+            "stage_timings": _merge_timings(existing_timings, svc, latency_ms),
         }
 
     if result is None:
@@ -154,7 +164,7 @@ def execute(state: dict[str, Any]) -> dict[str, Any]:
         return {
             "executed_path": "structured_aggregate_fallback",
             "reranker_mode": RerankerMode.BYPASSED.value,
-            "stage_timings": {**existing_timings, "structured_aggregate_ms": latency_ms},
+            "stage_timings": _merge_timings(existing_timings, svc, latency_ms),
         }
 
     latency_ms = (time.perf_counter() - t0) * 1000.0
@@ -225,9 +235,5 @@ def execute(state: dict[str, Any]) -> dict[str, Any]:
         "is_refusal": is_refusal,
         "retrieval_candidates": {"structured_rows": result.row_ids},
         "reranker_mode": RerankerMode.BYPASSED.value,
-        "stage_timings": {
-            **existing_timings,
-            **sub_timings,
-            "structured_aggregate_ms": latency_ms,
-        },
+        "stage_timings": _merge_timings(existing_timings, svc, latency_ms),
     }

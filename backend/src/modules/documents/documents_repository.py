@@ -270,15 +270,42 @@ class DocumentsRepository:
             from services.retrieval.bm25_retriever import get_cached_chunks
 
             def _fetch_workspace_chunks() -> list[Chunk]:
+                tel: dict[str, object] = {
+                    "dynamodb_query_pages": 0,
+                    "dynamodb_scan_pages": 0,
+                    "dynamodb_request_ms": 0.0,
+                    "dynamodb_retry_count": 0,
+                    "dynamodb_fallback_reason": None,
+                }
+                self.last_query_telemetry = tel
+
+                def _timed_call(op_type: str, fn, **kwargs):
+                    t0 = time.perf_counter()
+                    try:
+                        resp = fn(**kwargs)
+                    finally:
+                        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+                        tel["dynamodb_request_ms"] = round(float(tel["dynamodb_request_ms"]) + elapsed_ms, 3)
+                        key = "dynamodb_scan_pages" if op_type == "scan" else "dynamodb_query_pages"
+                        tel[key] = int(tel[key]) + 1
+                    meta = resp.get("ResponseMetadata") if isinstance(resp, dict) else None
+                    if isinstance(meta, dict):
+                        tel["dynamodb_retry_count"] = int(tel["dynamodb_retry_count"]) + int(meta.get("RetryAttempts", 0) or 0)
+                    return resp
+
                 try:
-                    response = self.table.query(
+                    response = _timed_call(
+                        "query",
+                        self.table.query,
                         IndexName="GSI1",
                         KeyConditionExpression=Key("GSI1PK").eq(f"WORKSPACE#{workspace_id}")
                         & Key("GSI1SK").begins_with("CHUNK#"),
                     )
                     items = response.get("Items", [])
                     while "LastEvaluatedKey" in response:
-                        response = self.table.query(
+                        response = _timed_call(
+                            "query",
+                            self.table.query,
                             IndexName="GSI1",
                             KeyConditionExpression=Key("GSI1PK").eq(f"WORKSPACE#{workspace_id}")
                             & Key("GSI1SK").begins_with("CHUNK#"),
@@ -287,16 +314,22 @@ class DocumentsRepository:
                         items.extend(response.get("Items", []))
                     return [self._parse_chunk(row) for row in items]
                 except Exception as e:
+                    tel["dynamodb_query_pages"] = 0
+                    tel["dynamodb_fallback_reason"] = str(e)
                     logger.warning("DynamoDB GSI1 query failed for workspace %s: %s", workspace_id, e)
                     from boto3.dynamodb.conditions import Attr
 
-                    resp = self.table.scan(
+                    resp = _timed_call(
+                        "scan",
+                        self.table.scan,
                         FilterExpression=Attr("workspace_id").eq(workspace_id)
-                        & Attr("SK").begins_with("CHUNK#")
+                        & Attr("SK").begins_with("CHUNK#"),
                     )
                     items = resp.get("Items", [])
                     while "LastEvaluatedKey" in resp:
-                        resp = self.table.scan(
+                        resp = _timed_call(
+                            "scan",
+                            self.table.scan,
                             FilterExpression=Attr("workspace_id").eq(workspace_id)
                             & Attr("SK").begins_with("CHUNK#"),
                             ExclusiveStartKey=resp["LastEvaluatedKey"],

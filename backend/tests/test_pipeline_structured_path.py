@@ -392,12 +392,121 @@ def test_structured_aggregate_stage_timings_recorded(populated_workspace):
     timings = res.stage_timings
     assert "table_lookup_ms" in timings
     assert "row_reads_ms" in timings
+    assert "aggregate_ms" in timings
     assert "computation_ms" in timings
     assert "structured_aggregate_ms" in timings
     assert timings["table_lookup_ms"] >= 0.0
     assert timings["row_reads_ms"] >= 0.0
+    assert timings["aggregate_ms"] >= 0.0
     assert timings["computation_ms"] >= 0.0
     assert timings["structured_aggregate_ms"] >= 0.0
+
+
+def test_structured_aggregate_citation_provenance_missing_versions(tmp_path, monkeypatch):
+    from db.workspace_boundary_repo import InMemoryWorkspaceBoundaryRepository
+    from schemas.contracts.boundary import DocumentSnapshot
+    from services.evaluation.benchmark_scorer import evaluate_grounded_answer
+    import services.retrieval.run_structured_aggregate as rsa
+
+    csv_path = tmp_path / "sales_metrics_tbl.csv"
+    csv_path.write_text("Year,Region,Revenue\n2024,North,1000\n2025,North,1250\n", encoding="utf-8")
+
+    ws = "ws_synth_prov_ver"
+    doc_id = "doc_synth_ver_01"
+    registered_filename = "annual_metrics_2026.csv"
+    store = get_shared_table_store()
+    ingest_csv_to_table_store(
+        path=csv_path,
+        document_id=doc_id,
+        workspace_id=ws,
+        store=store,
+        batch_size=100,
+    )
+    man = store.get_ingestion_manifest(doc_id, ws)
+    assert man is not None
+    doc_version = man["document_version"]
+    man["coverage_complete"] = True
+    store.publish_active_version("sales_metrics_tbl", ws, doc_id, doc_version, man)
+
+    # Case 1: Snapshot has empty/missing version while aggregate result has doc_version
+    no_snap_ver_repo = InMemoryWorkspaceBoundaryRepository()
+    no_snap_ver_repo.save_document_snapshot(
+        DocumentSnapshot(
+            workspace_id=ws,
+            document_id=doc_id,
+            source=registered_filename,
+            version="",
+            format="csv",
+            incomplete_coverage_flag=False,
+            persisted_rows=2,
+            total_rows=2,
+            created_at="2026-11-25T00:00:00Z",
+        )
+    )
+    monkeypatch.setattr(rsa, "get_workspace_boundary_repo", lambda: no_snap_ver_repo, raising=False)
+
+    init_request_telemetry()
+    res_no_snap_ver = pipeline.run(
+        query="What is the earliest and latest Year in sales_metrics_tbl?",
+        workspace_id=ws,
+        document_ids=[doc_id],
+    )
+    assert res_no_snap_ver.executed_path == "structured_aggregate"
+    assert "document_filename" not in res_no_snap_ver.citations[0]
+    assert "document_filename" not in res_no_snap_ver.retained_evidence_items[0].citation_payload
+    assert "document_filename" not in res_no_snap_ver.retained_evidence_items[0].structured_payload
+    assert "document_filename" not in res_no_snap_ver.retained_evidence_items[0].provenance
+
+    score_no_snap_ver = evaluate_grounded_answer(
+        answer=res_no_snap_ver.answer,
+        citations=res_no_snap_ver.citations,
+        is_answer_text_correct=True,
+        question_type="structured_aggregate",
+        expected_sources=[registered_filename],
+        expected_source_version=doc_version,
+        retained_evidence_items=res_no_snap_ver.retained_evidence_items,
+    )
+    assert score_no_snap_ver["is_grounded_correct"] is False
+
+    # Case 2: Snapshot has doc_version while aggregate result has missing/empty version
+    valid_repo = InMemoryWorkspaceBoundaryRepository()
+    valid_repo.save_document_snapshot(
+        DocumentSnapshot(
+            workspace_id=ws,
+            document_id=doc_id,
+            source=registered_filename,
+            version=doc_version,
+            format="csv",
+            incomplete_coverage_flag=False,
+            persisted_rows=2,
+            total_rows=2,
+            created_at="2026-11-25T00:00:00Z",
+        )
+    )
+    monkeypatch.setattr(rsa, "get_workspace_boundary_repo", lambda: valid_repo, raising=False)
+
+    orig_execute = rsa.StructuredQueryService.execute
+
+    def _execute_missing_ver(self, *args, **kwargs):
+        res = orig_execute(self, *args, **kwargs)
+        if res is not None:
+            res.document_version = ""
+        return res
+
+    monkeypatch.setattr(rsa.StructuredQueryService, "execute", _execute_missing_ver)
+
+    init_request_telemetry()
+    res_no_agg_ver = pipeline.run(
+        query="What is the earliest and latest Year in sales_metrics_tbl?",
+        workspace_id=ws,
+        document_ids=[doc_id],
+    )
+    assert res_no_agg_ver.executed_path == "structured_aggregate"
+    assert "document_filename" not in res_no_agg_ver.citations[0]
+    assert "document_filename" not in res_no_agg_ver.retained_evidence_items[0].citation_payload
+    assert "document_filename" not in res_no_agg_ver.retained_evidence_items[0].structured_payload
+    assert "document_filename" not in res_no_agg_ver.retained_evidence_items[0].provenance
+
 
 
 

@@ -700,5 +700,409 @@ def test_min_max_range_word_boundary_column_matching():
     assert res.secondary_value == 2020
 
 
+def test_timed_store_proxy_stream_rows_and_execute_single_pass_query():
+    import time
+    from db.table_store.base import AggregateOp
+    from services.retrieval.structured_query_service import _TimedStoreProxy
+
+    class _StubStreamStore:
+        def stream_rows(self, *args, **kwargs):
+            time.sleep(0.015)
+            yield "row1"
+            time.sleep(0.015)
+            yield "row2"
+
+        def execute_single_pass_query(self, *args, **kwargs):
+            time.sleep(0.015)
+            return (Decimal("10"), 1, ["r1"], [0], "0" * 16)
+
+    proxy = _TimedStoreProxy(_StubStreamStore())
+    for _row in proxy.stream_rows("t", "ws"):
+        time.sleep(0.040)  # caller processing time must be excluded
+
+    assert proxy.row_reads_ms >= 25.0
+    assert proxy.row_reads_ms < 70.0
+
+    class _FailingStreamStore:
+        def stream_rows(self, *args, **kwargs):
+            time.sleep(0.015)
+            yield "row1"
+            time.sleep(0.015)
+            raise RuntimeError("iterator broke")
+
+    proxy_fail = _TimedStoreProxy(_FailingStreamStore())
+    with pytest.raises(RuntimeError, match="iterator broke"):
+        for _row in proxy_fail.stream_rows("t", "ws"):
+            time.sleep(0.030)
+
+    assert proxy_fail.row_reads_ms >= 25.0
+    assert proxy_fail.row_reads_ms < 65.0
+
+    proxy.execute_single_pass_query("t", "ws", 0, AggregateOp.MIN)
+    assert proxy.aggregate_ms >= 10.0
+
+
+def test_dynamodb_store_pagination_retry_and_telemetry(monkeypatch):
+    import json as _json
+    from db.table_store.dynamodb_store import DynamoDBTableStore
+    from services.retrieval.run_structured_aggregate import execute as run_agg_execute
+
+    class _StubDynamoTable:
+        def __init__(self, fail_on_second_page: bool = False):
+            self.fail_on_second_page = fail_on_second_page
+            self.query_calls = 0
+
+        def get_item(self, Key):
+            pk, sk = Key["PK"], Key["SK"]
+            if sk == "ACTIVE_VERSION":
+                return {"Item": {"active_version": "v1", "coverage_complete": True}}
+            if sk.startswith("MANIFEST"):
+                return {"Item": {"coverage_complete": True, "persisted_rows": 2, "document_version": "v1"}}
+            if sk == "SCHEMA":
+                schema_json = _json.dumps({
+                    "columns": [
+                        {"col_index": 0, "name": "Year", "inferred_dtype": "integer", "nullable": False, "cardinality": 2, "sample_values": ["2024", "2025"]},
+                        {"col_index": 1, "name": "Revenue", "inferred_dtype": "decimal", "nullable": False, "cardinality": 2, "sample_values": ["100", "200"]},
+                    ],
+                    "header_rows": [0],
+                    "header_topology": "single_row",
+                    "confidence": 1.0,
+                })
+                return {"Item": {"document_id": "doc1", "schema_json": schema_json}}
+            return {}
+
+        def query(self, **kwargs):
+            pk = str(kwargs.get("KeyConditionExpression", ""))
+            # Distinguish workspace table list vs row pagination
+            if "ExclusiveStartKey" not in kwargs and self.query_calls == 0 and kwargs.get("_is_list"):
+                return {"Items": [{"table_id": "sales_tbl"}]}
+            self.query_calls += 1
+            if "ExclusiveStartKey" not in kwargs:
+                # First call could be list_tables or first page of rows
+                if self.query_calls == 1:
+                    return {"Items": [{"table_id": "sales_tbl"}], "ResponseMetadata": {"RetryAttempts": 0}}
+                return {
+                    "Items": [{"row_id": "r1", "row_index": 0, "cells_json": _json.dumps([{"row_index": 0, "col_index": 0, "raw_value": "2024", "normalized_value": 2024}, {"row_index": 0, "col_index": 1, "raw_value": "100", "normalized_value": "100"}])}],
+                    "LastEvaluatedKey": {"PK": "p", "SK": "k1"},
+                    "ResponseMetadata": {"RetryAttempts": 2},
+                }
+            if self.fail_on_second_page:
+                raise RuntimeError("ddb page 2 failure")
+            return {
+                "Items": [{"row_id": "r2", "row_index": 1, "cells_json": _json.dumps([{"row_index": 1, "col_index": 0, "raw_value": "2025", "normalized_value": 2025}, {"row_index": 1, "col_index": 1, "raw_value": "200", "normalized_value": "200"}])}],
+                "ResponseMetadata": {"RetryAttempts": 1},
+            }
+
+    class _StubResource:
+        def __init__(self, tbl):
+            self._tbl = tbl
+
+        def Table(self, name):
+            return self._tbl
+
+    store_ok = DynamoDBTableStore(table_name="stub_tbl", resource=_StubResource(_StubDynamoTable(fail_on_second_page=False)))
+    monkeypatch.setattr("services.retrieval.run_structured_aggregate.get_shared_table_store", lambda: store_ok)
+    out_ok = run_agg_execute({"workspace_id": "ws1", "query": "What is the earliest and latest Year in sales_tbl?", "stage_timings": {}})
+    assert out_ok["executed_path"] == "structured_aggregate"
+    st_ok = out_ok["stage_timings"]
+    assert st_ok["dynamodb_query_pages"] >= 2
+    assert st_ok["dynamodb_scan_pages"] == 0
+    assert st_ok["dynamodb_retry_count"] >= 3
+    assert st_ok["dynamodb_request_ms"] >= 0.0
+    assert st_ok["dynamodb_fallback_reason"] is None
+
+    store_fail = DynamoDBTableStore(table_name="stub_tbl", resource=_StubResource(_StubDynamoTable(fail_on_second_page=True)))
+    monkeypatch.setattr("services.retrieval.run_structured_aggregate.get_shared_table_store", lambda: store_fail)
+    out_fail = run_agg_execute({"workspace_id": "ws1", "query": "What is the earliest and latest Year in sales_tbl?", "stage_timings": {}})
+    assert out_fail["executed_path"] == "structured_aggregate_storage_failure"
+    st_fail = out_fail["stage_timings"]
+    assert st_fail["dynamodb_query_pages"] >= 1
+    assert st_fail["dynamodb_retry_count"] >= 2
+    assert st_fail["dynamodb_request_ms"] >= 0.0
+
+
+def test_documents_repository_gsi1_fallback_to_scan_telemetry(monkeypatch):
+    from modules.documents.documents_repository import DocumentsRepository
+
+    class _StubDocTable:
+        def __init__(self):
+            self.scan_calls = 0
+
+        def query(self, **kwargs):
+            if kwargs.get("IndexName") == "GSI1":
+                raise RuntimeError("ValidationException: The table does not have the specified index: GSI1")
+            return {"Items": []}
+
+        def scan(self, **kwargs):
+            self.scan_calls += 1
+            if self.scan_calls == 1:
+                return {
+                    "Items": [],
+                    "LastEvaluatedKey": {"PK": "p", "SK": "s1"},
+                    "ResponseMetadata": {"RetryAttempts": 1},
+                }
+            return {
+                "Items": [],
+                "ResponseMetadata": {"RetryAttempts": 0},
+            }
+
+    repo = DocumentsRepository.__new__(DocumentsRepository)
+    repo.table = _StubDocTable()
+    monkeypatch.setattr("modules.documents.documents_repository._is_test_env", lambda: False)
+    monkeypatch.setattr("services.retrieval.bm25_retriever.get_cached_chunks", lambda ws, fn: fn())
+
+    chunks = repo.get_all_chunks(workspace_id="ws_gsi_test")
+    assert chunks == []
+    tel = repo.last_query_telemetry
+    assert tel["dynamodb_query_pages"] == 0
+    assert tel["dynamodb_scan_pages"] == 2
+    assert tel["dynamodb_retry_count"] == 1
+    assert tel["dynamodb_request_ms"] >= 0.0
+    assert "GSI1" in str(tel["dynamodb_fallback_reason"])
+
+
+def test_min_max_range_single_traversal_three_pages_and_grounded_citation(monkeypatch):
+    import json as _json
+    from db.table_store.dynamodb_store import DynamoDBTableStore
+    from db.workspace_boundary_repo import InMemoryWorkspaceBoundaryRepository
+    from schemas.contracts.boundary import DocumentSnapshot
+    from services.evaluation.benchmark_scorer import evaluate_grounded_answer
+    import services.retrieval.run_structured_aggregate as rsa
+
+    class _ThreePageRegionalTable:
+        def __init__(self):
+            self.query_log: list[dict[str, Any]] = []
+
+        def get_item(self, Key):
+            sk = Key["SK"]
+            if sk == "ACTIVE_VERSION":
+                return {"Item": {"active_version": "v1", "coverage_complete": True}}
+            if sk.startswith("MANIFEST"):
+                return {"Item": {"coverage_complete": True, "persisted_rows": 7, "document_version": "v1"}}
+            if sk == "SCHEMA":
+                schema_json = _json.dumps({
+                    "columns": [
+                        {"col_index": 0, "name": "Year", "inferred_dtype": "integer", "nullable": False, "cardinality": 5, "sample_values": ["2010", "2018", "2020", "2025", "2035"]},
+                        {"col_index": 1, "name": "Region", "inferred_dtype": "string", "nullable": False, "cardinality": 2, "sample_values": ["North", "South"]},
+                    ],
+                    "header_rows": [0],
+                    "header_topology": "single_row",
+                    "confidence": 1.0,
+                })
+                return {"Item": {"document_id": "doc_reg", "schema_json": schema_json}}
+            return {}
+
+        def query(self, **kwargs):
+            start_key = kwargs.get("ExclusiveStartKey")
+            self.query_log.append({"start_key": start_key})
+            if start_key is None:
+                return {
+                    "Items": [
+                        # Filtered-out row BELOW matching MIN (2018)
+                        {"row_id": "r1", "row_index": 0, "cells_json": _json.dumps([{"row_index": 0, "col_index": 0, "raw_value": "2010", "normalized_value": 2010}, {"row_index": 0, "col_index": 1, "raw_value": "South", "normalized_value": "South"}])},
+                        # Matching non-extremum row on page 1
+                        {"row_id": "r2", "row_index": 1, "cells_json": _json.dumps([{"row_index": 1, "col_index": 0, "raw_value": "2020", "normalized_value": 2020}, {"row_index": 1, "col_index": 1, "raw_value": "North", "normalized_value": "North"}])},
+                    ],
+                    "LastEvaluatedKey": {"PK": "p", "SK": "k1"},
+                    "ResponseMetadata": {"RetryAttempts": 0},
+                }
+            if start_key == {"PK": "p", "SK": "k1"}:
+                return {
+                    "Items": [
+                        # Matching MIN on page 2
+                        {"row_id": "r3", "row_index": 2, "cells_json": _json.dumps([{"row_index": 2, "col_index": 0, "raw_value": "2018", "normalized_value": 2018}, {"row_index": 2, "col_index": 1, "raw_value": "North", "normalized_value": "North"}])},
+                        # Null value in target column -> skipped
+                        {"row_id": "r4", "row_index": 3, "cells_json": _json.dumps([{"row_index": 3, "col_index": 0, "raw_value": "", "normalized_value": None}, {"row_index": 3, "col_index": 1, "raw_value": "North", "normalized_value": "North"}])},
+                    ],
+                    "LastEvaluatedKey": {"PK": "p", "SK": "k2"},
+                    "ResponseMetadata": {"RetryAttempts": 0},
+                }
+            return {
+                "Items": [
+                    # Non-numeric value in target column -> skipped
+                    {"row_id": "r5", "row_index": 4, "cells_json": _json.dumps([{"row_index": 4, "col_index": 0, "raw_value": "N/A", "normalized_value": "N/A"}, {"row_index": 4, "col_index": 1, "raw_value": "North", "normalized_value": "North"}])},
+                    # Matching MAX on page 3
+                    {"row_id": "r6", "row_index": 5, "cells_json": _json.dumps([{"row_index": 5, "col_index": 0, "raw_value": "2025", "normalized_value": 2025}, {"row_index": 5, "col_index": 1, "raw_value": "North", "normalized_value": "North"}])},
+                    # Filtered-out row ABOVE matching MAX (2025)
+                    {"row_id": "r7", "row_index": 6, "cells_json": _json.dumps([{"row_index": 6, "col_index": 0, "raw_value": "2035", "normalized_value": 2035}, {"row_index": 6, "col_index": 1, "raw_value": "South", "normalized_value": "South"}])},
+                ],
+                "ResponseMetadata": {"RetryAttempts": 0},
+            }
+
+    class _StubResource:
+        def __init__(self, tbl):
+            self._tbl = tbl
+
+        def Table(self, name):
+            return self._tbl
+
+    raw_tbl = _ThreePageRegionalTable()
+    store = DynamoDBTableStore(table_name="regional_metrics", resource=_StubResource(raw_tbl))
+    monkeypatch.setattr(store, "list_tables", lambda ws: ["regional_metrics"])
+
+    probe_pages: list[Any] = []
+    range_pages: list[Any] = []
+    orig_query_rows = store.query_rows
+
+    def _spied_query_rows(*args, **kwargs):
+        before = len(raw_tbl.query_log)
+        res = orig_query_rows(*args, **kwargs)
+        added = [entry["start_key"] for entry in raw_tbl.query_log[before:]]
+        if kwargs.get("limit") is not None:
+            probe_pages.extend(added)
+        else:
+            range_pages.extend(added)
+        return res
+
+    monkeypatch.setattr(store, "query_rows", _spied_query_rows)
+
+    boundary_repo = InMemoryWorkspaceBoundaryRepository()
+    boundary_repo.save_document_snapshot(
+        DocumentSnapshot(
+            workspace_id="ws_reg",
+            document_id="doc_reg",
+            source="regional_metrics.csv",
+            version="v1",
+            format="csv",
+            incomplete_coverage_flag=False,
+            persisted_rows=7,
+            total_rows=7,
+            created_at="2026-11-25T00:00:00Z",
+        )
+    )
+    monkeypatch.setattr(rsa, "get_shared_table_store", lambda: store)
+    monkeypatch.setattr(rsa, "get_workspace_boundary_repo", lambda: boundary_repo)
+
+    out = rsa.execute({
+        "workspace_id": "ws_reg",
+        "query": "For North, what is the earliest and latest Year in regional_metrics?",
+        "stage_timings": {},
+    })
+    assert out["executed_path"] == "structured_aggregate"
+    assert out["final_answer"] == "2018 and 2025."
+    # Verify exact single range traversal across all 3 pages in order
+    assert range_pages == [None, {"PK": "p", "SK": "k1"}, {"PK": "p", "SK": "k2"}]
+    # Predicate probing runs with limit=50 and stops once limit or pages finish
+    assert len(probe_pages) >= 1
+    assert out["stage_timings"]["row_reads_ms"] >= 0.0
+    assert out["stage_timings"]["dynamodb_query_pages"] == len(probe_pages) + len(range_pages)
+
+    grd = evaluate_grounded_answer(
+        answer=out["final_answer"],
+        citations=out["citations"],
+        is_answer_text_correct=True,
+        question_type="structured_aggregate",
+        expected_sources=["regional_metrics.csv"],
+        expected_source_version="v1",
+        retained_evidence_items=out["retained_evidence_items"],
+    )
+    assert grd["is_grounded_correct"] is True
+
+
+def test_min_max_range_ties_zero_matches_truncation_and_later_page_failure(monkeypatch):
+    import json as _json
+    from db.table_store.base import TableRowList
+    from db.table_store.dynamodb_store import DynamoDBTableStore
+    import services.retrieval.run_structured_aggregate as rsa
+
+    class _EdgeCaseTable:
+        def __init__(self, fail_on_page3: bool = False):
+            self.fail_on_page3 = fail_on_page3
+
+        def get_item(self, Key):
+            sk = Key["SK"]
+            if sk == "ACTIVE_VERSION":
+                return {"Item": {"active_version": "v1", "coverage_complete": True}}
+            if sk.startswith("MANIFEST"):
+                return {"Item": {"coverage_complete": True, "persisted_rows": 5, "document_version": "v1"}}
+            if sk == "SCHEMA":
+                schema_json = _json.dumps({
+                    "columns": [
+                        {"col_index": 0, "name": "Year", "inferred_dtype": "integer", "nullable": False, "cardinality": 3, "sample_values": ["2018", "2020", "2025"]},
+                        {"col_index": 1, "name": "Region", "inferred_dtype": "string", "nullable": False, "cardinality": 2, "sample_values": ["North", "East"]},
+                        {"col_index": 2, "name": "Category", "inferred_dtype": "string", "nullable": False, "cardinality": 2, "sample_values": ["Hardware", "Software"]},
+                    ],
+                    "header_rows": [0],
+                    "header_topology": "single_row",
+                    "confidence": 1.0,
+                })
+                return {"Item": {"document_id": "doc_edge", "schema_json": schema_json}}
+            return {}
+
+        def query(self, **kwargs):
+            sk = kwargs.get("ExclusiveStartKey")
+            if sk is None:
+                return {
+                    "Items": [
+                        {"row_id": "t1", "row_index": 0, "cells_json": _json.dumps([{"row_index": 0, "col_index": 0, "raw_value": "2018", "normalized_value": 2018}, {"row_index": 0, "col_index": 1, "raw_value": "North", "normalized_value": "North"}, {"row_index": 0, "col_index": 2, "raw_value": "Hardware", "normalized_value": "Hardware"}])},
+                    ],
+                    "LastEvaluatedKey": {"PK": "p", "SK": "k1"},
+                    "ResponseMetadata": {"RetryAttempts": 0},
+                }
+            if sk == {"PK": "p", "SK": "k1"}:
+                return {
+                    "Items": [
+                        {"row_id": "t2", "row_index": 1, "cells_json": _json.dumps([{"row_index": 1, "col_index": 0, "raw_value": "2018", "normalized_value": 2018}, {"row_index": 1, "col_index": 1, "raw_value": "North", "normalized_value": "North"}, {"row_index": 1, "col_index": 2, "raw_value": "Hardware", "normalized_value": "Hardware"}])},
+                        {"row_id": "t3", "row_index": 2, "cells_json": _json.dumps([{"row_index": 2, "col_index": 0, "raw_value": "2025", "normalized_value": 2025}, {"row_index": 2, "col_index": 1, "raw_value": "North", "normalized_value": "North"}, {"row_index": 2, "col_index": 2, "raw_value": "Hardware", "normalized_value": "Hardware"}])},
+                        {"row_id": "t5", "row_index": 4, "cells_json": _json.dumps([{"row_index": 4, "col_index": 0, "raw_value": "2020", "normalized_value": 2020}, {"row_index": 4, "col_index": 1, "raw_value": "East", "normalized_value": "East"}, {"row_index": 4, "col_index": 2, "raw_value": "Software", "normalized_value": "Software"}])},
+                    ],
+                    "LastEvaluatedKey": {"PK": "p", "SK": "k2"},
+                    "ResponseMetadata": {"RetryAttempts": 0},
+                }
+            if self.fail_on_page3:
+                raise RuntimeError("ddb page 3 failure")
+            return {
+                "Items": [
+                    {"row_id": "t4", "row_index": 3, "cells_json": _json.dumps([{"row_index": 3, "col_index": 0, "raw_value": "2025", "normalized_value": 2025}, {"row_index": 3, "col_index": 1, "raw_value": "North", "normalized_value": "North"}, {"row_index": 3, "col_index": 2, "raw_value": "Hardware", "normalized_value": "Hardware"}])},
+                ],
+                "ResponseMetadata": {"RetryAttempts": 0},
+            }
+
+    class _StubResource:
+        def __init__(self, tbl):
+            self._tbl = tbl
+
+        def Table(self, name):
+            return self._tbl
+
+    # 1. Ties across pages
+    store_ties = DynamoDBTableStore(table_name="edge_tbl", resource=_StubResource(_EdgeCaseTable(fail_on_page3=False)))
+    monkeypatch.setattr(store_ties, "list_tables", lambda ws: ["edge_tbl"])
+    monkeypatch.setattr(rsa, "get_shared_table_store", lambda: store_ties)
+    out_ties = rsa.execute({"workspace_id": "ws_edge", "query": "For North, what is the earliest and latest Year in edge_tbl?", "stage_timings": {}})
+    assert out_ties["executed_path"] == "structured_aggregate"
+    assert out_ties["final_answer"] == "2018 and 2025."
+    assert out_ties["execution_result"].row_ids == ["t1", "t2", "t3", "t4"]
+
+    # 2. Zero matches (both East and Hardware exist in edge_tbl, but their intersection is empty)
+    out_zero = rsa.execute({"workspace_id": "ws_edge", "query": "For East Hardware, what is the earliest and latest Year in edge_tbl?", "stage_timings": {}})
+    assert out_zero["executed_path"] == "structured_aggregate"
+    assert out_zero["is_refusal"] is True
+    assert out_zero["citations"] == []
+    assert "No rows matched" in out_zero["final_answer"]
+
+    # 3. Truncation reported -> no partial range
+    orig_qr = store_ties.query_rows
+    monkeypatch.setattr(store_ties, "query_rows", lambda *a, **kw: TableRowList([], is_truncated=True, scanned_count=1) if kw.get("limit") is None else orig_qr(*a, **kw))
+    out_trunc = rsa.execute({"workspace_id": "ws_edge", "query": "For North, what is the earliest and latest Year in edge_tbl?", "stage_timings": {}})
+    assert out_trunc["executed_path"] == "structured_aggregate_storage_failure"
+    assert "citations" not in out_trunc or out_trunc["citations"] == []
+
+    # 4. Later-page failure after earlier pages succeed -> no partial range, timings survive
+    store_fail = DynamoDBTableStore(table_name="edge_tbl", resource=_StubResource(_EdgeCaseTable(fail_on_page3=True)))
+    monkeypatch.setattr(store_fail, "list_tables", lambda ws: ["edge_tbl"])
+    monkeypatch.setattr(rsa, "get_shared_table_store", lambda: store_fail)
+    out_fail = rsa.execute({"workspace_id": "ws_edge", "query": "For North, what is the earliest and latest Year in edge_tbl?", "stage_timings": {}})
+    assert out_fail["executed_path"] == "structured_aggregate_storage_failure"
+    assert "citations" not in out_fail or out_fail["citations"] == []
+    assert out_fail["stage_timings"]["table_lookup_ms"] >= 0.0
+    assert out_fail["stage_timings"]["row_reads_ms"] >= 0.0
+    assert out_fail["stage_timings"]["dynamodb_query_pages"] >= 3
+    assert out_fail["stage_timings"]["dynamodb_request_ms"] >= 0.0
+
+
+
+
+
 
 

@@ -48,6 +48,7 @@ class _TimedStoreProxy:
     def __init__(self, store: TableStore) -> None:
         self._store = store
         self.row_reads_ms: float = 0.0
+        self.aggregate_ms: float = 0.0
 
     def query_rows(self, *args: Any, **kwargs: Any) -> Any:
         t0 = time.perf_counter()
@@ -61,7 +62,29 @@ class _TimedStoreProxy:
         try:
             return self._store.aggregate(*args, **kwargs)
         finally:
+            self.aggregate_ms += (time.perf_counter() - t0) * 1000.0
+
+    def execute_single_pass_query(self, *args: Any, **kwargs: Any) -> Any:
+        t0 = time.perf_counter()
+        try:
+            return self._store.execute_single_pass_query(*args, **kwargs)
+        finally:
+            self.aggregate_ms += (time.perf_counter() - t0) * 1000.0
+
+    def stream_rows(self, *args: Any, **kwargs: Any) -> Any:
+        it = iter(self._store.stream_rows(*args, **kwargs))
+        while True:
+            t0 = time.perf_counter()
+            try:
+                item = next(it)
+            except StopIteration:
+                self.row_reads_ms += (time.perf_counter() - t0) * 1000.0
+                return
+            except Exception:
+                self.row_reads_ms += (time.perf_counter() - t0) * 1000.0
+                raise
             self.row_reads_ms += (time.perf_counter() - t0) * 1000.0
+            yield item
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._store, name)
@@ -118,6 +141,7 @@ SKIP_FILTER_WORDS: set[str] = {
 class StructuredQueryService:
     def __init__(self, store: TableStore) -> None:
         self.store = store
+        self.last_stage_timings: dict[str, float] = {}
 
     def execute(
         self,
@@ -128,65 +152,73 @@ class StructuredQueryService:
         if not workspace_id:
             raise ValueError("workspace_id must not be empty")
 
+        self.last_stage_timings = {}
+        if hasattr(self.store, "reset_query_telemetry"):
+            self.store.reset_query_telemetry()
         t_lookup_start = time.perf_counter()
-        q_lower = query.lower()
-
-        # 1. Discover authorised candidate tables in workspace
         try:
-            available_tables = self.store.list_tables(workspace_id)
-        except Exception as e:
-            raise StorageFailureError(f"Failed to list tables for workspace {workspace_id}: {e}") from e
+            # 1. Discover authorised candidate tables in workspace
+            try:
+                available_tables = self.store.list_tables(workspace_id)
+            except Exception as e:
+                raise StorageFailureError(f"Failed to list tables for workspace {workspace_id}: {e}") from e
 
-        if not available_tables:
-            logger.info("StructuredQueryService: no tables found in workspace %s", workspace_id)
-            return None
+            if not available_tables:
+                logger.info("StructuredQueryService: no tables found in workspace %s", workspace_id)
+                return None
 
-        # Filter by document_ids if provided and exclude tombstoned sources
-        candidate_tables = []
-        for tid in available_tables:
-            ver = self.store.get_active_version(tid, workspace_id)
-            t_meta = self.store.get_table(tid, workspace_id, version=ver)
-            if t_meta:
-                try:
-                    from src.db.workspace_boundary_repo import get_workspace_boundary_repo
-                    brepo = get_workspace_boundary_repo()
-                    if brepo and (brepo.has_tombstone(workspace_id, "source", t_meta.document_id) or brepo.has_tombstone(workspace_id, "source", tid)):
-                        continue
-                except Exception:
-                    pass
-                if document_ids is None or t_meta.document_id in document_ids:
-                    candidate_tables.append((tid, t_meta, ver))
+            # Filter by document_ids if provided and exclude tombstoned sources
+            candidate_tables = []
+            for tid in available_tables:
+                ver = self.store.get_active_version(tid, workspace_id)
+                t_meta = self.store.get_table(tid, workspace_id, version=ver)
+                if t_meta:
+                    try:
+                        from src.db.workspace_boundary_repo import get_workspace_boundary_repo
+                        brepo = get_workspace_boundary_repo()
+                        if brepo and (brepo.has_tombstone(workspace_id, "source", t_meta.document_id) or brepo.has_tombstone(workspace_id, "source", tid)):
+                            continue
+                    except Exception:
+                        pass
+                    if document_ids is None or t_meta.document_id in document_ids:
+                        candidate_tables.append((tid, t_meta, ver))
 
-        if not candidate_tables:
-            logger.info("StructuredQueryService: no candidate tables match document scope %s", document_ids)
-            return None
+            if not candidate_tables:
+                logger.info("StructuredQueryService: no candidate tables match document scope %s", document_ids)
+                return None
 
-        # 2. Defensible table binding before execution
-        bound_candidate = self._bind_table(candidate_tables, query, workspace_id)
-        if not bound_candidate:
-            return None
+            # 2. Defensible table binding before execution
+            bound_candidate = self._bind_table(candidate_tables, query, workspace_id)
+            if not bound_candidate:
+                return None
 
-        selected_tid, selected_meta, selected_ver = bound_candidate
+            selected_tid, selected_meta, selected_ver = bound_candidate
 
-        # 3. Completeness check on bound table — require coverage_complete
-        if not self.store.has_coverage_complete_table(selected_tid, workspace_id):
-            manifest = self.store.get_ingestion_manifest(selected_meta.document_id, workspace_id, selected_ver)
-            logger.error("StructuredQueryService: bound table %s is not coverage_complete", selected_tid)
-            raise IncompleteDataError(selected_tid, manifest)
+            # 3. Completeness check on bound table — require coverage_complete
+            if not self.store.has_coverage_complete_table(selected_tid, workspace_id):
+                manifest = self.store.get_ingestion_manifest(selected_meta.document_id, workspace_id, selected_ver)
+                logger.error("StructuredQueryService: bound table %s is not coverage_complete", selected_tid)
+                raise IncompleteDataError(selected_tid, manifest)
 
-        schema = selected_meta.schema
-        if not schema or not schema.columns:
-            return None
+            schema = selected_meta.schema
+            if not schema or not schema.columns:
+                return None
 
-        manifest = self.store.get_ingestion_manifest(selected_meta.document_id, workspace_id, selected_ver) or {}
-        total_rows_in_table = int(manifest.get("persisted_rows", 0))
-        table_lookup_ms = (time.perf_counter() - t_lookup_start) * 1000.0
+            manifest = self.store.get_ingestion_manifest(selected_meta.document_id, workspace_id, selected_ver) or {}
+            total_rows_in_table = int(manifest.get("persisted_rows", 0))
+        finally:
+            table_lookup_ms = (time.perf_counter() - t_lookup_start) * 1000.0
+            self.last_stage_timings["table_lookup_ms"] = round(table_lookup_ms, 3)
+            ddb_tel = getattr(self.store, "last_query_telemetry", None)
+            if isinstance(ddb_tel, dict):
+                self.last_stage_timings.update(ddb_tel)
 
         # 4. Execute on bound table (never switches to another table)
         t_exec_start = time.perf_counter()
         timed_store = _TimedStoreProxy(self.store)
         orig_store = self.store
         self.store = timed_store
+        result: StructuredQueryResult | None = None
         try:
             result = self._execute_on_table(
                 query=query,
@@ -199,15 +231,20 @@ class StructuredQueryService:
             )
         finally:
             self.store = orig_store
-        exec_total_ms = (time.perf_counter() - t_exec_start) * 1000.0
-        if result is not None:
+            exec_total_ms = (time.perf_counter() - t_exec_start) * 1000.0
             row_reads_ms = timed_store.row_reads_ms
-            computation_ms = max(0.0, exec_total_ms - row_reads_ms)
-            result.stage_timings = {
-                "table_lookup_ms": round(table_lookup_ms, 3),
+            aggregate_ms = timed_store.aggregate_ms
+            computation_ms = max(0.0, exec_total_ms - row_reads_ms - aggregate_ms)
+            self.last_stage_timings.update({
                 "row_reads_ms": round(row_reads_ms, 3),
+                "aggregate_ms": round(aggregate_ms, 3),
                 "computation_ms": round(computation_ms, 3),
-            }
+            })
+            ddb_tel = getattr(orig_store, "last_query_telemetry", None)
+            if isinstance(ddb_tel, dict):
+                self.last_stage_timings.update(ddb_tel)
+            if result is not None:
+                result.stage_timings = dict(self.last_stage_timings)
         return result
 
     def _bind_table(
@@ -870,31 +907,49 @@ class StructuredQueryService:
         )
 
         try:
-            min_val, count, min_ids, min_idx, digest_min = self.store.execute_single_pass_query(
+            rows = self.store.query_rows(
                 table_id=table_id,
                 workspace_id=workspace_id,
-                column_index=target_col_idx,
-                op=AggregateOp.MIN,
                 predicates=predicates,
-                version=version,
-            )
-            max_val, _, max_ids, max_idx, digest_max = self.store.execute_single_pass_query(
-                table_id=table_id,
-                workspace_id=workspace_id,
-                column_index=target_col_idx,
-                op=AggregateOp.MAX,
-                predicates=predicates,
+                limit=None,
                 version=version,
             )
         except Exception as e:
             raise StorageFailureError(f"Failed to query table store: {e}") from e
+
+        if getattr(rows, "is_truncated", False):
+            raise StorageFailureError(f"Incomplete table read during range query on '{table_id}'")
+
+        count = len(rows)
+        min_val: Decimal | None = None
+        max_val: Decimal | None = None
+        combined_ids = sorted({r.row_id for r in rows})
+        combined_idx = sorted({r.row_index for r in rows})
+        selection_hash = hashlib.sha256(",".join(combined_ids).encode()).hexdigest()[:16]
+
+        for r in rows:
+            if target_col_idx < len(r.cells):
+                val = r.cells[target_col_idx].normalized_value
+                if val is not None:
+                    d_val: Decimal | None = None
+                    if isinstance(val, Decimal):
+                        d_val = val
+                    else:
+                        try:
+                            d_val = Decimal(str(val).replace(",", "").strip())
+                        except Exception:
+                            d_val = None
+                    if d_val is not None:
+                        if min_val is None or d_val < min_val:
+                            min_val = d_val
+                        if max_val is None or d_val > max_val:
+                            max_val = d_val
 
         if min_val is None or max_val is None:
             if count == 0:
                 answer_text = f"No rows matched the requested filters in table '{table_id}' (0 matching rows). Minimum and maximum are undefined."
                 combined_ids = []
                 combined_idx = []
-                selection_hash = digest_min
                 int_min = None
                 int_max = None
             else:
@@ -903,9 +958,6 @@ class StructuredQueryService:
             int_min = int(min_val) if min_val == int(min_val) else min_val
             int_max = int(max_val) if max_val == int(max_val) else max_val
             answer_text = f"{int_min} and {int_max}."
-            combined_ids = sorted(list(set(min_ids + max_ids)))
-            combined_idx = sorted(list(set(min_idx + max_idx)))
-            selection_hash = hashlib.sha256(",".join(combined_ids).encode()).hexdigest()[:16]
 
         return StructuredQueryResult(
             answer_text=answer_text,

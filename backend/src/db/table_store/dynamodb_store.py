@@ -166,6 +166,35 @@ class DynamoDBTableStore:
         self.table_name = table_name or settings.DYNAMODB_TABLE_NAME
         self._client = client
         self._resource = resource
+        self.last_query_telemetry: dict[str, Any] = {}
+        self.reset_query_telemetry()
+
+    def reset_query_telemetry(self) -> None:
+        self.last_query_telemetry = {
+            "dynamodb_query_pages": 0,
+            "dynamodb_scan_pages": 0,
+            "dynamodb_request_ms": 0.0,
+            "dynamodb_retry_count": 0,
+            "dynamodb_fallback_reason": None,
+        }
+
+    def _timed_ddb_call(self, op_type: str, fn: Any, **kwargs: Any) -> dict[str, Any]:
+        t0 = time.perf_counter()
+        try:
+            resp = fn(**kwargs)
+        finally:
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            self.last_query_telemetry["dynamodb_request_ms"] = round(
+                float(self.last_query_telemetry.get("dynamodb_request_ms", 0.0)) + elapsed_ms, 3
+            )
+            page_key = "dynamodb_scan_pages" if op_type == "scan" else "dynamodb_query_pages"
+            self.last_query_telemetry[page_key] = int(self.last_query_telemetry.get(page_key, 0)) + 1
+        meta = resp.get("ResponseMetadata") if isinstance(resp, dict) else None
+        if isinstance(meta, dict):
+            self.last_query_telemetry["dynamodb_retry_count"] = int(
+                self.last_query_telemetry.get("dynamodb_retry_count", 0)
+            ) + int(meta.get("RetryAttempts", 0) or 0)
+        return resp
 
     @property
     def client(self):
@@ -586,7 +615,7 @@ class DynamoDBTableStore:
         }
 
         while True:
-            resp = self.table.query(**query_kwargs)
+            resp = self._timed_ddb_call("query", self.table.query, **query_kwargs)
             items = resp.get("Items", [])
 
             for item in items:
@@ -733,7 +762,7 @@ class DynamoDBTableStore:
         }
 
         while True:
-            resp = self.table.query(**query_kwargs)
+            resp = self._timed_ddb_call("query", self.table.query, **query_kwargs)
             items = resp.get("Items", [])
             for idx, item in enumerate(items):
                 scanned_count += 1

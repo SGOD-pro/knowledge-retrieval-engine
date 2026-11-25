@@ -744,3 +744,97 @@ def test_benchmark_serialization_preserves_pre_rerank_and_compressed_context_ord
     assert details[0]["stage_timings"]["table_lookup_ms"] == 1.2
     assert res["total_questions"] == 1
 
+
+def test_structured_aggregate_timings_preserved_on_success_and_store_failure_through_benchmark(tmp_path, monkeypatch):
+    """Verify table_lookup_ms, row_reads_ms, aggregate_ms, and computation_ms serialize through run_benchmark on success and store failure."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    from config import settings
+    from db.table_store import get_shared_table_store
+    from ingestion.csv_table_ingester import ingest_csv_to_table_store
+    import scripts.run_canonical_60_benchmark as bench_mod
+
+    monkeypatch.setattr(settings, "ENVIRONMENT", "test")
+    monkeypatch.setattr(settings, "MODEL_PROVIDER", "test")
+    store = get_shared_table_store(reset=True)
+
+    csv_path = tmp_path / "sales_timings.csv"
+    csv_path.write_text("Year,Region,Revenue\n2024,North,1000\n2025,North,1250\n", encoding="utf-8")
+
+    ws = "ws_timings_bench"
+    doc_id = "doc_timings_01"
+    ingest_csv_to_table_store(path=csv_path, document_id=doc_id, workspace_id=ws, store=store, batch_size=100)
+    man = store.get_ingestion_manifest(doc_id, ws)
+    assert man is not None
+    man["coverage_complete"] = True
+    store.publish_active_version("sales_timings", ws, doc_id, man["document_version"], man)
+
+    suite_file = tmp_path / "suite_timings.json"
+    suite_file.write_text(
+        json.dumps({
+            "documents": [],
+            "questions": [{
+                "id": "Q_OK",
+                "category": "NUMERIC",
+                "question": "What is the sum of Revenue in sales_timings.csv?",
+                "expected_answer": "2250",
+                "expected_sources": ["sales_timings.csv"],
+            }],
+        }),
+        encoding="utf-8",
+    )
+    gt_file = tmp_path / "gt_timings.json"
+    gt_file.write_text(
+        json.dumps({"Q_OK": {"answer_contract": {"contract_type": "numeric", "target_value": "2250", "tolerance": 0.01}}}),
+        encoding="utf-8",
+    )
+
+    mock_repo = MagicMock()
+    mock_repo.get_all_chunks.return_value = [SimpleNamespace(id="c1", document_id=doc_id, metadata={"document_filename": "sales_timings.csv"})]
+    mock_repo.get_workspace_documents.return_value = {"documents": [{"id": doc_id, "filename": "sales_timings.csv"}]}
+
+    monkeypatch.setattr(bench_mod, "ROOT_DIR", tmp_path)
+    monkeypatch.setattr(bench_mod, "BACKEND_DIR", tmp_path / "backend")
+    monkeypatch.setattr(bench_mod, "GROUND_TRUTH_FILE", gt_file)
+    monkeypatch.setattr(bench_mod, "QueryRepository", lambda: mock_repo)
+    monkeypatch.setattr(bench_mod, "get_current_commit_sha", lambda: "testsha_timings")
+    monkeypatch.setattr(bench_mod, "verify_live_providers", lambda: None)
+    monkeypatch.setattr(bench_mod, "invalidate_chunk_cache", lambda: None)
+    monkeypatch.setattr(bench_mod, "compute_corpus_manifest_hash", lambda docs: ("corpus_sha", {}))
+    monkeypatch.setattr("db.table_store.get_shared_table_store", lambda **kw: store)
+
+    # 1. Successful structured aggregate execution
+    bench_mod.run_benchmark(
+        workspace_id=ws,
+        benchmark_type="cold",
+        test_path="suite_timings.json",
+        allow_dirty=True,
+    )
+    ok_dirs = sorted((tmp_path / "backend" / "reports" / "testsha_timings").iterdir())
+    ok_details = json.loads((ok_dirs[-1] / "query_details.json").read_text(encoding="utf-8"))
+    ok_timings = ok_details[0]["stage_timings"]
+    assert ok_timings["table_lookup_ms"] >= 0.0
+    assert ok_timings["row_reads_ms"] >= 0.0
+    assert ok_timings["aggregate_ms"] >= 0.0
+    assert ok_timings["computation_ms"] >= 0.0
+    assert ok_timings["structured_aggregate_ms"] >= 0.0
+
+    # 2. Failing store call during aggregate() -> table_lookup_ms and aggregate_ms still preserved
+    def _failing_aggregate(*args, **kwargs):
+        raise RuntimeError("simulated aggregate store failure")
+
+    monkeypatch.setattr(store, "aggregate", _failing_aggregate)
+    bench_mod.run_benchmark(
+        workspace_id=ws,
+        benchmark_type="cold",
+        test_path="suite_timings.json",
+        allow_dirty=True,
+    )
+    fail_dirs = sorted((tmp_path / "backend" / "reports" / "testsha_timings").iterdir())
+    fail_details = json.loads((fail_dirs[-1] / "query_details.json").read_text(encoding="utf-8"))
+    fail_timings = fail_details[0]["stage_timings"]
+    assert fail_timings["table_lookup_ms"] >= 0.0
+    assert fail_timings["aggregate_ms"] >= 0.0
+    assert fail_timings["structured_aggregate_ms"] >= 0.0
+
+
