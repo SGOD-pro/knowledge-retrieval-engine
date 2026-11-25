@@ -778,3 +778,143 @@ def test_conditional_inventory_backfill_primitive_across_backends(tmp_path: Path
         ddb_repo.tombstone_workspace("ws_bf2", "owner-1")
         with pytest.raises(CASConflictError):
             ddb_repo.update_document_snapshot_inventory("ws_bf2", "doc_ws_tomb", "v1", inv1)
+
+
+def test_workbook_row_survives_competing_pdfs_and_rejects_unrelated_or_missing_citations(tmp_path: Path, monkeypatch):
+    """Reproduce Q150 failure: competing PDFs crowd out Sheet1 row, and missing/unrelated citations leak PDFs."""
+    from ingestion.parse_service import parse_file
+    from modules.query.query_service import QueryRequest, QueryService
+    from services.retrieval import bm25_retriever
+
+    monkeypatch.setenv("BEDROCK_RERANK_ENABLED", "false")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "")
+
+    ws_id = "ws_q150_repro"
+    xls_path = tmp_path / "NFHS_Test_Workbook.xls"
+    xls_bytes = b"synthetic-nfhs-workbook-v1"
+    xls_path.write_bytes(xls_bytes)
+    xls_ver = hashlib.sha256(xls_bytes).hexdigest()[:32]
+    fake_xls = _FakeXlsWorkbook(
+        [
+            _FakeXlsSheet("Sheet1", [["District Names", "State/UT", "Households"], ["Nicobars", "AN", 882]]),
+            _FakeXlsSheet("Sheet2", []),
+            _FakeXlsSheet("Sheet3", []),
+        ]
+    )
+    with patch("xlrd.open_workbook", return_value=fake_xls):
+        wb_doc = parse_file(xls_path, document_id="doc-wb-q150", workspace_id=ws_id)
+
+    row_cid = "doc-wb-q150:xls:Sheet1:row1"
+    inv_cid = f"doc-wb-q150:sheet_inventory:{xls_ver}"
+
+    # 12 competing PDF chunks mentioning dataset / populated / Sheet2 / Sheet3
+    pdf_chunks = [
+        Chunk(
+            id=f"doc-pdf-{i}:page:{i+1}:element:{i}",
+            document_id=f"doc-pdf-{i}",
+            source_format="pdf",
+            text=f"Populated dataset analysis Sheet2 Sheet3 district datasets comparison {i}.",
+            element_type="text",
+            page_number=i + 1,
+            workspace_id=ws_id,
+        )
+        for i in range(12)
+    ]
+
+    all_chunks = list(wb_doc.chunks) + pdf_chunks
+
+    class _CrowdDocRepo:
+        def get_workspace_documents(self, workspace_id: str, page: int = 1, limit: int = 1000):
+            return {
+                "documents": [{"id": wb_doc.id, "filename": wb_doc.filename}]
+                + [{"id": f"doc-pdf-{i}", "filename": f"Distractor_{i}.pdf"} for i in range(12)]
+            }
+
+        def get_all_chunks(self, document_ids=None, workspace_id: str = ""):
+            if document_ids is not None:
+                ds = set(document_ids)
+                return [c for c in all_chunks if c.document_id in ds]
+            return list(all_chunks)
+
+        def get(self, doc_id: str):
+            return wb_doc if doc_id == wb_doc.id else None
+
+        def search_vector(self, *args, **kwargs):
+            return []
+
+        def check_semantic_cache(self, *args, **kwargs):
+            return None
+
+    b_repo = InMemoryWorkspaceBoundaryRepository()
+    b_repo.create_workspace("Q150 Repro", "owner-1", workspace_id=ws_id)
+    b_repo.create_source(ws_id, wb_doc.filename, source_id=wb_doc.id)
+    snap = DocumentSnapshot(
+        workspace_id=ws_id,
+        document_id=wb_doc.id,
+        source=wb_doc.filename,
+        version=xls_ver,
+        format="xls",
+        created_at="2026-11-26T00:00:00Z",
+        sheet_inventory=wb_doc.sheet_inventory,
+    )
+    b_repo.save_document_snapshot(snap)
+    for i in range(12):
+        b_repo.create_source(ws_id, f"Distractor_{i}.pdf", source_id=f"doc-pdf-{i}")
+        b_repo.save_document_snapshot(
+            DocumentSnapshot(
+                workspace_id=ws_id,
+                document_id=f"doc-pdf-{i}",
+                source=f"Distractor_{i}.pdf",
+                version=f"vpdf{i}",
+                format="pdf",
+                created_at="2026-11-26T00:00:00Z",
+            )
+        )
+
+    doc_repo = _CrowdDocRepo()
+    query = "Are Sheet2 and Sheet3 additional populated district datasets in the NFHS_Test_Workbook.xls workbook?"
+    ans_text = "No. Sheet2 and Sheet3 are empty (0 data rows); district data for Nicobars (882 Households) are on Sheet1."
+
+    def _run(llm_raw_resp: str):
+        if hasattr(bm25_retriever, "_CHUNK_CACHE"):
+            bm25_retriever._CHUNK_CACHE.clear()
+        qs = QueryService(repo=doc_repo)
+        req = QueryRequest(query=query, workspace_id=ws_id, benchmark_mode=True, cache=False, force_full_path=True)
+        with (
+            patch("src.db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+            patch("db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+            patch("services.langgraph_pipeline._get_repo", return_value=doc_repo),
+            patch("services.langgraph_pipeline.check_fidelity", return_value=True),
+            patch("services.llm.llm_service.generate_completion", return_value=(llm_raw_resp, {"input_tokens": 50, "output_tokens": 20})),
+        ):
+            return qs.execute_query(req)
+
+    # 1. Missing citation output must NOT dump all 6 context chunks (no unrelated PDFs cited)
+    res_missing_cit = _run(json.dumps({"answer": ans_text, "citations": []}))
+    assert not any(c.get("source_format") == "pdf" for c in res_missing_cit.get("citations", []))
+    assert res_missing_cit.get("citations") == []
+
+    # 2. Explicit unrelated PDF citation alongside inventory must NOT admit PDF or pass without row support
+    res_unrel_cit = _run(json.dumps({"answer": ans_text, "citations": [inv_cid, "doc-pdf-0:page:1:element:0"]}))
+    assert not any(c.get("source_format") == "pdf" for c in res_unrel_cit.get("citations", []))
+
+    # 3. Supported full answer citing both real Sheet1 row and inventory survives rerank and passes strict scorer
+    res_full = _run(json.dumps({"answer": ans_text, "citations": [row_cid, inv_cid]}))
+    comp_ids = (res_full.get("retrieval_candidates") or {}).get("compressed_context") or []
+    assert row_cid in comp_ids, f"Sheet1 row {row_cid} lost before context: {comp_ids}"
+    assert inv_cid in comp_ids, f"Inventory {inv_cid} lost before context: {comp_ids}"
+    assert [c["chunk_id"] for c in res_full["citations"]] == [row_cid, inv_cid]
+
+    eval_res = evaluate_grounded_answer(
+        answer=res_full["answer"],
+        citations=res_full["citations"],
+        is_answer_text_correct=True,
+        contract_type="semantic",
+        expected_sources=[wb_doc.filename],
+        expected_source_version=xls_ver,
+        retained_evidence_items=res_full["retained_evidence_items"],
+        context_chunk_ids=comp_ids,
+        ground_truth_chunk_ids=[row_cid],
+        query=query,
+    )
+    assert eval_res["is_grounded_correct"] is True, f"Scorer failed: {eval_res}"

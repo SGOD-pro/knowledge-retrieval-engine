@@ -1119,6 +1119,51 @@ def run_reranker(state: PipelineState):
         reranker_mode = getattr(rerank_res, "reranker_mode", RerankerMode.BYPASSED.value)
         reranker_telemetry = dict(getattr(rerank_res, "reranker_telemetry", None) or get_bypassed_reranker_telemetry(mode=reranker_mode, candidate_count=len(merged)))
 
+    # Ensure each retained sheet_inventory chunk keeps a supporting row/content chunk
+    # from the same authorized workbook document and active version in top_chunks.
+    if isinstance(top_chunks, list) and top_chunks:
+        ws_id_rr = str(state.get("workspace_id", "") or "")
+        for inv_c in list(top_chunks):
+            if getattr(inv_c, "element_type", "") != "sheet_inventory":
+                continue
+            inv_did = str(getattr(inv_c, "document_id", "") or "")
+            inv_ver = getattr(inv_c, "document_version", None) or getattr(inv_c, "version", None)
+            has_row = any(
+                str(getattr(c, "document_id", "") or "") == inv_did
+                and getattr(c, "element_type", "") != "sheet_inventory"
+                for c in top_chunks
+            )
+            if has_row:
+                continue
+            row_cand = None
+            for cand in merged:
+                if str(getattr(cand, "document_id", "") or "") != inv_did:
+                    continue
+                if getattr(cand, "element_type", "") == "sheet_inventory":
+                    continue
+                c_ws = str(getattr(cand, "workspace_id", "") or "")
+                if ws_id_rr and c_ws and c_ws != ws_id_rr:
+                    continue
+                c_meta = getattr(cand, "metadata", None) or {}
+                c_ver = (
+                    getattr(cand, "document_version", None)
+                    or getattr(cand, "version", None)
+                    or c_meta.get("document_version")
+                    or c_meta.get("version")
+                )
+                if c_ver and inv_ver and str(c_ver) != str(inv_ver):
+                    continue
+                row_cand = cand
+                break
+            if row_cand is not None:
+                if len(top_chunks) >= 6:
+                    for idx in range(len(top_chunks) - 1, -1, -1):
+                        if str(getattr(top_chunks[idx], "document_id", "") or "") != inv_did:
+                            top_chunks[idx] = row_cand
+                            break
+                else:
+                    top_chunks.append(row_cand)
+
     if fin_binding and getattr(fin_binding, "is_active", False) and top_chunks:
         try:
             from services.retrieval.table_metric_binding import score_table_chunk_metric_affinity
@@ -1436,8 +1481,9 @@ def run_llm(state: PipelineState):
         if cid in chunk_by_id:
             final_cited_chunks.append(chunk_by_id[cid])
 
+    has_sheet_inventory = any(getattr(c, "element_type", "") == "sheet_inventory" for c in top_chunks)
     if not final_cited_chunks and ans != "NOT_FOUND":
-        if not is_financial:
+        if not is_financial and not has_sheet_inventory:
             final_cited_chunks = [c for c in top_chunks if str(c.id) in compressed_ids]
 
     if ans == "NOT_FOUND" or not top_chunks:

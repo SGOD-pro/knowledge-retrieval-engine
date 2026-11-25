@@ -9,7 +9,7 @@ from schemas.models import Chunk
 from services.retrieval.evidence_contract import EvidenceItem, evidence_item_from_chunk
 
 _EMPTY_OR_ABSENT_SHEET_RE = re.compile(
-    r"\b(sheet\s*[a-z0-9_]*)\s+(?:is\s+)?(?:empty|blank|has\s+0\s+data\s+rows|has\s+no\s+data|contains\s+no\s+data|is\s+absent|does\s+not\s+exist|is\s+missing)\b",
+    r"\b(sheet\s*[a-z0-9_]+(?:\s*(?:,|and)\s*sheet\s*[a-z0-9_]+)*)\s+(?:is\s+|are\s+)?(?:empty|blank|have\s+0\s+data\s+rows|has\s+0\s+data\s+rows|have\s+no\s+data|has\s+no\s+data|contain\s+no\s+data|contains\s+no\s+data|absent|do\s+not\s+exist|does\s+not\s+exist|missing)\b",
     re.IGNORECASE,
 )
 
@@ -188,11 +188,8 @@ def verify_sheet_status_claims(
     retained_evidence_items: list[Any],
     citations: list[dict[str, Any]] | None = None,
 ) -> tuple[bool, str | None]:
-    """Verify any sheet-empty or sheet-absent claim in an answer against retained sheet_inventory evidence."""
+    """Verify sheet-status claims against retained sheet_inventory and populated-sheet row evidence."""
     if not answer or answer == "NOT_FOUND":
-        return True, None
-    matches = list(_EMPTY_OR_ABSENT_SHEET_RE.finditer(answer))
-    if not matches:
         return True, None
 
     cited_ids = {
@@ -201,37 +198,76 @@ def verify_sheet_status_claims(
         if isinstance(c, dict) and c.get("chunk_id")
     }
     inv_items = []
+    cited_ev_items = []
     for ev in retained_evidence_items or []:
+        ev_id = str(getattr(ev, "evidence_id", ""))
+        if ev_id not in cited_ids:
+            continue
+        cited_ev_items.append(ev)
         prov = getattr(ev, "provenance", {}) or {}
         meta = prov.get("metadata") if isinstance(prov, dict) else {}
         if getattr(ev, "strategy", "") == "sheet_inventory" or (
             isinstance(meta, dict) and meta.get("sheet_inventory")
         ):
-            ev_id = str(getattr(ev, "evidence_id", ""))
-            if not cited_ids or ev_id in cited_ids:
-                inv_items.append(ev)
+            inv_items.append(ev)
+
+    matches = list(_EMPTY_OR_ABSENT_SHEET_RE.finditer(answer))
+    if not matches and not inv_items:
+        return True, None
+
+    if not cited_ids:
+        return False, "missing_citations_for_sheet_claim"
 
     if not inv_items:
         return False, "missing_authoritative_sheet_inventory"
 
+    inv_doc_ids = {str(getattr(ev, "document_id", "") or "") for ev in inv_items}
+
+    # Reject unrelated non-workbook citations on single-workbook sheet-inventory answers
+    for ev in cited_ev_items:
+        ev_did = str(getattr(ev, "document_id", "") or "")
+        if ev_did and ev_did not in inv_doc_ids:
+            return False, f"unrelated_document_citation:{ev_did}"
+
     for m in matches:
-        claimed_sheet = re.sub(r"\s+", "", m.group(1)).lower()
         clause = m.group(0).lower()
-        expects_absent = any(k in clause for k in ("absent", "does not exist", "missing"))
-        supported = False
-        for ev in inv_items:
-            inv = ((getattr(ev, "provenance", {}) or {}).get("metadata") or {}).get("sheet_inventory") or {}
-            if not inv.get("complete"):
-                continue
-            sheets = inv.get("sheets") or []
-            by_name = {re.sub(r"\s+", "", str(s.get("name", ""))).lower(): s for s in sheets}
-            entry = by_name.get(claimed_sheet)
-            if expects_absent and entry is None:
-                supported = True
-                break
-            if not expects_absent and entry is not None and entry.get("status") == "empty":
-                supported = True
-                break
-        if not supported:
-            return False, f"unsupported_sheet_status_claim:{m.group(1)}"
+        expects_absent = any(k in clause for k in ("absent", "does not exist", "do not exist", "missing"))
+        sheet_names = re.findall(r"sheet\s*[a-z0-9_]+", m.group(1), re.IGNORECASE)
+        for raw_name in sheet_names:
+            claimed_sheet = re.sub(r"\s+", "", raw_name).lower()
+            supported = False
+            for ev in inv_items:
+                inv = ((getattr(ev, "provenance", {}) or {}).get("metadata") or {}).get("sheet_inventory") or {}
+                if not inv.get("complete"):
+                    continue
+                sheets = inv.get("sheets") or []
+                by_name = {re.sub(r"\s+", "", str(s.get("name", ""))).lower(): s for s in sheets}
+                entry = by_name.get(claimed_sheet)
+                if expects_absent and entry is None:
+                    supported = True
+                    break
+                if not expects_absent and entry is not None and entry.get("status") == "empty":
+                    supported = True
+                    break
+            if not supported:
+                return False, f"unsupported_sheet_status_claim:{raw_name}"
+
+    # If the answer also references a populated sheet from the inventory, require a cited row/cell chunk
+    for ev in inv_items:
+        ev_did = str(getattr(ev, "document_id", "") or "")
+        inv = ((getattr(ev, "provenance", {}) or {}).get("metadata") or {}).get("sheet_inventory") or {}
+        populated_names = [
+            str(s.get("name", ""))
+            for s in (inv.get("sheets") or [])
+            if s.get("status") == "populated" and s.get("name")
+        ]
+        if any(re.search(rf"\b{re.escape(name)}\b", answer, re.IGNORECASE) for name in populated_names):
+            has_row_cit = any(
+                str(getattr(c_ev, "document_id", "") or "") == ev_did
+                and c_ev not in inv_items
+                for c_ev in cited_ev_items
+            )
+            if not has_row_cit:
+                return False, "missing_populated_sheet_row_support"
+
     return True, None
