@@ -365,3 +365,238 @@ def test_live_synthesis_prompt_excludes_benchmark_data():
             if q_text:
                 assert q_text.lower() not in captured_system_prompt.lower(), f"Benchmark question '{q_text}' leaked into live synthesis prompt!"
 
+
+def test_workbook_discovery_for_sheet_queries_and_isolation(monkeypatch):
+    """Verify workbook discovery brings eligible Sheet1 rows into pre_rerank_chunk_ids while enforcing workspace, version, and document scope isolation."""
+    from unittest.mock import MagicMock, patch
+    from db.workspace_boundary_repo import InMemoryWorkspaceBoundaryRepository
+    from schemas.contracts.boundary import DocumentSnapshot
+    from schemas.models import Chunk
+    from services.langgraph_pipeline import run_bm25, run_reranker
+
+    ws_main = "ws_wb_main"
+    ws_other = "ws_wb_other"
+    doc_wb = "doc_health_wb"
+    doc_wb_other = "doc_finance_wb"
+    doc_pdf1 = "doc_pdf_distractor_1"
+    doc_pdf2 = "doc_pdf_distractor_2"
+
+    # Active workbook chunk (Sheet1 row lacking 'Sheet2', 'Sheet3', 'workbook')
+    wb_active = Chunk(
+        id=f"{doc_wb}:xls:Sheet1:row1",
+        document_id=doc_wb,
+        text="District: Northville | Population: 120,000 | Clinics: 14",
+        page_number=1,
+        element_type="table",
+        source_format="xls",
+        workspace_id=ws_main,
+        metadata={"document_filename": "Health_Districts_Data.xls", "document_version": "v2", "sheet_name": "Sheet1"},
+    )
+    # Stale version chunk of same workbook
+    wb_stale = Chunk(
+        id=f"{doc_wb}:xls:Sheet1:row1:v1",
+        document_id=doc_wb,
+        text="District: Oldville | Population: 90,000",
+        page_number=1,
+        element_type="table",
+        source_format="xls",
+        workspace_id=ws_main,
+        metadata={"document_filename": "Health_Districts_Data.xls", "document_version": "v1", "sheet_name": "Sheet1"},
+    )
+    # Out-of-scope workbook in same workspace
+    wb_out_of_scope = Chunk(
+        id=f"{doc_wb_other}:xls:Sheet1:row1",
+        document_id=doc_wb_other,
+        text="District: Southville | Budget: 500,000",
+        page_number=1,
+        element_type="table",
+        source_format="xls",
+        workspace_id=ws_main,
+        metadata={"document_filename": "Finance_Districts_Data.xls", "document_version": "v1", "sheet_name": "Sheet1"},
+    )
+    # Other workspace workbook
+    wb_other_ws = Chunk(
+        id=f"doc_other_ws:xls:Sheet1:row1",
+        document_id="doc_other_ws",
+        text="District: Eastville | Population: 50,000",
+        page_number=1,
+        element_type="table",
+        source_format="xls",
+        workspace_id=ws_other,
+        metadata={"document_filename": "Health_Districts_Data.xls", "document_version": "v2", "sheet_name": "Sheet1"},
+    )
+    # Distractor PDFs mentioning Sheet2, Sheet3, and workbook
+    pdf1 = Chunk(
+        id=f"{doc_pdf1}:page:1:element:1",
+        document_id=doc_pdf1,
+        text="The workbook guide explains Sheet2 and Sheet3 formatting conventions for annual reports.",
+        page_number=1,
+        element_type="narrative",
+        source_format="pdf",
+        workspace_id=ws_main,
+        metadata={"document_filename": "Reporting_Guide.pdf", "document_version": "1"},
+    )
+    pdf2 = Chunk(
+        id=f"{doc_pdf2}:page:2:element:1",
+        document_id=doc_pdf2,
+        text="Sheet2 and Sheet3 in a standard workbook may contain district summaries.",
+        page_number=2,
+        element_type="narrative",
+        source_format="pdf",
+        workspace_id=ws_main,
+        metadata={"document_filename": "Data_Manual.pdf", "document_version": "1"},
+    )
+
+    boundary_repo = InMemoryWorkspaceBoundaryRepository()
+    boundary_repo.save_document_snapshot(
+        DocumentSnapshot(
+            workspace_id=ws_main,
+            document_id=doc_wb,
+            source="Health_Districts_Data.xls",
+            version="v2",
+            format="xls",
+            incomplete_coverage_flag=False,
+            persisted_rows=1,
+            total_rows=1,
+            created_at="2026-11-25T00:00:00Z",
+        )
+    )
+
+    ws_chunks = {
+        ws_main: [pdf1, pdf2, wb_active, wb_stale, wb_out_of_scope],
+        ws_other: [wb_other_ws],
+    }
+    mock_repo = MagicMock()
+    mock_repo.get_all_chunks.side_effect = lambda document_ids=None, workspace_id="": ws_chunks.get(workspace_id, [])
+
+    monkeypatch.setattr("services.langgraph_pipeline._get_repo", lambda: mock_repo)
+    monkeypatch.setattr("services.retrieval.bm25_retriever.get_cached_chunks", lambda ws, fn: fn())
+
+    # 1. Eligible workbook reaches pre_rerank_chunk_ids; stale/other-ws/out-of-scope excluded
+    query_wb = "Are Sheet2 and Sheet3 additional populated district datasets in the Health workbook?"
+    bm25_out = run_bm25({
+        "query": query_wb,
+        "workspace_id": ws_main,
+        "document_ids": [doc_wb, doc_pdf1, doc_pdf2],
+        "boundary_repo": boundary_repo,
+        "stage_timings": {},
+    })
+    with patch("services.langgraph_pipeline.rerank", return_value=(bm25_out["bm25_candidates"][:2], "lexical_bm25_plus", {})):
+        rr_out = run_reranker({
+            "query": query_wb,
+            "workspace_id": ws_main,
+            "bm25_candidates": bm25_out["bm25_candidates"],
+            "candidate_chunks": [],
+            "graph_chunks": [],
+            "structural_candidates": [],
+            "okf_candidates": [],
+            "stage_timings": {},
+            "retrieval_candidates": {},
+        })
+    pre_ids = rr_out["retrieval_candidates"]["pre_rerank"]
+    assert wb_active.id in pre_ids
+    assert wb_stale.id not in pre_ids
+    assert wb_out_of_scope.id not in pre_ids
+    assert wb_other_ws.id not in pre_ids
+
+    # 2. Generic-only query without identifying workbook token must NOT select ambiguous workbook
+    from services.langgraph_pipeline import _discover_workbook_candidates
+    assert _discover_workbook_candidates("Are Sheet2 and Sheet3 populated in the workbook?", [wb_active, wb_out_of_scope], set()) == []
+
+    # 3. PDF-only control adds zero workbook candidates
+    ws_chunks["ws_pdf_only"] = [pdf1, pdf2]
+    bm25_pdf_only = run_bm25({
+        "query": query_wb,
+        "workspace_id": "ws_pdf_only",
+        "boundary_repo": boundary_repo,
+        "stage_timings": {},
+    })
+    assert all(c.source_format == "pdf" for c in bm25_pdf_only["bm25_candidates"])
+
+
+def test_legacy_workbook_discovery_via_registered_snapshot_without_chunk_filename(monkeypatch):
+    """Reproduce live Q150 miss: legacy XLS chunk has NO document_filename/version metadata, registered DocumentSnapshot supplies source, and 45 competing PDFs push it out of BM25 top-40."""
+    from unittest.mock import MagicMock, patch
+    from db.workspace_boundary_repo import InMemoryWorkspaceBoundaryRepository
+    from schemas.contracts.boundary import DocumentSnapshot
+    from schemas.models import Chunk
+    from services.langgraph_pipeline import run_bm25, run_reranker
+
+    ws_id = "ws_legacy_wb"
+    doc_wb = "doc_legacy_health_wb"
+
+    # Legacy XLS chunk matching xls_adapter.py output: NO document_filename, NO document_version
+    wb_legacy = Chunk(
+        id=f"{doc_wb}:xls:Sheet1:row1",
+        document_id=doc_wb,
+        text="District Names: Northville. Population: 120000.",
+        page_number=1,
+        element_type="row",
+        source_format="xls",
+        workspace_id=ws_id,
+        metadata={"sheet": "Sheet1", "row": 2},
+    )
+
+    # 45 competing PDFs mentioning Sheet2, Sheet3, and workbook so BM25 top-40 is saturated by PDFs
+    pdf_chunks = [
+        Chunk(
+            id=f"doc_pdf_{i}:page:1:element:1",
+            document_id=f"doc_pdf_{i}",
+            text=f"Report {i}: Sheet2 and Sheet3 in the workbook contain district annual summary notes.",
+            page_number=1,
+            element_type="narrative",
+            source_format="pdf",
+            workspace_id=ws_id,
+            metadata={"document_filename": f"Guide_{i}.pdf", "document_version": "1"},
+        )
+        for i in range(45)
+    ]
+
+    boundary_repo = InMemoryWorkspaceBoundaryRepository()
+    boundary_repo.save_document_snapshot(
+        DocumentSnapshot(
+            workspace_id=ws_id,
+            document_id=doc_wb,
+            source="Health_Districts_Data.xls",
+            version="v_active",
+            format="xls",
+            incomplete_coverage_flag=False,
+            persisted_rows=1,
+            total_rows=1,
+            created_at="2026-11-25T00:00:00Z",
+        )
+    )
+
+    mock_repo = MagicMock()
+    mock_repo.get_all_chunks.return_value = pdf_chunks + [wb_legacy]
+    monkeypatch.setattr("services.langgraph_pipeline._get_repo", lambda: mock_repo)
+    monkeypatch.setattr("db.workspace_boundary_repo.get_workspace_boundary_repo", lambda: boundary_repo)
+    monkeypatch.setattr("services.retrieval.bm25_retriever.get_cached_chunks", lambda ws, fn: fn())
+
+    query_wb = "Are Sheet2 and Sheet3 additional populated district datasets in the Health workbook?"
+    bm25_out = run_bm25({
+        "query": query_wb,
+        "workspace_id": ws_id,
+        "stage_timings": {},
+    })
+    with patch("services.langgraph_pipeline.rerank", return_value=(bm25_out["bm25_candidates"][:6], "lexical_bm25_plus", {})):
+        rr_out = run_reranker({
+            "query": query_wb,
+            "workspace_id": ws_id,
+            "bm25_candidates": bm25_out["bm25_candidates"],
+            "candidate_chunks": [],
+            "graph_chunks": [],
+            "structural_candidates": [],
+            "okf_candidates": [],
+            "stage_timings": {},
+            "retrieval_candidates": {},
+        })
+
+    pre_ids = rr_out["retrieval_candidates"]["pre_rerank"]
+    assert wb_legacy.id in pre_ids
+    # Never infer/mutate chunk version from the snapshot
+    assert wb_legacy.document_version is None
+    assert "document_version" not in wb_legacy.metadata
+
+
+

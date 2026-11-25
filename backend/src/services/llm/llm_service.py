@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import time
 from typing import Any
 
@@ -27,6 +28,38 @@ def _strip_markdown_json(text: str) -> str:
         text = text[3:]
     text = text.removesuffix("```")
     return text.strip()
+
+
+def _recover_malformed_json_payload(cleaned_json: str) -> dict[str, Any] | None:
+    """Recover {'answer', 'citations'} when model output has minor JSON syntax noise (e.g. ']]}')."""
+    # 1. Common trailing extra bracket before closing brace: ..."]]}
+    repaired = re.sub(r"\]\s*\]\s*\}\s*$", "]}", cleaned_json)
+    if repaired != cleaned_json:
+        try:
+            obj = json.loads(repaired)
+            if isinstance(obj, dict) and "answer" in obj:
+                return {"answer": str(obj["answer"]), "citations": list(obj.get("citations") or [])}
+        except json.JSONDecodeError:
+            pass
+
+    # 2. Regex extraction of JSON "answer" and optional "citations" array
+    ans_match = re.search(r'"answer"\s*:\s*"((?:[^"\\]|\\.)*)"', cleaned_json)
+    if ans_match:
+        try:
+            ans_val = json.loads(f'"{ans_match.group(1)}"')
+        except json.JSONDecodeError:
+            ans_val = ans_match.group(1)
+        cits: list[str] = []
+        cit_match = re.search(r'"citations"\s*:\s*(\[[^\]]*\])', cleaned_json)
+        if cit_match:
+            try:
+                raw_cits = json.loads(cit_match.group(1))
+                if isinstance(raw_cits, list):
+                    cits = [str(c) for c in raw_cits]
+            except json.JSONDecodeError:
+                pass
+        return {"answer": str(ans_val), "citations": cits}
+    return None
 
 
 def call(
@@ -109,18 +142,23 @@ def call(
     try:
         parsed_response = json.loads(cleaned_json)
     except json.JSONDecodeError:
-        # Attempt to extract a plain-text answer before falling back to NOT_FOUND.
-        # Some model responses return unstructured text instead of JSON.
-        stripped = cleaned_json.strip()
-        if stripped and stripped.upper() != "NOT_FOUND" and len(stripped) > 10:
-            logger.warning(
-                "LLM returned non-JSON text (len=%d). Wrapping as plain answer.",
-                len(stripped),
-            )
-            parsed_response = {"answer": stripped, "citations": []}
+        recovered = _recover_malformed_json_payload(cleaned_json)
+        if recovered is not None:
+            logger.warning("LLM returned malformed JSON; recovered answer and %d citations.", len(recovered.get("citations", [])))
+            parsed_response = recovered
         else:
-            logger.error("LLM returned invalid JSON and no recoverable text: %s", raw_response[:200])
-            parsed_response = {"answer": NOT_FOUND_STATIC, "citations": []}
+            # Attempt to extract a plain-text answer before falling back to NOT_FOUND.
+            # Some model responses return unstructured text instead of JSON.
+            stripped = cleaned_json.strip()
+            if stripped and stripped.upper() != "NOT_FOUND" and len(stripped) > 10:
+                logger.warning(
+                    "LLM returned non-JSON text (len=%d). Wrapping as plain answer.",
+                    len(stripped),
+                )
+                parsed_response = {"answer": stripped, "citations": []}
+            else:
+                logger.error("LLM returned invalid JSON and no recoverable text: %s", raw_response[:200])
+                parsed_response = {"answer": NOT_FOUND_STATIC, "citations": []}
 
     # Enforce Rule 15 programmatically
     for forbidden_key in ["confidence", "certainty", "score"]:

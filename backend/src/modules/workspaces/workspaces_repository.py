@@ -386,6 +386,17 @@ class WorkspacesRepository:
                 except Exception:
                     pass
             if hasattr(b_repo, "save_document_snapshot"):
+                raw_inv = getattr(document, "sheet_inventory", None)
+                snap_sheet_inv = (
+                    {
+                        **raw_inv,
+                        "version": str(doc_ver),
+                        "complete": bool(raw_inv.get("complete", True))
+                        and not bool(getattr(document, "incomplete_coverage_flag", False)),
+                    }
+                    if isinstance(raw_inv, dict)
+                    else None
+                )
                 b_repo.save_document_snapshot(
                     DocumentSnapshot(
                         workspace_id=workspace_id,
@@ -394,6 +405,7 @@ class WorkspacesRepository:
                         version=str(doc_ver),
                         format=getattr(document, "source_format", "pdf").lower().replace(".", "") or "pdf",
                         created_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                        sheet_inventory=snap_sheet_inv,
                     )
                 )
         except Exception as be:

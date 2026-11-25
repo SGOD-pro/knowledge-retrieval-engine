@@ -26,6 +26,7 @@ from src.schemas.contracts.boundary import (
     SourceItem,
     StorageUnavailableError,
     TombstoneRecord,
+    WorkbookSheetInventory,
     WorkspaceAccessDeniedError,
     WorkspaceRecord,
 )
@@ -77,6 +78,13 @@ class WorkspaceBoundaryRepositoryBase(Protocol):
     def save_document_snapshot(self, snapshot: DocumentSnapshot) -> None: ...
     def get_document_snapshot(self, workspace_id: str, document_id: str) -> DocumentSnapshot | None: ...
     def list_document_snapshots(self, workspace_id: str) -> list[DocumentSnapshot]: ...
+    def update_document_snapshot_inventory(
+        self,
+        workspace_id: str,
+        document_id: str,
+        expected_version: str,
+        sheet_inventory: WorkbookSheetInventory,
+    ) -> DocumentSnapshot: ...
     def save_benchmark_metadata(self, metadata: BenchmarkRunMetadata) -> None: ...
     def get_benchmark_metadata(self, workspace_id: str, benchmark_run_id: str) -> BenchmarkRunMetadata | None: ...
     def list_benchmark_metadata(self, workspace_id: str) -> list[BenchmarkRunMetadata]: ...
@@ -369,6 +377,33 @@ class InMemoryWorkspaceBoundaryRepository:
         with self._op_lock:
             return [snap for (ws_id, _), snap in self._document_snapshots.items() if ws_id == workspace_id]
 
+    def update_document_snapshot_inventory(
+        self,
+        workspace_id: str,
+        document_id: str,
+        expected_version: str,
+        sheet_inventory: WorkbookSheetInventory,
+    ) -> DocumentSnapshot:
+        if str(sheet_inventory.version) != str(expected_version):
+            raise ValueError("sheet_inventory.version must match expected_version")
+        with self._op_lock:
+            if (workspace_id, "workspace", workspace_id) in self._tombstones or (
+                workspace_id,
+                "source",
+                document_id,
+            ) in self._tombstones:
+                raise CASConflictError("Cannot update inventory for tombstoned workspace or source")
+            snap = self._document_snapshots.get((workspace_id, document_id))
+            if snap is None or str(snap.version) != str(expected_version):
+                raise CASConflictError("Snapshot missing or active version changed")
+            if snap.sheet_inventory is not None:
+                if snap.sheet_inventory.model_dump() == sheet_inventory.model_dump():
+                    return snap
+                raise CASConflictError("Snapshot already carries a different sheet_inventory")
+            updated = snap.model_copy(update={"sheet_inventory": sheet_inventory})
+            self._document_snapshots[(workspace_id, document_id)] = updated
+            return updated
+
     def save_benchmark_metadata(self, metadata: BenchmarkRunMetadata) -> None:
         with self._op_lock:
             self._benchmark_metadata[(metadata.workspace_id, metadata.benchmark_run_id)] = metadata
@@ -553,6 +588,7 @@ class SQLiteWorkspaceBoundaryRepository:
                         okf_status TEXT,
                         okf_entities_count INTEGER DEFAULT 0,
                         okf_properties_count INTEGER DEFAULT 0,
+                        sheet_inventory_json TEXT,
                         PRIMARY KEY (workspace_id, document_id)
                     )
                     """
@@ -572,6 +608,8 @@ class SQLiteWorkspaceBoundaryRepository:
                     self._conn.execute("ALTER TABLE document_snapshots ADD COLUMN okf_entities_count INTEGER DEFAULT 0")
                 if "okf_properties_count" not in snap_cols:
                     self._conn.execute("ALTER TABLE document_snapshots ADD COLUMN okf_properties_count INTEGER DEFAULT 0")
+                if "sheet_inventory_json" not in snap_cols:
+                    self._conn.execute("ALTER TABLE document_snapshots ADD COLUMN sheet_inventory_json TEXT")
 
                 self._conn.execute(
                     """
@@ -1086,14 +1124,20 @@ class SQLiteWorkspaceBoundaryRepository:
     def save_document_snapshot(self, snapshot: DocumentSnapshot) -> None:
         with self._lock:
             with self._conn:
+                inv_json = (
+                    json.dumps(snapshot.sheet_inventory.model_dump())
+                    if snapshot.sheet_inventory is not None
+                    else None
+                )
                 self._conn.execute(
                     """
                     INSERT OR REPLACE INTO document_snapshots (
                         workspace_id, document_id, source, version, format,
                         incomplete_coverage_flag, exclusions_json, persisted_rows, total_rows, created_at,
                         page_index_status, page_index_elements_count,
-                        okf_status, okf_entities_count, okf_properties_count
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        okf_status, okf_entities_count, okf_properties_count,
+                        sheet_inventory_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         snapshot.workspace_id,
@@ -1111,6 +1155,7 @@ class SQLiteWorkspaceBoundaryRepository:
                         snapshot.okf_status,
                         snapshot.okf_entities_count,
                         snapshot.okf_properties_count,
+                        inv_json,
                     ),
                 )
 
@@ -1123,6 +1168,7 @@ class SQLiteWorkspaceBoundaryRepository:
             row = cursor.fetchone()
             if not row:
                 return None
+            raw_inv = row["sheet_inventory_json"] if "sheet_inventory_json" in row.keys() else None
             return DocumentSnapshot(
                 workspace_id=row["workspace_id"],
                 document_id=row["document_id"],
@@ -1139,6 +1185,7 @@ class SQLiteWorkspaceBoundaryRepository:
                 okf_status=row["okf_status"] if "okf_status" in row.keys() else None,
                 okf_entities_count=int(row["okf_entities_count"] or 0) if "okf_entities_count" in row.keys() else 0,
                 okf_properties_count=int(row["okf_properties_count"] or 0) if "okf_properties_count" in row.keys() else 0,
+                sheet_inventory=json.loads(raw_inv) if raw_inv else None,
             )
 
     def list_document_snapshots(self, workspace_id: str) -> list[DocumentSnapshot]:
@@ -1165,9 +1212,50 @@ class SQLiteWorkspaceBoundaryRepository:
                     okf_status=r["okf_status"] if "okf_status" in r.keys() else None,
                     okf_entities_count=int(r["okf_entities_count"] or 0) if "okf_entities_count" in r.keys() else 0,
                     okf_properties_count=int(r["okf_properties_count"] or 0) if "okf_properties_count" in r.keys() else 0,
+                    sheet_inventory=json.loads(r["sheet_inventory_json"]) if ("sheet_inventory_json" in r.keys() and r["sheet_inventory_json"]) else None,
                 )
                 for r in rows
             ]
+
+    def update_document_snapshot_inventory(
+        self,
+        workspace_id: str,
+        document_id: str,
+        expected_version: str,
+        sheet_inventory: WorkbookSheetInventory,
+    ) -> DocumentSnapshot:
+        if str(sheet_inventory.version) != str(expected_version):
+            raise ValueError("sheet_inventory.version must match expected_version")
+        inv_json = json.dumps(sheet_inventory.model_dump())
+        with self._lock:
+            with self._conn:
+                tomb_row = self._conn.execute(
+                    """
+                    SELECT 1 FROM tombstones
+                    WHERE workspace_id = ?
+                      AND ((resource_type = 'workspace' AND resource_id = ?)
+                           OR (resource_type = 'source' AND resource_id = ?))
+                    LIMIT 1
+                    """,
+                    (workspace_id, workspace_id, document_id),
+                ).fetchone()
+                if tomb_row is not None:
+                    raise CASConflictError("Cannot update inventory for tombstoned workspace or source")
+                cur = self._conn.execute(
+                    """
+                    UPDATE document_snapshots
+                    SET sheet_inventory_json = ?
+                    WHERE workspace_id = ? AND document_id = ? AND version = ?
+                      AND (sheet_inventory_json IS NULL OR sheet_inventory_json = ?)
+                    """,
+                    (inv_json, workspace_id, document_id, expected_version, inv_json),
+                )
+                if cur.rowcount == 0:
+                    raise CASConflictError("Snapshot missing, version replaced, or different inventory exists")
+        snap = self.get_document_snapshot(workspace_id, document_id)
+        if snap is None:
+            raise CASConflictError("Snapshot missing after update")
+        return snap
 
     def save_page_index_summary(self, summary: PageIndexSummary) -> None:
         with self._lock:
@@ -1898,6 +1986,8 @@ class DynamoDBWorkspaceBoundaryRepository:
                 item["page_index_status"] = snapshot.page_index_status
             if snapshot.okf_status is not None:
                 item["okf_status"] = snapshot.okf_status
+            if snapshot.sheet_inventory is not None:
+                item["sheet_inventory_json"] = json.dumps(snapshot.sheet_inventory.model_dump())
             self.table.put_item(Item=item)
         except Exception as err:
             raise StorageUnavailableError(f"DynamoDB error saving document snapshot: {err}") from err
@@ -1926,6 +2016,7 @@ class DynamoDBWorkspaceBoundaryRepository:
                 okf_status=item.get("okf_status"),
                 okf_entities_count=int(item.get("okf_entities_count", 0)),
                 okf_properties_count=int(item.get("okf_properties_count", 0)),
+                sheet_inventory=json.loads(item["sheet_inventory_json"]) if item.get("sheet_inventory_json") else None,
             )
         except Exception as err:
             raise StorageUnavailableError(f"DynamoDB error getting document snapshot: {err}") from err
@@ -1955,11 +2046,68 @@ class DynamoDBWorkspaceBoundaryRepository:
                     okf_status=item.get("okf_status"),
                     okf_entities_count=int(item.get("okf_entities_count", 0)),
                     okf_properties_count=int(item.get("okf_properties_count", 0)),
+                    sheet_inventory=json.loads(item["sheet_inventory_json"]) if item.get("sheet_inventory_json") else None,
                 )
                 for item in items
             ]
         except Exception as err:
             raise StorageUnavailableError(f"DynamoDB error listing document snapshots: {err}") from err
+
+    def update_document_snapshot_inventory(
+        self,
+        workspace_id: str,
+        document_id: str,
+        expected_version: str,
+        sheet_inventory: WorkbookSheetInventory,
+    ) -> DocumentSnapshot:
+        if str(sheet_inventory.version) != str(expected_version):
+            raise ValueError("sheet_inventory.version must match expected_version")
+        inv_json = json.dumps(sheet_inventory.model_dump())
+        table_name = self.table.table_name
+        pk = f"WORKSPACE#{workspace_id}"
+        try:
+            self.table.meta.client.transact_write_items(
+                TransactItems=[
+                    {
+                        "ConditionCheck": {
+                            "TableName": table_name,
+                            "Key": {"PK": pk, "SK": f"TOMBSTONE#workspace#{workspace_id}"},
+                            "ConditionExpression": "attribute_not_exists(PK)",
+                        }
+                    },
+                    {
+                        "ConditionCheck": {
+                            "TableName": table_name,
+                            "Key": {"PK": pk, "SK": f"TOMBSTONE#source#{document_id}"},
+                            "ConditionExpression": "attribute_not_exists(PK)",
+                        }
+                    },
+                    {
+                        "Update": {
+                            "TableName": table_name,
+                            "Key": {"PK": pk, "SK": f"DOC_SNAPSHOT#{document_id}"},
+                            "UpdateExpression": "SET sheet_inventory_json = :inv",
+                            "ConditionExpression": (
+                                "attribute_exists(PK) AND version = :ver "
+                                "AND (attribute_not_exists(sheet_inventory_json) OR sheet_inventory_json = :inv)"
+                            ),
+                            "ExpressionAttributeValues": {
+                                ":inv": inv_json,
+                                ":ver": expected_version,
+                            },
+                        }
+                    },
+                ]
+            )
+        except Exception as err:
+            err_name = getattr(getattr(err, "response", None), "get", lambda *_: {})("Error", {}).get("Code", "")
+            if err_name == "TransactionCanceledException" or "TransactionCanceled" in type(err).__name__:
+                raise CASConflictError(f"Conditional snapshot inventory update rejected: {err}") from err
+            raise StorageUnavailableError(f"DynamoDB error updating snapshot inventory: {err}") from err
+        snap = self.get_document_snapshot(workspace_id, document_id)
+        if snap is None:
+            raise CASConflictError("Snapshot missing after conditional update")
+        return snap
 
     def save_benchmark_metadata(self, metadata: BenchmarkRunMetadata) -> None:
         from decimal import Decimal

@@ -89,6 +89,25 @@ class SnapshotRecord(BaseModel):
         return dict(self.source_versions)
 
 
+class SheetInventoryEntry(BaseModel):
+    """Per-sheet presence and population summary bound to a workbook version."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    name: str = Field(..., max_length=256)
+    status: Literal["populated", "empty", "unknown"]
+    data_rows: int = 0
+    header_only: bool = False
+
+
+class WorkbookSheetInventory(BaseModel):
+    """Version-bound workbook sheet inventory."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    version: str = Field(..., max_length=64)
+    complete: bool = True
+    sheets: tuple[SheetInventoryEntry, ...] = Field(default_factory=tuple)
+
+
 class DocumentSnapshot(BaseModel):
     """Authoritative document snapshot recording provenance, version, and coverage.
 
@@ -107,6 +126,7 @@ class DocumentSnapshot(BaseModel):
     persisted_rows: int = Field(default=0, description="Persisted tabular rows or indexed chunks")
     total_rows: int = Field(default=0, description="Total source rows or parsed units (chunks plus exclusions)")
     created_at: str
+    sheet_inventory: WorkbookSheetInventory | None = None
     page_index_status: Literal["ready", "missing_layout", "failed"] | None = None
     page_index_elements_count: int = 0
     okf_status: Literal["ready", "empty", "failed"] | None = None

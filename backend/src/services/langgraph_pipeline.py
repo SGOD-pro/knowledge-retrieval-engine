@@ -405,6 +405,59 @@ def run_okf_router(state: PipelineState):
     }
 
 
+_WORKBOOK_GENERIC_TOKENS = frozenset({
+    "data", "file", "sheet", "workbook", "xls", "xlsx", "factsheet",
+    "table", "report", "the", "and", "for", "are", "in", "with", "from",
+})
+
+
+def _discover_workbook_candidates(
+    query: str,
+    all_chunks: list[Any],
+    existing_ids: set[str],
+    snapshot_sources: dict[str, str] | None = None,
+    max_docs: int = 2,
+    max_chunks_per_doc: int = 2,
+) -> list[Any]:
+    """Bounded workbook discovery when query asks about sheets/workbooks by identifying filename."""
+    q_lower = query.lower()
+    if not re.search(r"\b(?:sheet\s*\d+|workbook)\b|\.(?:xls|xlsx)\b", q_lower):
+        return []
+    q_tokens = set(re.findall(r"[a-z0-9]{3,}", q_lower))
+    if not q_tokens:
+        return []
+
+    matched_by_doc: dict[str, list[Any]] = {}
+    for c in all_chunks:
+        cid = str(getattr(c, "id", ""))
+        if cid in existing_ids:
+            continue
+        did = str(getattr(c, "document_id", ""))
+        fmt = str(getattr(c, "source_format", "") or "").lower()
+        meta = getattr(c, "metadata", None) or {}
+        fname = str(
+            meta.get("document_filename")
+            or getattr(c, "document_filename", "")
+            or (snapshot_sources or {}).get(did, "")
+            or ""
+        )
+        if fmt not in ("xls", "xlsx") and not fname.lower().endswith((".xls", ".xlsx")):
+            continue
+        fname_tokens = set(re.findall(r"[a-z0-9]{3,}", fname.lower())) - _WORKBOOK_GENERIC_TOKENS
+        if not (fname_tokens & q_tokens):
+            continue
+        bucket = matched_by_doc.setdefault(did, [])
+        if len(bucket) < max_chunks_per_doc:
+            bucket.append(c)
+            if len(matched_by_doc) >= max_docs and len(bucket) == max_chunks_per_doc:
+                continue
+
+    added: list[Any] = []
+    for did in list(matched_by_doc.keys())[:max_docs]:
+        added.extend(matched_by_doc[did])
+    return added
+
+
 def run_bm25(state: PipelineState):
     """BM25 retrieval (Component 1 + 2). top_k=40 for union design."""
     t0 = time.perf_counter()
@@ -422,6 +475,44 @@ def run_bm25(state: PipelineState):
         all_chunks = [c for c in cached_chunks if str(c.document_id) in doc_set]
     else:
         all_chunks = cached_chunks
+
+    b_repo = state.get("boundary_repo")
+    if b_repo is None:
+        try:
+            from db.workspace_boundary_repo import get_workspace_boundary_repo
+            b_repo = get_workspace_boundary_repo()
+        except Exception:
+            b_repo = None
+    snapshot_sources: dict[str, str] = {}
+    snapshots_by_doc: dict[str, Any] = {}
+    if b_repo is not None and ws_id:
+        active_versions: dict[str, str] = {}
+        try:
+            for snap in b_repo.list_document_snapshots(ws_id):
+                did = str(getattr(snap, "document_id", "") or "")
+                if not did:
+                    continue
+                snapshots_by_doc[did] = snap
+                if getattr(snap, "version", None):
+                    active_versions[did] = str(snap.version)
+                if getattr(snap, "source", None):
+                    snapshot_sources[did] = str(snap.source)
+        except Exception:
+            active_versions = {}
+            snapshot_sources = {}
+            snapshots_by_doc = {}
+        if active_versions:
+            filtered_chunks = []
+            for c in all_chunks:
+                did = str(getattr(c, "document_id", ""))
+                exp_ver = active_versions.get(did)
+                if exp_ver:
+                    meta = getattr(c, "metadata", None) or {}
+                    c_ver = getattr(c, "document_version", None) or meta.get("document_version")
+                    if c_ver and str(c_ver) != exp_ver:
+                        continue
+                filtered_chunks.append(c)
+            all_chunks = filtered_chunks
 
     retriever = BM25Retriever()
     from services.retrieval.subgoal_decomposer import decompose_query
@@ -446,6 +537,36 @@ def run_bm25(state: PipelineState):
         results = retriever.search(state["query"], all_chunks, top_k=40)
 
     chunks = [c for c, _ in results]
+    wb_added = _discover_workbook_candidates(
+        state["query"],
+        all_chunks,
+        {str(c.id) for c in chunks},
+        snapshot_sources=snapshot_sources,
+    )
+    if wb_added:
+        chunks.extend(wb_added)
+    if b_repo is not None and ws_id and snapshots_by_doc and re.search(r"\b(?:sheet\s*\d+|workbook)\b|\.(?:xls|xlsx)\b", state["query"].lower()):
+        from services.retrieval.sheet_inventory import build_sheet_inventory_chunk_and_evidence
+        allowed_set = {str(d) for d in doc_ids} if doc_ids else None
+        existing_ids = {str(c.id) for c in chunks}
+        matched_dids = {str(getattr(c, "document_id", "")) for c in wb_added} | {
+            str(getattr(c, "document_id", ""))
+            for c in chunks
+            if str(getattr(c, "source_format", "") or "").lower() in ("xls", "xlsx")
+        }
+        for did in matched_dids:
+            snap = snapshots_by_doc.get(did)
+            if snap is None:
+                continue
+            pair = build_sheet_inventory_chunk_and_evidence(
+                snap,
+                workspace_id=ws_id,
+                boundary_repo=b_repo,
+                allowed_document_ids=allowed_set,
+            )
+            if pair is not None and pair[0].id not in existing_ids:
+                chunks.append(pair[0])
+                existing_ids.add(pair[0].id)
     avg_score = sum(s for _, s in results) / max(1, len(results))
     latency_ms = (time.perf_counter() - t0) * 1000.0
     logger.info(
@@ -1134,14 +1255,16 @@ def run_deterministic_math(state: PipelineState):
 
     ans_str = res.format_answer(state["query"])
 
-    # Map provenance citations to response builder citations from chunks
+    # Map provenance citations to response builder citations from chunks (deduplicated)
     citations = []
     ws_id = state.get("workspace_id", "")
     b_repo = state.get("boundary_repo")
     chunk_by_id = {getattr(c, "id", ""): c for c in chunks}
+    seen_cids: set[str] = set()
     for prov in res.provenance_citations:
         cid = prov.get("chunk_id") if isinstance(prov, dict) else getattr(prov, "chunk_id", "")
-        if cid and cid in chunk_by_id:
+        if cid and cid in chunk_by_id and cid not in seen_cids:
+            seen_cids.add(cid)
             citations.append(build_citation(chunk_by_id[cid], workspace_id=ws_id, boundary_repo=b_repo).to_dict())
     if not citations and chunks:
         citations = [build_citation(chunks[0], workspace_id=ws_id, boundary_repo=b_repo).to_dict()]
@@ -2131,6 +2254,29 @@ def delivery_gate(state: PipelineState) -> dict[str, Any]:
             logger.warning(
                 "delivery_gate.financial_metric_binding_rejected reason=%s answer=%s (delivery blocked)",
                 rejection_reason,
+                ans,
+            )
+            return {
+                "final_answer": "NOT_FOUND",
+                "citations": [],
+                "confidence_score": 0.0,
+                "retrieval_incomplete": True,
+                "retained_evidence_items": [],
+                "top_chunks": [],
+            }
+
+    # 2b. Workbook sheet-status claim verification against retained sheet_inventory evidence
+    if ans and ans != "NOT_FOUND":
+        from services.retrieval.sheet_inventory import verify_sheet_status_claims
+        sheet_ok, sheet_reason = verify_sheet_status_claims(
+            ans,
+            state.get("retained_evidence_items", []),
+            state.get("citations", []),
+        )
+        if not sheet_ok:
+            logger.warning(
+                "delivery_gate.sheet_status_rejected reason=%s answer=%s (delivery blocked)",
+                sheet_reason,
                 ans,
             )
             return {

@@ -1,0 +1,780 @@
+"""Offline tests for version-bound workbook sheet inventory, persistence, and grounded citations."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock, PropertyMock, patch
+
+import pytest
+
+BACKEND_ROOT = Path(__file__).resolve().parent.parent
+SRC_ROOT = BACKEND_ROOT / "src"
+for p in (str(BACKEND_ROOT), str(SRC_ROOT)):
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+from db.workspace_boundary_repo import (
+    DynamoDBWorkspaceBoundaryRepository,
+    InMemoryWorkspaceBoundaryRepository,
+    SQLiteWorkspaceBoundaryRepository,
+)
+from schemas.models import Chunk
+from services.evaluation.benchmark_scorer import evaluate_grounded_answer
+from services.retrieval.evidence_contract import evidence_item_from_chunk
+from services.retrieval.sheet_inventory import (
+    build_sheet_inventory_chunk_and_evidence,
+    lookup_sheet_status,
+)
+from src.schemas.contracts.boundary import (
+    DocumentSnapshot,
+    SheetInventoryEntry,
+    WorkbookSheetInventory,
+)
+
+
+class _FakeXlsSheet:
+    def __init__(self, name: str, rows: list[list[object]]) -> None:
+        self.name = name
+        self._rows = rows
+        self.nrows = len(rows)
+        self.ncols = max((len(r) for r in rows), default=0)
+
+    def row_values(self, idx: int) -> list[object]:
+        return self._rows[idx]
+
+
+class _FakeXlsWorkbook:
+    def __init__(self, sheets: list[_FakeXlsSheet]) -> None:
+        self._sheets = sheets
+
+    def sheets(self) -> list[_FakeXlsSheet]:
+        return self._sheets
+
+
+def _write_synthetic_xlsx(path: Path) -> bytes:
+    """Create a real .xlsx file using openpyxl with:
+    - Sheet1: populated (header + 2 data rows)
+    - Sheet2: header-only (1 row, 0 data rows -> empty of data rows)
+    - SheetEmpty: 0 cells (completely empty)
+    """
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    s1 = wb.active
+    s1.title = "Sheet1"
+    s1.append(["Metric", "Value"])
+    s1.append(["Revenue", 12500])
+    s1.append(["Profit", 3400])
+
+    s2 = wb.create_sheet("Sheet2")
+    s2.append(["Metric", "Value"])
+
+    wb.create_sheet("SheetEmpty")
+
+    wb.save(str(path))
+    return path.read_bytes()
+
+
+def test_xls_and_xlsx_parse_and_extract_sheet_inventory(tmp_path: Path):
+    from ingestion.parse_service import parse_file
+
+    xls_path = tmp_path / "report_2025.xls"
+    xls_bytes = b"synthetic-xls-bytes-v1"
+    xls_path.write_bytes(xls_bytes)
+    xls_ver = hashlib.sha256(xls_bytes).hexdigest()[:32]
+
+    fake_wb = _FakeXlsWorkbook(
+        [
+            _FakeXlsSheet("Sheet1", [["Metric", "Value"], ["Revenue", 12500], ["Profit", 3400]]),
+            _FakeXlsSheet("Sheet2", [["Metric", "Value"]]),  # header-only -> empty
+            _FakeXlsSheet("SheetEmpty", []),  # 0 rows/cols -> empty
+        ]
+    )
+    with patch("xlrd.open_workbook", return_value=fake_wb):
+        xls_doc = parse_file(xls_path, document_id="doc-xls-1", workspace_id="ws-1")
+
+    # Existing row chunk IDs preserved
+    assert [c.id for c in xls_doc.chunks] == [
+        "doc-xls-1:xls:Sheet1:row1",
+        "doc-xls-1:xls:Sheet1:row2",
+    ]
+    assert xls_doc.sheet_inventory is not None
+    assert xls_doc.sheet_inventory["version"] == xls_ver
+    assert xls_doc.sheet_inventory["complete"] is True
+
+    xlsx_path = tmp_path / "report_2025.xlsx"
+    xlsx_bytes = _write_synthetic_xlsx(xlsx_path)
+    xlsx_ver = hashlib.sha256(xlsx_bytes).hexdigest()[:32]
+
+    xlsx_doc = parse_file(xlsx_path, document_id="doc-xlsx-1", workspace_id="ws-1")
+    assert any(c.id == "doc-xlsx-1:xlsx:Sheet1:A2" for c in xlsx_doc.chunks)
+    assert xlsx_doc.sheet_inventory is not None
+    assert xlsx_doc.sheet_inventory["version"] == xlsx_ver
+    assert xlsx_doc.sheet_inventory["complete"] is True
+
+    for fmt, doc, ver in (("xls", xls_doc, xls_ver), ("xlsx", xlsx_doc, xlsx_ver)):
+        snap = DocumentSnapshot(
+            workspace_id="ws-1",
+            document_id=doc.id,
+            source=doc.filename,
+            version=ver,
+            format=fmt,
+            created_at="2026-11-25T00:00:00Z",
+            sheet_inventory=doc.sheet_inventory,
+        )
+        assert lookup_sheet_status(snap, "Sheet1")["status"] == "populated"
+        s2_res = lookup_sheet_status(snap, "Sheet2")
+        assert s2_res["status"] == "empty"
+        assert s2_res["header_only"] is True
+        se_res = lookup_sheet_status(snap, "SheetEmpty")
+        assert se_res["status"] == "empty"
+        assert se_res["header_only"] is False
+        assert lookup_sheet_status(snap, "Sheet3")["status"] == "absent"
+
+
+def test_missing_incomplete_mismatched_and_unauthorized_inventory_returns_unknown():
+    # 1. Legacy snapshot without sheet_inventory -> unknown
+    legacy_snap = DocumentSnapshot(
+        workspace_id="ws-1",
+        document_id="doc-1",
+        source="legacy.xls",
+        version="v1",
+        format="xls",
+        created_at="2026-11-25T00:00:00Z",
+    )
+    assert legacy_snap.sheet_inventory is None
+    assert lookup_sheet_status(legacy_snap, "Sheet2")["status"] == "unknown"
+    assert lookup_sheet_status(legacy_snap, "Sheet3")["status"] == "unknown"
+
+    # 2. Incomplete inventory -> unknown (never absent)
+    incomplete_snap = DocumentSnapshot(
+        workspace_id="ws-1",
+        document_id="doc-1",
+        source="partial.xls",
+        version="v1",
+        format="xls",
+        incomplete_coverage_flag=False,
+        created_at="2026-11-25T00:00:00Z",
+        sheet_inventory=WorkbookSheetInventory(
+            version="v1",
+            complete=False,
+            sheets=(SheetInventoryEntry(name="Sheet1", status="populated", data_rows=2),),
+        ),
+    )
+    assert lookup_sheet_status(incomplete_snap, "Sheet3")["status"] == "unknown"
+
+    # 3. incomplete_coverage_flag=True on snapshot -> unknown
+    cov_flag_snap = DocumentSnapshot(
+        workspace_id="ws-1",
+        document_id="doc-1",
+        source="partial2.xls",
+        version="v1",
+        format="xls",
+        incomplete_coverage_flag=True,
+        created_at="2026-11-25T00:00:00Z",
+        sheet_inventory=WorkbookSheetInventory(
+            version="v1",
+            complete=True,
+            sheets=(SheetInventoryEntry(name="Sheet1", status="populated", data_rows=2),),
+        ),
+    )
+    assert lookup_sheet_status(cov_flag_snap, "Sheet3")["status"] == "unknown"
+
+    # 4. Version mismatch between snapshot and inventory -> unknown
+    stale_inv_snap = DocumentSnapshot(
+        workspace_id="ws-1",
+        document_id="doc-1",
+        source="stale.xls",
+        version="v2",
+        format="xls",
+        created_at="2026-11-25T00:00:00Z",
+        sheet_inventory=WorkbookSheetInventory(
+            version="v1",
+            complete=True,
+            sheets=(SheetInventoryEntry(name="Sheet1", status="populated", data_rows=2),),
+        ),
+    )
+    assert lookup_sheet_status(stale_inv_snap, "Sheet3")["status"] == "unknown"
+
+    # 5. Wrong workspace, out-of-scope, or tombstoned source -> unknown & no evidence
+    valid_snap = DocumentSnapshot(
+        workspace_id="ws-1",
+        document_id="doc-1",
+        source="active.xls",
+        version="v1",
+        format="xls",
+        created_at="2026-11-25T00:00:00Z",
+        sheet_inventory=WorkbookSheetInventory(
+            version="v1",
+            complete=True,
+            sheets=(SheetInventoryEntry(name="Sheet1", status="populated", data_rows=2),),
+        ),
+    )
+    assert lookup_sheet_status(valid_snap, "Sheet1", workspace_id="ws-other")["status"] == "unknown"
+    assert lookup_sheet_status(valid_snap, "Sheet1", allowed_document_ids={"doc-other"})["status"] == "unknown"
+
+    mem_repo = InMemoryWorkspaceBoundaryRepository()
+    mem_repo.create_workspace("WS1", "owner-1", workspace_id="ws_1")
+    mem_repo.create_source("ws_1", "active.xls", source_id="doc-1")
+    valid_ws_snap = valid_snap.model_copy(update={"workspace_id": "ws_1"})
+    mem_repo.save_document_snapshot(valid_ws_snap)
+    mem_repo.record_source_tombstone("ws_1", "doc-1", "owner-1")
+    assert lookup_sheet_status(valid_ws_snap, "Sheet1", workspace_id="ws_1", boundary_repo=mem_repo)["status"] == "unknown"
+    assert build_sheet_inventory_chunk_and_evidence(valid_ws_snap, workspace_id="ws_1", boundary_repo=mem_repo) is None
+
+
+def test_persistence_roundtrip_inmemory_sqlite_and_dynamodb_and_legacy_readability(tmp_path: Path):
+    inv = WorkbookSheetInventory(
+        version="ver-abc",
+        complete=True,
+        sheets=(
+            SheetInventoryEntry(name="Sheet1", status="populated", data_rows=2, header_only=False),
+            SheetInventoryEntry(name="Sheet2", status="empty", data_rows=0, header_only=True),
+        ),
+    )
+    snap = DocumentSnapshot(
+        workspace_id="ws-1",
+        document_id="doc-1",
+        source="wb.xls",
+        version="ver-abc",
+        format="xls",
+        created_at="2026-11-25T00:00:00Z",
+        sheet_inventory=inv,
+    )
+
+    # 1. InMemory
+    mem_repo = InMemoryWorkspaceBoundaryRepository()
+    mem_repo.save_document_snapshot(snap)
+    got_mem = mem_repo.get_document_snapshot("ws-1", "doc-1")
+    assert got_mem is not None and got_mem.sheet_inventory == inv
+
+    # 2. SQLite (including legacy row without sheet_inventory_json)
+    db_path = tmp_path / "boundary.db"
+    sql_repo = SQLiteWorkspaceBoundaryRepository(db_path=str(db_path))
+    sql_repo.save_document_snapshot(snap)
+    got_sql = sql_repo.get_document_snapshot("ws-1", "doc-1")
+    assert got_sql is not None and got_sql.sheet_inventory == inv
+    assert sql_repo.list_document_snapshots("ws-1")[0].sheet_inventory == inv
+
+    legacy_snap = DocumentSnapshot(
+        workspace_id="ws-1",
+        document_id="doc-legacy",
+        source="legacy.xls",
+        version="ver-old",
+        format="xls",
+        created_at="2026-11-25T00:00:00Z",
+    )
+    sql_repo.save_document_snapshot(legacy_snap)
+    got_legacy_sql = sql_repo.get_document_snapshot("ws-1", "doc-legacy")
+    assert got_legacy_sql is not None and got_legacy_sql.sheet_inventory is None
+
+    # 3. DynamoDB (mocked table)
+    stored_items: dict[tuple[str, str], dict] = {}
+    mock_table = MagicMock()
+
+    def _put_item(Item):
+        stored_items[(Item["PK"], Item["SK"])] = dict(Item)
+
+    def _get_item(Key):
+        it = stored_items.get((Key["PK"], Key["SK"]))
+        return {"Item": dict(it)} if it else {}
+
+    def _query(**kwargs):
+        return {"Items": [dict(v) for (pk, sk), v in stored_items.items() if sk.startswith("DOC_SNAPSHOT#")]}
+
+    mock_table.put_item.side_effect = _put_item
+    mock_table.get_item.side_effect = _get_item
+    mock_table.query.side_effect = _query
+
+    ddb_repo = DynamoDBWorkspaceBoundaryRepository.__new__(DynamoDBWorkspaceBoundaryRepository)
+    with patch.object(DynamoDBWorkspaceBoundaryRepository, "table", new_callable=PropertyMock, return_value=mock_table):
+        ddb_repo.save_document_snapshot(snap)
+        ddb_repo.save_document_snapshot(legacy_snap)
+
+        got_ddb = ddb_repo.get_document_snapshot("ws-1", "doc-1")
+        assert got_ddb is not None and got_ddb.sheet_inventory == inv
+        got_legacy_ddb = ddb_repo.get_document_snapshot("ws-1", "doc-legacy")
+        assert got_legacy_ddb is not None and got_legacy_ddb.sheet_inventory is None
+        listed_ddb = {s.document_id: s for s in ddb_repo.list_document_snapshots("ws-1")}
+        assert listed_ddb["doc-1"].sheet_inventory == inv
+        assert listed_ddb["doc-legacy"].sheet_inventory is None
+
+
+def test_grounded_citation_path_with_row_and_inventory_evidence_items():
+    """Verify existing citation & scorer path with a real row citation + inventory evidence item."""
+    ws_id = "ws_inv_test"
+    doc_id = "doc-wb-1"
+    doc_fname = "Health_Districts_Data.xls"
+    doc_ver = "v_active_001"
+
+    repo = InMemoryWorkspaceBoundaryRepository()
+    repo.create_workspace("Test", "owner-1", workspace_id=ws_id)
+    repo.create_source(ws_id, doc_fname, source_id=doc_id)
+    snap = DocumentSnapshot(
+        workspace_id=ws_id,
+        document_id=doc_id,
+        source=doc_fname,
+        version=doc_ver,
+        format="xls",
+        created_at="2026-11-25T00:00:00Z",
+        sheet_inventory=WorkbookSheetInventory(
+            version=doc_ver,
+            complete=True,
+            sheets=(
+                SheetInventoryEntry(name="Sheet1", status="populated", data_rows=2, header_only=False),
+                SheetInventoryEntry(name="Sheet2", status="empty", data_rows=0, header_only=True),
+            ),
+        ),
+    )
+    repo.save_document_snapshot(snap)
+
+    # Unversioned legacy row chunk must never have version inferred
+    unversioned_row = Chunk(
+        id=f"{doc_id}:xls:Sheet1:row1",
+        document_id=doc_id,
+        source_format="xls",
+        text="Sheet1 row 2: District=North; Indicator=12500",
+        element_type="row",
+        section_path=("Sheet1",),
+        location_reference="Sheet1 row 2",
+        workspace_id=ws_id,
+        metadata={"sheet": "Sheet1", "row": 2},
+    )
+    unver_ev = evidence_item_from_chunk(unversioned_row, workspace_id=ws_id, strategy="bm25", boundary_repo=repo)
+    assert unver_ev.document_version is None
+
+    # Version-bound row chunk + version-bound inventory evidence item
+    row_chunk = Chunk(
+        id=f"{doc_id}:xls:Sheet1:row1",
+        document_id=doc_id,
+        source_format="xls",
+        text="Sheet1 row 2: District=North; Indicator=12500",
+        element_type="row",
+        section_path=("Sheet1",),
+        location_reference="Sheet1 row 2",
+        workspace_id=ws_id,
+        version=doc_ver,
+        document_version=doc_ver,
+        metadata={"sheet": "Sheet1", "row": 2, "document_version": doc_ver},
+    )
+    row_ev = evidence_item_from_chunk(row_chunk, workspace_id=ws_id, strategy="bm25", boundary_repo=repo)
+
+    inv_pair = build_sheet_inventory_chunk_and_evidence(snap, workspace_id=ws_id, boundary_repo=repo)
+    assert inv_pair is not None
+    inv_chunk, inv_ev = inv_pair
+
+    retained = [row_ev, inv_ev]
+    context_ids = [row_chunk.id, inv_chunk.id]
+    gt_ids = [row_chunk.id]
+
+    row_cit = {
+        "chunk_id": row_chunk.id,
+        "document_id": doc_id,
+        "document_filename": doc_fname,
+        "document_version": doc_ver,
+        "location_reference": "Sheet1 row 2",
+        "snippet": row_chunk.text,
+    }
+    inv_cit = {
+        "chunk_id": inv_chunk.id,
+        "document_id": doc_id,
+        "document_filename": doc_fname,
+        "document_version": doc_ver,
+        "location_reference": "Sheet Inventory",
+        "snippet": inv_chunk.text,
+    }
+
+    full_answer = "In Sheet1, North District has Indicator 12500, while Sheet2 is empty with 0 data rows."
+
+    # 1. Both required evidence items present and cited -> PASS
+    res_both = evaluate_grounded_answer(
+        answer=full_answer,
+        citations=[row_cit, inv_cit],
+        is_answer_text_correct=True,
+        contract_type="semantic",
+        expected_sources=[doc_fname],
+        expected_source_version=doc_ver,
+        retained_evidence_items=retained,
+        context_chunk_ids=context_ids,
+        ground_truth_chunk_ids=gt_ids,
+    )
+    assert res_both["is_grounded_correct"] is True, f"Unexpected failure: {res_both}"
+
+    # 2. Removing the row evidence item prevents a grounded full answer
+    res_no_row = evaluate_grounded_answer(
+        answer=full_answer,
+        citations=[inv_cit],
+        is_answer_text_correct=True,
+        contract_type="semantic",
+        expected_sources=[doc_fname],
+        expected_source_version=doc_ver,
+        retained_evidence_items=[inv_ev],
+        context_chunk_ids=[inv_chunk.id],
+        ground_truth_chunk_ids=gt_ids,
+    )
+    assert res_no_row["is_grounded_correct"] is False
+
+    # 3. Removing the inventory evidence item prevents a grounded full answer about empty Sheet2
+    # (when answer asserts Sheet2 is empty, row_chunk alone does not mention Sheet2 or empty)
+    empty_sheet_answer = "Sheet2 is empty with 0 data rows and contains no data."
+    res_no_inv = evaluate_grounded_answer(
+        answer=empty_sheet_answer,
+        citations=[row_cit],
+        is_answer_text_correct=True,
+        contract_type="semantic",
+        expected_sources=[doc_fname],
+        expected_source_version=doc_ver,
+        retained_evidence_items=[row_ev],
+        context_chunk_ids=[row_chunk.id],
+        ground_truth_chunk_ids=gt_ids,
+    )
+    assert res_no_inv["is_grounded_correct"] is False
+
+    # 4. Unknown status preserves scoped refusal with zero citations
+    res_refusal = evaluate_grounded_answer(
+        answer="NOT_FOUND",
+        citations=[],
+        is_answer_text_correct=True,
+        contract_type="refusal",
+        ans_is_refusal=True,
+    )
+    assert res_refusal["is_grounded_correct"] is True
+    assert res_refusal["reason"] == "valid_unsupported_refusal"
+
+
+def test_xls_and_xlsx_first_row_data_vs_header_only_and_ambiguous(tmp_path: Path):
+    """Verify blank, genuine header-only, first-row data, ambiguous first row, populated, and absent sheets."""
+    from openpyxl import Workbook
+    from ingestion.parse_service import parse_file
+
+    # XLSX workbook
+    xlsx_path = tmp_path / "first_row_cases.xlsx"
+    wb = Workbook()
+    s_blank = wb.active
+    s_blank.title = "BlankSheet"
+    s_hdr = wb.create_sheet("HeaderOnly")
+    s_hdr.append(["Metric", "Value"])
+    s_fr = wb.create_sheet("FirstRowData")
+    s_fr.append(["Total Households", 1292])
+    s_amb = wb.create_sheet("AmbiguousFirstRow")
+    s_amb.append(["This single row contains an explanatory note rather than column headers."])
+    s_pop = wb.create_sheet("Populated")
+    s_pop.append(["District", "Households"])
+    s_pop.append(["North", 882])
+    wb.save(str(xlsx_path))
+
+    xlsx_doc = parse_file(xlsx_path, document_id="doc-xlsx-cases", workspace_id="ws_1")
+    # Preserve existing cell IDs
+    assert any(c.id == "doc-xlsx-cases:xlsx:FirstRowData:A1" for c in xlsx_doc.chunks)
+    assert any(c.id == "doc-xlsx-cases:xlsx:Populated:B2" for c in xlsx_doc.chunks)
+    xlsx_snap = DocumentSnapshot(
+        workspace_id="ws_1",
+        document_id=xlsx_doc.id,
+        source=xlsx_doc.filename,
+        version=xlsx_doc.sheet_inventory["version"],
+        format="xlsx",
+        created_at="2026-11-26T00:00:00Z",
+        sheet_inventory=xlsx_doc.sheet_inventory,
+    )
+    assert lookup_sheet_status(xlsx_snap, "BlankSheet")["status"] == "empty"
+    assert lookup_sheet_status(xlsx_snap, "BlankSheet")["header_only"] is False
+    assert lookup_sheet_status(xlsx_snap, "HeaderOnly")["status"] == "empty"
+    assert lookup_sheet_status(xlsx_snap, "HeaderOnly")["header_only"] is True
+    assert lookup_sheet_status(xlsx_snap, "FirstRowData")["status"] == "populated"
+    assert lookup_sheet_status(xlsx_snap, "AmbiguousFirstRow")["status"] == "unknown"
+    assert lookup_sheet_status(xlsx_snap, "Populated")["status"] == "populated"
+    assert lookup_sheet_status(xlsx_snap, "MissingSheet")["status"] == "absent"
+
+    # XLS workbook
+    xls_path = tmp_path / "first_row_cases.xls"
+    xls_bytes = b"synthetic-xls-first-row-cases"
+    xls_path.write_bytes(xls_bytes)
+    fake_xls = _FakeXlsWorkbook(
+        [
+            _FakeXlsSheet("BlankSheet", []),
+            _FakeXlsSheet("HeaderOnly", [["Metric", "Value"]]),
+            _FakeXlsSheet("FirstRowData", [["Total Households", 1292]]),
+            _FakeXlsSheet("AmbiguousFirstRow", [["This single row contains an explanatory note rather than column headers."]]),
+            _FakeXlsSheet("Populated", [["District", "Households"], ["North", 882]]),
+        ]
+    )
+    with patch("xlrd.open_workbook", return_value=fake_xls):
+        xls_doc = parse_file(xls_path, document_id="doc-xls-cases", workspace_id="ws_1")
+
+    assert [c.id for c in xls_doc.chunks] == ["doc-xls-cases:xls:Populated:row1"]
+    xls_snap = DocumentSnapshot(
+        workspace_id="ws_1",
+        document_id=xls_doc.id,
+        source=xls_doc.filename,
+        version=xls_doc.sheet_inventory["version"],
+        format="xls",
+        created_at="2026-11-26T00:00:00Z",
+        sheet_inventory=xls_doc.sheet_inventory,
+    )
+    assert lookup_sheet_status(xls_snap, "BlankSheet")["status"] == "empty"
+    assert lookup_sheet_status(xls_snap, "HeaderOnly")["status"] == "empty"
+    assert lookup_sheet_status(xls_snap, "HeaderOnly")["header_only"] is True
+    assert lookup_sheet_status(xls_snap, "FirstRowData")["status"] == "populated"
+    assert lookup_sheet_status(xls_snap, "AmbiguousFirstRow")["status"] == "unknown"
+    assert lookup_sheet_status(xls_snap, "Populated")["status"] == "populated"
+    assert lookup_sheet_status(xls_snap, "MissingSheet")["status"] == "absent"
+
+
+def test_query_service_end_to_end_workbook_inventory_and_negative_blocking(tmp_path: Path):
+    """Prove normal QueryService path cites row + inventory, passes strict scorer, and blocks unsupported claims."""
+    from ingestion.parse_service import parse_file
+    from modules.query.query_service import QueryRequest, QueryService
+    from services.retrieval import bm25_retriever
+
+    ws_id = "ws_qs_e2e"
+    xls_path = tmp_path / "district_survey_2025.xls"
+    xls_bytes = b"synthetic-xls-e2e-bytes"
+    xls_path.write_bytes(xls_bytes)
+    xls_ver = hashlib.sha256(xls_bytes).hexdigest()[:32]
+    fake_xls = _FakeXlsWorkbook(
+        [
+            _FakeXlsSheet("Sheet1", [["District", "Households"], ["North", 882], ["South", 410]]),
+            _FakeXlsSheet("Sheet2", [["District", "Households"]]),
+        ]
+    )
+    with patch("xlrd.open_workbook", return_value=fake_xls):
+        xls_doc = parse_file(xls_path, document_id="doc-xls-e2e", workspace_id=ws_id)
+
+    # Simulate legacy chunk missing filename/version metadata on row chunks
+    legacy_chunks = tuple(
+        Chunk(
+            id=c.id,
+            document_id=c.document_id,
+            source_format=c.source_format,
+            text=c.text,
+            element_type=c.element_type,
+            section_path=c.section_path,
+            location_reference=c.location_reference,
+            metadata={"sheet": "Sheet1", "row": 2},
+            workspace_id=ws_id,
+        )
+        for c in xls_doc.chunks
+    )
+
+    class _MemDocRepo:
+        def get_workspace_documents(self, workspace_id: str, page: int = 1, limit: int = 1000):
+            return {"documents": [{"id": xls_doc.id, "filename": xls_doc.filename}]}
+
+        def get_all_chunks(self, document_ids=None, workspace_id: str = ""):
+            if document_ids and xls_doc.id not in document_ids:
+                return []
+            return list(legacy_chunks)
+
+        def get(self, doc_id: str):
+            return xls_doc if doc_id == xls_doc.id else None
+
+        def search_vector(self, *args, **kwargs):
+            return []
+
+        def check_semantic_cache(self, *args, **kwargs):
+            return None
+
+    doc_repo = _MemDocRepo()
+    row_cid = "doc-xls-e2e:xls:Sheet1:row1"
+    inv_cid = f"doc-xls-e2e:sheet_inventory:{xls_ver}"
+    query = "In district_survey_2025.xls, how many Households are in North in Sheet1 and what is in Sheet2?"
+    ans_text = "In Sheet1, North has 882 Households, and Sheet2 is empty with 0 data rows."
+
+    def _fake_rerank(q, chunks, top_k=6, **kwargs):
+        return list(chunks)[:top_k], "bypassed", {"mode": "bypassed", "candidate_count": len(chunks)}
+
+    def _run_qs(snap: DocumentSnapshot | None, *, tombstone: bool = False, llm_cits: list[str]):
+        if hasattr(bm25_retriever, "_CHUNK_CACHE"):
+            bm25_retriever._CHUNK_CACHE.clear()
+        b_repo = InMemoryWorkspaceBoundaryRepository()
+        b_repo.create_workspace("E2E WS", "owner-1", workspace_id=ws_id)
+        b_repo.create_source(ws_id, xls_doc.filename, source_id=xls_doc.id)
+        if snap is not None:
+            b_repo.save_document_snapshot(snap)
+        if tombstone:
+            b_repo.record_source_tombstone(ws_id, xls_doc.id, "owner-1")
+
+        qs = QueryService(repo=doc_repo)
+        req = QueryRequest(query=query, workspace_id=ws_id, benchmark_mode=True, cache=False, force_full_path=True)
+        llm_payload = json.dumps({"answer": ans_text, "citations": llm_cits})
+        with (
+            patch("src.db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+            patch("db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+            patch("services.langgraph_pipeline._get_repo", return_value=doc_repo),
+            patch("services.langgraph_pipeline.rerank", side_effect=_fake_rerank),
+            patch("services.langgraph_pipeline.check_fidelity", return_value=True),
+            patch("services.llm.llm_service.generate_completion", return_value=(llm_payload, {"input_tokens": 50, "output_tokens": 20})),
+        ):
+            return qs.execute_query(req)
+
+    valid_snap = DocumentSnapshot(
+        workspace_id=ws_id,
+        document_id=xls_doc.id,
+        source=xls_doc.filename,
+        version=xls_ver,
+        format="xls",
+        created_at="2026-11-26T00:00:00Z",
+        sheet_inventory=xls_doc.sheet_inventory,
+    )
+    res_ok = _run_qs(valid_snap, llm_cits=[row_cid, inv_cid])
+    assert res_ok["answer"] == ans_text
+    assert [c["chunk_id"] for c in res_ok["citations"]] == [row_cid, inv_cid]
+    eval_ok = evaluate_grounded_answer(
+        answer=res_ok["answer"],
+        citations=res_ok["citations"],
+        is_answer_text_correct=True,
+        contract_type="semantic",
+        expected_sources=[xls_doc.filename],
+        expected_source_version=xls_ver,
+        retained_evidence_items=res_ok["retained_evidence_items"],
+        context_chunk_ids=res_ok.get("retrieval_candidates", {}).get("compressed_context"),
+        ground_truth_chunk_ids=[row_cid],
+        query=query,
+    )
+    assert eval_ok["is_grounded_correct"] is True
+
+    # Negative cases: missing, incomplete, stale inventory with mocked LLM asserting empty Sheet2 using only row_cid
+    snap_missing = valid_snap.model_copy(update={"sheet_inventory": None})
+    snap_incomplete = valid_snap.model_copy(
+        update={"sheet_inventory": WorkbookSheetInventory(version=xls_ver, complete=False, sheets=valid_snap.sheet_inventory.sheets)}
+    )
+    snap_stale = valid_snap.model_copy(
+        update={"sheet_inventory": WorkbookSheetInventory(version="stale_ver", complete=True, sheets=valid_snap.sheet_inventory.sheets)}
+    )
+    for neg_snap, tomb in ((snap_missing, False), (snap_incomplete, False), (snap_stale, False), (valid_snap, True)):
+        neg_res = _run_qs(neg_snap, tombstone=tomb, llm_cits=[row_cid])
+        assert neg_res["citations"] == []
+        assert "empty" not in neg_res["answer"].lower()
+
+
+def test_conditional_inventory_backfill_primitive_across_backends(tmp_path: Path):
+    """Prove atomic conditional inventory backfill across InMemory, SQLite, and DynamoDB."""
+    from src.schemas.contracts.boundary import CASConflictError
+
+    inv1 = WorkbookSheetInventory(
+        version="v1",
+        complete=True,
+        sheets=(SheetInventoryEntry(name="Sheet1", status="populated", data_rows=5),),
+    )
+    inv2 = WorkbookSheetInventory(
+        version="v1",
+        complete=True,
+        sheets=(SheetInventoryEntry(name="Sheet1", status="populated", data_rows=6),),
+    )
+    base_snap = DocumentSnapshot(
+        workspace_id="ws_bf",
+        document_id="doc_bf",
+        source="wb.xls",
+        version="v1",
+        format="xls",
+        persisted_rows=5,
+        total_rows=5,
+        created_at="2026-11-26T00:00:00Z",
+        page_index_status="ready",
+        page_index_elements_count=12,
+        okf_status="ready",
+    )
+
+    def _exercise_repo(repo, *, is_ddb=False):
+        repo.create_workspace("BF", "owner-1", workspace_id="ws_bf")
+        repo.create_source("ws_bf", "wb.xls", source_id="doc_bf")
+        repo.save_document_snapshot(base_snap)
+
+        # 1. First write succeeds and preserves unrelated fields
+        updated = repo.update_document_snapshot_inventory("ws_bf", "doc_bf", "v1", inv1)
+        assert updated.sheet_inventory == inv1
+        assert updated.persisted_rows == 5
+        assert updated.page_index_status == "ready"
+        assert updated.page_index_elements_count == 12
+        assert updated.okf_status == "ready"
+
+        # 2. Identical retry is idempotent
+        retried = repo.update_document_snapshot_inventory("ws_bf", "doc_bf", "v1", inv1)
+        assert retried.sheet_inventory == inv1
+
+        # 3. Different existing inventory is rejected
+        with pytest.raises(CASConflictError):
+            repo.update_document_snapshot_inventory("ws_bf", "doc_bf", "v1", inv2)
+
+        # 4. Concurrent version replacement is rejected
+        newer_snap = base_snap.model_copy(update={"version": "v2", "sheet_inventory": None})
+        repo.save_document_snapshot(newer_snap)
+        with pytest.raises(CASConflictError):
+            repo.update_document_snapshot_inventory("ws_bf", "doc_bf", "v1", inv1)
+
+        # 5. Source revocation and workspace revocation are rejected
+        v2_inv = WorkbookSheetInventory(version="v2", complete=True, sheets=inv1.sheets)
+        repo.record_source_tombstone("ws_bf", "doc_bf", "owner-1")
+        with pytest.raises(CASConflictError):
+            repo.update_document_snapshot_inventory("ws_bf", "doc_bf", "v2", v2_inv)
+
+    # InMemory
+    _exercise_repo(InMemoryWorkspaceBoundaryRepository())
+
+    # SQLite
+    _exercise_repo(SQLiteWorkspaceBoundaryRepository(db_path=str(tmp_path / "bf.db")))
+
+    # DynamoDB (atomic transact_write_items simulation)
+    stored: dict[tuple[str, str], dict] = {}
+    mock_table = MagicMock()
+    mock_table.table_name = "boundary-table"
+
+    def _put_item(Item, **kwargs):
+        stored[(Item["PK"], Item["SK"])] = dict(Item)
+
+    def _get_item(Key, **kwargs):
+        it = stored.get((Key["PK"], Key["SK"]))
+        return {"Item": dict(it)} if it else {}
+
+    def _transact_write_items(TransactItems):
+        # Validate all conditions before mutating (atomic)
+        for ti in TransactItems:
+            if "ConditionCheck" in ti:
+                cc = ti["ConditionCheck"]
+                k = (cc["Key"]["PK"], cc["Key"]["SK"])
+                if "attribute_not_exists(PK)" in cc["ConditionExpression"] and k in stored:
+                    raise RuntimeError("TransactionCanceledException: tombstone exists")
+            elif "Update" in ti:
+                up = ti["Update"]
+                k = (up["Key"]["PK"], up["Key"]["SK"])
+                cur = stored.get(k)
+                vals = up["ExpressionAttributeValues"]
+                if cur is None or cur.get("version") != vals[":ver"]:
+                    raise RuntimeError("TransactionCanceledException: version mismatch")
+                cur_inv = cur.get("sheet_inventory_json")
+                if cur_inv is not None and cur_inv != vals[":inv"]:
+                    raise RuntimeError("TransactionCanceledException: different inventory exists")
+        for ti in TransactItems:
+            if "Update" in ti:
+                up = ti["Update"]
+                k = (up["Key"]["PK"], up["Key"]["SK"])
+                stored[k]["sheet_inventory_json"] = up["ExpressionAttributeValues"][":inv"]
+
+    class _TxCanceled(Exception):
+        pass
+
+    def _tx_wrapper(TransactItems):
+        try:
+            _transact_write_items(TransactItems)
+        except RuntimeError as e:
+            err = _TxCanceled(str(e))
+            err.response = {"Error": {"Code": "TransactionCanceledException"}}
+            raise err from e
+
+    mock_table.put_item.side_effect = _put_item
+    mock_table.get_item.side_effect = _get_item
+    mock_table.meta.client.transact_write_items.side_effect = _tx_wrapper
+
+    ddb_repo = DynamoDBWorkspaceBoundaryRepository.__new__(DynamoDBWorkspaceBoundaryRepository)
+    with patch.object(DynamoDBWorkspaceBoundaryRepository, "table", new_callable=PropertyMock, return_value=mock_table):
+        _exercise_repo(ddb_repo, is_ddb=True)
+        # Also verify workspace tombstone rejection
+        ddb_repo.save_document_snapshot(base_snap.model_copy(update={"workspace_id": "ws_bf2", "document_id": "doc_ws_tomb"}))
+        ddb_repo.create_workspace("BF2", "owner-1", workspace_id="ws_bf2")
+        ddb_repo.tombstone_workspace("ws_bf2", "owner-1")
+        with pytest.raises(CASConflictError):
+            ddb_repo.update_document_snapshot_inventory("ws_bf2", "doc_ws_tomb", "v1", inv1)

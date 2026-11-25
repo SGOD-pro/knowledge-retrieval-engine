@@ -84,6 +84,19 @@ def parse_file(
             chunk_list.append(c)
 
     chunks = tuple(chunk_list)
+    sheet_inventory = None
+    if source_format in ("xls", "xlsx") and file_ver:
+        try:
+            from ingestion.adapters.sheet_inventory import extract_workbook_sheet_inventory
+            sheet_inventory = extract_workbook_sheet_inventory(
+                path=path,
+                source_format=source_format,
+                version=file_ver,
+                incomplete_coverage=incomplete_cov,
+            )
+        except Exception as inv_err:
+            logger.warning("parse_service.sheet_inventory_failed doc_id=%s error=%s", document_id, inv_err)
+
     doc = Document(
         id=document_id,
         filename=doc_filename,
@@ -92,6 +105,7 @@ def parse_file(
         workspace_id=workspace_id,
         incomplete_coverage_flag=incomplete_cov,
         exclusions=exclusions,
+        sheet_inventory=sheet_inventory,
     )
     latency_ms = (time.perf_counter() - t0) * 1000.0
     logger.info(

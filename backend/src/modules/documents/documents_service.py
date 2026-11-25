@@ -265,6 +265,13 @@ class DocumentsService:
                     persisted = len(document.chunks)
                     total = len(document.chunks) + len(exclusions)
 
+                raw_inv = getattr(document, "sheet_inventory", None)
+                snap_sheet_inv = (
+                    {**raw_inv, "version": doc_ver, "complete": bool(raw_inv.get("complete", True)) and not incomplete_cov}
+                    if isinstance(raw_inv, dict)
+                    else None
+                )
+
                 # 1. Publish baseline DocumentSnapshot and Ready status immediately (ADR-001)
                 baseline_snapshot = DocumentSnapshot(
                     workspace_id=workspace_id,
@@ -277,6 +284,7 @@ class DocumentsService:
                     persisted_rows=persisted,
                     total_rows=total,
                     created_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    sheet_inventory=snap_sheet_inv,
                     page_index_status=None,
                     page_index_elements_count=0,
                     okf_status=None,
@@ -357,6 +365,7 @@ class DocumentsService:
                     persisted_rows=persisted,
                     total_rows=total,
                     created_at=baseline_snapshot.created_at,
+                    sheet_inventory=baseline_snapshot.sheet_inventory,
                     page_index_status=pi_status,
                     page_index_elements_count=pi_count,
                     okf_status=okf_stat,
@@ -526,6 +535,13 @@ class DocumentsService:
                         persisted = len(doc.chunks)
                         total = len(doc.chunks) + len(exclusions)
 
+                    raw_inv = getattr(doc, "sheet_inventory", None)
+                    snap_sheet_inv = (
+                        {**raw_inv, "version": doc_ver, "complete": bool(raw_inv.get("complete", True)) and not incomplete_cov}
+                        if isinstance(raw_inv, dict)
+                        else None
+                    )
+
                     # 1. Publish baseline DocumentSnapshot and Ready status immediately (ADR-001)
                     baseline_snapshot = DocumentSnapshot(
                         workspace_id=workspace_id,
@@ -538,6 +554,7 @@ class DocumentsService:
                         persisted_rows=persisted,
                         total_rows=total,
                         created_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                        sheet_inventory=snap_sheet_inv,
                         page_index_status=None,
                         page_index_elements_count=0,
                         okf_status=None,
@@ -617,6 +634,7 @@ class DocumentsService:
                         persisted_rows=persisted,
                         total_rows=total,
                         created_at=baseline_snapshot.created_at,
+                        sheet_inventory=baseline_snapshot.sheet_inventory,
                         page_index_status=pi_status,
                         page_index_elements_count=pi_count,
                         okf_status=okf_stat,

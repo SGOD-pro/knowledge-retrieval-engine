@@ -52,6 +52,7 @@ class Document:
     workspace_id: str = ""
     incomplete_coverage_flag: bool = False
     exclusions: tuple[str, ...] = ()
+    sheet_inventory: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -62,6 +63,7 @@ class Document:
             "workspace_id": self.workspace_id,
             "incomplete_coverage_flag": self.incomplete_coverage_flag,
             "exclusions": list(self.exclusions),
+            "sheet_inventory": self.sheet_inventory,
         }
 
 
