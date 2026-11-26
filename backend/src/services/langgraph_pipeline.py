@@ -1523,7 +1523,7 @@ def run_llm(state: PipelineState):
         if not is_financial and not has_sheet_inventory:
             ans_for_verify = json.dumps(ans) if isinstance(ans, (dict, list)) else str(ans)
             retained_pool = [c for c in top_chunks if str(c.id) in compressed_ids]
-            claims = [
+            sentences = [
                 seg.strip()
                 for seg in re.split(r"(?<=[.!?])\s+|\n+", ans_for_verify)
                 if seg.strip()
@@ -1535,9 +1535,43 @@ def run_llm(state: PipelineState):
                 "information", "context", "provided", "indicates", "data", "absence",
                 "necessarily", "specific", "meanwhile",
             }
+            claims: list[tuple[str, str | None]] = []
+            prev_regime: str | None = None
+            for sent in sentences:
+                s_lower = sent.lower()
+                has_inf = bool(re.search(r"\binference\b", s_lower))
+                has_trn = bool(re.search(r"\b(?:training|pretraining)\b", s_lower))
+                if has_inf and not has_trn:
+                    sent_regime: str | None = "inference"
+                elif has_trn and not has_inf:
+                    sent_regime = "training"
+                elif re.match(r"^(?:this|it|these|such)\b", s_lower):
+                    sent_regime = prev_regime
+                else:
+                    sent_regime = None
+                prev_regime = sent_regime
+
+                parts = [
+                    p.strip()
+                    for p in re.split(
+                        r";\s+|,\s+(?:and|while|whereas|but)\s+|\s+(?:and|while|whereas)\s+",
+                        sent,
+                    )
+                    if p.strip()
+                ]
+                if len(parts) > 1 and all(
+                    len({w for w in re.findall(r"[a-z0-9]{4,}", p.lower()) if w not in _stop}) >= 2
+                    or bool(extract_numbers_normalized(p))
+                    for p in parts
+                ):
+                    for p in parts:
+                        claims.append((p, sent_regime))
+                else:
+                    claims.append((sent, sent_regime))
+
             selected_by_id: dict[str, Any] = {}
             all_claims_supported = bool(retained_pool)
-            for claim in claims:
+            for claim, claim_regime in claims:
                 claim_nums = extract_numbers_normalized(claim)
                 claim_terms = {
                     w for w in re.findall(r"[a-z0-9]{4,}", claim.lower())
@@ -1579,10 +1613,47 @@ def run_llm(state: PipelineState):
                         )
                         if not all_cells_ok:
                             continue
-                    claim_faith = compute_faithfulness(claim, cand_text) or 0.0
-                    content_hits = sum(1 for t in claim_terms if t in c_lower)
-                    claim_faith = compute_faithfulness(claim, cand_text) or 0.0
-                    whole_faith = compute_faithfulness(ans_for_verify, cand_text) or 0.0
+                    cand_lines = [ln.strip() for ln in cand_text.splitlines() if ln.strip()]
+                    support_text = cand_text
+                    if (
+                        len(cand_lines) >= 2
+                        and len(cand_lines[0]) <= 120
+                        and not cand_lines[0].endswith((".", "!", "?"))
+                    ):
+                        # Exclude bare running headers/titles over unrelated body text
+                        support_text = "\n".join(cand_lines[1:])
+                    support_lower = support_text.lower()
+                    if claim_regime in ("inference", "training") and claim_terms:
+                        ev_sents = [
+                            es.strip().lower()
+                            for es in re.split(r"(?<=[.!?])\s+|\n+", support_text)
+                            if es.strip()
+                        ]
+                        sent_scores = [
+                            (sum(1 for t in claim_terms if re.search(rf"\b{re.escape(t)}\b", es)), es)
+                            for es in ev_sents
+                        ]
+                        max_sent_hits = max((sc for sc, _ in sent_scores), default=0)
+                        top_sents = [es for sc, es in sent_scores if sc == max_sent_hits and sc > 0]
+                        if top_sents:
+                            req_pat = (
+                                r"\binference\b"
+                                if claim_regime == "inference"
+                                else r"\b(?:training|pretraining)\b"
+                            )
+                            opp_pat = (
+                                r"\b(?:training|pretraining)\b"
+                                if claim_regime == "inference"
+                                else r"\binference\b"
+                            )
+                            if all(
+                                re.search(opp_pat, es) and not re.search(req_pat, es)
+                                for es in top_sents
+                            ):
+                                continue
+                    claim_faith = compute_faithfulness(claim, support_text) or 0.0
+                    content_hits = sum(1 for t in claim_terms if t in support_lower)
+                    whole_faith = compute_faithfulness(ans_for_verify, support_text) or 0.0
                     if (claim_faith >= 0.25 or content_hits >= 2) and (content_hits >= 1 or claim_nums):
                         cand_key = (content_hits, whole_faith, claim_faith)
                         if cand_key > best_key:
@@ -1592,6 +1663,24 @@ def run_llm(state: PipelineState):
                     all_claims_supported = False
                     break
                 selected_by_id[str(best_chunk.id)] = best_chunk
+            if all_claims_supported and selected_by_id:
+                query_text = state.get("query", "") or ""
+                query_entities = {
+                    w.lower()
+                    for w in re.findall(r"\b[A-Z][A-Za-z0-9-]{3,}\b", query_text)
+                    if w.lower() not in _stop and w.lower() not in {"does", "what", "when", "where", "which", "explain", "using", "both", "papers"}
+                }
+                answered_entities = {
+                    w.lower()
+                    for w in re.findall(r"\b[A-Z][A-Za-z0-9-]{3,}\b", ans_for_verify)
+                    if w.lower() in query_entities
+                }
+                selected_corpus = "\n".join(
+                    (getattr(c, "text", "") or "").lower()
+                    for c in selected_by_id.values()
+                )
+                if answered_entities and not all(ent in selected_corpus for ent in answered_entities):
+                    all_claims_supported = False
             if all_claims_supported and selected_by_id:
                 final_cited_chunks = [c for c in retained_pool if str(c.id) in selected_by_id]
             else:

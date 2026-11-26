@@ -1,4 +1,5 @@
 import logging
+import os
 import time
 from typing import Any
 
@@ -11,6 +12,15 @@ from providers.reranker_provider import (
 from schemas.models import Chunk, RerankerMode
 
 logger = logging.getLogger(__name__)
+
+
+def is_lexical_rrf_blend_enabled() -> bool:
+    """Return True when the opt-in local BM25Plus + RRF input-rank blend is enabled."""
+    env_val = os.environ.get("LEXICAL_RRF_BLEND_ENABLED")
+    if env_val is not None:
+        return env_val.strip().lower() in ("1", "true", "yes", "on")
+    from config import settings
+    return bool(getattr(settings, "LEXICAL_RRF_BLEND_ENABLED", False))
 
 
 def rerank(
@@ -64,13 +74,27 @@ def rerank(
     from dataclasses import replace
     from services.retrieval.table_metric_binding import score_table_chunk_metric_affinity
 
+    use_rrf_blend = is_lexical_rrf_blend_enabled() and (
+        telemetry.get("provider") == "lexical"
+        or telemetry.get("model") == "bm25plus"
+        or telemetry.get("effective_mode") == RerankerMode.CIRCUIT_OPEN_LEXICAL_FALLBACK.value
+    )
+    if use_rrf_blend:
+        telemetry["model"] = "bm25plus_rrf_blend"
+        telemetry["reranker_policy"] = "lexical_bm25_plus_rrf_blend"
+        telemetry["lexical_rrf_blend_enabled"] = True
+
     scored_candidates = []
-    for chunk, score in zip(candidates, scores):
+    for idx, (chunk, score) in enumerate(zip(candidates, scores)):
         aff = 0.0
         if financial_binding and getattr(financial_binding, "is_active", False):
             aff = score_table_chunk_metric_affinity(getattr(chunk, "text", ""), financial_binding)
-        scored_chunk = replace(chunk, reranker_score=score)
-        scored_candidates.append((scored_chunk, aff, score or 0.0))
+        eff_score = float(score or 0.0)
+        if use_rrf_blend:
+            rrf_norm = 61.0 / (61.0 + idx)
+            eff_score = round(0.5 * eff_score + 0.5 * rrf_norm, 4)
+        scored_chunk = replace(chunk, reranker_score=eff_score)
+        scored_candidates.append((scored_chunk, aff, eff_score))
 
     # Sort candidates by (affinity, base_score) descending
     # Reuses the existing ranking design and preserves relevance ordering where affinity is equal.

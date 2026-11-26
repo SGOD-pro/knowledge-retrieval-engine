@@ -294,6 +294,9 @@ def get_reranker_policy() -> str:
         return f"bedrock:{model}:{region} (fallback: lexical_bm25_plus)"
 
     if os.environ.get("RERANKER_PROVIDER") in ("lexical", "bm25", "bm25plus") or getattr(settings, "RERANKER_PROVIDER", "") in ("lexical", "bm25", "bm25plus"):
+        from services.retrieval.reranker import is_lexical_rrf_blend_enabled
+        if is_lexical_rrf_blend_enabled():
+            return "lexical_bm25_plus_rrf_blend"
         return "lexical_bm25_plus"
 
     model = getattr(
@@ -709,9 +712,10 @@ def run_benchmark(
             "reranker_policy": get_reranker_policy(),
             "reranker_config": {
                 "provider": reranker_cfg["provider"],
-                "model": reranker_cfg["model"],
+                "model": "bm25plus_rrf_blend" if get_reranker_policy() == "lexical_bm25_plus_rrf_blend" else reranker_cfg["model"],
                 "region": reranker_cfg["region"],
                 "fallback_count": reranker_fallback_count,
+                "lexical_rrf_blend_enabled": get_reranker_policy() == "lexical_bm25_plus_rrf_blend",
             },
             "strategies": {
                 "page_index_enabled": bool(getattr(settings, "PAGEINDEX_ENABLED", True)),

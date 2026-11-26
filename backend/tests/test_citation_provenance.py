@@ -291,3 +291,529 @@ def test_q162_unsupported_citation_fallback_and_controls(monkeypatch):
     # 9. Explicit valid IDs (genuinely supporting + real retained but unrelated) bypass fallback checks
     res_explicit_mixed = _run_with_llm(q162_query, json.dumps({"answer": q162_ans, "citations": [c_bill.id, c_ai.id]}))
     assert [c["chunk_id"] for c in res_explicit_mixed["citations"]] == [c_bill.id, c_ai.id]
+
+
+def test_opt_in_lexical_rrf_blend_through_query_service(monkeypatch):
+    """Opt-in LEXICAL_RRF_BLEND_ENABLED changes ranking in QueryService while default preserves plain BM25Plus."""
+    import json
+    from unittest.mock import patch
+    from db.workspace_boundary_repo import DocumentSnapshot, InMemoryWorkspaceBoundaryRepository
+    from modules.query.query_service import QueryRequest, QueryService
+    from schemas.models import Chunk
+    from services.retrieval import bm25_retriever
+    from services.telemetry import init_request_telemetry
+
+    monkeypatch.setenv("RERANKER_PROVIDER", "lexical")
+    ws = "ws_rrf_blend_opt_in"
+    query_text = "What unit and value are recorded for the 2025 Current ratio?"
+
+    # Supporting chunk has strong lexical overlap + RRF rank 0 from vector search
+    c_target = Chunk(
+        id="doc-tbl:csv:row28",
+        document_id="doc-tbl",
+        source_format="csv",
+        text="Year: 2025. Unit and value recorded for 2025 current ratio: 1.42.",
+        element_type="table_row",
+        page_number=None,
+        workspace_id=ws,
+        version="v1",
+        document_version="v1",
+    )
+    # 8 distractors across two competing PDFs repeat "current ratio" twice so plain BM25Plus drops c_target
+    distractors = [
+        Chunk(
+            id=f"doc-pdf-{'a' if i < 4 else 'b'}:page:{i+1}:element:0",
+            document_id=f"doc-pdf-{'a' if i < 4 else 'b'}",
+            source_format="pdf",
+            text=f"Section {i+1}: unit and value recorded for 2025 current ratio current ratio.",
+            element_type="text",
+            page_number=i + 1,
+            workspace_id=ws,
+            version="v1",
+            document_version="v1",
+        )
+        for i in range(8)
+    ]
+    pool_chunks = [c_target] + distractors
+
+    class _BlendDocRepo:
+        def get_workspace_documents(self, workspace_id: str, page: int = 1, limit: int = 1000):
+            return {
+                "documents": [
+                    {"id": "doc-tbl", "filename": "survey.csv"},
+                    {"id": "doc-pdf-a", "filename": "notes_a.pdf"},
+                    {"id": "doc-pdf-b", "filename": "notes_b.pdf"},
+                ]
+            }
+
+        def get_all_chunks(self, document_ids=None, workspace_id: str = ""):
+            return pool_chunks
+
+        def get(self, doc_id: str):
+            return None
+
+        def search_vector(self, *args, **kwargs):
+            return [(c_target, 0.99)]
+
+        def check_semantic_cache(self, *args, **kwargs):
+            return None
+
+    b_repo = InMemoryWorkspaceBoundaryRepository()
+    b_repo.create_workspace("Blend WS", "owner-1", workspace_id=ws)
+    for d_id, fname, fmt in (
+        ("doc-tbl", "survey.csv", "csv"),
+        ("doc-pdf-a", "notes_a.pdf", "pdf"),
+        ("doc-pdf-b", "notes_b.pdf", "pdf"),
+    ):
+        b_repo.create_source(ws, fname, source_id=d_id)
+        b_repo.save_document_snapshot(
+            DocumentSnapshot(workspace_id=ws, document_id=d_id, source=fname, version="v1", format=fmt, created_at="2026-11-26T00:00:00Z")
+        )
+
+    doc_repo = _BlendDocRepo()
+    qs = QueryService(repo=doc_repo)
+
+    def _exec(flag_val: str | None):
+        if flag_val is None:
+            monkeypatch.delenv("LEXICAL_RRF_BLEND_ENABLED", raising=False)
+        else:
+            monkeypatch.setenv("LEXICAL_RRF_BLEND_ENABLED", flag_val)
+        if hasattr(bm25_retriever, "_CHUNK_CACHE"):
+            bm25_retriever._CHUNK_CACHE.clear()
+        init_request_telemetry()
+        req = QueryRequest(query=query_text, workspace_id=ws, benchmark_mode=True, cache=False, force_full_path=True)
+        llm_resp = json.dumps({"answer": "The 2025 liquidity ratio value is 1.42.", "citations": [c_target.id]})
+        with (
+            patch("src.db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+            patch("db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+            patch("services.langgraph_pipeline._get_repo", return_value=doc_repo),
+            patch("services.langgraph_pipeline.check_fidelity", return_value=True),
+            patch("services.llm.llm_service.generate_completion", return_value=(llm_resp, {"input_tokens": 10, "output_tokens": 10})),
+        ):
+            return qs.execute_query(req)
+
+    # Default (flag off): plain BM25Plus policy, c_target dropped by distractors
+    res_off = _exec(None)
+    assert res_off["reranker_telemetry"].get("model") == "bm25plus"
+    assert res_off["reranker_telemetry"].get("reranker_policy") is None
+    assert c_target.id not in res_off["compressed_context_chunk_ids"]
+
+    # Opt-in (flag on): experimental blend promotes c_target into compressed_context and citations
+    res_on = _exec("true")
+    assert res_on["reranker_telemetry"].get("model") == "bm25plus_rrf_blend"
+    assert res_on["reranker_telemetry"].get("reranker_policy") == "lexical_bm25_plus_rrf_blend"
+    assert c_target.id in res_on["compressed_context_chunk_ids"]
+    assert [c["chunk_id"] for c in res_on["citations"]] == [c_target.id]
+
+
+def test_partial_claim_coverage_in_citation_fallback(monkeypatch):
+    """Fallback must cover all factual claims in a compound sentence or refuse."""
+    import json
+    from unittest.mock import patch
+    from db.workspace_boundary_repo import DocumentSnapshot, InMemoryWorkspaceBoundaryRepository
+    from modules.query.query_service import QueryRequest, QueryService
+    from schemas.models import Chunk
+    from services.retrieval import bm25_retriever
+    from services.telemetry import init_request_telemetry
+
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    monkeypatch.setenv("RERANKER_PROVIDER", "lexical")
+    ws = "ws_partial_claim_fallback"
+
+    c_turbine = Chunk(
+        id="doc-turbine:page:1:element:0",
+        document_id="doc-turbine",
+        source_format="pdf",
+        text="Northbridge Turbine relies on magnetic bearings for frictionless rotor suspension.",
+        element_type="text",
+        page_number=1,
+        workspace_id=ws,
+        version="v1",
+        document_version="v1",
+    )
+    c_battery = Chunk(
+        id="doc-battery:page:1:element:0",
+        document_id="doc-battery",
+        source_format="pdf",
+        text="Southport Battery uses solid-state electrolyte cells for thermal stability.",
+        element_type="text",
+        page_number=1,
+        workspace_id=ws,
+        version="v1",
+        document_version="v1",
+    )
+    c_distractor = Chunk(
+        id="doc-distractor:page:1:element:0",
+        document_id="doc-distractor",
+        source_format="pdf",
+        text=(
+            "Legacy Turbine Maintenance Guide mentions magnetic bearings and thermal stability "
+            "only in historical valve checklists."
+        ),
+        element_type="text",
+        page_number=1,
+        workspace_id=ws,
+        version="v1",
+        document_version="v1",
+    )
+
+    def _run_case(pool_chunks: list[Chunk], answer_text: str):
+        if hasattr(bm25_retriever, "_CHUNK_CACHE"):
+            bm25_retriever._CHUNK_CACHE.clear()
+        if hasattr(bm25_retriever, "_BM25_CACHE"):
+            bm25_retriever._BM25_CACHE.clear()
+        init_request_telemetry()
+
+        docs_meta = [
+            (c.document_id, f"{c.document_id}.pdf", "pdf")
+            for c in pool_chunks
+        ]
+
+        class _DocRepo:
+            def get_workspace_documents(self, workspace_id: str, page: int = 1, limit: int = 1000):
+                return {"documents": [{"id": d, "filename": fn} for d, fn, _ in docs_meta]}
+
+            def get_all_chunks(self, document_ids=None, workspace_id: str = ""):
+                return list(pool_chunks)
+
+            def get(self, doc_id: str):
+                return None
+
+            def search_vector(self, *args, **kwargs):
+                return []
+
+            def check_semantic_cache(self, *args, **kwargs):
+                return None
+
+        b_repo = InMemoryWorkspaceBoundaryRepository()
+        b_repo.create_workspace("Partial Claim WS", "tester", workspace_id=ws)
+        for d_id, fname, fmt in docs_meta:
+            b_repo.create_source(ws, fname, source_id=d_id)
+            b_repo.save_document_snapshot(
+                DocumentSnapshot(
+                    workspace_id=ws,
+                    document_id=d_id,
+                    source=fname,
+                    version="v1",
+                    format=fmt,
+                    created_at="2026-11-26T00:00:00Z",
+                )
+            )
+
+        doc_repo = _DocRepo()
+        qs = QueryService(repo=doc_repo)
+        req = QueryRequest(
+            query="How do Northbridge Turbine and Southport Battery operate?",
+            workspace_id=ws,
+            benchmark_mode=True,
+            cache=False,
+            force_full_path=True,
+        )
+        raw_json = json.dumps({"answer": answer_text, "citations": []})
+        with (
+            patch("src.db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+            patch("db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+            patch("services.langgraph_pipeline._get_repo", return_value=doc_repo),
+            patch("services.langgraph_pipeline.check_fidelity", return_value=True),
+            patch("services.llm.llm_service.generate_completion", return_value=(raw_json, {"input_tokens": 10, "output_tokens": 10})) as mock_gen,
+        ):
+            out = qs.execute_query(req)
+            assert mock_gen.call_count <= 1
+            return out
+
+    compound_ans = (
+        "The station pairs magnetic bearings in Northbridge Turbine "
+        "and solid-state electrolyte cells in Southport Battery."
+    )
+
+    # 1. Both sources present -> must cite both c_turbine and c_battery (not distractor)
+    res_both = _run_case([c_turbine, c_battery, c_distractor], compound_ans)
+    cited_ids_both = {c["chunk_id"] for c in res_both["citations"]}
+    assert cited_ids_both == {c_turbine.id, c_battery.id}
+    assert c_distractor.id not in cited_ids_both
+
+    # 2. Either source removed -> must refuse unsupported compound answer
+    res_no_battery = _run_case([c_turbine, c_distractor], compound_ans)
+    assert res_no_battery["citations"] == []
+    assert res_no_battery["retained_evidence_items"] == []
+    assert "couldn't find any relevant" in res_no_battery["answer"].lower()
+
+    res_no_turbine = _run_case([c_battery, c_distractor], compound_ans)
+    assert res_no_turbine["citations"] == []
+    assert res_no_turbine["retained_evidence_items"] == []
+    assert "couldn't find any relevant" in res_no_turbine["answer"].lower()
+
+    # 3. Valid multi-document control (separate sentences) -> must still cite both
+    multi_sent_ans = (
+        "Northbridge Turbine relies on magnetic bearings for frictionless rotor suspension. "
+        "Southport Battery uses solid-state electrolyte cells for thermal stability."
+    )
+    res_multi = _run_case([c_turbine, c_battery, c_distractor], multi_sent_ans)
+    assert {c["chunk_id"] for c in res_multi["citations"]} == {c_turbine.id, c_battery.id}
+
+
+def test_header_only_evidence_in_citation_fallback(monkeypatch):
+    """Heading-only match over unrelated body must be refused; genuine factual captions pass."""
+    import json
+    from unittest.mock import patch
+    from db.workspace_boundary_repo import DocumentSnapshot, InMemoryWorkspaceBoundaryRepository
+    from modules.query.query_service import QueryRequest, QueryService
+    from schemas.models import Chunk
+    from services.retrieval import bm25_retriever
+    from services.telemetry import init_request_telemetry
+
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    monkeypatch.setenv("RERANKER_PROVIDER", "lexical")
+    ws = "ws_header_only_fallback"
+
+    c_supporting = Chunk(
+        id="doc-grid:page:1:element:0",
+        document_id="doc-grid",
+        source_format="pdf",
+        text=(
+            "Coastal Microgrid Architecture\n"
+            "The inverter array relies on galvanic isolation and synchronous rectification "
+            "for fault ride-through."
+        ),
+        element_type="text",
+        page_number=1,
+        workspace_id=ws,
+        version="v1",
+        document_version="v1",
+    )
+    c_header_only = Chunk(
+        id="doc-grid:page:2:element:1",
+        document_id="doc-grid",
+        source_format="pdf",
+        text=(
+            "Coastal Microgrid: Galvanic Isolation and Synchronous Rectification\n"
+            "Table 4 summarizes quarterly rainfall totals and ambient humidity readings "
+            "across northern weather stations."
+        ),
+        element_type="text",
+        page_number=2,
+        workspace_id=ws,
+        version="v1",
+        document_version="v1",
+    )
+    c_genuine_caption = Chunk(
+        id="doc-grid:page:3:element:2",
+        document_id="doc-grid",
+        source_format="pdf",
+        text=(
+            "Figure 2. Coastal Microgrid inverter array relies on galvanic isolation "
+            "and synchronous rectification for fault ride-through."
+        ),
+        element_type="caption",
+        page_number=3,
+        workspace_id=ws,
+        version="v1",
+        document_version="v1",
+    )
+
+    def _run_case(pool_chunks: list[Chunk]):
+        if hasattr(bm25_retriever, "_CHUNK_CACHE"):
+            bm25_retriever._CHUNK_CACHE.clear()
+        if hasattr(bm25_retriever, "_BM25_CACHE"):
+            bm25_retriever._BM25_CACHE.clear()
+        init_request_telemetry()
+
+        class _DocRepo:
+            def get_workspace_documents(self, workspace_id: str, page: int = 1, limit: int = 1000):
+                return {"documents": [{"id": "doc-grid", "filename": "microgrid.pdf"}]}
+
+            def get_all_chunks(self, document_ids=None, workspace_id: str = ""):
+                return list(pool_chunks)
+
+            def get(self, doc_id: str):
+                return None
+
+            def search_vector(self, *args, **kwargs):
+                return []
+
+            def check_semantic_cache(self, *args, **kwargs):
+                return None
+
+        b_repo = InMemoryWorkspaceBoundaryRepository()
+        b_repo.create_workspace("Header Only WS", "tester", workspace_id=ws)
+        b_repo.create_source(ws, "microgrid.pdf", source_id="doc-grid")
+        b_repo.save_document_snapshot(
+            DocumentSnapshot(
+                workspace_id=ws,
+                document_id="doc-grid",
+                source="microgrid.pdf",
+                version="v1",
+                format="pdf",
+                created_at="2026-11-26T00:00:00Z",
+            )
+        )
+
+        doc_repo = _DocRepo()
+        qs = QueryService(repo=doc_repo)
+        req = QueryRequest(
+            query="How does Coastal Microgrid achieve fault ride-through?",
+            workspace_id=ws,
+            benchmark_mode=True,
+            cache=False,
+            force_full_path=True,
+        )
+        ans = (
+            "Coastal Microgrid achieves fault ride-through through galvanic isolation "
+            "and synchronous rectification."
+        )
+        raw_json = json.dumps({"answer": ans, "citations": []})
+        with (
+            patch("src.db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+            patch("db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+            patch("services.langgraph_pipeline._get_repo", return_value=doc_repo),
+            patch("services.langgraph_pipeline.check_fidelity", return_value=True),
+            patch("services.llm.llm_service.generate_completion", return_value=(raw_json, {"input_tokens": 10, "output_tokens": 10})) as mock_gen,
+        ):
+            out = qs.execute_query(req)
+            assert mock_gen.call_count <= 1
+            return out
+
+    # 1. Supporting passage present -> cite supporting passage and preserve answer
+    res_supported = _run_case([c_supporting, c_header_only])
+    assert "galvanic isolation" in res_supported["answer"].lower()
+    assert [c["chunk_id"] for c in res_supported["citations"]] == [c_supporting.id]
+
+    # 2. Only heading + unrelated body text -> must refuse
+    res_header_only = _run_case([c_header_only])
+    assert res_header_only["citations"] == []
+    assert res_header_only["retained_evidence_items"] == []
+    assert "couldn't find any relevant" in res_header_only["answer"].lower()
+
+    # 3. Genuine factual caption stating the fact -> preserve answer and cite caption
+    res_caption = _run_case([c_genuine_caption])
+    assert "galvanic isolation" in res_caption["answer"].lower()
+    assert [c["chunk_id"] for c in res_caption["citations"]] == [c_genuine_caption.id]
+
+
+def test_training_vs_inference_evidence_in_citation_fallback(monkeypatch):
+    """Training-only mechanism mention must not satisfy an inference claim."""
+    import json
+    from unittest.mock import patch
+    from db.workspace_boundary_repo import DocumentSnapshot, InMemoryWorkspaceBoundaryRepository
+    from modules.query.query_service import QueryRequest, QueryService
+    from schemas.models import Chunk
+    from services.retrieval import bm25_retriever
+    from services.telemetry import init_request_telemetry
+
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    monkeypatch.setenv("RERANKER_PROVIDER", "lexical")
+    ws = "ws_train_vs_infer"
+
+    c_infer = Chunk(
+        id="doc-vortex:page:2:element:0",
+        document_id="doc-vortex",
+        source_format="pdf",
+        text=(
+            "VortexNet performs block-sparse gating on fixed-size state buffers. "
+            "Because buffer dimensions stay constant, inference latency remains independent of sequence length."
+        ),
+        element_type="text",
+        page_number=2,
+        workspace_id=ws,
+        version="v1",
+        document_version="v1",
+    )
+    c_train_only = Chunk(
+        id="doc-vortex:page:4:element:1",
+        document_id="doc-vortex",
+        source_format="pdf",
+        text=(
+            "VortexNet relies on block-sparse gating to achieve O(N) training complexity during pretraining. "
+            "Separate benchmarks evaluate inference throughput across batch sizes."
+        ),
+        element_type="text",
+        page_number=4,
+        workspace_id=ws,
+        version="v1",
+        document_version="v1",
+    )
+    c_kv = Chunk(
+        id="doc-vortex:page:6:element:2",
+        document_id="doc-vortex",
+        source_format="pdf",
+        text="Baseline models apply KV-window pruning during inference to bound memory growth.",
+        element_type="text",
+        page_number=6,
+        workspace_id=ws,
+        version="v1",
+        document_version="v1",
+    )
+
+    def _run_case(pool_chunks: list[Chunk]):
+        if hasattr(bm25_retriever, "_CHUNK_CACHE"):
+            bm25_retriever._CHUNK_CACHE.clear()
+        if hasattr(bm25_retriever, "_BM25_CACHE"):
+            bm25_retriever._BM25_CACHE.clear()
+        init_request_telemetry()
+
+        class _DocRepo:
+            def get_workspace_documents(self, workspace_id: str, page: int = 1, limit: int = 1000):
+                return {"documents": [{"id": "doc-vortex", "filename": "vortex.pdf"}]}
+
+            def get_all_chunks(self, document_ids=None, workspace_id: str = ""):
+                return list(pool_chunks)
+
+            def get(self, doc_id: str):
+                return None
+
+            def search_vector(self, *args, **kwargs):
+                return []
+
+            def check_semantic_cache(self, *args, **kwargs):
+                return None
+
+        b_repo = InMemoryWorkspaceBoundaryRepository()
+        b_repo.create_workspace("Train vs Infer WS", "tester", workspace_id=ws)
+        b_repo.create_source(ws, "vortex.pdf", source_id="doc-vortex")
+        b_repo.save_document_snapshot(
+            DocumentSnapshot(
+                workspace_id=ws,
+                document_id="doc-vortex",
+                source="vortex.pdf",
+                version="v1",
+                format="pdf",
+                created_at="2026-11-26T00:00:00Z",
+            )
+        )
+
+        doc_repo = _DocRepo()
+        qs = QueryService(repo=doc_repo)
+        req = QueryRequest(
+            query="How does VortexNet keep inference latency independent of sequence length?",
+            workspace_id=ws,
+            benchmark_mode=True,
+            cache=False,
+            force_full_path=True,
+        )
+        ans = (
+            "VortexNet maintains constant inference latency independent of sequence length. "
+            "This is achieved through block-sparse gating and KV-window pruning in baseline models."
+        )
+        raw_json = json.dumps({"answer": ans, "citations": []})
+        with (
+            patch("src.db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+            patch("db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+            patch("services.langgraph_pipeline._get_repo", return_value=doc_repo),
+            patch("services.langgraph_pipeline.check_fidelity", return_value=True),
+            patch("services.llm.llm_service.generate_completion", return_value=(raw_json, {"input_tokens": 10, "output_tokens": 10})) as mock_gen,
+        ):
+            out = qs.execute_query(req)
+            assert mock_gen.call_count <= 1
+            return out
+
+    # 1. With inference passage present -> cite c_infer and c_kv, not c_train_only
+    res_with_infer = _run_case([c_infer, c_train_only, c_kv])
+    cited_ids = {c["chunk_id"] for c in res_with_infer["citations"]}
+    assert cited_ids == {c_infer.id, c_kv.id}
+    assert c_train_only.id not in cited_ids
+
+    # 2. With inference passage removed (only training-only + KV-window) -> must refuse
+    res_no_infer = _run_case([c_train_only, c_kv])
+    assert res_no_infer["citations"] == []
+    assert res_no_infer["retained_evidence_items"] == []
+    assert "couldn't find any relevant" in res_no_infer["answer"].lower()

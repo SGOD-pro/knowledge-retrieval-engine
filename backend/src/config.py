@@ -61,6 +61,7 @@ class Settings(BaseSettings):
     BEDROCK_RERANKER_TIMEOUT_S: float = 1.5
     BEDROCK_RERANKER_MAX_CONCURRENCY: int = 1
     RERANKER_PROVIDER: str = "openrouter"
+    LEXICAL_RRF_BLEND_ENABLED: bool = False
 
     # MODEL_PROVIDER: controls which Bedrock profile is used at query time
     MODEL_PROVIDER: str = "prod"
