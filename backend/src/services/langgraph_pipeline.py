@@ -527,7 +527,7 @@ def run_bm25(state: PipelineState):
                 if c.id not in seen_ids:
                     seen_ids.add(c.id)
                     combined_results.append((c, s))
-        overall_res = retriever.search(state["query"], all_chunks, top_k=25)
+        overall_res = retriever.search(state["query"], all_chunks, top_k=40)
         for c, s in overall_res:
             if c.id not in seen_ids:
                 seen_ids.add(c.id)

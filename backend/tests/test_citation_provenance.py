@@ -690,6 +690,68 @@ def test_header_only_evidence_in_citation_fallback(monkeypatch):
     assert [c["chunk_id"] for c in res_caption["citations"]] == [c_genuine_caption.id]
 
 
+def test_multi_subgoal_bm25_preserves_top40_per_doc_budget(monkeypatch):
+    """Multi-subgoal BM25 must keep the same top_k=40 per-doc budget as single-subgoal."""
+    from unittest.mock import patch
+    from schemas.models import Chunk
+    from services.langgraph_pipeline import run_bm25
+    from services.retrieval import bm25_retriever
+
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    if hasattr(bm25_retriever, "_CHUNK_CACHE"):
+        bm25_retriever._CHUNK_CACHE.clear()
+    if hasattr(bm25_retriever, "_BM25_CACHE"):
+        bm25_retriever._BM25_CACHE.clear()
+
+    ws = "ws_subgoal_bm25_cap"
+    chunks: list[Chunk] = []
+    # 13 higher-TF chunks in doc-report + 1 target chunk at rank 14 + 15 distractor chunks in doc-other
+    for i in range(13):
+        chunks.append(
+            Chunk(
+                id=f"doc-report:page:{i+1}:element:{i}",
+                document_id="doc-report",
+                source_format="pdf",
+                text="Northwind 2025 gross margin percentage quarterly margin margin summary.",
+                element_type="text",
+                page_number=i + 1,
+                workspace_id=ws,
+            )
+        )
+    target = Chunk(
+        id="doc-report:page:20:element:20",
+        document_id="doc-report",
+        source_format="pdf",
+        text="Northwind 2025 gross margin appendix table notes.",
+        element_type="text",
+        page_number=20,
+        workspace_id=ws,
+    )
+    chunks.append(target)
+    for i in range(15):
+        chunks.append(
+            Chunk(
+                id=f"doc-other:page:{i+1}:element:{i}",
+                document_id="doc-other",
+                source_format="pdf",
+                text="Northwind 2025 gross margin percentage regional benchmark notes.",
+                element_type="text",
+                page_number=i + 1,
+                workspace_id=ws,
+            )
+        )
+
+    class _Repo:
+        def get_all_chunks(self, document_ids=None, workspace_id: str = ""):
+            return list(chunks)
+
+    q_multi = "What was Northwind 2025 gross margin percentage? Please give both."
+    with patch("services.langgraph_pipeline._get_repo", return_value=_Repo()):
+        out = run_bm25({"query": q_multi, "workspace_id": ws, "boundary_repo": None, "stage_timings": {}})
+    bm25_ids = {str(c.id) for c in out["bm25_candidates"]}
+    assert target.id in bm25_ids
+
+
 def test_training_vs_inference_evidence_in_citation_fallback(monkeypatch):
     """Training-only mechanism mention must not satisfy an inference claim."""
     import json

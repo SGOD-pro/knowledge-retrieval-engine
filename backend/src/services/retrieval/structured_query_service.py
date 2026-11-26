@@ -139,9 +139,23 @@ SKIP_FILTER_WORDS: set[str] = {
 
 
 class StructuredQueryService:
-    def __init__(self, store: TableStore) -> None:
+    def __init__(self, store: TableStore, boundary_repo: Any | None = None) -> None:
         self.store = store
+        self._boundary_repo = boundary_repo
         self.last_stage_timings: dict[str, float] = {}
+
+    def _get_boundary_repo(self) -> Any | None:
+        if self._boundary_repo is not None:
+            return self._boundary_repo
+        try:
+            from src.db.workspace_boundary_repo import get_workspace_boundary_repo
+            return get_workspace_boundary_repo()
+        except Exception:
+            try:
+                from db.workspace_boundary_repo import get_workspace_boundary_repo
+                return get_workspace_boundary_repo()
+            except Exception:
+                return None
 
     def execute(
         self,
@@ -167,19 +181,24 @@ class StructuredQueryService:
                 logger.info("StructuredQueryService: no tables found in workspace %s", workspace_id)
                 return None
 
-            # Filter by document_ids if provided and exclude tombstoned sources
+            # Filter by document_ids if provided and exclude tombstoned/stale sources
             candidate_tables = []
+            brepo = self._get_boundary_repo()
+
+            if brepo and brepo.has_tombstone(workspace_id, "workspace", workspace_id):
+                logger.info("StructuredQueryService: workspace %s is tombstoned", workspace_id)
+                return None
+
             for tid in available_tables:
                 ver = self.store.get_active_version(tid, workspace_id)
                 t_meta = self.store.get_table(tid, workspace_id, version=ver)
                 if t_meta:
-                    try:
-                        from src.db.workspace_boundary_repo import get_workspace_boundary_repo
-                        brepo = get_workspace_boundary_repo()
-                        if brepo and (brepo.has_tombstone(workspace_id, "source", t_meta.document_id) or brepo.has_tombstone(workspace_id, "source", tid)):
-                            continue
-                    except Exception:
-                        pass
+                    if brepo:
+                        try:
+                            if brepo.has_tombstone(workspace_id, "source", t_meta.document_id) or brepo.has_tombstone(workspace_id, "source", tid):
+                                continue
+                        except Exception:
+                            pass
                     if document_ids is None or t_meta.document_id in document_ids:
                         candidate_tables.append((tid, t_meta, ver))
 
@@ -247,6 +266,27 @@ class StructuredQueryService:
                 result.stage_timings = dict(self.last_stage_timings)
         return result
 
+    def _candidate_source_aliases(self, tid: str, meta: Any, ver: str, workspace_id: str) -> list[str]:
+        aliases = [tid]
+        sheet_name = getattr(meta, "sheet_name", None) if meta else None
+        if sheet_name:
+            aliases.append(str(sheet_name))
+        try:
+            brepo = self._get_boundary_repo()
+            doc_id = getattr(meta, "document_id", None) if meta else None
+            if brepo and doc_id:
+                snap = brepo.get_document_snapshot(workspace_id, doc_id)
+                if snap and getattr(snap, "source", None) and (not snap.version or not ver or str(snap.version) == str(ver)):
+                    src = str(snap.source)
+                    aliases.append(src)
+                    stem = re.sub(r"\.(?:csv|xlsx?|tsv)$", "", src, flags=re.IGNORECASE)
+                    if stem:
+                        aliases.append(stem)
+                        aliases.append(stem.replace("_", " ").replace("-", " "))
+        except Exception:
+            pass
+        return [a.lower().strip() for a in aliases if a and a.strip()]
+
     def _bind_table(
         self,
         candidate_tables: list[tuple[str, Any, str]],
@@ -255,12 +295,60 @@ class StructuredQueryService:
     ) -> tuple[str, Any, str] | None:
         q_lower = query.lower()
 
-        # 1. Explicit table name or file in query
+        # 1. Explicit table name or trusted active source filename/stem in query
         candidate_tables_sorted = sorted(candidate_tables, key=lambda x: len(x[0]), reverse=True)
+        explicit_matches: list[tuple[str, Any, str]] = []
+        alias_map: dict[str, list[str]] = {}
         for tid, meta, ver in candidate_tables_sorted:
-            pattern = rf"(?:\b|_){re.escape(tid)}(?:\.csv|\.xlsx)?(?:\b|_)"
-            if re.search(pattern, q_lower):
-                return (tid, meta, ver)
+            aliases = self._candidate_source_aliases(tid, meta, ver, workspace_id)
+            alias_map[tid] = aliases
+            matched = False
+            for alias in sorted(aliases, key=len, reverse=True):
+                pattern = rf"(?:\b|_){re.escape(alias)}(?:\.csv|\.xlsx?)?(?:\b|_)"
+                if re.search(pattern, q_lower):
+                    matched = True
+                    break
+            if matched:
+                explicit_matches.append((tid, meta, ver))
+
+        if len(explicit_matches) == 1:
+            return explicit_matches[0]
+        if len(explicit_matches) > 1:
+            competing = [item[0] for item in explicit_matches]
+            raise AmbiguousBindingError(
+                f"Ambiguous table binding: multiple active tables match explicit source reference ({', '.join(competing)}) "
+                f"for query '{query[:60]}'."
+            )
+
+        # 1b. If query names a specific source/file that did not resolve to any active table, never guess by shared columns
+        generic_source_words = {
+            "the", "this", "that", "uploaded", "attached", "selected", "current",
+            "same", "given", "provided", "available", "each", "all", "any", "a", "an",
+            "csv", "xlsx", "xls", "tsv", "workbook", "spreadsheet", "dataset", "table", "file",
+        }
+        explicit_refs: list[str] = []
+        explicit_refs.extend(re.findall(r"\b([a-z0-9_.\-]+\.(?:csv|xlsx?|tsv))\b", q_lower))
+        for m in re.finditer(
+            r"\b(?:in|from)\s+(?:the\s+)?([a-z0-9_.\- ]+?)\s+(?:csv|xlsx?|tsv|workbook|spreadsheet|dataset|table)\b",
+            q_lower,
+        ):
+            explicit_refs.append(m.group(1).strip())
+
+        for ref in explicit_refs:
+            ref_tokens = [
+                t for t in re.findall(r"[a-z0-9]{2,}", ref)
+                if t not in generic_source_words
+            ]
+            if not ref_tokens:
+                continue
+            ref_matched = any(
+                all(any(tok in al for al in alias_map.get(tid, [])) for tok in ref_tokens)
+                for tid, _, _ in candidate_tables_sorted
+            )
+            if not ref_matched:
+                raise AmbiguousBindingError(
+                    f"Explicit source reference '{ref}' could not be resolved to an active table in workspace '{workspace_id}'."
+                )
 
         # Document table indicators: references to numbered tables/figures/charts in narrative papers/reports
         is_tabular_explicit = bool(
@@ -373,7 +461,8 @@ class StructuredQueryService:
 
             if has_temporal:
                 score += 1.0
-            if has_metric:
+            is_count_query = bool(re.search(r"\bcount\b|\bhow many (?:rows|records|entries|items)\b", q_lower))
+            if has_metric and not is_count_query:
                 score += 2.0
 
             if explicit_terms:
@@ -438,7 +527,7 @@ class StructuredQueryService:
             )
 
         # 6. Pattern 3: Standard Aggregates (sum, avg, count)
-        if bool(re.search(r'\b(?:total|sum|average|avg|count)\b', q_lower)):
+        if bool(re.search(r'\b(?:total|sum|average|avg|count)\b|\bhow many (?:rows|records|entries|items)\b', q_lower)):
             return self._execute_aggregate(
                 query=query,
                 table_id=table_id,
@@ -1297,7 +1386,7 @@ class StructuredQueryService:
         total_rows: int,
     ) -> StructuredQueryResult:
         q_lower = query.lower()
-        if bool(re.search(r'\bcount\b', q_lower)):
+        if bool(re.search(r'\bcount\b|\bhow many (?:rows|records|entries|items)\b', q_lower)):
             op = AggregateOp.COUNT
         elif bool(re.search(r'\b(?:sum|total)\b', q_lower)):
             op = AggregateOp.SUM

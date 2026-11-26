@@ -1483,6 +1483,233 @@ def test_metric_delta_missing_operand_duplicate_and_interrupted_traversal(monkey
     assert out_fail["stage_timings"]["dynamodb_request_ms"] >= 0.0
 
 
+def test_how_many_records_count_and_incomplete_coverage():
+    """Unseen 'How many records...' COUNT query routes, binds, and enforces coverage."""
+    from services.retrieval.planner import planner
+    from services.retrieval.structured_query_service import IncompleteDataError
+
+    store = MemoryTableStore()
+    ws = "ws_how_many_count"
+    cols = (
+        ColumnDefinition(col_index=0, name="Year", inferred_dtype=InferredDtype.INTEGER),
+        ColumnDefinition(col_index=1, name="Region", inferred_dtype=InferredDtype.STRING),
+    )
+    schema = TableSchema(columns=cols, header_rows=(0,), header_topology=HeaderTopology.SINGLE_ROW, confidence=1.0)
+    rows = (
+        TableRow(
+            row_index=0,
+            row_id="fdl_r0",
+            cells=(
+                TableCell(cell_id="fdl_c00", row_index=0, col_index=0, coordinate="A1", raw_value="2024", normalized_value=2024),
+                TableCell(cell_id="fdl_c01", row_index=0, col_index=1, coordinate="B1", raw_value="North", normalized_value="North"),
+            ),
+        ),
+        TableRow(
+            row_index=1,
+            row_id="fdl_r1",
+            cells=(
+                TableCell(cell_id="fdl_c10", row_index=1, col_index=0, coordinate="A2", raw_value="2024", normalized_value=2024),
+                TableCell(cell_id="fdl_c11", row_index=1, col_index=1, coordinate="B2", raw_value="South", normalized_value="South"),
+            ),
+        ),
+        TableRow(
+            row_index=2,
+            row_id="fdl_r2",
+            cells=(
+                TableCell(cell_id="fdl_c20", row_index=2, col_index=0, coordinate="A3", raw_value="2025", normalized_value=2025),
+                TableCell(cell_id="fdl_c21", row_index=2, col_index=1, coordinate="B3", raw_value="East", normalized_value="East"),
+            ),
+        ),
+    )
+    table = StructuredTable(
+        table_id="fleet_dispatch_log",
+        document_id="doc_fleet",
+        sheet_name=None,
+        page_number=None,
+        schema=schema,
+        rows=rows,
+    )
+    store.store_table(table, ws)
+    store.publish_active_version(
+        "fleet_dispatch_log",
+        ws,
+        "doc_fleet",
+        "v1",
+        {"coverage_complete": True, "source_rows": 3, "persisted_rows": 3, "rejected_rows": 0},
+    )
+
+    q = "How many records have Year equal to 2024 in the fleet_dispatch_log CSV?"
+    plan = planner.route(q)
+    assert plan.use_structured_aggregate is True
+
+    svc = StructuredQueryService(store)
+    res = svc.execute(q, workspace_id=ws)
+    assert res is not None
+    assert res.operator == "count"
+    assert res.selection_count == 2
+    assert res.result_value == Decimal(2)
+    assert res.predicate_columns == ["Year"]
+    assert res.predicate_values == [2024]
+
+    # Incomplete coverage must never return a complete count
+    store.publish_active_version(
+        "fleet_dispatch_log",
+        ws,
+        "doc_fleet",
+        "v2",
+        {"coverage_complete": False, "source_rows": 5, "persisted_rows": 3, "rejected_rows": 2},
+    )
+    with pytest.raises(IncompleteDataError):
+        svc.execute(q, workspace_id=ws)
+
+
+def test_structured_count_source_binding_and_safety_controls(monkeypatch):
+    """Structured COUNT must bind to trusted requested source or refuse safely."""
+    from unittest.mock import patch
+    from db.workspace_boundary_repo import InMemoryWorkspaceBoundaryRepository
+    from modules.query.query_service import QueryRequest, QueryService
+    from schemas.contracts.boundary import DocumentSnapshot
+    import services.retrieval.run_structured_aggregate as rsa
+
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    ws = "ws_count_source_safety"
+    store = MemoryTableStore()
+    b_repo = InMemoryWorkspaceBoundaryRepository()
+    b_repo.create_workspace("Count Source Safety WS", "tester", workspace_id=ws)
+
+    def _add_table(tid: str, doc_id: str, fname: str, years_units: list[tuple[int, str, str]], *, coverage_complete: bool = True, snap_ver: str = "v1", table_ver: str = "v1"):
+        cols = (
+            ColumnDefinition(col_index=0, name="Year", inferred_dtype=InferredDtype.INTEGER),
+            ColumnDefinition(col_index=1, name="Region", inferred_dtype=InferredDtype.STRING),
+            ColumnDefinition(col_index=2, name="Units", inferred_dtype=InferredDtype.DECIMAL),
+        )
+        schema = TableSchema(columns=cols, header_rows=(0,), header_topology=HeaderTopology.SINGLE_ROW, confidence=1.0)
+        rows = tuple(
+            TableRow(
+                row_index=i,
+                row_id=f"{tid}_r{i}",
+                cells=(
+                    TableCell(cell_id=f"{tid}_c{i}_0", row_index=i, col_index=0, coordinate=f"A{i+1}", raw_value=str(yr), normalized_value=yr),
+                    TableCell(cell_id=f"{tid}_c{i}_1", row_index=i, col_index=1, coordinate=f"B{i+1}", raw_value=reg, normalized_value=reg),
+                    TableCell(cell_id=f"{tid}_c{i}_2", row_index=i, col_index=2, coordinate=f"C{i+1}", raw_value=val, normalized_value=Decimal(val)),
+                ),
+            )
+            for i, (yr, reg, val) in enumerate(years_units)
+        )
+        tbl = StructuredTable(table_id=tid, document_id=doc_id, sheet_name=None, page_number=None, schema=schema, rows=rows)
+        store.store_table(tbl, ws)
+        store.publish_active_version(
+            tid,
+            ws,
+            doc_id,
+            table_ver,
+            {"coverage_complete": coverage_complete, "source_rows": len(rows), "persisted_rows": len(rows), "rejected_rows": 0},
+        )
+        b_repo.create_source(ws, fname, source_id=doc_id)
+        b_repo.save_document_snapshot(
+            DocumentSnapshot(
+                workspace_id=ws,
+                document_id=doc_id,
+                source=fname,
+                version=snap_ver,
+                format="csv",
+                created_at="2026-11-26T00:00:00Z",
+            )
+        )
+
+    # alpha has 2 rows for 2024; beta has 3 rows for 2024 (plus extra numeric column Units)
+    _add_table("alpha_emissions_tbl", "doc-alpha", "alpha_emissions.csv", [(2024, "North", "100"), (2024, "South", "200"), (2025, "North", "150")])
+    _add_table("beta_outages_tbl", "doc-beta", "beta_outages.csv", [(2024, "North", "10"), (2024, "East", "20"), (2024, "West", "30"), (2025, "North", "40")])
+
+    class _MinimalDocRepo:
+        def get_workspace_documents(self, workspace_id: str, page: int = 1, limit: int = 1000):
+            return {"documents": [{"id": "doc-alpha", "filename": "alpha_emissions.csv"}, {"id": "doc-beta", "filename": "beta_outages.csv"}]}
+        def get_all_chunks(self, *a, **kw): return []
+        def get(self, doc_id: str): return None
+        def search_vector(self, *a, **kw): return []
+        def check_semantic_cache(self, *a, **kw): return None
+
+    qs = QueryService(repo=_MinimalDocRepo())
+
+    def _ask(query: str, document_ids: list[str] | None = None):
+        req = QueryRequest(query=query, workspace_id=ws, document_ids=document_ids, cache=False, benchmark_mode=True)
+        with (
+            patch("src.db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+            patch("db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+            patch("db.table_store.get_shared_table_store", return_value=store),
+            patch.object(rsa, "get_shared_table_store", return_value=store),
+            patch.object(rsa, "get_workspace_boundary_repo", return_value=b_repo),
+        ):
+            return qs.execute_query(req)
+
+    # 1. Trusted source filename/alias selects the right table
+    out_alpha = _ask("How many records have Year equal to 2024 in the alpha_emissions CSV?")
+    assert out_alpha["executed_path"] == "structured_aggregate"
+    assert "2" in out_alpha["answer"] and "3" not in out_alpha["answer"]
+    assert out_alpha["citations"][0]["document_filename"] == "alpha_emissions.csv"
+
+    out_beta = _ask("How many records have Year equal to 2024 in the beta_outages CSV?")
+    assert out_beta["executed_path"] == "structured_aggregate"
+    assert "3" in out_beta["answer"]
+    assert out_beta["citations"][0]["document_filename"] == "beta_outages.csv"
+
+    # 2. Unresolvable explicit source reference must NEVER silently select another table
+    out_unknown = _ask("How many records have Year equal to 2024 in the Gamma Telemetry CSV?")
+    assert out_unknown["executed_path"] != "structured_aggregate"
+    assert out_unknown["citations"] == []
+    assert out_unknown.get("confidence_score", 0.0) == 0.0
+
+    # 3a. Ambiguous (shared Year column, no source specified) must not guess
+    out_ambig = _ask("How many records have Year equal to 2024 in the CSV?")
+    assert out_ambig["executed_path"] != "structured_aggregate"
+    assert out_ambig["citations"] == []
+
+    # 3b. Out-of-scope document_ids filter
+    out_scope = _ask("How many records have Year equal to 2024 in the beta_outages CSV?", document_ids=["doc-alpha"])
+    assert out_scope["executed_path"] != "structured_aggregate"
+    assert out_scope["citations"] == []
+
+    # 3c. Supported zero count + SUM + delta controls
+    out_zero = _ask("How many records have Year equal to 1999 in the alpha_emissions CSV?")
+    assert out_zero["executed_path"] == "structured_aggregate"
+    assert "0" in out_zero["answer"]
+
+    out_sum = _ask("What is the total Units in the alpha_emissions CSV?")
+    assert out_sum["executed_path"] == "structured_aggregate"
+    assert "450" in out_sum["answer"]
+
+    out_delta = _ask("For North, how did Units change from 2024 to 2025 in the alpha_emissions CSV?")
+    assert out_delta["executed_path"] == "structured_aggregate"
+    assert "50" in out_delta["answer"]
+
+    # 3d. Stale snapshot version cannot produce a confident count
+    b_repo.save_document_snapshot(
+        DocumentSnapshot(workspace_id=ws, document_id="doc-alpha", source="alpha_emissions.csv", version="v999", format="csv", created_at="2026-11-26T00:00:00Z")
+    )
+    out_stale = _ask("How many records have Year equal to 2024 in the alpha_emissions CSV?")
+    assert out_stale["executed_path"] != "structured_aggregate"
+    assert out_stale["citations"] == []
+
+    # Restore v1, then test revoked source (tombstone)
+    b_repo.save_document_snapshot(
+        DocumentSnapshot(workspace_id=ws, document_id="doc-alpha", source="alpha_emissions.csv", version="v1", format="csv", created_at="2026-11-26T00:00:00Z")
+    )
+    b_repo.record_source_tombstone(ws, "doc-alpha", "tester")
+    out_revoked = _ask("How many records have Year equal to 2024 in the alpha_emissions CSV?")
+    assert out_revoked["executed_path"] != "structured_aggregate"
+    assert out_revoked["citations"] == []
+
+    # 3e. Incomplete coverage on beta cannot produce a complete count
+    store.publish_active_version(
+        "beta_outages_tbl", ws, "doc-beta", "v1",
+        {"coverage_complete": False, "source_rows": 10, "persisted_rows": 4, "rejected_rows": 6},
+    )
+    out_incomp = _ask("How many records have Year equal to 2024 in the beta_outages CSV?")
+    assert out_incomp["executed_path"] != "structured_aggregate"
+    assert out_incomp["citations"] == []
+    assert "incomplete" in out_incomp["answer"].lower()
+
+
 
 
 

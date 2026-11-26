@@ -87,7 +87,11 @@ def execute(state: dict[str, Any]) -> dict[str, Any]:
     document_ids = state.get("document_ids")
 
     store = get_shared_table_store()
-    svc = StructuredQueryService(store)
+    try:
+        b_repo = get_workspace_boundary_repo()
+    except Exception:
+        b_repo = None
+    svc = StructuredQueryService(store, boundary_repo=b_repo)
     existing_timings = state.get("stage_timings", {})
 
     try:
