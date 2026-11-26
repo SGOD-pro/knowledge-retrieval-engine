@@ -58,7 +58,7 @@ class StrategyRouter:
 
         # 1. Detect false premise or contradiction inquiry
         # Phrasing suggesting potential false assumptions or contradiction checking
-        false_premise_pattern = r"\b(when everyone knows|why did.*collapse|why is.*zero|despite.*failing|given that.*bankrupt|supposedly|allegedly)\b"
+        false_premise_pattern = r"(?:,\s*right\??|\b(?:when everyone knows|why did.*collapse|why is.*zero|despite.*failing|given that.*bankrupt|supposedly|allegedly|check against)\b|\bis (?:it|that) (?:just|true|correct|right)\b)"
         if re.search(false_premise_pattern, q_lower):
             return SelectedStrategies(
                 primary=["vector_rerank", "bm25"],

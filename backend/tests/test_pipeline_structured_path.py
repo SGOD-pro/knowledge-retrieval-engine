@@ -508,6 +508,122 @@ def test_structured_aggregate_citation_provenance_missing_versions(tmp_path, mon
     assert "document_filename" not in res_no_agg_ver.retained_evidence_items[0].provenance
 
 
+def test_premise_comparison_routes_to_evidence_path_while_sum_and_delta_stay_structured(populated_workspace, monkeypatch):
+    """Q155 regression: premise comparisons must bypass structured_aggregate, while SUM and delta stay structured."""
+    import json
+    from db.workspace_boundary_repo import DocumentSnapshot, InMemoryWorkspaceBoundaryRepository
+    from schemas.models import Chunk
+    from services.retrieval import bm25_retriever
+    from services.retrieval.strategy_router import StrategyRouter
+
+    monkeypatch.setenv("RERANKER_PROVIDER", "lexical")
+    ws, doc_id = populated_workspace
+
+    c1 = Chunk(
+        id=f"{doc_id}:csv:row1",
+        document_id=doc_id,
+        source_format="csv",
+        text="Year: 2025. Industry: All industries (99999). Variable: Total income. Value: 979702.",
+        element_type="table_row",
+        page_number=None,
+        workspace_id=ws,
+        version="v1",
+        document_version="v1",
+    )
+    c2 = Chunk(
+        id=f"{doc_id}:csv:row2",
+        document_id=doc_id,
+        source_format="csv",
+        text="Year: 2025. Industry: All industries (99999). Variable: Total expenditure. Value: 871375. Surplus before income tax: 109848.",
+        element_type="table_row",
+        page_number=None,
+        workspace_id=ws,
+        version="v1",
+        document_version="v1",
+    )
+
+    class _PremiseDocRepo:
+        def get_workspace_documents(self, workspace_id: str, page: int = 1, limit: int = 1000):
+            return {"documents": [{"id": doc_id, "filename": "survay.csv"}]}
+
+        def get_all_chunks(self, document_ids=None, workspace_id: str = ""):
+            return [c1, c2]
+
+        def get(self, d_id: str):
+            return None
+
+        def search_vector(self, *args, **kwargs):
+            return []
+
+        def check_semantic_cache(self, *args, **kwargs):
+            return None
+
+    b_repo = InMemoryWorkspaceBoundaryRepository()
+    b_repo.create_workspace("Premise WS", "owner-1", workspace_id=ws)
+    b_repo.create_source(ws, "survay.csv", source_id=doc_id)
+    b_repo.save_document_snapshot(
+        DocumentSnapshot(
+            workspace_id=ws,
+            document_id=doc_id,
+            source="survay.csv",
+            version="v1",
+            format="csv",
+            created_at="2026-11-26T00:00:00Z",
+        )
+    )
+    doc_repo = _PremiseDocRepo()
+    if hasattr(bm25_retriever, "_CHUNK_CACHE"):
+        bm25_retriever._CHUNK_CACHE.clear()
+
+    # 1. Premise comparison through normal QueryService entry point
+    premise_q = "For 2025 All industries, surplus before income tax is just total income minus total expenditure, right? Check against the CSV."
+    qs = QueryService(repo=doc_repo)
+    llm_payload = json.dumps({
+        "answer": "No, total income minus total expenditure is 108,327, while reported surplus before income tax is 109,848.",
+        "citations": [c1.id, c2.id],
+    })
+    init_request_telemetry()
+    with (
+        patch("src.db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+        patch("db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+        patch("services.langgraph_pipeline._get_repo", return_value=doc_repo),
+        patch("services.langgraph_pipeline.check_fidelity", return_value=True),
+        patch("services.llm.llm_service.generate_completion", return_value=(llm_payload, {"input_tokens": 10, "output_tokens": 10})),
+    ):
+        res_premise = qs.execute_query(
+            QueryRequest(
+                query=premise_q,
+                workspace_id=ws,
+                document_ids=[doc_id],
+                benchmark_mode=True,
+                cache=False,
+            )
+        )
+
+    assert res_premise["planned_path"] != "structured_aggregate"
+    assert res_premise["executed_path"] != "structured_aggregate"
+    assert res_premise["structured_aggregate"] is False
+    assert "109,848" in res_premise["answer"]
+
+    # 2. Controls: StrategyRouter and QueryService preserve legitimate SUM and numeric delta comparisons
+    router = StrategyRouter()
+    assert "structured_table" in router.route("What is the total Value for 2025 in survay.csv?").primary
+    assert "structured_table" in router.route("For All industries (99999), how did total income change from 2024 to 2025?").primary
+
+    with patch("services.langgraph_pipeline._get_repo", return_value=doc_repo):
+        res_delta = qs.execute_query(
+            QueryRequest(
+                query="For All industries (99999), how did total income change from 2024 to 2025? Give the amount and percentage change.",
+                workspace_id=ws,
+                document_ids=[doc_id],
+                benchmark_mode=True,
+                cache=False,
+            )
+        )
+    assert res_delta["executed_path"] == "structured_aggregate"
+    assert res_delta["structured_aggregate"] is True
+
+
 
 
 
