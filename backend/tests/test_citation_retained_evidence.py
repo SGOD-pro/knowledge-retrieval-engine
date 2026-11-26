@@ -497,3 +497,57 @@ def test_inline_citation_ids_excluded_from_numeric_claims_only_when_validated_an
         ground_truth_chunk_ids=[cid_cited],
     )
     assert res_uncited_id["is_grounded_correct"] is False
+
+
+def test_entity_negation_does_not_cross_that_clause_while_true_denial_still_rejects():
+    """Negation on a matrix verb ('does not prove that ...') must not negate an entity inside the complement clause."""
+    from services.evaluation.benchmark_scorer import detect_contradiction_against_evidence, evaluate_grounded_answer
+
+    cid = "doc-bills:csv:row4"
+    ev = [
+        {
+            "evidence_id": cid,
+            "document_id": "doc-bills",
+            "document_filename": "bills.csv",
+            "document_version": "v1",
+            "text": "Year: 2014. Bill No.: LIII. Short Title of the Bill: THE ALPHA-BETA BILL, 2016. Referred to Committee / Report Presented: NA. Status: Assented.",
+            "locator": {"row_index": 4},
+        }
+    ]
+    cit = [{"chunk_id": cid, "document_id": "doc-bills", "document_filename": "bills.csv", "document_version": "v1", "location_reference": "row 4"}]
+
+    # 1. Negation on matrix verb ('does not prove that') must not falsely negate ALPHA-BETA
+    ans_ok = (
+        "No, a blank Committee / Report Presented cell does not prove that the Alpha-Beta Bill was never referred to a committee. "
+        "It only indicates that the report data was not provided."
+    )
+    assert detect_contradiction_against_evidence(ans_ok, ev[0]["text"]) is None
+    res_ok = evaluate_grounded_answer(
+        answer=ans_ok,
+        citations=cit,
+        is_answer_text_correct=True,
+        contract_type="semantic",
+        expected_sources=["bills.csv"],
+        expected_source_version="v1",
+        retained_evidence_items=ev,
+        context_chunk_ids=[cid],
+        ground_truth_chunk_ids=[cid],
+    )
+    assert res_ok["is_grounded_correct"] is True, res_ok.get("reason")
+
+    # 2. Control: genuine denial of the cited entity must still be rejected
+    ans_deny = "No Alpha-Beta Bill is in the bills dataset and it was never assented."
+    contra = detect_contradiction_against_evidence(ans_deny, ev[0]["text"])
+    assert contra is not None and "ALPHA-BETA" in contra
+    res_deny = evaluate_grounded_answer(
+        answer=ans_deny,
+        citations=cit,
+        is_answer_text_correct=True,
+        contract_type="semantic",
+        expected_sources=["bills.csv"],
+        expected_source_version="v1",
+        retained_evidence_items=ev,
+        context_chunk_ids=[cid],
+        ground_truth_chunk_ids=[cid],
+    )
+    assert res_deny["is_grounded_correct"] is False

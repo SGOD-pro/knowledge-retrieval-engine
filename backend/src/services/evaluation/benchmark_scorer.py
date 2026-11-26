@@ -14,8 +14,8 @@ from services.retrieval.table_metric_binding import (
     parse_financial_table_cells,
 )
 
-# Scorer 2.5.0: excludes validated, cited inline [chunk_id] tags from numeric claim extraction.
-SCORER_VERSION = "2.5.0"
+# Scorer 2.6.0: stops entity negation scope from crossing 'that' complement clause boundaries.
+SCORER_VERSION = "2.6.0"
 
 _MONTH_NAMES_RE = (
     r"january|february|march|april|may|june|july|august|september|october|november|december"
@@ -1580,7 +1580,7 @@ _COPULAR_AND_ADVERB_TOKENS = {
 
 _CONJUNCTION_AND_BOUNDARY_TOKENS = {
     "and", "but", "or", "however", "instead", "rather", "although", "whereas",
-    "while", "yet", ",", ";", ":",
+    "while", "yet", "that", ",", ";", ":",
 }
 
 _CONTRAST_PATTERN = re.compile(
