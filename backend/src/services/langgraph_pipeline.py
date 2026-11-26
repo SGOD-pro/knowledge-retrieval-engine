@@ -1474,9 +1474,21 @@ def run_llm(state: PipelineState):
     existing = state.get("stage_timings", {})
 
     from services.retrieval.response_builder import build_citation
-    from services.evaluation.benchmark_scorer import compute_faithfulness
+    from services.evaluation.benchmark_scorer import (
+        compute_faithfulness,
+        detect_contradiction_against_evidence,
+        extract_numbers_normalized,
+    )
+    from services.retrieval.table_metric_binding import (
+        bind_financial_query,
+        cell_matches_financial_claim,
+        extract_financial_claims,
+        parse_financial_table_cells,
+    )
 
     ans = response.get("answer", "NOT_FOUND")
+    if ans is None or (isinstance(ans, str) and not ans.strip()):
+        ans = "NOT_FOUND"
     usage = response.get("usage", {"input_tokens": 0, "output_tokens": 0})
 
     cands = dict(state.get("retrieval_candidates", {}))
@@ -1509,7 +1521,82 @@ def run_llm(state: PipelineState):
     has_sheet_inventory = any(getattr(c, "element_type", "") == "sheet_inventory" for c in top_chunks)
     if not final_cited_chunks and ans != "NOT_FOUND":
         if not is_financial and not has_sheet_inventory:
-            final_cited_chunks = [c for c in top_chunks if str(c.id) in compressed_ids]
+            ans_for_verify = json.dumps(ans) if isinstance(ans, (dict, list)) else str(ans)
+            retained_pool = [c for c in top_chunks if str(c.id) in compressed_ids]
+            claims = [
+                seg.strip()
+                for seg in re.split(r"(?<=[.!?])\s+|\n+", ans_for_verify)
+                if seg.strip()
+            ] or [ans_for_verify]
+            _stop = {
+                "that", "this", "with", "from", "have", "been", "were", "only",
+                "about", "does", "mean", "there", "their", "which", "when", "what",
+                "where", "while", "into", "over", "under", "between", "because",
+                "information", "context", "provided", "indicates", "data", "absence",
+                "necessarily", "specific", "meanwhile",
+            }
+            selected_by_id: dict[str, Any] = {}
+            all_claims_supported = bool(retained_pool)
+            for claim in claims:
+                claim_nums = extract_numbers_normalized(claim)
+                claim_terms = {
+                    w for w in re.findall(r"[a-z0-9]{4,}", claim.lower())
+                    if w not in _stop
+                }
+                best_chunk = None
+                best_key = (0, 0.0, 0.0)
+                for cand in retained_pool:
+                    cand_text = getattr(cand, "text", "") or ""
+                    if claim_nums and not (claim_nums <= extract_numbers_normalized(cand_text)):
+                        continue
+                    if detect_contradiction_against_evidence(answer=claim, context=cand_text):
+                        continue
+                    c_lower = cand_text.lower()
+                    claim_lower = claim.lower()
+                    if not re.search(r"\b(?:not|never|no)\b", claim_lower) and any(
+                        re.search(rf"\b{m.group(1)}\s+{re.escape(m.group(2))}\b", claim_lower)
+                        for m in re.finditer(r"\b(is|are|was|were)\s+not\s+([a-z]{3,})\b", c_lower)
+                    ):
+                        continue
+                    q_bind = bind_financial_query(state.get("query", ""))
+                    fin_claims = extract_financial_claims(claim)
+                    table_cells = parse_financial_table_cells(cand_text) if fin_claims else []
+                    if fin_claims and table_cells:
+                        all_cells_ok = all(
+                            any(
+                                cell_matches_financial_claim(
+                                    cell,
+                                    fc,
+                                    target_metric=(q_bind.metric if q_bind and q_bind.is_active else None) or fc.get("metric"),
+                                    target_entity=(q_bind.entity if q_bind and q_bind.is_active else None) or fc.get("entity"),
+                                    required_duration=fc.get("duration_norm") or (q_bind.duration_norm if q_bind and q_bind.is_active else None),
+                                    required_date=fc.get("date_parsed") or (q_bind.date_parsed if q_bind and q_bind.is_active else None),
+                                    chunk_context=cand_text,
+                                )
+                                for cell in table_cells
+                            )
+                            for fc in fin_claims
+                        )
+                        if not all_cells_ok:
+                            continue
+                    claim_faith = compute_faithfulness(claim, cand_text) or 0.0
+                    content_hits = sum(1 for t in claim_terms if t in c_lower)
+                    claim_faith = compute_faithfulness(claim, cand_text) or 0.0
+                    whole_faith = compute_faithfulness(ans_for_verify, cand_text) or 0.0
+                    if (claim_faith >= 0.25 or content_hits >= 2) and (content_hits >= 1 or claim_nums):
+                        cand_key = (content_hits, whole_faith, claim_faith)
+                        if cand_key > best_key:
+                            best_key = cand_key
+                            best_chunk = cand
+                if best_chunk is None:
+                    all_claims_supported = False
+                    break
+                selected_by_id[str(best_chunk.id)] = best_chunk
+            if all_claims_supported and selected_by_id:
+                final_cited_chunks = [c for c in retained_pool if str(c.id) in selected_by_id]
+            else:
+                ans = "NOT_FOUND"
+                final_cited_chunks = []
 
     if ans == "NOT_FOUND" or not top_chunks:
         citation_utilization_rate = None
