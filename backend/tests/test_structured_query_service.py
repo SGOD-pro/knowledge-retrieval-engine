@@ -1710,6 +1710,106 @@ def test_structured_count_source_binding_and_safety_controls(monkeypatch):
     assert "incomplete" in out_incomp["answer"].lower()
 
 
+def test_structured_count_known_plus_missing_csv_refuses_and_same_source_aliases_succeed(monkeypatch):
+    """COUNT requiring a known CSV and a missing CSV must never return the known CSV's count alone."""
+    from unittest.mock import patch
+    from db.workspace_boundary_repo import InMemoryWorkspaceBoundaryRepository
+    from modules.query.query_service import QueryRequest, QueryService
+    from schemas.contracts.boundary import DocumentSnapshot
+    import services.retrieval.run_structured_aggregate as rsa
+
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    ws = "ws_count_known_plus_missing"
+    store = MemoryTableStore()
+    b_repo = InMemoryWorkspaceBoundaryRepository()
+    b_repo.create_workspace("Known Plus Missing WS", "tester", workspace_id=ws)
+
+    cols = (
+        ColumnDefinition(col_index=0, name="Year", inferred_dtype=InferredDtype.INTEGER),
+        ColumnDefinition(col_index=1, name="Units", inferred_dtype=InferredDtype.DECIMAL),
+    )
+    schema = TableSchema(columns=cols, header_rows=(0,), header_topology=HeaderTopology.SINGLE_ROW, confidence=1.0)
+    rows_a = (
+        TableRow(row_index=0, row_id="a_r0", cells=(
+            TableCell(cell_id="a_c0_0", row_index=0, col_index=0, coordinate="A1", raw_value="2024", normalized_value=2024),
+            TableCell(cell_id="a_c0_1", row_index=0, col_index=1, coordinate="B1", raw_value="10", normalized_value=Decimal("10")),
+        )),
+        TableRow(row_index=1, row_id="a_r1", cells=(
+            TableCell(cell_id="a_c1_0", row_index=1, col_index=0, coordinate="A2", raw_value="2024", normalized_value=2024),
+            TableCell(cell_id="a_c1_1", row_index=1, col_index=1, coordinate="B2", raw_value="20", normalized_value=Decimal("20")),
+        )),
+    )
+    tbl_a = StructuredTable(table_id="alpha_emissions_tbl", document_id="doc-alpha", sheet_name=None, page_number=None, schema=schema, rows=rows_a)
+    store.store_table(tbl_a, ws)
+    store.publish_active_version(
+        "alpha_emissions_tbl", ws, "doc-alpha", "v1",
+        {"coverage_complete": True, "source_rows": 2, "persisted_rows": 2, "rejected_rows": 0},
+    )
+    b_repo.create_source(ws, "alpha_emissions.csv", source_id="doc-alpha")
+    b_repo.save_document_snapshot(
+        DocumentSnapshot(
+            workspace_id=ws,
+            document_id="doc-alpha",
+            source="alpha_emissions.csv",
+            version="v1",
+            format="csv",
+            created_at="2026-11-26T00:00:00Z",
+        )
+    )
+
+    class _MinimalDocRepo:
+        def get_workspace_documents(self, workspace_id: str, page: int = 1, limit: int = 1000):
+            return {"documents": [{"id": "doc-alpha", "filename": "alpha_emissions.csv"}]}
+        def get_all_chunks(self, *a, **kw): return []
+        def get(self, doc_id: str): return None
+        def search_vector(self, *a, **kw): return []
+        def check_semantic_cache(self, *a, **kw): return None
+
+    qs = QueryService(repo=_MinimalDocRepo())
+
+    def _ask(query: str):
+        req = QueryRequest(query=query, workspace_id=ws, cache=False, benchmark_mode=True)
+        with (
+            patch("src.db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+            patch("db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+            patch("db.table_store.get_shared_table_store", return_value=store),
+            patch.object(rsa, "get_shared_table_store", return_value=store),
+            patch.object(rsa, "get_workspace_boundary_repo", return_value=b_repo),
+        ):
+            return qs.execute_query(req)
+
+    # 1. Single known CSV returns exact count
+    out_single = _ask("How many records have Year equal to 2024 in alpha_emissions.csv?")
+    assert out_single["executed_path"] == "structured_aggregate"
+    assert "2" in out_single["answer"]
+
+    # 2. Two names for the SAME active source do not create false ambiguity
+    out_same_alias = _ask("How many records have Year equal to 2024 in alpha_emissions.csv and the alpha emissions CSV?")
+    assert out_same_alias["executed_path"] == "structured_aggregate"
+    assert "2" in out_same_alias["answer"]
+
+    # 3. Known CSV + missing CSV must ask for clarification / refuse, NEVER return count 2 as total
+    for q_missing in [
+        "How many records have Year equal to 2024 across alpha_emissions.csv and gamma_telemetry.csv?",
+        "How many records have Year equal to 2024 in the alpha_emissions CSV and the gamma_telemetry CSV?",
+        "How many records have Year equal to 2024 using alpha_emissions.csv and missing_sheet.xlsx?",
+    ]:
+        out_missing = _ask(q_missing)
+        assert out_missing["executed_path"] != "structured_aggregate", f"Leaked partial count for: {q_missing}"
+        assert out_missing["citations"] == []
+        assert (
+            "clarification" in out_missing["answer"].lower()
+            or "could not be resolved" in out_missing["answer"].lower()
+            or "couldn't find" in out_missing["answer"].lower()
+        )
+
+    # 4. Generic qualifier ("valid") before matched table name does not trigger false missing-source error
+    out_qualified = _ask("How many records have Year equal to 2024 in the valid alpha_emissions table?")
+    assert out_qualified["executed_path"] == "structured_aggregate"
+    assert "2" in out_qualified["answer"]
+
+
+
 
 
 

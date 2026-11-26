@@ -311,25 +311,18 @@ class StructuredQueryService:
             if matched:
                 explicit_matches.append((tid, meta, ver))
 
-        if len(explicit_matches) == 1:
-            return explicit_matches[0]
-        if len(explicit_matches) > 1:
-            competing = [item[0] for item in explicit_matches]
-            raise AmbiguousBindingError(
-                f"Ambiguous table binding: multiple active tables match explicit source reference ({', '.join(competing)}) "
-                f"for query '{query[:60]}'."
-            )
-
         # 1b. If query names a specific source/file that did not resolve to any active table, never guess by shared columns
+        # (Must run before returning a single explicit_match so known + missing multi-source queries fail safely.)
         generic_source_words = {
             "the", "this", "that", "uploaded", "attached", "selected", "current",
             "same", "given", "provided", "available", "each", "all", "any", "a", "an",
+            "valid", "active", "complete", "full", "entire", "main", "primary",
             "csv", "xlsx", "xls", "tsv", "workbook", "spreadsheet", "dataset", "table", "file",
         }
         explicit_refs: list[str] = []
         explicit_refs.extend(re.findall(r"\b([a-z0-9_.\-]+\.(?:csv|xlsx?|tsv))\b", q_lower))
         for m in re.finditer(
-            r"\b(?:in|from)\s+(?:the\s+)?([a-z0-9_.\- ]+?)\s+(?:csv|xlsx?|tsv|workbook|spreadsheet|dataset|table)\b",
+            r"\b(?:in|from|across|between|using|and)\s+(?:the\s+)?([a-z0-9_\-]+(?:\s+(?!to\b|in\b|from\b|and\b|or\b)[a-z0-9_\-]+){0,2})\s+(?:csv|xlsx?|tsv|workbook|spreadsheet|dataset|table)\b",
             q_lower,
         ):
             explicit_refs.append(m.group(1).strip())
@@ -349,6 +342,15 @@ class StructuredQueryService:
                 raise AmbiguousBindingError(
                     f"Explicit source reference '{ref}' could not be resolved to an active table in workspace '{workspace_id}'."
                 )
+
+        if len(explicit_matches) == 1:
+            return explicit_matches[0]
+        if len(explicit_matches) > 1:
+            competing = [item[0] for item in explicit_matches]
+            raise AmbiguousBindingError(
+                f"Ambiguous table binding: multiple active tables match explicit source reference ({', '.join(competing)}) "
+                f"for query '{query[:60]}'."
+            )
 
         # Document table indicators: references to numbered tables/figures/charts in narrative papers/reports
         is_tabular_explicit = bool(

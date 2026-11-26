@@ -34,6 +34,7 @@ class Subgoal:
     structural_hint: str | None = None
     source_hint: str | None = None
     expected_dtype: str | None = None
+    eligible_sources: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -123,18 +124,31 @@ def decompose_query(query: str) -> QueryPlan:
         # Extract source hints if present (e.g. "from SEC filing", "in doc A")
         s1_match = re.search(r"(?:in|from)\s+([A-Za-z0-9_\-\. ]+?)(?:\s+and|\s+with|\s*$)", part1, re.IGNORECASE)
         s2_match = re.search(r"(?:in|from)\s+([A-Za-z0-9_\-\. ]+?)(?:\s*$)", part2, re.IGNORECASE)
+        s1_hint = s1_match.group(1).strip() if s1_match else None
+        s2_hint = s2_match.group(1).strip() if s2_match else None
+        eligible_prefix: tuple[str, ...] = ()
+        if s1_hint is None and s2_hint is None:
+            prefix_files = re.findall(
+                r"\b([A-Za-z0-9_.\-]+\.(?:pdf|csv|xlsx?|tsv))\b",
+                query[:compare_m.start()],
+                re.IGNORECASE,
+            )
+            if len(prefix_files) >= 2:
+                eligible_prefix = tuple(prefix_files)
 
         subgoal1 = Subgoal(
             subgoal_id="sub_1",
             query_text=part1,
             target_operator=operator,
-            source_hint=s1_match.group(1).strip() if s1_match else None,
+            source_hint=s1_hint,
+            eligible_sources=eligible_prefix,
         )
         subgoal2 = Subgoal(
             subgoal_id="sub_2",
             query_text=part2,
             target_operator=operator,
-            source_hint=s2_match.group(1).strip() if s2_match else None,
+            source_hint=s2_hint,
+            eligible_sources=eligible_prefix,
         )
         return QueryPlan(
             primary_intent=QueryIntent.MULTI_HOP,

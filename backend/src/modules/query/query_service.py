@@ -528,6 +528,10 @@ class QueryService:
             "compressed_context_chunk_ids": retrieval_candidates.get("compressed_context", []),
             "llm_cited_chunk_ids": retrieval_candidates.get("llm_citations", []),
             "final_citation_chunk_ids": final_cit_ids,
+            "requirement_ids": retrieval_candidates.get("requirement_ids", []),
+            "requirement_evidence": retrieval_candidates.get("requirement_evidence", {}),
+            "missing_required_sources": retrieval_candidates.get("missing_required_sources", []),
+            "unverified_operands": retrieval_candidates.get("unverified_operands", []),
         }
 
         # 4. Write Cache (ONLY if cache enabled and not in benchmark_mode)

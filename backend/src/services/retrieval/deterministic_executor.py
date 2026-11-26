@@ -677,3 +677,387 @@ class DeterministicExecutor:
                 return self.execute(ExecutionOperator.SUM, [op1, op2])
 
         return None
+
+
+def _bind_subgoal_operand(
+    sg: dict[str, Any],
+    chunks: list[Any],
+) -> tuple[Operand, str | None, set[str], Any] | None:
+    """Bind a requirement subgoal to the best-matching numeric Operand and source chunk."""
+    q_txt = str(sg.get("query_text") or "")
+    q_low = q_txt.lower()
+    req_years = {y for y in re.findall(r"\b(19\d{2}|20\d{2})\b", q_low)}
+    req_codes = re.findall(r"\b([A-Za-z]\d{1,4})\b", q_txt)
+    q_tokens = {
+        t for t in re.findall(r"[a-z0-9]+", q_low)
+        if len(t) >= 3 and t not in {"the", "and", "for", "with", "from", "value", "values"}
+    }
+
+    best_score = -1
+    best_match: tuple[Operand, str | None, set[str], Any] | None = None
+
+    def _score_chunk(c: Any, txt_low: str, matched_balance_sheet: bool) -> int:
+        c_tokens = set(re.findall(r"[a-z0-9]+", txt_low))
+        fmt = str(getattr(c, "source_format", "") or "").lower()
+        if fmt:
+            c_tokens.add(fmt)
+        score = len(q_tokens & c_tokens)
+        if matched_balance_sheet and ("balance sheet" in q_low or "10q" in q_low or "10k" in q_low or fmt == "pdf"):
+            score += 2
+        if ("csv" in q_low or "xlsx" in q_low or "survey" in q_low) and fmt in {"csv", "xlsx"}:
+            score += 2
+        return score
+
+    for c in chunks:
+        txt = str(getattr(c, "text", "") or "")
+        txt_low = txt.lower()
+        if req_years and not (req_years <= set(re.findall(r"\b(19\d{2}|20\d{2})\b", txt_low))):
+            continue
+        if req_codes and not all(re.search(rf"\b{re.escape(code.lower())}\b", txt_low) for code in req_codes):
+            continue
+        if "current ratio" in q_low and re.search(r"\bnot\s+current\s+ratio\b", txt_low):
+            continue
+
+        candidate: tuple[Operand, str | None, set[str], Any] | None = None
+        matched_bs = False
+
+        # 1. Balance-sheet current ratio: compute (current assets / current liabilities) * 100
+        if "current ratio" in q_low and "current assets" in txt_low and "current liabilities" in txt_low:
+            m_assets = re.search(r"current\s+assets[^\d\n]*\$?\s*([\d,]+(?:\.\d+)?)", txt_low)
+            m_liab = re.search(r"current\s+liabilities[^\d\n]*\$?\s*([\d,]+(?:\.\d+)?)", txt_low)
+            if m_assets and m_liab:
+                a_val = parse_decimal_value(m_assets.group(1))
+                l_val = parse_decimal_value(m_liab.group(1))
+                if l_val != 0:
+                    ratio_pct = (a_val / l_val) * Decimal("100")
+                    raw_set = {
+                        str(a_val).rstrip("0").rstrip("."),
+                        str(l_val).rstrip("0").rstrip("."),
+                        str(ratio_pct.quantize(Decimal("0.01"))).rstrip("0").rstrip("."),
+                    }
+                    candidate = (
+                        Operand(raw_value=f"{a_val}/{l_val}", normalized_value=ratio_pct),
+                        "percentage",
+                        raw_set,
+                        c,
+                    )
+                    matched_bs = True
+
+        # 2. Structured CSV/XLSX row ("Value: <num>" or "value <num>" and optional "Units: <unit>")
+        if candidate is None:
+            m_val = re.search(r"\bvalue\s*[:\s]\s*(-?[\d,]+(?:\.\d+)?)", txt_low)
+            if m_val:
+                val_dec = parse_decimal_value(m_val.group(1))
+                unit: str | None = None
+                m_unit = re.search(r"\bunits?\s*:\s*([a-z0-9 %()$]+)", txt_low)
+                if m_unit:
+                    u_str = m_unit.group(1).strip()
+                    if "percent" in u_str or "%" in u_str:
+                        unit = "percentage"
+                    elif "dollar" in u_str or "$" in u_str:
+                        unit = "dollars"
+                candidate = (
+                    Operand(raw_value=m_val.group(1), normalized_value=val_dec),
+                    unit,
+                    {str(val_dec).rstrip("0").rstrip(".")},
+                    c,
+                )
+
+        # 3. Direct percentage/value near metric
+        if candidate is None and "current ratio" in q_low and "current ratio" in txt_low:
+            m_pct = re.search(r"current\s+ratio[^\d\n]*(-?[\d,]+(?:\.\d+)?)\s*%", txt_low)
+            if m_pct:
+                val_dec = parse_decimal_value(m_pct.group(1))
+                candidate = (
+                    Operand(raw_value=m_pct.group(0), normalized_value=val_dec),
+                    "percentage",
+                    {str(val_dec).rstrip("0").rstrip(".")},
+                    c,
+                )
+
+        if candidate is not None:
+            sc = _score_chunk(c, txt_low, matched_bs)
+            if sc > best_score:
+                best_score = sc
+                best_match = candidate
+
+    return best_match
+
+
+def _fmt_dec_variants(val: Decimal) -> set[str]:
+    out = {str(val).rstrip("0").rstrip(".") or "0"}
+    for q in ("0.1", "0.01"):
+        s_raw = str(val.quantize(Decimal(q)))
+        out.add(s_raw)
+        out.add(s_raw.rstrip("0").rstrip(".") or "0")
+    return out
+
+
+def verify_two_operand_comparison(
+    query: str,
+    subgoal_specs: list[dict[str, Any]],
+    chunks: list[Any],
+    answer: str,
+) -> tuple[bool, str, set[str]]:
+    """Bind two comparison operands from evidence, run DeterministicExecutor, and validate answer direction & delta."""
+    if len(subgoal_specs) != 2 or not chunks:
+        return True, "not_applicable", set()
+
+    q_low = query.lower()
+    if not re.search(r"\b(?:compare|difference|percentage\s+point|percentage\s+difference|higher|lower)\b", q_low):
+        return True, "not_comparison", set()
+
+    b1 = _bind_subgoal_operand(subgoal_specs[0], chunks)
+    b2 = _bind_subgoal_operand(subgoal_specs[1], chunks)
+    if b1 is None or b2 is None:
+        return False, "unresolved_comparison_operands", set()
+
+    op1, unit1, raw1, _ = b1
+    op2, unit2, raw2, _ = b2
+    if unit1 and unit2 and unit1 != unit2:
+        return False, f"incompatible_units:{unit1}_vs_{unit2}", set()
+
+    executor = DeterministicExecutor()
+    res = executor.execute(ExecutionOperator.COMPARE, [op1, op2], unit=unit1 or unit2)
+    cmp_dict = res.result_value
+    a_dec = parse_decimal_value(op1.normalized_value)
+    b_dec = parse_decimal_value(op2.normalized_value)
+    abs_delta = abs(a_dec - b_dec)
+    rel_pct = abs(cmp_dict["percent_delta"]) if cmp_dict.get("percent_delta") is not None else None
+
+    derived_nums: set[str] = set()
+    derived_nums |= _fmt_dec_variants(a_dec) | _fmt_dec_variants(b_dec) | _fmt_dec_variants(abs_delta) | raw1 | raw2
+    if rel_pct is not None:
+        derived_nums |= _fmt_dec_variants(rel_pct)
+
+    # Extract distinguishing subject tokens for sub_1 vs sub_2
+    _subj_stop = {
+        "the", "and", "for", "with", "from", "that", "this", "value", "values",
+        "ratio", "current", "percentage", "percent", "points", "scale", "same",
+        "june", "july", "january", "march", "april", "may", "august", "september",
+        "october", "november", "december",
+    }
+    def _subj_tokens(sg: dict[str, Any]) -> set[str]:
+        toks = set(re.findall(r"[a-z0-9]{3,}", str(sg.get("query_text") or "").lower()))
+        return {t for t in toks if t not in _subj_stop and not t.isdigit()}
+
+    t1 = _subj_tokens(subgoal_specs[0])
+    t2 = _subj_tokens(subgoal_specs[1])
+    s1_only = t1 - t2
+    s2_only = t2 - t1
+
+    pos_pat = re.compile(r"\b(?:higher|greater|larger|exceeds|more\s+than|above)\b", re.IGNORECASE)
+    neg_pat = re.compile(r"\b(?:lower|less|smaller|below|under)\b", re.IGNORECASE)
+    eq_pat = re.compile(r"\b(?:equal|identical|the\s+same)\b", re.IGNORECASE)
+    negation_pat = re.compile(r"\b(?:not|neither|no|never)\b", re.IGNORECASE)
+
+    known_operand_strs = _fmt_dec_variants(a_dec) | _fmt_dec_variants(b_dec) | raw1 | raw2
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", answer) if s.strip()]
+    for sent in sentences:
+        sent_low = sent.lower()
+        has_pos = bool(pos_pat.search(sent_low))
+        has_neg = bool(neg_pat.search(sent_low))
+        has_eq = bool(eq_pat.search(sent_low))
+
+        # 1. Direction check when comparison language appears without negation
+        if (has_pos or has_neg or has_eq) and not negation_pat.search(sent_low):
+            if cmp_dict["equal"] and (has_pos or has_neg):
+                return False, "direction_contradiction_equal_values", derived_nums
+
+            # Identify grammatical subject before the direction word (or before "than")
+            dir_m = pos_pat.search(sent_low) or neg_pat.search(sent_low)
+            if dir_m:
+                prefix_low = sent_low[:dir_m.start()]
+                has_s1_subj = any(re.search(rf"\b{re.escape(t)}\b", prefix_low) for t in s1_only) if s1_only else False
+                has_s2_subj = any(re.search(rf"\b{re.escape(t)}\b", prefix_low) for t in s2_only) if s2_only else False
+                # Handle "Acme's current ratio is 200% and Retail H36 is 84%. Acme's ratio is lower..."
+                if not has_s1_subj and not has_s2_subj and not re.search(r"\bthan\b", sent_low):
+                    has_s1_subj = bool(s1_only)
+                if has_s1_subj and not has_s2_subj:
+                    if cmp_dict["greater"] and has_neg:
+                        return False, "direction_contradiction_s1_greater", derived_nums
+                    if cmp_dict["less"] and has_pos:
+                        return False, "direction_contradiction_s1_less", derived_nums
+                elif has_s2_subj and not has_s1_subj:
+                    if cmp_dict["greater"] and has_pos:
+                        return False, "direction_contradiction_s2_less", derived_nums
+                    if cmp_dict["less"] and has_neg:
+                        return False, "direction_contradiction_s2_greater", derived_nums
+
+        # 2. Difference & scale check
+        if has_pos or has_neg or re.search(r"\b(?:percentage\s+points?|pp|difference|change|relative)\b", sent_low):
+            sent_clean = re.sub(r"\b[A-Za-z]\d{1,4}\b", " ", sent)
+            raw_nums = re.findall(r"(?<![A-Za-z0-9.])(\d[\d,]*(?:\.\d+)?)\s*(%?)", sent_clean)
+            for num_str, pct_sign in raw_nums:
+                norm_s = num_str.replace(",", "")
+                if len(norm_s) == 4 and norm_s.isdigit() and 1900 <= int(norm_s) <= 2099:
+                    continue
+                if norm_s in known_operand_strs:
+                    continue
+                try:
+                    d_val = Decimal(norm_s)
+                except InvalidOperation:
+                    continue
+                is_pp_phrase = bool(re.search(rf"{re.escape(num_str)}\s*(?:percentage\s+points?|pp\b)", sent_low))
+                if is_pp_phrase:
+                    if abs(d_val - abs_delta) > Decimal("0.15"):
+                        return False, f"wrong_percentage_point_delta:{d_val}_expected_{abs_delta}", derived_nums
+                elif pct_sign == "%" or "relative" in sent_low:
+                    ok_rel = rel_pct is not None and abs(d_val - rel_pct) <= Decimal("0.15")
+                    ok_abs = abs(d_val - abs_delta) <= Decimal("0.15") and not ("relative" in sent_low)
+                    if not (ok_rel or ok_abs):
+                        return False, f"wrong_relative_delta:{d_val}", derived_nums
+                else:
+                    if abs(d_val - abs_delta) > Decimal("0.15"):
+                        return False, f"wrong_difference:{d_val}_expected_{abs_delta}", derived_nums
+
+    return True, "verified", derived_nums
+
+
+def _format_clean_decimal(val: Decimal) -> str:
+    if val == val.to_integral_value():
+        return str(int(val))
+    return str(val.quantize(Decimal("0.01"))).rstrip("0").rstrip(".") or "0"
+
+
+def evaluate_two_operand_comparison(
+    query: str,
+    subgoal_specs: list[dict[str, Any]],
+    chunks: list[Any],
+    snapshot_sources: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Evaluate a two-operand numeric comparison: verified render, unverified refusal, or unsupported."""
+    if len(subgoal_specs) != 2:
+        return {"supported": False, "status": "unsupported"}
+
+    q_low = query.lower()
+    if not re.search(r"\b(?:compare|difference|percentage\s+point|percentage\s+difference|higher|lower)\b", q_low):
+        return {"supported": False, "status": "unsupported"}
+
+    b1 = _bind_subgoal_operand(subgoal_specs[0], chunks) if chunks else None
+    b2 = _bind_subgoal_operand(subgoal_specs[1], chunks) if chunks else None
+
+    def _is_numeric_subgoal(sg: dict[str, Any]) -> bool:
+        txt = str(sg.get("query_text") or "")
+        return bool(
+            "current ratio" in txt.lower()
+            or re.search(r"\b[A-Za-z]\d{1,4}\b", txt)
+            or "percentage point" in q_low
+        )
+
+    is_supported_path = (
+        b1 is not None
+        or b2 is not None
+        or _is_numeric_subgoal(subgoal_specs[0])
+        or _is_numeric_subgoal(subgoal_specs[1])
+    )
+    if not is_supported_path:
+        return {"supported": False, "status": "unsupported"}
+
+    unverified: list[dict[str, str]] = []
+    if b1 is None:
+        unverified.append({
+            "subgoal_id": str(subgoal_specs[0].get("subgoal_id") or subgoal_specs[0].get("id") or "sub_1"),
+            "query_text": str(subgoal_specs[0].get("query_text") or "").strip(),
+            "reason": "operand_not_found",
+        })
+    if b2 is None:
+        unverified.append({
+            "subgoal_id": str(subgoal_specs[1].get("subgoal_id") or subgoal_specs[1].get("id") or "sub_2"),
+            "query_text": str(subgoal_specs[1].get("query_text") or "").strip(),
+            "reason": "operand_not_found",
+        })
+    if unverified:
+        return {"supported": True, "status": "unverified", "unverified_operands": unverified}
+
+    op1, unit1, _, c1 = b1
+    op2, unit2, _, c2 = b2
+    if unit1 and unit2 and unit1 != unit2:
+        return {
+            "supported": True,
+            "status": "unverified",
+            "unverified_operands": [{"subgoal_id": "unit_mismatch", "query_text": f"{unit1} vs {unit2}", "reason": "unit_mismatch"}],
+        }
+
+    # Enforce distinct eligible source coverage when >=2 explicit files were named
+    if snapshot_sources:
+        all_elig = {
+            str(e).strip().lower()
+            for sg in subgoal_specs
+            for e in (sg.get("eligible_sources") or [])
+            if str(e).strip()
+        }
+        if len(all_elig) >= 2:
+            cited_srcs = {
+                str(snapshot_sources.get(str(getattr(c, "document_id", "") or ""), "") or "").lower()
+                for c in (c1, c2)
+            } - {""}
+            missing_elig = [e for e in sorted(all_elig) if e not in cited_srcs]
+            if missing_elig:
+                return {
+                    "supported": True,
+                    "status": "unverified",
+                    "unverified_operands": [
+                        {"subgoal_id": "source_coverage", "query_text": e, "reason": "missing_eligible_source"}
+                        for e in missing_elig
+                    ],
+                }
+
+    eff_unit = unit1 or unit2
+    if eff_unit is None and ("percentage point" in q_low or "current ratio" in q_low or "%" in q_low):
+        eff_unit = "percentage"
+    is_pct = eff_unit == "percentage"
+    executor = DeterministicExecutor()
+    res = executor.execute(ExecutionOperator.COMPARE, [op1, op2], unit=eff_unit)
+    cmp_dict = res.result_value
+    a_dec = parse_decimal_value(op1.normalized_value)
+    b_dec = parse_decimal_value(op2.normalized_value)
+    abs_delta = abs(a_dec - b_dec)
+    rel_pct = abs(cmp_dict["percent_delta"]) if cmp_dict.get("percent_delta") is not None else None
+
+    pct_sfx = "%" if is_pct else ""
+    v1_str = f"{_format_clean_decimal(a_dec)}{pct_sfx}"
+    v2_str = f"{_format_clean_decimal(b_dec)}{pct_sfx}"
+
+    def _clean_label(raw: Any, fallback: str) -> str:
+        lbl = str(raw or fallback).strip().rstrip(".?!")
+        return re.sub(r"\s+(?:in\s+percentage\s+points?|by\s+percentage\s+difference)$", "", lbl, flags=re.IGNORECASE).strip()
+
+    s1_label = _clean_label(subgoal_specs[0].get("query_text"), "First value")
+    s2_label = _clean_label(subgoal_specs[1].get("query_text"), "Second value")
+
+    if cmp_dict["equal"]:
+        pp_sfx = " percentage points" if is_pct else ""
+        answer = f"{s1_label} ({v1_str}) equals {s2_label} ({v2_str}), a difference of 0{pp_sfx}."
+    else:
+        dir_word = "higher" if cmp_dict["greater"] else "lower"
+        wants_rel = bool(re.search(r"\b(?:percentage\s+difference|percent\s+change|relative\s+percent)\b", q_low))
+        if wants_rel and rel_pct is not None:
+            diff_str = f"{_format_clean_decimal(rel_pct)}% (relative change)"
+        elif is_pct:
+            diff_str = f"{_format_clean_decimal(abs_delta)} percentage points"
+        else:
+            diff_str = _format_clean_decimal(abs_delta)
+        answer = f"{s1_label} ({v1_str}) is {diff_str} {dir_word} than {s2_label} ({v2_str})."
+
+    cited_chunks = [c1] if str(c1.id) == str(c2.id) else [c1, c2]
+    return {
+        "supported": True,
+        "status": "verified",
+        "answer": answer,
+        "cited_chunks": cited_chunks,
+        "unverified_operands": [],
+    }
+
+
+def render_verified_two_operand_comparison(
+    query: str,
+    subgoal_specs: list[dict[str, Any]],
+    chunks: list[Any],
+    snapshot_sources: dict[str, str] | None = None,
+) -> tuple[str, list[Any]] | None:
+    """Deterministically compute and render a supported two-operand numeric comparison with source citations."""
+    res = evaluate_two_operand_comparison(query, subgoal_specs, chunks, snapshot_sources)
+    if res.get("status") == "verified":
+        return res["answer"], res["cited_chunks"]
+    return None
