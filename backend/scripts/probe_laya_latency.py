@@ -945,7 +945,7 @@ def run_offline_negative_controls(verbose: bool = True) -> list[str]:
 
     mock_verifier9.verify = spy_verify
 
-    def _mock_rerank_ctrl(q: str, chunks: Any, top_k: int = 6, return_mode: bool = False) -> Any:
+    def _mock_rerank_ctrl(q: str, chunks: Any, top_k: int = 6, return_mode: bool = False, **kwargs: Any) -> Any:
         c_list = list(chunks)
         c_list.sort(key=lambda c: 1.0 if "turnover" in c.text.lower() else 0.5, reverse=True)
         return (c_list[:top_k], "mocked") if return_mode else c_list[:top_k]
@@ -1044,7 +1044,7 @@ def run_latency_probe(endpoint_url: str, api_key: str, dry_run: bool = True) -> 
     }
     mock_verifier = MockOfflineVerifier(support_status="ASSERTED")
 
-    def _mock_rerank(q: str, chunks: Any, top_k: int = 6, return_mode: bool = False) -> Any:
+    def _mock_rerank(q: str, chunks: Any, top_k: int = 6, return_mode: bool = False, **kwargs: Any) -> Any:
         c_list = list(chunks)
         c_list.sort(key=lambda c: 1.0 if "turnover" in c.text.lower() else 0.5, reverse=True)
         return (c_list[:top_k], "mocked") if return_mode else c_list[:top_k]

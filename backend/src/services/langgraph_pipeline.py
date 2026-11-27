@@ -1161,7 +1161,10 @@ def run_reranker(state: PipelineState):
             return_telemetry=True,
         )
     except TypeError:
-        rerank_res = rerank(state["query"], merged, top_k=6, return_mode=True, financial_binding=fin_binding)
+        try:
+            rerank_res = rerank(state["query"], merged, top_k=6, return_mode=True, financial_binding=fin_binding)
+        except TypeError:
+            rerank_res = rerank(state["query"], merged, top_k=6, return_mode=True)
 
     from providers.reranker_provider import get_bypassed_reranker_telemetry, get_last_reranker_telemetry
 
@@ -3011,6 +3014,66 @@ def delivery_gate(state: PipelineState) -> dict[str, Any]:
             cited_chunks.append(auth_chunk_by_id[str(cid)])
 
         verified, rejection_reason = verify_financial_cell_binding(cited_chunks, ans, fin_binding)
+
+        if (
+            not verified
+            and (
+                rejection_reason == "no_cells_found_in_chunk"
+                or (state.get("executed_path") == "deterministic_excerpt" and rejection_reason in ("missing_period_date_in_table", "missing_period_duration_in_table"))
+            )
+            and not any(str(getattr(c, "element_type", "")).lower() in ("table", "tablerow") for c in cited_chunks)
+            and not any("|" in (getattr(c, "text", "") or "") for c in cited_chunks)
+        ):
+            from services.evaluation.benchmark_scorer import extract_numbers_normalized
+            from services.retrieval.table_metric_binding import bind_financial_query, classify_metric, extract_financial_claims
+
+            cited_text = "\n".join((getattr(c, "text", "") or "") for c in cited_chunks)
+            ans_nums = extract_numbers_normalized(ans)
+            cited_nums = extract_numbers_normalized(cited_text)
+            nums_ok = bool(ans_nums) and (ans_nums <= cited_nums)
+
+            expected_metrics = set(getattr(fin_binding, "metrics", ()) or ())
+            if getattr(fin_binding, "metric", None):
+                expected_metrics.add(fin_binding.metric)
+            ans_claims = extract_financial_claims(ans)
+            metric_ok = True
+            if expected_metrics:
+                ans_metrics = {cl.get("metric") for cl in ans_claims if cl.get("metric")}
+                cited_metric = classify_metric(cited_text)
+                if ans_metrics and not (ans_metrics <= expected_metrics):
+                    metric_ok = False
+                elif cited_metric is not None and cited_metric not in expected_metrics:
+                    metric_ok = False
+
+            period_ok = True
+            req_dp = getattr(fin_binding, "date_parsed", None)
+            if req_dp:
+                req_y, req_m, req_d = req_dp
+                if req_y is not None and str(req_y) not in cited_text:
+                    period_ok = False
+                for txt in (ans, cited_text):
+                    c_dp = getattr(bind_financial_query(txt), "date_parsed", None)
+                    if c_dp:
+                        c_y, c_m, c_d = c_dp
+                        if (
+                            (req_y is not None and c_y is not None and c_y != req_y)
+                            or (req_m is not None and c_m is not None and c_m != req_m)
+                            or (req_d is not None and c_d is not None and c_d != req_d)
+                        ):
+                            period_ok = False
+                            break
+
+            req_dur = getattr(fin_binding, "duration_norm", None)
+            if period_ok and req_dur:
+                for txt in (ans, cited_text):
+                    c_dur = getattr(bind_financial_query(txt), "duration_norm", None)
+                    if c_dur and c_dur != req_dur:
+                        period_ok = False
+                        break
+
+            if nums_ok and metric_ok and period_ok:
+                verified = True
+                rejection_reason = None
 
         if not verified:
             logger.warning(

@@ -17,8 +17,9 @@ def _default_bypassed_telemetry(mode: str = RerankerMode.BYPASSED.value) -> dict
 class QueryService:
     """Service orchestrating semantic caching, multi-stage retrieval, and grounded synthesis."""
 
-    def __init__(self, repo: QueryRepository | None = None):
+    def __init__(self, repo: QueryRepository | None = None, semantic_verifier: object | None = None):
         self.repo = repo or QueryRepository()
+        self.semantic_verifier = semantic_verifier
 
     def _is_revoked_by_boundary(
         self,
@@ -293,6 +294,8 @@ class QueryService:
                 kwargs["benchmark_mode"] = getattr(req, "benchmark_mode", False)
             if boundary_repo is not None:
                 kwargs["boundary_repo"] = boundary_repo
+            if self.semantic_verifier is not None and (accepts_var_kwargs or "semantic_verifier" in params):
+                kwargs["semantic_verifier"] = self.semantic_verifier
 
             response = pipeline.run(**kwargs)
         except Exception as e:

@@ -143,5 +143,104 @@ def extract_verified_fact(query: str, chunks: list[Chunk]) -> tuple[str | None, 
         logger.info("extractor.generic_tabular_resolved value='%s'", ans)
         return ans, c
 
+    # -----------------------------------------------------------------------
+    # 4. Deterministic Financial Metric + Period + Value + Unit Extraction
+    # -----------------------------------------------------------------------
+    from services.retrieval.table_metric_binding import (
+        bind_financial_query,
+        classify_metric,
+        extract_financial_claims,
+    )
+
+    fin_binding = bind_financial_query(query)
+    if fin_binding.is_active:
+        expected_metrics = set(fin_binding.metrics) if getattr(fin_binding, "metrics", None) else set()
+        if fin_binding.metric:
+            expected_metrics.add(fin_binding.metric)
+        _NON_ENTITY_WORDS = {
+            "what", "which", "when", "where", "how", "does", "did", "was", "were",
+            "the", "for", "and", "from", "with", "fiscal", "year", "annual", "total",
+            "quarter", "quarterly", "three", "six", "nine", "twelve", "months", "ended",
+            "january", "february", "march", "april", "may", "june", "july", "august",
+            "september", "october", "november", "december", "revenue", "sales",
+            "income", "profit", "margin", "turnover", "expenses", "operating", "net",
+        }
+        q_entities = {
+            w.lower()
+            for w in re.findall(r"\b([A-Z][A-Za-z0-9&-]{2,})\b", query)
+            if w.lower() not in _NON_ENTITY_WORDS and not re.fullmatch(r"q[1-4]", w.lower())
+        }
+        q_quarter = re.search(r"\b(q[1-4])\b", query, re.IGNORECASE)
+        req_quarter = q_quarter.group(1).lower() if q_quarter else None
+
+        if expected_metrics:
+            fin_matches: list[tuple[tuple[str, str], str, Chunk]] = []
+            for c in chunks:
+                txt = getattr(c, "text", "") or ""
+                if not txt.strip():
+                    continue
+                for cl in extract_financial_claims(txt):
+                    if cl.get("is_comparison"):
+                        continue
+                    clause = (cl.get("clause") or "").strip()
+                    clause_low = clause.lower()
+                    if q_entities and not all(re.search(rf"\b{re.escape(ent)}\b", clause_low) for ent in q_entities):
+                        continue
+                    if req_quarter:
+                        other_qs = {f"q{i}" for i in range(1, 5)} - {req_quarter}
+                        if any(re.search(rf"\b{oq}\b", clause_low) for oq in other_qs):
+                            continue
+                        if not re.search(rf"\b{req_quarter}\b", clause_low) and cl.get("duration_norm") != "three_months":
+                            continue
+
+                    cl_metric = cl.get("metric") or classify_metric(clause)
+                    if (
+                        cl_metric is None
+                        and (expected_metrics & {"net_sales", "revenue"})
+                        and re.search(r"\bturnover\b", clause_low)
+                        and not re.search(r"\b(?:employee|staff|workforce|inventory|asset|portfolio|labou?r)\s+turnover\b", clause_low)
+                        and not cl.get("is_percentage")
+                        and "%" not in str(cl.get("raw") or "")
+                        and ("$" in str(cl.get("raw") or "") or cl.get("unit") in ("millions", "billions", "thousands", "dollars"))
+                    ):
+                        cl_metric = "net_sales" if "net_sales" in expected_metrics else "revenue"
+                    if not cl_metric or cl_metric not in expected_metrics:
+                        continue
+
+                    if fin_binding.date_parsed:
+                        req_y, req_m, req_d = fin_binding.date_parsed
+                        c_dp = cl.get("date_parsed")
+                        if not c_dp:
+                            continue
+                        c_y, c_m, c_d = c_dp
+                        if (
+                            (req_y is not None and c_y != req_y)
+                            or (req_m is not None and req_m != c_m)
+                            or (req_d is not None and req_d != c_d)
+                        ):
+                            continue
+
+                    if fin_binding.duration_norm:
+                        c_dur = cl.get("duration_norm")
+                        if c_dur != fin_binding.duration_norm:
+                            continue
+
+                    val = cl.get("value")
+                    if val is None:
+                        continue
+                    unit = str(cl.get("unit") or ("%" if cl.get("is_percentage") else "")).lower()
+                    if not unit and "$" in str(cl.get("raw") or ""):
+                        unit = "usd"
+                    if not unit:
+                        continue
+                    val_key = (str(val), unit)
+                    fin_matches.append((val_key, f"{clause.rstrip('.')}.", c))
+
+            distinct_vals = {vk for vk, _, _ in fin_matches}
+            if len(distinct_vals) == 1 and fin_matches:
+                _, ans, c = fin_matches[0]
+                logger.info("extractor.financial_prose_resolved metric=%s value=%s", expected_metrics, distinct_vals)
+                return ans, c
+
     return None, None
 
