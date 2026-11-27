@@ -1628,6 +1628,104 @@ def run_fidelity(state: PipelineState):
         }
 
 
+def _verify_prose_financial_support(
+    query_str: str,
+    ans_str: str,
+    cited_chunks: list[Chunk],
+    fin_binding: Any,
+    conflict_pool: list[Chunk],
+) -> tuple[bool, str | None]:
+    """Verify prose financial claims against cited chunks and check for same-claim conflicts."""
+    from services.evaluation.benchmark_scorer import extract_numbers_normalized
+    from services.retrieval.extractor import _match_financial_prose_claims, has_conflicting_financial_prose
+    from services.retrieval.table_metric_binding import bind_financial_query, classify_metric, extract_financial_claims
+
+    ans_claims = extract_financial_claims(ans_str)
+    matched_prose = _match_financial_prose_claims(query_str, cited_chunks)
+    if matched_prose:
+        matched_val_keys = {vk for vk, _, _ in matched_prose}
+        ans_val_keys = set()
+        for cl in ans_claims:
+            if cl.get("is_comparison") or cl.get("value") is None:
+                continue
+            u = str(cl.get("unit") or ("%" if cl.get("is_percentage") else "")).lower()
+            if not u and "$" in str(cl.get("raw") or ""):
+                u = "usd"
+            if u:
+                ans_val_keys.add((str(cl.get("value")), u))
+        ans_period_ok = True
+        req_dp = getattr(fin_binding, "date_parsed", None)
+        if req_dp:
+            req_y, req_m, req_d = req_dp
+            a_dp = getattr(bind_financial_query(ans_str), "date_parsed", None)
+            if a_dp and (
+                (req_y is not None and a_dp[0] is not None and a_dp[0] != req_y)
+                or (req_m is not None and a_dp[1] is not None and a_dp[1] != req_m)
+                or (req_d is not None and a_dp[2] is not None and a_dp[2] != req_d)
+            ):
+                ans_period_ok = False
+        if (
+            len(matched_val_keys) == 1
+            and bool(ans_val_keys)
+            and ans_val_keys <= matched_val_keys
+            and ans_period_ok
+            and not has_conflicting_financial_prose(query_str, conflict_pool)
+        ):
+            return True, None
+        if len(matched_val_keys) > 1 or has_conflicting_financial_prose(query_str, conflict_pool):
+            return False, "conflicting_financial_evidence"
+        return False, "prose_claim_mismatch"
+
+    cited_text = "\n".join((getattr(c, "text", "") or "") for c in cited_chunks)
+    ans_nums = extract_numbers_normalized(ans_str)
+    cited_nums = extract_numbers_normalized(cited_text)
+    nums_ok = bool(ans_nums) and (ans_nums <= cited_nums)
+
+    expected_metrics = set(getattr(fin_binding, "metrics", ()) or ())
+    if getattr(fin_binding, "metric", None):
+        expected_metrics.add(fin_binding.metric)
+    metric_ok = True
+    if expected_metrics:
+        ans_metrics = {cl.get("metric") for cl in ans_claims if cl.get("metric")}
+        cited_metric = classify_metric(cited_text)
+        if ans_metrics and not (ans_metrics <= expected_metrics):
+            metric_ok = False
+        elif cited_metric is not None and cited_metric not in expected_metrics:
+            metric_ok = False
+
+    period_ok = True
+    req_dp = getattr(fin_binding, "date_parsed", None)
+    if req_dp:
+        req_y, req_m, req_d = req_dp
+        if req_y is not None and str(req_y) not in cited_text:
+            period_ok = False
+        for txt in (ans_str, cited_text):
+            c_dp = getattr(bind_financial_query(txt), "date_parsed", None)
+            if c_dp:
+                c_y, c_m, c_d = c_dp
+                if (
+                    (req_y is not None and c_y is not None and c_y != req_y)
+                    or (req_m is not None and c_m is not None and c_m != req_m)
+                    or (req_d is not None and c_d is not None and c_d != req_d)
+                ):
+                    period_ok = False
+                    break
+
+    req_dur = getattr(fin_binding, "duration_norm", None)
+    if period_ok and req_dur:
+        for txt in (ans_str, cited_text):
+            c_dur = getattr(bind_financial_query(txt), "duration_norm", None)
+            if c_dur and c_dur != req_dur:
+                period_ok = False
+                break
+
+    if nums_ok and metric_ok and period_ok:
+        if has_conflicting_financial_prose(query_str, conflict_pool):
+            return False, "conflicting_financial_evidence"
+        return True, None
+    return False, "prose_claim_mismatch"
+
+
 def run_llm(state: PipelineState):
     if state.get("error"):
         return {}
@@ -2062,65 +2160,31 @@ def run_llm(state: PipelineState):
                     dc_low = dc_txt.lower()
                     if is_financial:
                         from services.retrieval.table_metric_binding import (
-                            bind_financial_query as _bfq,
-                            classify_metric as _cm,
-                            extract_financial_claims as _efc,
                             parse_financial_table_cells as _pftc,
                             verify_financial_cell_binding as _vfcb,
                         )
                         is_tab = (
                             str(getattr(dc, "element_type", "")).lower() in ("table", "tablerow")
                             or "|" in dc_txt
-                            or bool(_pftc(dc_txt))
+                            or any(
+                                cell.get("date_parsed") is not None and cell.get("duration_norm") is not None
+                                for cell in _pftc(dc_txt)
+                            )
                         )
                         if is_tab:
                             ok_tab, _ = _vfcb([dc], ans_hint_str, fin_binding)
                             if ok_tab:
                                 supporting.append(dc)
                         else:
-                            dc_nums = extract_numbers_normalized(dc_txt)
-                            if not (ans_hint_nums and ans_hint_nums <= dc_nums):
-                                continue
-                            _non_ent = {
-                                "what", "which", "when", "where", "how", "does", "did", "was", "were",
-                                "the", "for", "and", "from", "with", "fiscal", "year", "annual", "total",
-                                "quarter", "quarterly", "three", "six", "nine", "twelve", "months", "ended",
-                                "january", "february", "march", "april", "may", "june", "july", "august",
-                                "september", "october", "november", "december", "revenue", "sales",
-                                "income", "profit", "margin", "turnover", "expenses", "operating", "net",
-                            }
-                            q_ents = {
-                                w.lower()
-                                for w in re.findall(r"\b([A-Z][A-Za-z0-9&-]{2,})\b", state.get("query", ""))
-                                if w.lower() not in _non_ent and not re.fullmatch(r"q[1-4]", w.lower())
-                            }
-                            if q_ents and not all(re.search(rf"\b{re.escape(ent)}\b", dc_low) for ent in q_ents):
-                                continue
-                            exp_m = set(getattr(fin_binding, "metrics", ()) or ())
-                            if getattr(fin_binding, "metric", None):
-                                exp_m.add(fin_binding.metric)
-                            if exp_m:
-                                dc_m = _cm(dc_txt)
-                                if dc_m is None and (exp_m & {"net_sales", "revenue"}) and re.search(r"\bturnover\b", dc_low) and not re.search(r"\b(?:employee|staff|workforce|inventory|asset|portfolio|labou?r)\s+turnover\b", dc_low):
-                                    dc_m = "net_sales" if "net_sales" in exp_m else "revenue"
-                                if not dc_m or dc_m not in exp_m:
-                                    continue
-                            req_dp = getattr(fin_binding, "date_parsed", None)
-                            if req_dp:
-                                ry, rm, rd = req_dp
-                                if ry is not None and str(ry) not in dc_txt:
-                                    continue
-                                dc_dp = getattr(_bfq(dc_txt), "date_parsed", None)
-                                if dc_dp:
-                                    cy, cm_v, cd = dc_dp
-                                    if (ry is not None and cy is not None and cy != ry) or (rm is not None and cm_v is not None and cm_v != rm) or (rd is not None and cd is not None and cd != rd):
-                                        continue
-                            req_dur = getattr(fin_binding, "duration_norm", None)
-                            if req_dur:
-                                dc_claims = _efc(dc_txt)
-                                if not any(cl.get("duration_norm") == req_dur for cl in dc_claims):
-                                    continue
-                            supporting.append(dc)
+                            ok_prose, _ = _verify_prose_financial_support(
+                                state.get("query", ""),
+                                ans_hint_str,
+                                [dc],
+                                fin_binding,
+                                top_chunks,
+                            )
+                            if ok_prose:
+                                supporting.append(dc)
                     else:
                         dc_nums = extract_numbers_normalized(dc_txt)
                         if ans_hint_nums and not (ans_hint_nums <= dc_nums):
@@ -3166,101 +3230,15 @@ def delivery_gate(state: PipelineState) -> dict[str, Any]:
             and not any(str(getattr(c, "element_type", "")).lower() in ("table", "tablerow") for c in cited_chunks)
             and not any("|" in (getattr(c, "text", "") or "") for c in cited_chunks)
         ):
-            from services.evaluation.benchmark_scorer import extract_numbers_normalized
-            from services.retrieval.extractor import _match_financial_prose_claims, has_conflicting_financial_prose
-            from services.retrieval.table_metric_binding import bind_financial_query, classify_metric, extract_financial_claims
-
-            query_str = state.get("query", "")
-            ans_claims = extract_financial_claims(ans)
-            matched_prose = _match_financial_prose_claims(query_str, cited_chunks)
-            if matched_prose:
-                matched_val_keys = {vk for vk, _, _ in matched_prose}
-                ans_val_keys = set()
-                for cl in ans_claims:
-                    if cl.get("is_comparison") or cl.get("value") is None:
-                        continue
-                    u = str(cl.get("unit") or ("%" if cl.get("is_percentage") else "")).lower()
-                    if not u and "$" in str(cl.get("raw") or ""):
-                        u = "usd"
-                    if u:
-                        ans_val_keys.add((str(cl.get("value")), u))
-                ans_period_ok = True
-                req_dp = getattr(fin_binding, "date_parsed", None)
-                if req_dp:
-                    req_y, req_m, req_d = req_dp
-                    a_dp = getattr(bind_financial_query(ans), "date_parsed", None)
-                    if a_dp and (
-                        (req_y is not None and a_dp[0] is not None and a_dp[0] != req_y)
-                        or (req_m is not None and a_dp[1] is not None and a_dp[1] != req_m)
-                        or (req_d is not None and a_dp[2] is not None and a_dp[2] != req_d)
-                    ):
-                        ans_period_ok = False
-                if (
-                    len(matched_val_keys) == 1
-                    and bool(ans_val_keys)
-                    and ans_val_keys <= matched_val_keys
-                    and ans_period_ok
-                    and not has_conflicting_financial_prose(query_str, top_chunks)
-                ):
-                    verified = True
-                    rejection_reason = None
-                elif len(matched_val_keys) > 1 or has_conflicting_financial_prose(query_str, top_chunks):
-                    verified = False
-                    rejection_reason = "conflicting_financial_evidence"
-                else:
-                    verified = False
-                    rejection_reason = "prose_claim_mismatch"
-            else:
-                cited_text = "\n".join((getattr(c, "text", "") or "") for c in cited_chunks)
-                ans_nums = extract_numbers_normalized(ans)
-                cited_nums = extract_numbers_normalized(cited_text)
-                nums_ok = bool(ans_nums) and (ans_nums <= cited_nums)
-
-                expected_metrics = set(getattr(fin_binding, "metrics", ()) or ())
-                if getattr(fin_binding, "metric", None):
-                    expected_metrics.add(fin_binding.metric)
-                metric_ok = True
-                if expected_metrics:
-                    ans_metrics = {cl.get("metric") for cl in ans_claims if cl.get("metric")}
-                    cited_metric = classify_metric(cited_text)
-                    if ans_metrics and not (ans_metrics <= expected_metrics):
-                        metric_ok = False
-                    elif cited_metric is not None and cited_metric not in expected_metrics:
-                        metric_ok = False
-
-                period_ok = True
-                req_dp = getattr(fin_binding, "date_parsed", None)
-                if req_dp:
-                    req_y, req_m, req_d = req_dp
-                    if req_y is not None and str(req_y) not in cited_text:
-                        period_ok = False
-                    for txt in (ans, cited_text):
-                        c_dp = getattr(bind_financial_query(txt), "date_parsed", None)
-                        if c_dp:
-                            c_y, c_m, c_d = c_dp
-                            if (
-                                (req_y is not None and c_y is not None and c_y != req_y)
-                                or (req_m is not None and c_m is not None and c_m != req_m)
-                                or (req_d is not None and c_d is not None and c_d != req_d)
-                            ):
-                                period_ok = False
-                                break
-
-                req_dur = getattr(fin_binding, "duration_norm", None)
-                if period_ok and req_dur:
-                    for txt in (ans, cited_text):
-                        c_dur = getattr(bind_financial_query(txt), "duration_norm", None)
-                        if c_dur and c_dur != req_dur:
-                            period_ok = False
-                            break
-
-                if nums_ok and metric_ok and period_ok:
-                    if has_conflicting_financial_prose(query_str, top_chunks):
-                        verified = False
-                        rejection_reason = "conflicting_financial_evidence"
-                    else:
-                        verified = True
-                        rejection_reason = None
+            ok_prose, prose_reason = _verify_prose_financial_support(
+                state.get("query", ""),
+                ans,
+                cited_chunks,
+                fin_binding,
+                top_chunks,
+            )
+            verified = ok_prose
+            rejection_reason = prose_reason if not ok_prose else None
 
         if not verified:
             logger.warning(

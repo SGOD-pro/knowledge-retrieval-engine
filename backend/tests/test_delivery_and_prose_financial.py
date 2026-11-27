@@ -911,3 +911,170 @@ def test_merged_year_h01_prose_verification_and_controls(monkeypatch):
     r_conf = _run_merged("conf26", "What was the revenue for fiscal year 2026?", "The revenue for fiscal year 2026 was $450 million.", extra_chunks=[c_conflict])
     assert "couldn't find" in r_conf["answer"].lower()
     assert r_conf["citations"] == []
+
+
+def test_t01_merged_prose_bare_uuid_repair_and_controls(monkeypatch):
+    """Reproduce T01 bare UUID repair on merged FY2028 turnover + FY2026 employee turnover chunk."""
+    from db.workspace_boundary_repo import InMemoryWorkspaceBoundaryRepository
+    from modules.query.query_service import QueryRequest, QueryService
+    from schemas.contracts.boundary import DocumentSnapshot
+    from schemas.models import Chunk
+    from services.retrieval.bm25_retriever import _BM25_CACHE, invalidate_chunk_cache
+
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    monkeypatch.setenv("RERANKER_PROVIDER", "lexical")
+    monkeypatch.setenv("BEDROCK_RERANKER_ENABLED", "false")
+    monkeypatch.setenv("LEXICAL_RRF_BLEND_ENABLED", "false")
+
+    doc_orion = "e30ae1ba-d3a8-5bb7-aa67-23465536c0bc"
+    doc_table = "f1111111-2222-5333-8444-555555555555"
+    merged_orion = (
+        "OrionBio's annual turnover for fiscal year 2028 was $740 million. "
+        "OrionBio's employee turnover for fiscal year 2026 was 11%."
+    )
+
+    def _run_t01_case(case_id: str, chunks: list[Chunk], doc_id: str, fname: str, query: str, stub_ans: str, stub_cits: list[str]):
+        ws = f"ws_t01_dbg_{case_id}"
+        _BM25_CACHE.clear()
+        invalidate_chunk_cache(ws)
+        from dataclasses import replace as _dc_replace
+        ws_chunks = [_dc_replace(c, workspace_id=ws) for c in chunks]
+
+        class _Repo:
+            def get_workspace_documents(self, workspace_id, page=1, limit=1000):
+                return {"documents": [{"id": doc_id, "filename": fname}]}
+
+            def get_all_chunks(self, document_ids=None, workspace_id=None, **kw):
+                return ws_chunks
+
+            def get(self, d_id):
+                return None
+
+            def search_vector(self, *a, **kw):
+                return []
+
+            def check_semantic_cache(self, *a, **kw):
+                return None
+
+        b_repo = InMemoryWorkspaceBoundaryRepository()
+        b_repo.create_workspace(ws, "tester", workspace_id=ws)
+        b_repo.create_source(ws, fname, source_id=doc_id)
+        b_repo.save_document_snapshot(
+            DocumentSnapshot(
+                workspace_id=ws,
+                document_id=doc_id,
+                source=fname,
+                version="v1",
+                format="docx",
+                created_at="2026-11-27T00:00:00Z",
+            )
+        )
+        repo_inst = _Repo()
+        svc = QueryService(repo=repo_inst)
+        with (
+            patch("services.langgraph_pipeline.call_llm", return_value={"answer": stub_ans, "citations": stub_cits, "usage": {"input_tokens": 30, "output_tokens": 12, "stop_reason": "end_turn"}}),
+            patch("services.langgraph_pipeline._get_repo", return_value=repo_inst),
+            patch("db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+            patch("src.db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+            patch("services.langgraph_pipeline.check_fidelity", return_value=1.0),
+        ):
+            return svc.execute_query(QueryRequest(query=query, workspace_id=ws, cache=False, benchmark_mode=True))
+
+    c_orion = Chunk(
+        id=f"{doc_orion}:p:0",
+        document_id=doc_orion,
+        element_type="NarrativeText",
+        text=merged_orion,
+        page_number=1,
+        source_format="docx",
+        workspace_id="placeholder",
+        version="v1",
+        document_version="v1",
+    )
+
+    # 1. T01 exact reproduction: bare UUID resolves to exact passage ID
+    r_ok = _run_t01_case(
+        "ok",
+        [c_orion],
+        doc_orion,
+        "orionbio_summary.docx",
+        "What was OrionBio's revenue for fiscal year 2028?",
+        "OrionBio's annual turnover for fiscal year 2028 was $740 million.",
+        [doc_orion],
+    )
+    assert "740 million" in r_ok["answer"]
+    assert [c["chunk_id"] for c in r_ok["citations"]] == [f"{doc_orion}:p:0"]
+
+    # 2. Swapped year / value control (2028 query claiming 11% or 2026 query claiming $740M)
+    r_swap = _run_t01_case(
+        "swap",
+        [c_orion],
+        doc_orion,
+        "orionbio_summary.docx",
+        "What was OrionBio's revenue for fiscal year 2028?",
+        "OrionBio's revenue for fiscal year 2028 was 11%.",
+        [doc_orion],
+    )
+    assert "couldn't find" in r_swap["answer"].lower()
+    assert r_swap["citations"] == []
+
+    # 3. Employee turnover control (2026 revenue query against 11% employee turnover)
+    r_emp = _run_t01_case(
+        "emp",
+        [c_orion],
+        doc_orion,
+        "orionbio_summary.docx",
+        "What was OrionBio's revenue for fiscal year 2026?",
+        "OrionBio's employee turnover for fiscal year 2026 was 11%.",
+        [doc_orion],
+    )
+    assert "couldn't find" in r_emp["answer"].lower()
+    assert r_emp["citations"] == []
+
+    # 4. Ambiguous passages control (2 supporting chunks in same doc)
+    c_orion_dup = Chunk(
+        id=f"{doc_orion}:p:1",
+        document_id=doc_orion,
+        element_type="NarrativeText",
+        text="OrionBio's annual turnover for fiscal year 2028 was $740 million.",
+        page_number=2,
+        source_format="docx",
+        workspace_id="placeholder",
+        version="v1",
+        document_version="v1",
+    )
+    r_ambig = _run_t01_case(
+        "ambig",
+        [c_orion, c_orion_dup],
+        doc_orion,
+        "orionbio_summary.docx",
+        "What was OrionBio's revenue for fiscal year 2028?",
+        "OrionBio's annual turnover for fiscal year 2028 was $740 million.",
+        [doc_orion],
+    )
+    assert "couldn't find" in r_ambig["answer"].lower()
+    assert r_ambig["citations"] == []
+
+    # 5. Real table lacking period metadata must still be rejected by table period check
+    c_table_no_period = Chunk(
+        id=f"{doc_table}:p:0",
+        document_id=doc_table,
+        element_type="Table",
+        text="| Metric | Amount |\n| OrionBio Revenue | $740 million |",
+        page_number=1,
+        source_format="pdf",
+        workspace_id="placeholder",
+        version="v1",
+        document_version="v1",
+    )
+    r_tab = _run_t01_case(
+        "tab_noperiod",
+        [c_table_no_period],
+        doc_table,
+        "orion_table.pdf",
+        "What was OrionBio's revenue for fiscal year 2028?",
+        "OrionBio's revenue for fiscal year 2028 was $740 million.",
+        [doc_table],
+    )
+    assert "couldn't find" in r_tab["answer"].lower()
+    assert r_tab["citations"] == []
