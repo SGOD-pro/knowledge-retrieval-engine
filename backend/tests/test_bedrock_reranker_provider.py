@@ -191,13 +191,11 @@ def test_bedrock_reranker_throttling_falls_back_to_bm25plus(monkeypatch):
     )
 
     with patch("providers.reranker_provider._get_bedrock_rerank_client", return_value=mock_client), \
-         patch("providers.reranker_provider._openrouter_reranker") as mock_openrouter, \
          patch("providers.reranker_provider._term_coverage_fallback", return_value=[0.5, 0.2]) as mock_fb:
         scores = rerank_documents("query", docs)
 
     assert scores == [0.5, 0.2]
     assert get_last_reranker_mode() == RerankerMode.CIRCUIT_OPEN_LEXICAL_FALLBACK.value
-    mock_openrouter.assert_not_called()
     mock_fb.assert_called_once()
     telemetry = get_last_reranker_telemetry()
     assert "throttled" in (telemetry.get("fallback_reason") or "").lower()
@@ -271,13 +269,11 @@ def test_bedrock_reranker_zero_remote_calls_in_lexical_mode(monkeypatch):
 
     docs = ["Doc A", "Doc B"]
     with patch("providers.reranker_provider._get_bedrock_rerank_client") as mock_bedrock, \
-         patch("providers.reranker_provider._openrouter_reranker") as mock_openrouter, \
          patch("providers.reranker_provider._term_coverage_fallback", return_value=[0.45, 0.25]):
         scores = rerank_documents("query", docs)
 
     assert scores == [0.45, 0.25]
     mock_bedrock.assert_not_called()
-    mock_openrouter.assert_not_called()
     assert get_last_reranker_mode() == RerankerMode.CIRCUIT_OPEN_LEXICAL_FALLBACK.value
     telemetry = get_last_reranker_telemetry()
     assert telemetry["provider"] == "lexical"
@@ -385,13 +381,14 @@ def test_bedrock_credential_resolution_matches_infra_and_preflight(monkeypatch):
     assert created_profiles == ["custom_prof"]
     reset_bedrock_rerank_client()
 
-    # 2. Local dev defaults to "aws" profile like aws.infra
+    # 2. Dev and prod both use the standard AWS SDK credential chain (profile_name=None) when AWS_PROFILE is unset
     monkeypatch.delenv("AWS_PROFILE", raising=False)
+    monkeypatch.setattr(settings, "AWS_PROFILE", None)
     monkeypatch.setattr(settings, "ENVIRONMENT", "dev")
     created_profiles.clear()
     with patch("providers.reranker_provider.boto3.Session", side_effect=fake_session):
         _get_bedrock_rerank_client()
-    assert created_profiles == ["aws"]
+    assert created_profiles == [None]
     reset_bedrock_rerank_client()
 
     # 3. Prod keeps normal default credential chain (profile_name=None)

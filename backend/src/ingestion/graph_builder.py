@@ -35,6 +35,7 @@ try:
         normalize_mention,
     )
     from src.schemas.contracts.location import DocumentLocation, TableLocation
+    from src.db.okf_repo import create_dedicated_storage_config
     from src.db.knowledge_graph_repo import (
         KnowledgeGraphRepositoryBase,
         OptimisticConcurrencyError,
@@ -42,6 +43,8 @@ try:
         get_knowledge_graph_repository,
         get_shared_knowledge_graph_repository,
     )
+    from providers.bedrock_models import get_extraction_model
+    from src.providers.bedrock_models import get_extraction_model
 except ImportError:
     from schemas.contracts.knowledge_graph import (
         KnowledgeGraphEntity,
@@ -54,6 +57,7 @@ except ImportError:
         normalize_mention,
     )
     from schemas.contracts.location import DocumentLocation, TableLocation
+    from db.okf_repo import create_dedicated_storage_config
     from db.knowledge_graph_repo import (
         KnowledgeGraphRepositoryBase,
         OptimisticConcurrencyError,
@@ -61,6 +65,7 @@ except ImportError:
         get_knowledge_graph_repository,
         get_shared_knowledge_graph_repository,
     )
+    from providers.bedrock_models import get_extraction_model
 
 logger = logging.getLogger(__name__)
 
@@ -1110,9 +1115,9 @@ class KnowledgeGraphBuilder:
         try:
             client = get_client("bedrock-runtime", config=cfg)
         except Exception:
-            profile = getattr(settings, "AWS_PROFILE", None) or os.getenv("AWS_PROFILE") or "aws"
+            profile = getattr(settings, "AWS_PROFILE", None) or os.getenv("AWS_PROFILE") or None
             region = getattr(settings, "AWS_REGION", None) or os.getenv("AWS_REGION") or "ap-south-1"
-            session = boto3.Session(profile_name=profile, region_name=region)
+            session = boto3.Session(profile_name=profile, region_name=region) if profile else boto3.Session(region_name=region)
             client = session.client(
                 "bedrock-runtime",
                 region_name=region,
@@ -1377,7 +1382,7 @@ class KnowledgeGraphBuilder:
         user_prompt = "\n\n".join(user_content_blocks)
         messages = [{"role": "user", "content": [{"text": user_prompt}]}]
         system = [{"text": BEDROCK_GRAPH_SYSTEM_PROMPT}]
-        model_id = getattr(settings, "GRAPH_BEDROCK_MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0")
+        model_id = get_extraction_model(getattr(settings, "GRAPH_BEDROCK_MODEL_ID", None))
 
         disable_client_retries(client)
         if not hasattr(client, "count_tokens"):

@@ -19,6 +19,7 @@ ENVIRONMENT values:
 """
 
 import logging
+import os
 
 import boto3
 from botocore.config import Config
@@ -71,6 +72,15 @@ def _is_floci_available() -> bool:
         return False
 
 
+def _resolve_cloud_session(region_name: str | None = None) -> boto3.Session:
+    """Build a boto3 Session using the standard AWS SDK credential chain (honoring AWS_PROFILE if set)."""
+    region = region_name or getattr(settings, "AWS_REGION", None) or os.getenv("AWS_REGION") or "ap-south-1"
+    profile = os.getenv("AWS_PROFILE") or getattr(settings, "AWS_PROFILE", None) or None
+    if profile:
+        return boto3.Session(profile_name=profile, region_name=region)
+    return boto3.Session(region_name=region)
+
+
 def _build_client(
     service: str,
     region_name: str | None = None,
@@ -80,16 +90,13 @@ def _build_client(
     client_config = config or _RETRY_CONFIG
 
     if service in _CLOUD_SERVICES:
-        # User requirement: lambda and bedrock always use profile=aws, region=ap-south-1
-        # regardless of env (prod or dev).
-        region = region_name or "ap-south-1"
+        session = _resolve_cloud_session(region_name)
         logger.debug(
             "aws.infra.client service=%s profile=%s region=%s",
             service,
-            _AWS_PROFILE,
-            region,
+            session.profile_name,
+            session.region_name,
         )
-        session = boto3.Session(profile_name=_AWS_PROFILE, region_name=region)
         return session.client(service, config=client_config)
 
     if env == "dev" and _is_floci_available():
@@ -105,16 +112,14 @@ def _build_client(
             service, endpoint_url=_FLOCI_ENDPOINT, config=client_config
         )
     else:
-        # Real AWS local services use aws profile and ap-south-1
-        region = region_name or "ap-south-1"
+        session = _resolve_cloud_session(region_name)
         logger.debug(
             "aws.infra.client service=%s env=%s profile=%s region=%s",
             service,
             env,
-            _AWS_PROFILE,
-            region,
+            session.profile_name,
+            session.region_name,
         )
-        session = boto3.Session(profile_name=_AWS_PROFILE, region_name=region)
         return session.client(service, config=client_config)
 
 
@@ -122,13 +127,13 @@ def _build_resource(service: str):
     env = settings.ENVIRONMENT
 
     if service in _CLOUD_SERVICES:
+        session = _resolve_cloud_session()
         logger.debug(
             "aws.infra.resource service=%s profile=%s region=%s",
             service,
-            _AWS_PROFILE,
-            "ap-south-1",
+            session.profile_name,
+            session.region_name,
         )
-        session = boto3.Session(profile_name=_AWS_PROFILE, region_name="ap-south-1")
         return session.resource(service, config=_RETRY_CONFIG)
 
     if env == "dev" and _is_floci_available():
@@ -143,14 +148,14 @@ def _build_resource(service: str):
             service, endpoint_url=_FLOCI_ENDPOINT, config=_RETRY_CONFIG
         )
     else:
+        session = _resolve_cloud_session()
         logger.debug(
             "aws.infra.resource service=%s env=%s profile=%s region=%s",
             service,
             env,
-            _AWS_PROFILE,
-            "ap-south-1",
+            session.profile_name,
+            session.region_name,
         )
-        session = boto3.Session(profile_name=_AWS_PROFILE, region_name="ap-south-1")
         return session.resource(service, config=_RETRY_CONFIG)
 
 

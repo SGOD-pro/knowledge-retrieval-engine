@@ -19,7 +19,7 @@ from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
 
 from config import settings
-from db.table_store.base import AggregateOp, Predicate, PredicateOp, TableRowList
+from db.table_store.base import AggregateOp, Predicate, PredicateOp, TableRowList, bind_schema_identity
 from schemas.structured_table import (
     ColumnDefinition,
     HeaderTopology,
@@ -688,7 +688,13 @@ class DynamoDBTableStore:
         resp = self.table.get_item(Key={"PK": pk, "SK": "SCHEMA"})
         item = resp.get("Item")
         if item and "schema_json" in item:
-            return _json_to_schema(item["schema_json"])
+            return bind_schema_identity(
+                _json_to_schema(item["schema_json"]),
+                workspace_id=item.get("workspace_id") or workspace_id,
+                table_id=item.get("table_id") or table_id,
+                document_id=item.get("document_id"),
+                document_version=item.get("document_version") or ver,
+            )
         return None
 
     def get_row(

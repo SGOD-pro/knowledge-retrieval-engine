@@ -9,7 +9,7 @@ from pathlib import Path
 import sqlite3
 from typing import Any
 
-from db.table_store.base import AggregateOp, Predicate, PredicateOp, TableRowList, TableStore
+from db.table_store.base import AggregateOp, Predicate, PredicateOp, TableRowList, TableStore, bind_schema_identity
 from schemas.structured_table import (
     ColumnDefinition,
     HeaderTopology,
@@ -999,12 +999,18 @@ class SQLiteTableStore:
                     return self._parse_legacy_schema(row["schema_json"])
                 return None
             cur = self._conn.execute(
-                "SELECT schema_json FROM versioned_schemas WHERE workspace_id = ? AND table_id = ? AND version = ?",
+                "SELECT schema_json, document_id, version, table_id, workspace_id FROM versioned_schemas WHERE workspace_id = ? AND table_id = ? AND version = ?",
                 (workspace_id, table_id, version),
             )
             row = cur.fetchone()
             if row:
-                return _json_to_schema(row["schema_json"])
+                return bind_schema_identity(
+                    _json_to_schema(row["schema_json"]),
+                    workspace_id=row["workspace_id"],
+                    table_id=row["table_id"],
+                    document_id=row["document_id"],
+                    document_version=row["version"],
+                )
             return None
 
         ver = self.get_active_version(table_id, workspace_id)
@@ -1019,12 +1025,18 @@ class SQLiteTableStore:
                     return self._parse_legacy_schema(row["schema_json"])
                 return None
             cur = self._conn.execute(
-                "SELECT schema_json FROM versioned_schemas WHERE workspace_id = ? AND table_id = ? AND version = ?",
+                "SELECT schema_json, document_id, version, table_id, workspace_id FROM versioned_schemas WHERE workspace_id = ? AND table_id = ? AND version = ?",
                 (workspace_id, table_id, ver),
             )
             row = cur.fetchone()
             if row:
-                return _json_to_schema(row["schema_json"])
+                return bind_schema_identity(
+                    _json_to_schema(row["schema_json"]),
+                    workspace_id=row["workspace_id"],
+                    table_id=row["table_id"],
+                    document_id=row["document_id"],
+                    document_version=row["version"],
+                )
             return None
 
         cur = self._conn.execute(

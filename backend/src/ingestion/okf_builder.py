@@ -44,6 +44,10 @@ logger = logging.getLogger(__name__)
 
 # Supported model configurations with verified BPE token bounds
 SUPPORTED_OKF_MODELS: set[str] = {
+    "apac.amazon.nova-micro-v1:0",
+    "apac.amazon.nova-lite-v1:0",
+    "global.anthropic.claude-sonnet-4-6",
+    "anthropic.claude-sonnet-4-6",
     "anthropic.claude-3-haiku-20240307-v1:0",
     "anthropic.claude-3-5-sonnet-20240620-v1:0",
     "anthropic.claude-3-sonnet-20240229-v1:0",
@@ -896,9 +900,9 @@ class OkfBuilder:
         try:
             client = get_client("bedrock-runtime", config=cfg)
         except Exception:
-            profile = getattr(settings, "AWS_PROFILE", None) or os.getenv("AWS_PROFILE") or "aws"
+            profile = getattr(settings, "AWS_PROFILE", None) or os.getenv("AWS_PROFILE") or None
             region = getattr(settings, "AWS_REGION", None) or os.getenv("AWS_REGION") or "ap-south-1"
-            session = boto3.Session(profile_name=profile, region_name=region)
+            session = boto3.Session(profile_name=profile, region_name=region) if profile else boto3.Session(region_name=region)
             client = session.client(
                 "bedrock-runtime",
                 region_name=region,
@@ -1564,7 +1568,8 @@ class OkfBuilder:
             user_content_blocks.append(block)
             remaining_user_bytes -= (len(block.encode("utf-8")) + sep_bytes)
 
-        model_id = getattr(settings, "OKF_BEDROCK_MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0")
+        from providers.bedrock_models import get_extraction_model
+        model_id = get_extraction_model(getattr(settings, "OKF_BEDROCK_MODEL_ID", None))
         if model_id not in SUPPORTED_OKF_MODELS:
             budget.exhausted = True
             budget.exhaustion_reason = f"unsupported_model_configuration ({model_id})"

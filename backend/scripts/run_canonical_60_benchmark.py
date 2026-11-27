@@ -300,12 +300,9 @@ def get_reranker_policy() -> str:
             return "lexical_bm25_plus_rrf_blend"
         return "lexical_bm25_plus"
 
-    model = getattr(
-        settings,
-        "OPENROUTER_RERANKER_MODEL",
-        "nvidia/llama-nemotron-rerank-vl-1b-v2:free",
-    )
-    return f"openrouter:{model} (fallback: lexical_bm25_plus)"
+    model = getattr(settings, "BEDROCK_RERANKER_MODEL", "amazon.rerank-v1:0")
+    region = getattr(settings, "BEDROCK_RERANKER_REGION", "us-west-2")
+    return f"bedrock:{model}:{region} (fallback: lexical_bm25_plus)"
 
 
 def run_benchmark(

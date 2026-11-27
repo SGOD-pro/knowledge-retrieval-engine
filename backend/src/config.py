@@ -1,6 +1,7 @@
 from pathlib import Path
 from typing import Literal
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings
 
 _SRC_DIR = Path(__file__).resolve().parent
@@ -18,10 +19,11 @@ class Settings(BaseSettings):
     ENVIRONMENT: Literal["dev", "prod", "test"] = "dev"
     KRE_AUTH_MODE: str = "test"
 
-    # AWS Region
-    AWS_REGION: str = "us-east-1"
+    # AWS Region and optional profile (uses standard AWS SDK credential chain when unset)
+    AWS_REGION: str = "ap-south-1"
+    AWS_PROFILE: str | None = None
 
-    # AWS Resources — Local services (DynamoDB, S3, SQS) route dev→LocalStack
+    # AWS Resources — dev/test default to isolated *-dev / *_dev names unless explicitly overridden
     DYNAMODB_TABLE_NAME: str = "kre-table"
     S3_BUCKET_NAME: str = "kre-documents-prod"
     S3_BENCHMARK_BUCKET: str = "kre-benchmarks"
@@ -44,23 +46,18 @@ class Settings(BaseSettings):
     QDRANT_URL: str = "http://localhost:6333"
     QDRANT_API_KEY: str | None = None
 
-    # PROD Models (Bedrock) — always prod
+    # Bedrock Models (shared across dev and prod)
     PROD_LLM_MODEL: str = "apac.amazon.nova-lite-v1:0"
     PROD_EMBEDDING_MODEL: str = "amazon.titan-embed-text-v2:0"
     PROD_CONCEPT_MODEL: str = "apac.amazon.nova-micro-v1:0"
 
-    # OpenRouter Reranker — legacy reranker provider.
-    # Fallback: BM25Plus lexical scoring when circuit breaker is tripped.
-    OPENROUTER_API_KEY: str = ""
-    OPENROUTER_RERANKER_MODEL: str = "nvidia/llama-nemotron-rerank-vl-1b-v2:free"
-
-    # Bedrock Reranker Settings (Opt-in)
-    BEDROCK_RERANKER_ENABLED: bool = False
+    # Bedrock Reranker Settings (BM25Plus is the bounded lexical fallback)
+    BEDROCK_RERANKER_ENABLED: bool = True
     BEDROCK_RERANKER_MODEL: str = "amazon.rerank-v1:0"
     BEDROCK_RERANKER_REGION: str = "us-west-2"
     BEDROCK_RERANKER_TIMEOUT_S: float = 1.5
     BEDROCK_RERANKER_MAX_CONCURRENCY: int = 1
-    RERANKER_PROVIDER: str = "openrouter"
+    RERANKER_PROVIDER: str = "bedrock"
     LEXICAL_RRF_BLEND_ENABLED: bool = False
 
     # MODEL_PROVIDER: controls which Bedrock profile is used at query time
@@ -93,7 +90,7 @@ class Settings(BaseSettings):
     OKF_MAX_INPUT_TOKENS_PER_DOC: int = 4000
     OKF_MAX_OUTPUT_TOKENS_PER_DOC: int = 1200
     OKF_MAX_MODEL_CALLS_PER_DOC: int = 2
-    OKF_BEDROCK_MODEL_ID: str = "anthropic.claude-3-haiku-20240307-v1:0"
+    OKF_BEDROCK_MODEL_ID: str = "apac.amazon.nova-micro-v1:0"
     OKF_FUSION_WEIGHT: float = 1.15
     OKF_MAX_CONCURRENCY: int = 4
     OKF_MAX_QUEUE: int = 8
@@ -107,7 +104,7 @@ class Settings(BaseSettings):
     GRAPH_MAX_INPUT_TOKENS_PER_DOC: int = 4000
     GRAPH_MAX_OUTPUT_TOKENS_PER_DOC: int = 1600
     GRAPH_MAX_MODEL_CALLS_PER_DOC: int = 2
-    GRAPH_BEDROCK_MODEL_ID: str = "anthropic.claude-3-haiku-20240307-v1:0"
+    GRAPH_BEDROCK_MODEL_ID: str = "apac.amazon.nova-micro-v1:0"
     GRAPH_FUSION_WEIGHT: float = 1.10
     GRAPH_AMBIGUOUS_FUSION_WEIGHT: float = 0.55
     GRAPH_MAX_HOPS: int = 2
@@ -129,9 +126,26 @@ class Settings(BaseSettings):
     LAYA_MAX_OUTPUT_TOKENS: int = 250
     LAYA_MAX_CONCURRENCY: int = 4
     LAYA_MAX_QUEUE: int = 8
-    LAYA_BEDROCK_MODEL_ID: str = "anthropic.claude-3-haiku-20240307-v1:0"
+    LAYA_BEDROCK_MODEL_ID: str = "apac.amazon.nova-micro-v1:0"
     LAYA_ENDPOINT_URL: str = ""
     LAYA_API_KEY: str = ""
+
+    @model_validator(mode="after")
+    def _apply_environment_resource_defaults(self) -> "Settings":
+        """Use isolated dev/test DynamoDB tables and S3 buckets unless explicitly overridden."""
+        if self.ENVIRONMENT != "prod":
+            dev_defaults = {
+                "DYNAMODB_TABLE_NAME": "kre-table-dev",
+                "S3_BUCKET_NAME": "kre-documents-dev",
+                "S3_BENCHMARK_BUCKET": "kre-benchmarks-dev",
+                "S3_PAGEINDEX_BUCKET": "kre-storage-dev",
+                "DYNAMODB_OKF_TABLE_NAME": "kre_okf_facts_dev",
+                "DYNAMODB_GRAPH_TABLE_NAME": "kre_knowledge_graph_dev",
+            }
+            for field_name, dev_val in dev_defaults.items():
+                if field_name not in self.model_fields_set:
+                    setattr(self, field_name, dev_val)
+        return self
 
     model_config = {"env_file": _ENV_FILES, "extra": "ignore"}
 

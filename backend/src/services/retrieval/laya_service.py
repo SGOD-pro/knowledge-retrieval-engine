@@ -133,7 +133,8 @@ class LayaDecisionService:
             self.endpoint_url = ""
             self.api_key = ""
             self.client = self._get_production_bedrock_client()
-        self.model_id = model_id or getattr(settings, "LAYA_BEDROCK_MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0")
+        from providers.bedrock_models import get_extraction_model
+        self.model_id = model_id or get_extraction_model(getattr(settings, "LAYA_BEDROCK_MODEL_ID", None))
         self.concurrency_controller = concurrency_controller or get_laya_concurrency_controller()
         self.last_dispatched = False
         self.last_valid_response = False

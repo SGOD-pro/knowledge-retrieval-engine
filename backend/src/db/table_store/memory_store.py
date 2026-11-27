@@ -4,7 +4,7 @@ from decimal import Decimal
 import logging
 from typing import Any
 
-from db.table_store.base import AggregateOp, Predicate, PredicateOp, TableRowList, TableStore
+from db.table_store.base import AggregateOp, Predicate, PredicateOp, TableRowList, TableStore, bind_schema_identity
 from schemas.structured_table import StructuredTable, TableRow, TableSchema
 
 logger = logging.getLogger(__name__)
@@ -281,7 +281,15 @@ class MemoryTableStore:
                 tbl = self._tables.get((workspace_id, table_id))
                 return tbl.schema if tbl else None
             entry = self._schemas.get((workspace_id, table_id, version))
-            return entry[0] if entry else None
+            if not entry:
+                return None
+            return bind_schema_identity(
+                entry[0],
+                workspace_id=workspace_id,
+                table_id=table_id,
+                document_id=entry[1],
+                document_version=entry[2],
+            )
 
         ver = self.get_active_version(table_id, workspace_id)
         if ver:
@@ -289,7 +297,15 @@ class MemoryTableStore:
                 tbl = self._tables.get((workspace_id, table_id))
                 return tbl.schema if tbl else None
             entry = self._schemas.get((workspace_id, table_id, ver))
-            return entry[0] if entry else None
+            if not entry:
+                return None
+            return bind_schema_identity(
+                entry[0],
+                workspace_id=workspace_id,
+                table_id=table_id,
+                document_id=entry[1],
+                document_version=entry[2],
+            )
 
         tbl = self._tables.get((workspace_id, table_id))
         return tbl.schema if tbl else None

@@ -1,11 +1,32 @@
 """Base protocol and definitions for pluggable TableStore backends."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from enum import Enum
 from typing import Any, Protocol, Sequence
 
 from schemas.structured_table import StructuredTable, TableRow, TableSchema
+
+
+def bind_schema_identity(
+    schema: TableSchema,
+    *,
+    workspace_id: str | None = None,
+    table_id: str | None = None,
+    document_id: str | None = None,
+    document_version: str | None = None,
+) -> TableSchema:
+    """Attach stored workspace/table/document/version identity to TableSchema metadata without overwriting existing values."""
+    meta = dict(getattr(schema, "metadata", None) or {})
+    if workspace_id:
+        meta.setdefault("workspace_id", workspace_id)
+    if table_id:
+        meta.setdefault("table_id", table_id)
+    if document_id:
+        meta.setdefault("document_id", document_id)
+    if document_version:
+        meta.setdefault("document_version", document_version)
+    return replace(schema, metadata=meta)
 
 
 class PredicateOp(str, Enum):
