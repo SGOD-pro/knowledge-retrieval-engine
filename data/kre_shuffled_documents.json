@@ -1,0 +1,109 @@
+{
+  "seed": 27112026,
+  "document_order": [
+    "2212.14776v3.pdf",
+    "2304.10557v6.pdf",
+    "Workflow Documentation.docx",
+    "2022050694-NFRA-Annual-Report.pdf",
+    "survay.csv",
+    "2501.05730v1.pdf",
+    "NFHS_5_India_Districts_Factsheet_Data.xls",
+    "Newsletter-NITI-SandhanOct-25.pdf",
+    "SEC-Form-10Q.pdf",
+    "machine-readable-business-employment-data-mar-2026-quarter.csv",
+    "CR640_20026D3C6848957549C28BC67D580FE05683.pdf",
+    "rs_status_bill_passed_assent-1952-2016.csv",
+    "submission.pptx",
+    "MO_Post_2024_25.csv",
+    "National-Strategy-for-Artificial-Intelligence.pdf",
+    "2103.16775v1.pdf",
+    "2412.20875v1.pdf"
+  ],
+  "manifest": [
+    {
+      "filename": "2212.14776v3.pdf",
+      "sha256": "bce22600474513c61b8c47701d19275bb465dae909f1ede1598521dcf0ba57da",
+      "bytes": 3405123
+    },
+    {
+      "filename": "2304.10557v6.pdf",
+      "sha256": "ad6e0372551b5050e1dda8b30af5b5d9b5ee1e98b61e67f550eeea9e03a0fe6b",
+      "bytes": 770185
+    },
+    {
+      "filename": "Workflow Documentation.docx",
+      "sha256": "a2f8e6f8f57b2658344933650bfcf91c4a54115efab8ecffcd824bd791f10318",
+      "bytes": 1679863
+    },
+    {
+      "filename": "2022050694-NFRA-Annual-Report.pdf",
+      "sha256": "36acf49354cfa968bc51b8406761506367c430a2be999d3e88bdf9315113dce7",
+      "bytes": 6190924
+    },
+    {
+      "filename": "survay.csv",
+      "sha256": "c029d234eefd3fee2563b9c0929946ca336509ab62a02bd111c80f978298c66c",
+      "bytes": 9525994
+    },
+    {
+      "filename": "2501.05730v1.pdf",
+      "sha256": "4eafc24abe305dd84a859a95e19456a5f3527003ab41bd17abda7de657cccb48",
+      "bytes": 1938722
+    },
+    {
+      "filename": "NFHS_5_India_Districts_Factsheet_Data.xls",
+      "sha256": "e482b990d74eb46b5ce5a6e10606b745a914d4b1b57838c1c6149e80ec8ad498",
+      "bytes": 757248
+    },
+    {
+      "filename": "Newsletter-NITI-SandhanOct-25.pdf",
+      "sha256": "cc6990e2e356ac3668cfe353bf1d52d0f78ceb4fdfff3e537595ea768f1960b9",
+      "bytes": 2695815
+    },
+    {
+      "filename": "SEC-Form-10Q.pdf",
+      "sha256": "3518726963892d32ec11a876a5dfa44810cd557d577b91eae28fccad29962505",
+      "bytes": 322159
+    },
+    {
+      "filename": "machine-readable-business-employment-data-mar-2026-quarter.csv",
+      "sha256": "b5bc5270dd8a4a479fbcef5b3ccb41634ee4c9aad2f32c96182656b6fff3252e",
+      "bytes": 4044361
+    },
+    {
+      "filename": "CR640_20026D3C6848957549C28BC67D580FE05683.pdf",
+      "sha256": "25d54c02812204fa7e5c678103ad187e53b3ba32efec61fb016bf615d074e090",
+      "bytes": 2474588
+    },
+    {
+      "filename": "rs_status_bill_passed_assent-1952-2016.csv",
+      "sha256": "85d048226e88f44a76f3bf68c3f96669162c3bd007081eb06ce7d57e4529e09e",
+      "bytes": 97861
+    },
+    {
+      "filename": "submission.pptx",
+      "sha256": "9c9ea143de281b5b0e98575c5f9d88c003aceb880ad0b3ac2d4eb1693223c935",
+      "bytes": 10203969
+    },
+    {
+      "filename": "MO_Post_2024_25.csv",
+      "sha256": "2de945512ab7b3668c08374d4867c038341f31cd302dbf03504a742ddfff0ef2",
+      "bytes": 132
+    },
+    {
+      "filename": "National-Strategy-for-Artificial-Intelligence.pdf",
+      "sha256": "da5404dbb584c8956aae707dfcfe324dc1df11a179bc8288af0e898f4e37dcc5",
+      "bytes": 4615281
+    },
+    {
+      "filename": "2103.16775v1.pdf",
+      "sha256": "f3bd7654730f0a4a9be9e00cb52686241655151fbafdc75c93661f34f30ea4b7",
+      "bytes": 4706490
+    },
+    {
+      "filename": "2412.20875v1.pdf",
+      "sha256": "927420d4297edb4f6ff566961a14c98af54a458f44a9cdb9f587bb9079fa877e",
+      "bytes": 4054765
+    }
+  ]
+}
