@@ -120,11 +120,18 @@ def compress_chunks(query: str, chunks: list[Chunk]) -> str:
                 scored_sents.sort(key=lambda x: x[1], reverse=True)
                 best_idx = scored_sents[0][0] if scored_sents and scored_sents[0][1] > 0 else 0
 
+                # Preserve a second high-scoring sentence if far from best_idx within budget_per_chunk
+                selected_indices = {best_idx}
+                curr_len_sent = len(raw_sents[best_idx])
+                if len(scored_sents) > 1 and scored_sents[1][1] > 0:
+                    sec_idx = scored_sents[1][0]
+                    if sec_idx not in selected_indices and curr_len_sent + len(raw_sents[sec_idx]) + 1 <= budget_per_chunk:
+                        selected_indices.add(sec_idx)
+                        curr_len_sent += len(raw_sents[sec_idx]) + 1
+
                 # Expand window around best_idx until budget_per_chunk is filled
                 left = best_idx
                 right = best_idx
-                curr_sents = [raw_sents[best_idx]]
-                curr_len_sent = len(raw_sents[best_idx])
 
                 # Check if the very first lines contain header / column / date metadata
                 if left > 1 and len(raw_sents) > 3:
@@ -132,32 +139,34 @@ def compress_chunks(query: str, chunks: list[Chunk]) -> str:
                         h_line = raw_sents[h_idx]
                         h_lower = h_line.lower()
                         if any(kw in h_lower for kw in ["months ended", "quarter", "statement", "unaudited", "table", "year", "date"]):
-                            if curr_len_sent + len(h_line) + 1 <= budget_per_chunk:
-                                curr_sents.insert(h_idx, h_line)
+                            if h_idx not in selected_indices and curr_len_sent + len(h_line) + 1 <= budget_per_chunk:
+                                selected_indices.add(h_idx)
                                 curr_len_sent += len(h_line) + 1
 
                 while True:
                     expanded = False
                     if left > 0:
                         cand = raw_sents[left - 1]
-                        if cand not in curr_sents and curr_len_sent + len(cand) + 1 <= budget_per_chunk:
-                            curr_sents.insert(0, cand)
+                        if (left - 1) not in selected_indices and curr_len_sent + len(cand) + 1 <= budget_per_chunk:
+                            selected_indices.add(left - 1)
                             curr_len_sent += len(cand) + 1
                             left -= 1
                             expanded = True
-                        elif cand in curr_sents:
+                        elif (left - 1) in selected_indices:
                             left -= 1
                     if right < len(raw_sents) - 1:
                         cand = raw_sents[right + 1]
-                        if cand not in curr_sents and curr_len_sent + len(cand) + 1 <= budget_per_chunk:
-                            curr_sents.append(cand)
+                        if (right + 1) not in selected_indices and curr_len_sent + len(cand) + 1 <= budget_per_chunk:
+                            selected_indices.add(right + 1)
                             curr_len_sent += len(cand) + 1
                             right += 1
                             expanded = True
-                        elif cand in curr_sents:
+                        elif (right + 1) in selected_indices:
                             right += 1
                     if not expanded:
                         break
+
+                curr_sents = [raw_sents[i] for i in sorted(selected_indices)]
 
                 prefix = "..." if left > 0 and raw_sents[0] not in curr_sents else ""
                 suffix = "..." if right < len(raw_sents) - 1 else ""

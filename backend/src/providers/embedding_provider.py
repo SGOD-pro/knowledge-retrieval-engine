@@ -175,8 +175,13 @@ def embed_batch_with_provenance(
     def _embed_single(text: str) -> tuple[list[float], str]:
         return embed_text_with_provenance(text, provider=provider, max_retries=max_retries)
 
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        results = list(executor.map(_embed_single, texts))
+    workers = min(4, max(3, len(texts) // 25))
+    pool = ThreadPoolExecutor(max_workers=workers)
+    try:
+        futures = [pool.submit(_embed_single, t) for t in texts]
+        results = [fut.result(timeout=45.0) for fut in futures]
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
     vectors = [r[0] for r in results]
     models = {r[1] for r in results}

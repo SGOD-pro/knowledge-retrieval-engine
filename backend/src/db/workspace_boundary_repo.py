@@ -959,6 +959,28 @@ class SQLiteWorkspaceBoundaryRepository:
                     raise FileNotFoundError(f"Workspace {workspace_id} not found")
 
                 src_id = source_id or f"src_{uuid.uuid4().hex[:12]}"
+                tomb_row = self._conn.execute(
+                    "SELECT 1 FROM tombstones WHERE workspace_id = ? AND resource_type = 'source' AND resource_id = ?",
+                    (workspace_id, src_id),
+                ).fetchone()
+                if tomb_row:
+                    raise PermissionError(f"Source {src_id} is tombstoned in workspace {workspace_id}")
+
+                existing = self._conn.execute(
+                    "SELECT title, status, created_at, updated_at FROM sources WHERE workspace_id = ? AND source_id = ?",
+                    (workspace_id, src_id),
+                ).fetchone()
+                if existing:
+                    if existing["status"] == "tombstoned":
+                        raise PermissionError(f"Source {src_id} is tombstoned in workspace {workspace_id}")
+                    return SourceItem(
+                        source_id=src_id,
+                        title=existing["title"],
+                        status=existing["status"],
+                        created_at=existing["created_at"],
+                        updated_at=existing["updated_at"],
+                    )
+
                 now = _now_utc()
                 self._conn.execute(
                     """

@@ -160,8 +160,19 @@ def decompose_query(query: str) -> QueryPlan:
             confidence=0.95,
         )
 
-    # Multi-sentence queries
+    # Multi-sentence queries (ignore trailing meta-confirmation sentences that add no new source/metric/year)
     sentences = [s.strip() for s in re.split(r"(?<=[.?!])\s+", query) if len(s.strip()) > 15]
+    if len(sentences) == 2:
+        s2_low = sentences[1].lower()
+        has_new_ref = bool(
+            re.search(r"\b(?:19\d{2}|20\d{2}|[A-Za-z]\d{1,4})\b", sentences[1])
+            or re.search(r"\b[A-Za-z0-9_.\-]+\.(?:pdf|csv|xlsx?|tsv)\b", sentences[1], re.IGNORECASE)
+        )
+        if not has_new_ref and re.match(
+            r"^(?:is\s+(?:that|this)\s+(?:correct|true|accurate|right|valid)|confirm\b|verify\b|explain\s+(?:whether|why)\b)",
+            s2_low,
+        ):
+            sentences = [query.strip()]
     if len(sentences) >= 2:
         subgoals = tuple(
             Subgoal(

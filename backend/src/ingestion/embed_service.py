@@ -26,27 +26,35 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def _call_bge_lambda_batch(texts: list[str], batch_size: int = 16) -> list[list[float]]:
-    """Invoke the deployed BGE Lambda with batches of texts."""
+def _call_bge_lambda_batch(
+    texts: list[str],
+    batch_size: int = 16,
+    timeout_s: float = 20.0,
+    max_workers: int = 4,
+) -> list[list[float]]:
+    """Invoke the deployed BGE Lambda with bounded-timeout concurrent batches."""
     if not texts:
         return []
 
+    from concurrent.futures import ThreadPoolExecutor
     from aws.infra import get_client
 
     client = get_client("lambda")
     function_name = settings.BGE_EMBEDDING_LAMBDA_NAME
-    all_embeddings: list[list[float]] = []
+    batches = [(i, texts[i : i + batch_size]) for i in range(0, len(texts), batch_size)]
 
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i : i + batch_size]
+    def _invoke_batch(item: tuple[int, list[str]]) -> list[list[float]]:
+        batch_idx, batch = item
         payload = json.dumps({"texts": batch})
-
+        t0 = time.perf_counter()
         try:
             response = client.invoke(
                 FunctionName=function_name,
                 InvocationType="RequestResponse",
                 Payload=payload.encode("utf-8"),
             )
+            elapsed_s = time.perf_counter() - t0
+            retries = int((response.get("ResponseMetadata") or {}).get("RetryAttempts", 0) or 0)
             try:
                 from services.telemetry import record_bge_lambda
                 record_bge_lambda()
@@ -63,25 +71,45 @@ def _call_bge_lambda_batch(texts: list[str], batch_size: int = 16) -> list[list[
                 elif isinstance(body, dict):
                     response_payload = body
 
+            logger.info(
+                "bge.lambda_batch idx=%d count=%d elapsed_s=%.3f retries=%d",
+                batch_idx,
+                len(batch),
+                elapsed_s,
+                retries,
+            )
             if "embeddings" in response_payload:
-                embeddings = response_payload["embeddings"]
-                logger.debug(
-                    "bge.lambda_success count=%d dim=%s",
-                    len(embeddings),
-                    response_payload.get("dim", 384),
-                )
-                all_embeddings.extend(embeddings)
-            elif "embedding" in response_payload:
-                all_embeddings.append(response_payload["embedding"])
-            elif "error" in response_payload:
+                return response_payload["embeddings"]
+            if "embedding" in response_payload:
+                return [response_payload["embedding"]]
+            if "error" in response_payload:
                 raise RuntimeError(f"Lambda returned an error: {response_payload['error']}")
-            else:
-                raise RuntimeError(f"Unexpected response from BGE Lambda: {response_payload}")
+            raise RuntimeError(f"Unexpected response from BGE Lambda: {response_payload}")
         except Exception as e:
-            logger.error("bge.lambda_failed func=%s batch_idx=%d error=%s", function_name, i, e)
+            logger.error(
+                "bge.lambda_failed func=%s batch_idx=%d elapsed_s=%.3f error=%s",
+                function_name,
+                batch_idx,
+                time.perf_counter() - t0,
+                e,
+            )
             raise
 
-    return all_embeddings
+    workers = max(1, min(max_workers, len(batches)))
+    pool = ThreadPoolExecutor(max_workers=workers)
+    try:
+        futures = [pool.submit(_invoke_batch, item) for item in batches]
+        all_embeddings: list[list[float]] = []
+        for idx, fut in enumerate(futures):
+            try:
+                all_embeddings.extend(fut.result(timeout=timeout_s))
+            except TimeoutError as exc:
+                raise TimeoutError(
+                    f"BGE Lambda batch {idx} timed out after {timeout_s:.1f}s"
+                ) from exc
+        return all_embeddings
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 def _call_bge_lambda(text: str) -> list[float]:

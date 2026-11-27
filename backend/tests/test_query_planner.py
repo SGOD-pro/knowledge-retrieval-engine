@@ -629,6 +629,865 @@ def test_verified_two_operand_comparison_renders_deterministically_without_llm(m
     assert out_qual["unverified_operands"] == []
 
 
+def test_premise_correction_two_sentence_and_no_evidence_control(monkeypatch):
+    """Two-sentence premise-correction queries deliver cited answers while no-evidence queries refuse."""
+    from unittest.mock import patch
+    from db.workspace_boundary_repo import InMemoryWorkspaceBoundaryRepository
+    from modules.query.query_service import QueryRequest, QueryService
+    from schemas.contracts.boundary import DocumentSnapshot
+    from schemas.models import Chunk
+    from services.retrieval.bm25_retriever import _BM25_CACHE
+
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    monkeypatch.setenv("RERANKER_PROVIDER", "lexical")
+    monkeypatch.setenv("BEDROCK_RERANKER_ENABLED", "false")
+    monkeypatch.setenv("LEXICAL_RRF_BLEND_ENABLED", "false")
+
+    ws = "ws_premise_ctrl"
+    chs = [
+        Chunk(
+            id="obs_row_1",
+            document_id="doc_obs",
+            element_type="TableRow",
+            text="Station: Coastal North | Metric: Humidity | Value: -14.2 | Unit: percent",
+            page_number=1,
+            source_format="csv",
+            workspace_id=ws,
+            version="v1",
+            document_version="v1",
+        ),
+        Chunk(
+            id="act_row_2",
+            document_id="doc_act",
+            element_type="TableRow",
+            text="Title: Coastal Protection Act, 2021 | EnactedYear: 2019 | Introduced: 04/11/2019",
+            page_number=1,
+            source_format="csv",
+            workspace_id=ws,
+            version="v1",
+            document_version="v1",
+        ),
+    ]
+    docs = [{"id": "doc_obs", "filename": "weather_obs.csv"}, {"id": "doc_act", "filename": "statute_log.csv"}]
+
+    class _Repo:
+        def get_workspace_documents(self, workspace_id, page=1, limit=1000): return {"documents": docs}
+        def get_all_chunks(self, document_ids=None, workspace_id=None, **kw): return chs
+        def get(self, doc_id): return None
+        def search_vector(self, *a, **kw): return []
+        def check_semantic_cache(self, *a, **kw): return None
+
+    b_repo = InMemoryWorkspaceBoundaryRepository()
+    b_repo.create_workspace(ws, "tester", workspace_id=ws)
+    for d in docs:
+        b_repo.create_source(ws, d["filename"], source_id=d["id"])
+        b_repo.save_document_snapshot(DocumentSnapshot(
+            workspace_id=ws, document_id=d["id"], source=d["filename"], version="v1",
+            format="csv", created_at="2026-11-26T00:00:00Z",
+        ))
+
+    repo_inst = _Repo()
+    qs = QueryService(repo=repo_inst)
+
+    _BM25_CACHE.clear()
+    with (
+        patch("services.langgraph_pipeline.call_llm", return_value={
+            "answer": "Coastal North stores -14.2%, which is negative and unsafe to interpret literally.",
+            "citations": ["obs_row_1"],
+            "usage": {"input_tokens": 10, "output_tokens": 10},
+        }),
+        patch("services.langgraph_pipeline._get_repo", return_value=repo_inst),
+        patch("db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+        patch("src.db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+    ):
+        out_prem1 = qs.execute_query(QueryRequest(
+            query="The weather log says Coastal North had 14.2% humidity. Confirm the exact stored value and whether it is safe to interpret literally.",
+            workspace_id=ws,
+            cache=False,
+            benchmark_mode=True,
+        ))
+    assert "-14.2%" in out_prem1["answer"]
+    assert out_prem1["final_citation_chunk_ids"] == ["obs_row_1"]
+
+    _BM25_CACHE.clear()
+    with (
+        patch("services.langgraph_pipeline.call_llm", return_value={
+            "answer": "No, the Coastal Protection Act, 2021 was introduced on 04/11/2019, not in 2021.",
+            "citations": ["act_row_2"],
+            "usage": {"input_tokens": 10, "output_tokens": 10},
+        }),
+        patch("services.langgraph_pipeline._get_repo", return_value=repo_inst),
+        patch("db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+        patch("src.db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+    ):
+        out_prem2 = qs.execute_query(QueryRequest(
+            query="The Coastal Protection Act has 2021 in its title, so the log must record its introduction in 2021. Is that correct?",
+            workspace_id=ws,
+            cache=False,
+            benchmark_mode=True,
+        ))
+    assert "04/11/2019" in out_prem2["answer"]
+    assert out_prem2["final_citation_chunk_ids"] == ["act_row_2"]
+
+    _BM25_CACHE.clear()
+    with (
+        patch("services.langgraph_pipeline.call_llm", return_value={"answer": "NOT_FOUND", "citations": [], "usage": {}}),
+        patch("services.langgraph_pipeline._get_repo", return_value=repo_inst),
+        patch("db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+        patch("src.db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+    ):
+        out_no_ev = qs.execute_query(QueryRequest(
+            query="What is the annual rainfall in Desert Basin according to weather_obs.csv?",
+            workspace_id=ws,
+            cache=False,
+            benchmark_mode=True,
+        ))
+    assert "couldn't find" in out_no_ev["answer"].lower()
+    assert out_no_ev["citations"] == []
+
+
+def test_scorer_ignores_sequential_list_markers_but_checks_real_claims():
+    """Scorer 2.10.0 ignores 1) 2) 3) 4) list markers while still rejecting unsupported numeric claims even if they repeat a list number."""
+    from services.evaluation.benchmark_scorer import SCORER_VERSION, evaluate_grounded_answer
+
+    assert SCORER_VERSION == "2.10.0"
+    cit = [{
+        "chunk_id": "doc_p1",
+        "document_id": "d1",
+        "document_filename": "paper.pdf",
+        "document_version": "v1",
+        "page_number": 1,
+        "source_format": "pdf",
+        "text": "The four phases of learning are Alpha, Beta, Gamma, and Delta.",
+        "text_snippet": "The four phases of learning are Alpha, Beta, Gamma, and Delta.",
+    }]
+    ev = [{
+        "evidence_id": "doc_p1",
+        "locator": {"chunk_id": "doc_p1"},
+        "text": cit[0]["text"],
+        "provenance": {"source": "paper.pdf", "version": "v1"},
+    }]
+    res_ok = evaluate_grounded_answer(
+        answer="The four phases are: 1) Alpha, 2) Beta, 3) Gamma, and 4) Delta. [doc_p1]",
+        citations=cit,
+        is_answer_text_correct=True,
+        expected_sources=["paper.pdf"],
+        expected_source_version="v1",
+        retained_evidence_items=ev,
+        context_chunk_ids=["doc_p1"],
+        ground_truth_chunk_ids=["doc_p1"],
+        query="Name the four phases of learning in order.",
+    )
+    assert res_ok["grounded_correct"] is True
+
+    res_bad_repeat = evaluate_grounded_answer(
+        answer="The phases are: 1) Alpha takes 2 hours, 2) Beta, 3) Gamma, and 4) Delta. [doc_p1]",
+        citations=cit,
+        is_answer_text_correct=True,
+        expected_sources=["paper.pdf"],
+        expected_source_version="v1",
+        retained_evidence_items=ev,
+        context_chunk_ids=["doc_p1"],
+        ground_truth_chunk_ids=["doc_p1"],
+        query="Name the four phases of learning in order.",
+    )
+    assert res_bad_repeat["grounded_correct"] is False
+    assert "numeric claims" in res_bad_repeat["reason"]
+
+
+def test_premise_correction_title_vs_intro_year_and_followup_control():
+    """Scorer allows disambiguating title vs introduction year while rejecting wrong years or title-year denials; real follow-ups still decompose."""
+    from services.evaluation.benchmark_scorer import evaluate_grounded_answer
+
+    cit = [{
+        "chunk_id": "stat_r2",
+        "document_id": "d_stat",
+        "document_filename": "statute_log.csv",
+        "document_version": "v1",
+        "location_reference": "Row 2",
+        "source_format": "csv",
+        "text": "Year: 2019. Short Title: Coastal Protection Act, 2021. Date of Introduction: 04/11/2019. Deadline for Introduction Amendments: 12/06/2023. Status: Assented.",
+        "text_snippet": "Year: 2019. Short Title: Coastal Protection Act, 2021. Date of Introduction: 04/11/2019. Deadline for Introduction Amendments: 12/06/2023. Status: Assented.",
+    }]
+    ev = [{
+        "evidence_id": "stat_r2",
+        "locator": {"chunk_id": "stat_r2"},
+        "text": cit[0]["text"],
+        "provenance": {"source": "statute_log.csv", "version": "v1"},
+    }]
+
+    res_ok = evaluate_grounded_answer(
+        answer="No, the Coastal Protection Act, 2021 was introduced on 04/11/2019, not in 2021. [stat_r2]",
+        citations=cit,
+        is_answer_text_correct=True,
+        expected_sources=["statute_log.csv"],
+        expected_source_version="v1",
+        retained_evidence_items=ev,
+        context_chunk_ids=["stat_r2"],
+        ground_truth_chunk_ids=["stat_r2"],
+        query="The Coastal Protection Act has 2021 in its title, so it must have been introduced in 2021. Correct?",
+    )
+    assert res_ok["grounded_correct"] is True
+
+    res_wrong_year = evaluate_grounded_answer(
+        answer="No, the Coastal Protection Act, 2021 was introduced in 2020, not in 2021. [stat_r2]",
+        citations=cit,
+        is_answer_text_correct=True,
+        expected_sources=["statute_log.csv"],
+        expected_source_version="v1",
+        retained_evidence_items=ev,
+        context_chunk_ids=["stat_r2"],
+        ground_truth_chunk_ids=["stat_r2"],
+        query="The Coastal Protection Act has 2021 in its title, so it must have been introduced in 2021. Correct?",
+    )
+    assert res_wrong_year["grounded_correct"] is False
+    assert "claim_contradicts_evidence" in res_wrong_year["reason"]
+
+    # 3-year control: substituting the passage/debate year (2023) for the introduction year (2019) must fail
+    res_passage_year = evaluate_grounded_answer(
+        answer="No, the Coastal Protection Act, 2021 was introduced in 2023, not in 2021. [stat_r2]",
+        citations=cit,
+        is_answer_text_correct=True,
+        expected_sources=["statute_log.csv"],
+        expected_source_version="v1",
+        retained_evidence_items=ev,
+        context_chunk_ids=["stat_r2"],
+        ground_truth_chunk_ids=["stat_r2"],
+        query="The Coastal Protection Act has 2021 in its title, so it must have been introduced in 2021. Correct?",
+    )
+    assert res_passage_year["grounded_correct"] is False
+    assert "claim_contradicts_evidence" in res_passage_year["reason"]
+
+    res_deny_title = evaluate_grounded_answer(
+        answer="The Coastal Protection Act does not have 2021 in its title. [stat_r2]",
+        citations=cit,
+        is_answer_text_correct=True,
+        expected_sources=["statute_log.csv"],
+        expected_source_version="v1",
+        retained_evidence_items=ev,
+        context_chunk_ids=["stat_r2"],
+        ground_truth_chunk_ids=["stat_r2"],
+        query="Does the Coastal Protection Act have 2021 in its title?",
+    )
+    assert res_deny_title["grounded_correct"] is False
+    assert "claim_contradicts_evidence" in res_deny_title["reason"]
+
+    # Control: a real second requirement without a year, metric code, or filename must still decompose into 2 subgoals
+    plan_real_followup = decompose_query("The model uses attention pooling. Also explain its memory limitation.")
+    assert len(plan_real_followup.subgoals) == 2
+
+
+def test_multi_claim_missing_citation_fallback_and_wrong_claim_rejection(monkeypatch):
+    """When two claims have support in context and model cites one, fallback adds the second supporting chunk or withholds if wrong claim."""
+    from unittest.mock import patch
+    from db.workspace_boundary_repo import InMemoryWorkspaceBoundaryRepository
+    from modules.query.query_service import QueryRequest, QueryService
+    from schemas.contracts.boundary import DocumentSnapshot
+    from schemas.models import Chunk
+    from services.retrieval.bm25_retriever import _BM25_CACHE
+
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    monkeypatch.setenv("RERANKER_PROVIDER", "lexical")
+    monkeypatch.setenv("BEDROCK_RERANKER_ENABLED", "false")
+    monkeypatch.setenv("LEXICAL_RRF_BLEND_ENABLED", "false")
+
+    docs = [{"id": "doc_pol", "filename": "policy_guide.pdf"}, {"id": "doc_eval", "filename": "eval_study.pdf"}]
+    q_text = (
+        "The regional policy requires auditable medical triage while preserving diagnostic speed. "
+        "What finding from the evaluation study shows why headline accuracy alone cannot guarantee safe triage?"
+    )
+    model_ans = (
+        "The regional policy requires auditable medical triage while preserving diagnostic speed. "
+        "The evaluation study shows that a triage classifier can reach 98% headline accuracy while misrouting critical cases."
+    )
+
+    def _run(ws: str, chs: list[Chunk]):
+        _BM25_CACHE.clear()
+        class _Repo:
+            def get_workspace_documents(self, workspace_id, page=1, limit=1000): return {"documents": docs}
+            def get_all_chunks(self, document_ids=None, workspace_id=None, **kw): return chs
+            def get(self, doc_id): return None
+            def search_vector(self, *a, **kw): return []
+            def check_semantic_cache(self, *a, **kw): return None
+        b_repo = InMemoryWorkspaceBoundaryRepository()
+        b_repo.create_workspace(ws, "tester", workspace_id=ws)
+        for d in docs:
+            b_repo.create_source(ws, d["filename"], source_id=d["id"])
+            b_repo.save_document_snapshot(DocumentSnapshot(
+                workspace_id=ws, document_id=d["id"], source=d["filename"], version="v1",
+                format="pdf", created_at="2026-11-26T00:00:00Z",
+            ))
+        repo_inst = _Repo()
+        qs = QueryService(repo=repo_inst)
+        with (
+            patch("services.langgraph_pipeline.call_llm", return_value={
+                "answer": model_ans,
+                "citations": ["eval_c1"],
+                "usage": {"input_tokens": 10, "output_tokens": 10},
+            }),
+            patch("services.langgraph_pipeline._get_repo", return_value=repo_inst),
+            patch("db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+            patch("src.db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+        ):
+            return qs.execute_query(QueryRequest(query=q_text, workspace_id=ws, cache=False, benchmark_mode=True))
+
+    # Case A: Both supporting chunks in context -> verified fallback adds pol_c1 alongside eval_c1
+    ws_ok = "ws_mc_ok"
+    chs_ok = [
+        Chunk(
+            id="pol_c1",
+            document_id="doc_pol",
+            element_type="NarrativeText",
+            text="Regional medical policy mandates auditable triage decisions while preserving diagnostic speed.",
+            page_number=12,
+            source_format="pdf",
+            workspace_id=ws_ok,
+            version="v1",
+            document_version="v1",
+        ),
+        Chunk(
+            id="eval_c1",
+            document_id="doc_eval",
+            element_type="NarrativeText",
+            text="The evaluation study shows a triage classifier can reach 98% headline accuracy while misrouting critical cases.",
+            page_number=5,
+            source_format="pdf",
+            workspace_id=ws_ok,
+            version="v1",
+            document_version="v1",
+        ),
+    ]
+    out_ok = _run(ws_ok, chs_ok)
+    assert set(out_ok["final_citation_chunk_ids"]) == {"pol_c1", "eval_c1"}
+
+    # Case B: policy_guide.pdf chunk supports a different claim (billing audit, not medical triage speed) -> withheld
+    ws_wrong = "ws_mc_wrong"
+    chs_wrong = [
+        Chunk(
+            id="pol_wrong",
+            document_id="doc_pol",
+            element_type="NarrativeText",
+            text="Regional policy covers quarterly billing audits for outpatient clinics.",
+            page_number=3,
+            source_format="pdf",
+            workspace_id=ws_wrong,
+            version="v1",
+            document_version="v1",
+        ),
+        Chunk(
+            id="eval_c1",
+            document_id="doc_eval",
+            element_type="NarrativeText",
+            text="The evaluation study shows a triage classifier can reach 98% headline accuracy while misrouting critical cases.",
+            page_number=5,
+            source_format="pdf",
+            workspace_id=ws_wrong,
+            version="v1",
+            document_version="v1",
+        ),
+    ]
+    out_wrong = _run(ws_wrong, chs_wrong)
+    assert "couldn't find" in out_wrong["answer"].lower()
+    assert out_wrong["citations"] == []
+
+
+def test_single_subgoal_missing_citation_recovery_and_wrong_claim_rejection(monkeypatch):
+    """Single-subgoal queries recover an omitted supporting chunk from retained context while rejecting overlapping wrong-claim chunks."""
+    from unittest.mock import patch
+    from db.workspace_boundary_repo import InMemoryWorkspaceBoundaryRepository
+    from modules.query.query_service import QueryRequest, QueryService
+    from schemas.contracts.boundary import DocumentSnapshot
+    from schemas.models import Chunk
+    from services.retrieval.bm25_retriever import _BM25_CACHE
+
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    monkeypatch.setenv("RERANKER_PROVIDER", "lexical")
+    monkeypatch.setenv("BEDROCK_RERANKER_ENABLED", "false")
+    monkeypatch.setenv("LEXICAL_RRF_BLEND_ENABLED", "false")
+
+    docs = [{"id": "doc_algo", "filename": "fast_attn.pdf"}]
+    q_text = "Because Fast-Attn inference is independent of sequence length, must its computation also be independent of channel count? Correct?"
+    model_ans = (
+        "No, Fast-Attn inference is independent of sequence length, "
+        "but its O(kC) inference cost depends on channel count C and kernel order k."
+    )
+
+    def _run(ws: str, chs: list[Chunk]):
+        _BM25_CACHE.clear()
+        class _Repo:
+            def get_workspace_documents(self, workspace_id, page=1, limit=1000): return {"documents": docs}
+            def get_all_chunks(self, document_ids=None, workspace_id=None, **kw): return chs
+            def get(self, doc_id): return None
+            def search_vector(self, *a, **kw): return []
+            def check_semantic_cache(self, *a, **kw): return None
+        b_repo = InMemoryWorkspaceBoundaryRepository()
+        b_repo.create_workspace(ws, "tester", workspace_id=ws)
+        b_repo.create_source(ws, "fast_attn.pdf", source_id="doc_algo")
+        b_repo.save_document_snapshot(DocumentSnapshot(
+            workspace_id=ws, document_id="doc_algo", source="fast_attn.pdf", version="v1",
+            format="pdf", created_at="2026-11-26T00:00:00Z",
+        ))
+        repo_inst = _Repo()
+        qs = QueryService(repo=repo_inst)
+        with (
+            patch("services.langgraph_pipeline.call_llm", return_value={
+                "answer": model_ans,
+                "citations": ["algo_p6"],
+                "usage": {"input_tokens": 10, "output_tokens": 10},
+            }),
+            patch("services.langgraph_pipeline._get_repo", return_value=repo_inst),
+            patch("db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+            patch("src.db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+        ):
+            return qs.execute_query(QueryRequest(query=q_text, workspace_id=ws, cache=False, benchmark_mode=True))
+
+    # Case A: algo_p5 in retained context supports Fast-Attn sequence length independence -> recovered
+    ws_rec = "ws_sg_rec"
+    chs_rec = [
+        Chunk(
+            id="algo_p6",
+            document_id="doc_algo",
+            element_type="NarrativeText",
+            text="Fast-Attn achieves O(kC) inference cost depending on channel count C and kernel order k.",
+            page_number=6,
+            source_format="pdf",
+            workspace_id=ws_rec,
+            version="v1",
+            document_version="v1",
+        ),
+        Chunk(
+            id="algo_p5",
+            document_id="doc_algo",
+            element_type="NarrativeText",
+            text="Fast-Attn updates constant-size caches so inference is independent of sequence length.",
+            page_number=5,
+            source_format="pdf",
+            workspace_id=ws_rec,
+            version="v1",
+            document_version="v1",
+        ),
+    ]
+    out_rec = _run(ws_rec, chs_rec)
+    assert set(out_rec["final_citation_chunk_ids"]) == {"algo_p6", "algo_p5"}
+
+    # Case B: algo_wrong has overlapping terms ("inference", "sequence length", "independent") but opposite claim -> NOT added
+    ws_wrong = "ws_sg_wrong"
+    chs_wrong = [
+        Chunk(
+            id="algo_p6",
+            document_id="doc_algo",
+            element_type="NarrativeText",
+            text="Fast-Attn achieves O(kC) inference cost depending on channel count C and kernel order k.",
+            page_number=6,
+            source_format="pdf",
+            workspace_id=ws_wrong,
+            version="v1",
+            document_version="v1",
+        ),
+        Chunk(
+            id="algo_wrong",
+            document_id="doc_algo",
+            element_type="NarrativeText",
+            text="Fast-Attn inference is not independent of sequence length under sliding windows.",
+            page_number=7,
+            source_format="pdf",
+            workspace_id=ws_wrong,
+            version="v1",
+            document_version="v1",
+        ),
+    ]
+    out_wrong = _run(ws_wrong, chs_wrong)
+    assert out_wrong["final_citation_chunk_ids"] == ["algo_p6"]
+
+
+def test_compression_distant_sentence_stop_reason_and_explain_using_both_papers(monkeypatch):
+    """Compression preserves distant decisive sentences within budget; max_tokens stop_reason is refused; 'Explain using both papers.' delivers."""
+    from unittest.mock import patch
+    from db.workspace_boundary_repo import InMemoryWorkspaceBoundaryRepository
+    from modules.query.query_service import QueryRequest, QueryService
+    from schemas.contracts.boundary import DocumentSnapshot
+    from schemas.models import Chunk
+    from services.retrieval.bm25_retriever import _BM25_CACHE
+    from services.retrieval.compressor import compress_chunks
+
+    # 1. Compression control: distant decisive sentence preserved within budget_per_chunk
+    filler = " ".join(["Background methodology details are summarized in appendix sections."] * 18)
+    long_chunk = Chunk(
+        id="long_c1",
+        document_id="doc_long",
+        element_type="NarrativeText",
+        text=f"Alpha caching keeps inference cost constant with sequence length. {filler} Beta polynomial order t determines the O(tD) cache update.",
+        page_number=5,
+        source_format="pdf",
+        workspace_id="ws_comp",
+        version="v1",
+        document_version="v1",
+    )
+    comp_out = compress_chunks("What does alpha caching do and how does beta polynomial order affect O(tD)?", [long_chunk])
+    assert "Alpha caching" in comp_out
+    assert "Beta polynomial order" in comp_out
+
+    # 2 & 3. Stop-reason control (end_turn vs max_tokens) + "Explain using both papers." control
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    monkeypatch.setenv("RERANKER_PROVIDER", "lexical")
+    monkeypatch.setenv("BEDROCK_RERANKER_ENABLED", "false")
+    monkeypatch.setenv("LEXICAL_RRF_BLEND_ENABLED", "false")
+
+    docs = [{"id": "doc_a", "filename": "fast_attn.pdf"}, {"id": "doc_b", "filename": "memory_layer.pdf"}]
+    q_text = "Does Fast-Attn constant-length cache establish persistent cross-session memory? Explain using both papers."
+    ans_text = (
+        "No, Fast-Attn uses constant-size caches for single-sequence inference, "
+        "whereas Memory-Layer adds a persistent module for cross-session recall."
+    )
+
+    def _run_stop(ws: str, stop_reason: str):
+        _BM25_CACHE.clear()
+        chs = [
+            Chunk(
+                id="fa_1",
+                document_id="doc_a",
+                element_type="NarrativeText",
+                text="Fast-Attn uses constant-size caches for single-sequence inference.",
+                page_number=5,
+                source_format="pdf",
+                workspace_id=ws,
+                version="v1",
+                document_version="v1",
+            ),
+            Chunk(
+                id="ml_1",
+                document_id="doc_b",
+                element_type="NarrativeText",
+                text="Memory-Layer adds a persistent module for cross-session recall across interactions.",
+                page_number=1,
+                source_format="pdf",
+                workspace_id=ws,
+                version="v1",
+                document_version="v1",
+            ),
+        ]
+        class _Repo:
+            def get_workspace_documents(self, workspace_id, page=1, limit=1000): return {"documents": docs}
+            def get_all_chunks(self, document_ids=None, workspace_id=None, **kw): return chs
+            def get(self, doc_id): return None
+            def search_vector(self, *a, **kw): return []
+            def check_semantic_cache(self, *a, **kw): return None
+        b_repo = InMemoryWorkspaceBoundaryRepository()
+        b_repo.create_workspace(ws, "tester", workspace_id=ws)
+        for d in docs:
+            b_repo.create_source(ws, d["filename"], source_id=d["id"])
+            b_repo.save_document_snapshot(DocumentSnapshot(
+                workspace_id=ws, document_id=d["id"], source=d["filename"], version="v1",
+                format="pdf", created_at="2026-11-26T00:00:00Z",
+            ))
+        repo_inst = _Repo()
+        qs = QueryService(repo=repo_inst)
+        with (
+            patch("services.langgraph_pipeline.call_llm", return_value={
+                "answer": ans_text,
+                "citations": ["fa_1", "ml_1"],
+                "usage": {"input_tokens": 120, "output_tokens": 42, "stop_reason": stop_reason},
+            }),
+            patch("services.langgraph_pipeline._get_repo", return_value=repo_inst),
+            patch("db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+            patch("src.db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+        ):
+            return qs.execute_query(QueryRequest(query=q_text, workspace_id=ws, cache=False, benchmark_mode=True))
+
+    out_ok = _run_stop("ws_stop_ok", "end_turn")
+    assert set(out_ok["final_citation_chunk_ids"]) == {"fa_1", "ml_1"}
+    assert out_ok["retrieval_candidates"]["llm_stop_reason"] == "end_turn"
+    assert out_ok["retrieval_candidates"]["llm_output_tokens"] == 42
+
+    out_trunc = _run_stop("ws_stop_trunc", "max_tokens")
+    assert "couldn't find" in out_trunc["answer"].lower()
+    assert out_trunc["citations"] == []
+    assert out_trunc["retrieval_candidates"]["llm_stop_reason"] == "max_tokens"
+    assert out_trunc["retrieval_candidates"]["llm_output_tokens"] == 42
+    assert out_trunc["retrieval_candidates"]["delivery_rejection_reason"] == "truncated_stop_reason:max_tokens"
+
+
+def test_sqlite_create_source_idempotent_and_preserves_tombstone(tmp_path):
+    from db.workspace_boundary_repo import SQLiteWorkspaceBoundaryRepository
+    from schemas.contracts.boundary import DocumentSnapshot
+
+    repo = SQLiteWorkspaceBoundaryRepository(str(tmp_path / "boundary.db"))
+    repo.create_workspace("Dup Workspace", "usr_alice", workspace_id="ws_dup")
+
+    first = repo.create_source("ws_dup", "facility_report.pdf", source_id="src_1")
+    second = repo.create_source("ws_dup", "facility_report.pdf", source_id="src_1")
+    assert first.source_id == second.source_id == "src_1"
+    rows = repo._conn.execute(
+        "SELECT source_id, status FROM sources WHERE workspace_id = ? AND source_id = ?",
+        ("ws_dup", "src_1"),
+    ).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["status"] == "registered"
+
+    repo.save_document_snapshot(DocumentSnapshot(
+        workspace_id="ws_dup",
+        document_id="src_1",
+        source="facility_report.pdf",
+        version="v1",
+        format="pdf",
+        created_at="2026-11-27T00:00:00Z",
+        persisted_rows=12,
+        total_rows=12,
+    ))
+    snap = repo.get_document_snapshot("ws_dup", "src_1")
+    assert snap is not None
+    assert snap.version == "v1"
+    assert snap.persisted_rows == 12
+    assert snap.total_rows == 12
+
+    repo.record_source_tombstone("ws_dup", "src_revoked", "usr_alice", "revoked")
+    with pytest.raises(PermissionError):
+        repo.create_source("ws_dup", "revoked.pdf", source_id="src_revoked")
+
+
+def test_bare_doc_uuid_citation_tag_recovers_in_verified_fallback(monkeypatch):
+    from unittest.mock import patch
+    from db.workspace_boundary_repo import InMemoryWorkspaceBoundaryRepository
+    from modules.query.query_service import QueryRequest, QueryService
+    from schemas.contracts.boundary import DocumentSnapshot
+    from schemas.models import Chunk
+    from services.retrieval.bm25_retriever import _BM25_CACHE
+
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    monkeypatch.setenv("RERANKER_PROVIDER", "lexical")
+    monkeypatch.setenv("BEDROCK_RERANKER_ENABLED", "false")
+    monkeypatch.setenv("LEXICAL_RRF_BLEND_ENABLED", "false")
+
+    ws = "ws_bare_uuid"
+    _BM25_CACHE.clear()
+    docs = [{"id": "alpha-doc-uuid-1111", "filename": "facility_brief.pdf"}]
+    chs = [
+        Chunk(
+            id="alpha_p1_0",
+            document_id="alpha-doc-uuid-1111",
+            element_type="NarrativeText",
+            text="The Q3 coolant pressure target was 42.5 psi across all loops.",
+            page_number=1,
+            source_format="pdf",
+            workspace_id=ws,
+            version="v1",
+            document_version="v1",
+        )
+    ]
+
+    class _Repo:
+        def get_workspace_documents(self, workspace_id, page=1, limit=1000): return {"documents": docs}
+        def get_all_chunks(self, document_ids=None, workspace_id=None, **kw): return chs
+        def get(self, doc_id): return None
+        def search_vector(self, *a, **kw): return []
+        def check_semantic_cache(self, *a, **kw): return None
+
+    b_repo = InMemoryWorkspaceBoundaryRepository()
+    b_repo.create_workspace(ws, "tester", workspace_id=ws)
+    b_repo.create_source(ws, "facility_brief.pdf", source_id="alpha-doc-uuid-1111")
+    b_repo.save_document_snapshot(DocumentSnapshot(
+        workspace_id=ws, document_id="alpha-doc-uuid-1111", source="facility_brief.pdf", version="v1",
+        format="pdf", created_at="2026-11-27T00:00:00Z",
+    ))
+    repo_inst = _Repo()
+    qs = QueryService(repo=repo_inst)
+    with (
+        patch("services.langgraph_pipeline.call_llm", return_value={
+            "answer": "The Q3 coolant pressure target was 42.5 psi. [alpha-doc-uuid-1111]",
+            "citations": ["alpha-doc-uuid-1111"],
+            "usage": {"input_tokens": 50, "output_tokens": 15, "stop_reason": "end_turn"},
+        }),
+        patch("services.langgraph_pipeline._get_repo", return_value=repo_inst),
+        patch("db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+        patch("src.db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+    ):
+        out = qs.execute_query(QueryRequest(
+            query="What was the Q3 coolant pressure target in the facility brief?",
+            workspace_id=ws,
+            cache=False,
+            benchmark_mode=True,
+        ))
+
+    assert "42.5" in out["answer"]
+    assert out["final_citation_chunk_ids"] == ["alpha_p1_0"]
+
+
+def test_cross_doc_explanation_allows_same_doc_sibling_year_in_fallback(monkeypatch):
+    from unittest.mock import patch
+    from db.workspace_boundary_repo import InMemoryWorkspaceBoundaryRepository
+    from modules.query.query_service import QueryRequest, QueryService
+    from schemas.contracts.boundary import DocumentSnapshot
+    from schemas.models import Chunk
+    from services.retrieval.bm25_retriever import _BM25_CACHE
+
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    monkeypatch.setenv("RERANKER_PROVIDER", "lexical")
+    monkeypatch.setenv("BEDROCK_RERANKER_ENABLED", "false")
+    monkeypatch.setenv("LEXICAL_RRF_BLEND_ENABLED", "false")
+
+    ws = "ws_sibling_year"
+    _BM25_CACHE.clear()
+    docs = [{"id": "doc_ops", "filename": "ops_plan.pptx"}, {"id": "doc_eng", "filename": "eng_log.pdf"}]
+    chs = [
+        Chunk(
+            id="ops_title",
+            document_id="doc_ops",
+            element_type="Title",
+            text="2027 Operations Plan",
+            page_number=1,
+            source_format="pptx",
+            workspace_id=ws,
+            version="v1",
+            document_version="v1",
+        ),
+        Chunk(
+            id="ops_body",
+            document_id="doc_ops",
+            element_type="NarrativeText",
+            text="Cooling power rose 18 percent to offset warmer ambient air.",
+            page_number=1,
+            source_format="pptx",
+            workspace_id=ws,
+            version="v1",
+            document_version="v1",
+        ),
+        Chunk(
+            id="eng_title",
+            document_id="doc_eng",
+            element_type="Title",
+            text="2027 Engineering Log",
+            page_number=1,
+            source_format="pdf",
+            workspace_id=ws,
+            version="v1",
+            document_version="v1",
+        ),
+        Chunk(
+            id="eng_body",
+            document_id="doc_eng",
+            element_type="NarrativeText",
+            text="Ambient inlet reached -12 degrees Celsius compared with -15 degrees Celsius baseline.",
+            page_number=2,
+            source_format="pdf",
+            workspace_id=ws,
+            version="v1",
+            document_version="v1",
+        ),
+    ]
+
+    class _Repo:
+        def get_workspace_documents(self, workspace_id, page=1, limit=1000): return {"documents": docs}
+        def get_all_chunks(self, document_ids=None, workspace_id=None, **kw): return chs
+        def get(self, doc_id): return None
+        def search_vector(self, *a, **kw): return []
+        def check_semantic_cache(self, *a, **kw): return None
+
+    b_repo = InMemoryWorkspaceBoundaryRepository()
+    b_repo.create_workspace(ws, "tester", workspace_id=ws)
+    for d in docs:
+        b_repo.create_source(ws, d["filename"], source_id=d["id"])
+        b_repo.save_document_snapshot(DocumentSnapshot(
+            workspace_id=ws, document_id=d["id"], source=d["filename"], version="v1",
+            format="pdf", created_at="2026-11-27T00:00:00Z",
+        ))
+    repo_inst = _Repo()
+    qs = QueryService(repo=repo_inst)
+    ans = (
+        "In 2027, cooling power rose 18 percent to offset warmer ambient air, "
+        "and ambient inlet reached -12 degrees Celsius compared with -15 degrees Celsius baseline."
+    )
+    with (
+        patch("services.langgraph_pipeline.call_llm", return_value={
+            "answer": ans,
+            "citations": ["ops_title", "eng_title"],
+            "usage": {"input_tokens": 80, "output_tokens": 30, "stop_reason": "end_turn"},
+        }),
+        patch("services.langgraph_pipeline._get_repo", return_value=repo_inst),
+        patch("db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+        patch("src.db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+    ):
+        out = qs.execute_query(QueryRequest(
+            query="Did 2027 cooling power rise to offset warmer ambient air when ambient inlet reached -12 degrees Celsius? Explain using both documents.",
+            workspace_id=ws,
+            cache=False,
+            benchmark_mode=True,
+        ))
+
+    assert "18" in out["answer"]
+    assert "-12" in out["answer"]
+    assert "ops_body" in out["final_citation_chunk_ids"]
+    assert "eng_body" in out["final_citation_chunk_ids"]
+
+
+def test_numeric_false_premise_bare_no_enriched_with_cited_correction(monkeypatch):
+    from unittest.mock import patch
+    from db.workspace_boundary_repo import InMemoryWorkspaceBoundaryRepository
+    from modules.query.query_service import QueryRequest, QueryService
+    from schemas.contracts.boundary import DocumentSnapshot
+    from schemas.models import Chunk
+    from services.retrieval.bm25_retriever import _BM25_CACHE
+
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    monkeypatch.setenv("RERANKER_PROVIDER", "lexical")
+    monkeypatch.setenv("BEDROCK_RERANKER_ENABLED", "false")
+    monkeypatch.setenv("LEXICAL_RRF_BLEND_ENABLED", "false")
+
+    ws = "ws_bare_no"
+    _BM25_CACHE.clear()
+    docs = [{"id": "doc_log", "filename": "eng_log.pdf"}]
+    chs = [
+        Chunk(
+            id="eng_body",
+            document_id="doc_log",
+            element_type="NarrativeText",
+            text="Ambient inlet reached -12 degrees Celsius during the night cycle.",
+            page_number=2,
+            source_format="pdf",
+            workspace_id=ws,
+            version="v1",
+            document_version="v1",
+        )
+    ]
+
+    class _Repo:
+        def get_workspace_documents(self, workspace_id, page=1, limit=1000): return {"documents": docs}
+        def get_all_chunks(self, document_ids=None, workspace_id=None, **kw): return chs
+        def get(self, doc_id): return None
+        def search_vector(self, *a, **kw): return []
+        def check_semantic_cache(self, *a, **kw): return None
+
+    b_repo = InMemoryWorkspaceBoundaryRepository()
+    b_repo.create_workspace(ws, "tester", workspace_id=ws)
+    b_repo.create_source(ws, "eng_log.pdf", source_id="doc_log")
+    b_repo.save_document_snapshot(DocumentSnapshot(
+        workspace_id=ws, document_id="doc_log", source="eng_log.pdf", version="v1",
+        format="pdf", created_at="2026-11-27T00:00:00Z",
+    ))
+    repo_inst = _Repo()
+    qs = QueryService(repo=repo_inst)
+    with (
+        patch("services.langgraph_pipeline.call_llm", return_value={
+            "answer": "No, that is not correct.",
+            "citations": ["eng_body"],
+            "usage": {"input_tokens": 40, "output_tokens": 8, "stop_reason": "end_turn"},
+        }),
+        patch("services.langgraph_pipeline._get_repo", return_value=repo_inst),
+        patch("db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+        patch("src.db.workspace_boundary_repo.get_workspace_boundary_repo", return_value=b_repo),
+    ):
+        out = qs.execute_query(QueryRequest(
+            query="Is it correct that the ambient inlet reached +12 degrees Celsius?",
+            workspace_id=ws,
+            cache=False,
+            benchmark_mode=True,
+        ))
+
+    assert "-12 degrees Celsius" in out["answer"]
+    assert out["final_citation_chunk_ids"] == ["eng_body"]
+
+
+
+
 
 
 

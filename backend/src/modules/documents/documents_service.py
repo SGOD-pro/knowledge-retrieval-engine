@@ -203,13 +203,27 @@ class DocumentsService:
                     )
                     return
 
-            document = ingest_fn(
-                temp_path,
-                document_id=doc_id,
-                filename=filename,
-                provider=settings.MODEL_PROVIDER,
-                workspace_id=workspace_id,
-            )
+            from concurrent.futures import ThreadPoolExecutor
+
+            ingest_timeout_s = float(getattr(self, "_ingest_timeout_s", 240.0))
+            ingest_pool = ThreadPoolExecutor(max_workers=1)
+            try:
+                ingest_future = ingest_pool.submit(
+                    ingest_fn,
+                    temp_path,
+                    document_id=doc_id,
+                    filename=filename,
+                    provider=settings.MODEL_PROVIDER,
+                    workspace_id=workspace_id,
+                )
+                try:
+                    document = ingest_future.result(timeout=ingest_timeout_s)
+                except TimeoutError as exc:
+                    raise TimeoutError(
+                        f"Ingestion timed out after {ingest_timeout_s:.1f}s for {filename}"
+                    ) from exc
+            finally:
+                ingest_pool.shutdown(wait=False, cancel_futures=True)
             if incoming_version and getattr(document, "chunks", None):
                 from dataclasses import replace
                 new_chunks = [
@@ -296,6 +310,28 @@ class DocumentsService:
                 except Exception as snap_err:
                     logger.warning("Could not persist initial DocumentSnapshot for %s: %s", doc_id, snap_err)
 
+                if incomplete_cov or (total > 0 and persisted < total):
+                    err_msg = (
+                        f"Incomplete ingestion coverage: {persisted}/{total} rows persisted"
+                        + (f" ({'; '.join(exclusions)})" if exclusions else "")
+                    )
+                    self.repo.update_document_status(
+                        workspace_id=workspace_id,
+                        doc_id=doc_id,
+                        status="Failed",
+                        chunk_count=len(document.chunks),
+                        error=err_msg,
+                    )
+                    logger.warning(
+                        "baseline_publication.incomplete_failed ws=%s doc_id=%s filename=%s persisted=%d total=%d",
+                        workspace_id,
+                        doc_id,
+                        filename,
+                        persisted,
+                        total,
+                    )
+                    return
+
                 self.repo.update_document_status(
                     workspace_id=workspace_id,
                     doc_id=doc_id,
@@ -381,6 +417,7 @@ class DocumentsService:
                     logger.warning("Could not update DocumentSnapshot enrichment for %s: %s", doc_id, snap_up_err)
             except Exception as outer_err:
                 logger.warning("Unexpected error during document ingestion for %s: %s", doc_id, outer_err)
+                raise
 
             self.repo.update_document_status(
                 workspace_id=workspace_id,

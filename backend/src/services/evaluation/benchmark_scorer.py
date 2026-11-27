@@ -15,7 +15,7 @@ from services.retrieval.table_metric_binding import (
 )
 
 # Scorer 2.6.0: stops entity negation scope from crossing 'that' complement clause boundaries.
-SCORER_VERSION = "2.6.0"
+SCORER_VERSION = "2.10.0"
 
 _MONTH_NAMES_RE = (
     r"january|february|march|april|may|june|july|august|september|october|november|december"
@@ -1146,6 +1146,46 @@ def grade_structured_premise(answer: str, contract: dict) -> bool:
     return True
 
 
+def _strip_sequential_list_markers(text: str) -> str:
+    """Remove sequential 1-based list markers (e.g. '1) ... 2) ...' or '1. ... 2. ...') while keeping real numeric claims."""
+    if not text:
+        return text
+    pattern = re.compile(r"(?:(?<=^)|(?<=[\s:;,(\n]))(\d{1,2})\s*[.)](?=\s+\S)")
+    matches = list(pattern.finditer(text))
+    if len(matches) < 2:
+        return text
+
+    # Identify maximal runs starting at 1 and incrementing by 1
+    to_strip: list[tuple[int, int]] = []
+    i = 0
+    while i < len(matches):
+        if int(matches[i].group(1)) == 1:
+            run = [matches[i]]
+            expected = 2
+            j = i + 1
+            while j < len(matches) and int(matches[j].group(1)) == expected:
+                run.append(matches[j])
+                expected += 1
+                j += 1
+            if len(run) >= 2:
+                for m in run:
+                    to_strip.append((m.start(1), m.end()))
+                i = j
+                continue
+        i += 1
+
+    if not to_strip:
+        return text
+    out_parts: list[str] = []
+    last = 0
+    for s, e in to_strip:
+        out_parts.append(text[last:s])
+        out_parts.append(" ")
+        last = e
+    out_parts.append(text[last:])
+    return "".join(out_parts)
+
+
 def extract_numbers_normalized(text: str) -> set[str]:
     """Extracts normalized numbers (including percentages, floats, ints, removing commas) from text."""
     if not text:
@@ -1722,6 +1762,51 @@ def detect_contradiction_against_evidence(
         if context:
             ctx_negated = _is_entity_negated_in_text(cand, context)
             if not ctx_negated and ans_negated:
+                # Allow premise-correction answers that affirm a year in one field (e.g. title)
+                # while denying it for another event/date in favor of a different year present in context.
+                if re.fullmatch(r"(?:19|20)\d{2}", cand):
+                    ans_clauses = _split_into_contradiction_clauses(answer)
+                    has_unnegated_cand = any(
+                        re.search(rf"\b{re.escape(cand)}\b", cl) and not _is_target_negated_in_clause(cand, cl)
+                        for cl in ans_clauses
+                    )
+                    other_ctx_years = {y for y in re.findall(r"\b(?:19|20)\d{2}\b", context) if y != cand}
+                    _yr_stop = {"that", "this", "with", "from", "year", "date", "bill", "title", "must", "have", "been", "were", "short"}
+                    _key_generic = {"date", "year", "time", "bill", "short", "the", "for", "and", "of"}
+                    _prose_competing = {"deadline", "amendment", "amendments", "debate", "passed", "assent", "repeal", "effective"}
+                    ctx_fields = [seg.strip().lower() for seg in re.split(r"[|\n]+|(?<=\S)\.\s+", context) if seg.strip()]
+                    affirms_bound_other_year = False
+                    if has_unnegated_cand and other_ctx_years:
+                        for oy in other_ctx_years:
+                            for cl in ans_clauses:
+                                if re.search(rf"\b{re.escape(oy)}\b", cl) and not _is_target_negated_in_clause(oy, cl):
+                                    cl_stems = {
+                                        w[:6] for w in re.findall(r"[a-z]{4,}", cl.lower())
+                                        if w not in _yr_stop
+                                    }
+                                    cl_words = set(re.findall(r"[a-z]{4,}", cl.lower()))
+                                    for cf in ctx_fields:
+                                        if not re.search(rf"\b{re.escape(oy)}\b", cf) or re.search(rf"\b{re.escape(cand)}\b", cf):
+                                            continue
+                                        if ":" in cf:
+                                            cf_key = cf.split(":", 1)[0]
+                                            key_stems = {
+                                                w[:6] for w in re.findall(r"[a-z]{3,}", cf_key)
+                                                if w not in _key_generic
+                                            }
+                                            if key_stems and key_stems <= cl_stems:
+                                                affirms_bound_other_year = True
+                                                break
+                                        else:
+                                            cf_words = set(re.findall(r"[a-z]{4,}", cf))
+                                            has_competing = bool((cf_words & _prose_competing) - cl_words)
+                                            if not has_competing and (not cl_stems or any(st in cf for st in cl_stems)):
+                                                affirms_bound_other_year = True
+                                                break
+                            if affirms_bound_other_year:
+                                break
+                    if has_unnegated_cand and affirms_bound_other_year:
+                        continue
                 return f"claim_contradicts_evidence: answer negates evidence-affirmed entity '{cand}'"
             if ctx_negated and not ans_negated:
                 ans_tokens = _tokenize(answer)
@@ -2037,7 +2122,7 @@ def evaluate_grounded_answer(
     context_dates, masked_context = _extract_dates_and_mask_text(joined_context)
 
     # Verify numeric claims against context snippets or legitimate derived calculation targets
-    ans_nums = extract_numbers_normalized(masked_answer)
+    ans_nums = extract_numbers_normalized(_strip_sequential_list_markers(masked_answer))
     context_nums = extract_numbers_normalized(masked_context)
     contract_targets = set()
     raw_operands = contract.get("operands", []) if contract and contract_type == "numeric" else []

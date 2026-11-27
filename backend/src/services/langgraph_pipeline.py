@@ -1752,8 +1752,20 @@ def run_llm(state: PipelineState):
     if ans is None or (isinstance(ans, str) and not ans.strip()):
         ans = "NOT_FOUND"
     usage = response.get("usage", {"input_tokens": 0, "output_tokens": 0})
+    stop_reason = usage.get("stop_reason") if isinstance(usage, dict) else None
+    out_tokens = int(usage.get("output_tokens", 0) or 0) if isinstance(usage, dict) else 0
 
     cands = dict(state.get("retrieval_candidates", {}))
+    cands["llm_stop_reason"] = stop_reason
+    cands["llm_output_tokens"] = out_tokens
+    if stop_reason in ("max_tokens", "length"):
+        logger.warning(
+            "run_llm.truncated_response stop_reason=%s output_tokens=%d (refusing incomplete output)",
+            stop_reason,
+            out_tokens,
+        )
+        ans = "NOT_FOUND"
+        cands["delivery_rejection_reason"] = f"truncated_stop_reason:{stop_reason}"
     compressed_ids = set(cands.get("compressed_context", []))
     if not compressed_ids and compressed:
         compressed_ids = {str(c.id) for c in top_chunks if f"[{c.id}]" in compressed}
@@ -1801,195 +1813,275 @@ def run_llm(state: PipelineState):
     has_sheet_inventory = any(getattr(c, "element_type", "") == "sheet_inventory" for c in top_chunks)
     subgoal_specs_llm = state.get("subgoal_specs") or []
     snapshot_sources_llm = state.get("snapshot_sources") or {}
+    def _run_verified_claim_fallback(ans_val: Any) -> tuple[Any, list[Any]]:
+        if is_financial or has_sheet_inventory:
+            return ans_val, []
+        ans_for_verify = json.dumps(ans_val) if isinstance(ans_val, (dict, list)) else str(ans_val)
+        ans_for_verify = re.sub(r"\[[^\]]+\]", " ", ans_for_verify).strip()
+        retained_pool_fb = [c for c in top_chunks if str(c.id) in compressed_ids]
+        doc_nums_by_id: dict[str, set[str]] = {}
+        for rc in retained_pool_fb:
+            did = str(getattr(rc, "document_id", "") or "")
+            doc_nums_by_id.setdefault(did, set()).update(extract_numbers_normalized(getattr(rc, "text", "") or ""))
+        from services.retrieval.deterministic_executor import verify_two_operand_comparison
+        _fb_cmp_ok, _, _fb_cmp_derived = verify_two_operand_comparison(
+            state.get("query", ""),
+            subgoal_specs_llm,
+            retained_pool_fb,
+            ans_for_verify,
+        )
+        sentences = [
+            seg.strip()
+            for seg in re.split(r"(?<=[.!?])\s+|\n+", ans_for_verify)
+            if seg.strip()
+        ] or [ans_for_verify]
+        _stop = {
+            "that", "this", "with", "from", "have", "been", "were", "only",
+            "about", "does", "mean", "there", "their", "which", "when", "what",
+            "where", "while", "into", "over", "under", "between", "because",
+            "information", "context", "provided", "indicates", "data", "absence",
+            "necessarily", "specific", "meanwhile",
+        }
+        claims: list[tuple[str, str | None]] = []
+        prev_regime: str | None = None
+        for sent in sentences:
+            s_lower = sent.lower()
+            has_inf = bool(re.search(r"\binference\b", s_lower))
+            has_trn = bool(re.search(r"\b(?:training|pretraining)\b", s_lower))
+            if has_inf and not has_trn:
+                sent_regime: str | None = "inference"
+            elif has_trn and not has_inf:
+                sent_regime = "training"
+            elif re.match(r"^(?:this|it|these|such)\b", s_lower):
+                sent_regime = prev_regime
+            else:
+                sent_regime = None
+            prev_regime = sent_regime
+
+            parts = [
+                p.strip()
+                for p in re.split(
+                    r";\s+|,\s+(?:and|while|whereas|but)\s+|\s+(?:and|while|whereas)\s+",
+                    sent,
+                )
+                if p.strip()
+            ]
+            if len(parts) > 1 and all(
+                len({w for w in re.findall(r"[a-z0-9]{4,}", p.lower()) if w not in _stop}) >= 2
+                or bool(extract_numbers_normalized(p))
+                for p in parts
+            ):
+                for p in parts:
+                    claims.append((p, sent_regime))
+            else:
+                claims.append((sent, sent_regime))
+
+        selected_by_id: dict[str, Any] = {}
+        all_claims_supported = bool(retained_pool_fb)
+        for claim, claim_regime in claims:
+            claim_nums = extract_numbers_normalized(claim)
+            claim_terms = {
+                w for w in re.findall(r"[a-z0-9]{4,}", claim.lower())
+                if w not in _stop
+            }
+            best_chunk = None
+            best_key = (0, 0.0, 0.0)
+            for cand in retained_pool_fb:
+                cand_text = getattr(cand, "text", "") or ""
+                cand_nums = extract_numbers_normalized(cand_text)
+                if claim_nums and not (claim_nums <= cand_nums):
+                    from services.evaluation.benchmark_scorer import _verify_cited_derived_calculations
+                    same_doc_years = {
+                        n for n in doc_nums_by_id.get(str(getattr(cand, "document_id", "") or ""), set())
+                        if len(n) == 4 and n.isdigit() and 1900 <= int(n) <= 2099
+                    }
+                    derived_claim = _verify_cited_derived_calculations(
+                        answer=claim,
+                        ans_nums=claim_nums,
+                        context_nums=cand_nums,
+                        joined_context=cand_text,
+                    ) | _derived_ratio_numbers(cand_nums) | (_fb_cmp_derived if _fb_cmp_ok else set()) | same_doc_years
+                    if not ((claim_nums - derived_claim) <= cand_nums):
+                        continue
+                if detect_contradiction_against_evidence(answer=claim, context=cand_text):
+                    continue
+                c_lower = cand_text.lower()
+                claim_lower = claim.lower()
+                if not re.search(r"\b(?:not|never|no)\b", claim_lower) and any(
+                    re.search(rf"\b{m.group(1)}\s+{re.escape(m.group(2))}\b", claim_lower)
+                    for m in re.finditer(r"\b(is|are|was|were)\s+not\s+([a-z]{3,})\b", c_lower)
+                ):
+                    continue
+                q_bind = bind_financial_query(state.get("query", ""))
+                fin_claims = extract_financial_claims(claim)
+                table_cells = (
+                    parse_financial_table_cells(cand_text)
+                    if fin_claims and getattr(cand, "element_type", "") != "TableRow"
+                    else []
+                )
+                if fin_claims and table_cells:
+                    derived_tbl = _derived_ratio_numbers(cand_nums)
+                    all_cells_ok = all(
+                        (str(fc.get("value") or "").rstrip("0").rstrip(".") in derived_tbl)
+                        or any(
+                            cell_matches_financial_claim(
+                                cell,
+                                fc,
+                                target_metric=(q_bind.metric if q_bind and q_bind.is_active else None) or fc.get("metric"),
+                                target_entity=(q_bind.entity if q_bind and q_bind.is_active else None) or fc.get("entity"),
+                                required_duration=fc.get("duration_norm") or (q_bind.duration_norm if q_bind and q_bind.is_active else None),
+                                required_date=fc.get("date_parsed") or (q_bind.date_parsed if q_bind and q_bind.is_active else None),
+                                chunk_context=cand_text,
+                            )
+                            for cell in table_cells
+                        )
+                        for fc in fin_claims
+                    )
+                    if not all_cells_ok:
+                        continue
+                cand_lines = [ln.strip() for ln in cand_text.splitlines() if ln.strip()]
+                support_text = cand_text
+                if (
+                    len(cand_lines) >= 2
+                    and len(cand_lines[0]) <= 120
+                    and not cand_lines[0].endswith((".", "!", "?"))
+                ):
+                    support_text = "\n".join(cand_lines[1:])
+                support_lower = support_text.lower()
+                if claim_regime in ("inference", "training") and claim_terms:
+                    ev_sents = [
+                        es.strip().lower()
+                        for es in re.split(r"(?<=[.!?])\s+|\n+", support_text)
+                        if es.strip()
+                    ]
+                    sent_scores = [
+                        (sum(1 for t in claim_terms if re.search(rf"\b{re.escape(t)}\b", es)), es)
+                        for es in ev_sents
+                    ]
+                    max_sent_hits = max((sc for sc, _ in sent_scores), default=0)
+                    top_sents = [es for sc, es in sent_scores if sc == max_sent_hits and sc > 0]
+                    if top_sents:
+                        req_pat = (
+                            r"\binference\b"
+                            if claim_regime == "inference"
+                            else r"\b(?:training|pretraining)\b"
+                        )
+                        opp_pat = (
+                            r"\b(?:training|pretraining)\b"
+                            if claim_regime == "inference"
+                            else r"\binference\b"
+                        )
+                        if all(
+                            re.search(opp_pat, es) and not re.search(req_pat, es)
+                            for es in top_sents
+                        ):
+                            continue
+                claim_faith = compute_faithfulness(claim, support_text) or 0.0
+                content_hits = sum(1 for t in claim_terms if t in support_lower)
+                stem_hits = sum(1 for t in claim_terms if len(t) >= 5 and t[:5] in support_lower)
+                whole_faith = compute_faithfulness(ans_for_verify, support_text) or 0.0
+                multi_non_num_ok = (
+                    not claim_nums
+                    and len(claims) > 1
+                    and (content_hits >= 1 or stem_hits >= 1)
+                )
+                if ((claim_faith >= 0.25 or content_hits >= 2) and (content_hits >= 1 or claim_nums)) or multi_non_num_ok:
+                    cand_key = (content_hits if (claim_faith >= 0.25 or content_hits >= 2) else 0, whole_faith, claim_faith)
+                    if cand_key > best_key:
+                        best_key = cand_key
+                        best_chunk = cand
+            if best_chunk is None:
+                if (
+                    not claim_nums
+                    and len(claims) > 1
+                    and re.match(r"^(?:no|yes)\b", claim.lower())
+                    and len(claim_terms) <= 2
+                ):
+                    continue
+                all_claims_supported = False
+                break
+            selected_by_id[str(best_chunk.id)] = best_chunk
+        if all_claims_supported and selected_by_id:
+            query_text = state.get("query", "") or ""
+            query_entities = {
+                w.lower()
+                for w in re.findall(r"\b[A-Z][A-Za-z0-9-]{3,}\b", query_text)
+                if w.lower() not in _stop and w.lower() not in {"does", "what", "when", "where", "which", "explain", "using", "both", "papers"}
+            }
+            answered_entities = {
+                w.lower()
+                for w in re.findall(r"\b[A-Z][A-Za-z0-9-]{3,}\b", ans_for_verify)
+                if w.lower() in query_entities
+            }
+            selected_corpus = "\n".join(
+                (getattr(c, "text", "") or "").lower()
+                for c in selected_by_id.values()
+            )
+            if answered_entities and not all(ent in selected_corpus for ent in answered_entities):
+                all_claims_supported = False
+        if all_claims_supported and selected_by_id:
+            return ans_val, [c for c in retained_pool_fb if str(c.id) in selected_by_id]
+        return "NOT_FOUND", []
+
     if not final_cited_chunks and ans != "NOT_FOUND":
         if not is_financial and not has_sheet_inventory:
-            ans_for_verify = json.dumps(ans) if isinstance(ans, (dict, list)) else str(ans)
-            retained_pool = [c for c in top_chunks if str(c.id) in compressed_ids]
-            from services.retrieval.deterministic_executor import verify_two_operand_comparison
-            _fb_cmp_ok, _, _fb_cmp_derived = verify_two_operand_comparison(
-                state.get("query", ""),
-                subgoal_specs_llm,
-                retained_pool,
-                ans_for_verify,
+            ans, final_cited_chunks = _run_verified_claim_fallback(ans)
+    elif final_cited_chunks and ans != "NOT_FOUND" and not is_financial and not has_sheet_inventory:
+        # Recover missing supporting chunks from retained_pool when model citations omit a claim's evidence
+        ans_check_str = json.dumps(ans) if isinstance(ans, (dict, list)) else str(ans)
+        retained_pool_aug = [c for c in top_chunks if str(c.id) in compressed_ids]
+        cited_ids_set = {str(c.id) for c in final_cited_chunks}
+        _aug_stop = {
+            "that", "this", "with", "from", "have", "been", "were", "only",
+            "about", "does", "mean", "there", "their", "which", "when", "what",
+            "where", "while", "into", "over", "under", "between", "because",
+            "however", "specifically", "during", "using", "results", "cannot",
+        }
+        aug_sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+|;\s+|,\s+(?:and|while|whereas|but)\s+", ans_check_str) if s.strip()]
+        for aug_s in aug_sents:
+            aug_s_clean = re.sub(r"\[[^\]]+\]", " ", aug_s).strip()
+            s_terms = {w for w in re.findall(r"[a-z0-9]{4,}", aug_s_clean.lower()) if w not in _aug_stop}
+            if len(s_terms) < 2:
+                continue
+            max_cited_hits = max(
+                (sum(1 for t in s_terms if t in (getattr(cc, "text", "") or "").lower()) for cc in final_cited_chunks),
+                default=0,
             )
-            sentences = [
-                seg.strip()
-                for seg in re.split(r"(?<=[.!?])\s+|\n+", ans_for_verify)
-                if seg.strip()
-            ] or [ans_for_verify]
-            _stop = {
-                "that", "this", "with", "from", "have", "been", "were", "only",
-                "about", "does", "mean", "there", "their", "which", "when", "what",
-                "where", "while", "into", "over", "under", "between", "because",
-                "information", "context", "provided", "indicates", "data", "absence",
-                "necessarily", "specific", "meanwhile",
-            }
-            claims: list[tuple[str, str | None]] = []
-            prev_regime: str | None = None
-            for sent in sentences:
-                s_lower = sent.lower()
-                has_inf = bool(re.search(r"\binference\b", s_lower))
-                has_trn = bool(re.search(r"\b(?:training|pretraining)\b", s_lower))
-                if has_inf and not has_trn:
-                    sent_regime: str | None = "inference"
-                elif has_trn and not has_inf:
-                    sent_regime = "training"
-                elif re.match(r"^(?:this|it|these|such)\b", s_lower):
-                    sent_regime = prev_regime
-                else:
-                    sent_regime = None
-                prev_regime = sent_regime
-
-                parts = [
-                    p.strip()
-                    for p in re.split(
-                        r";\s+|,\s+(?:and|while|whereas|but)\s+|\s+(?:and|while|whereas)\s+",
-                        sent,
-                    )
-                    if p.strip()
-                ]
-                if len(parts) > 1 and all(
-                    len({w for w in re.findall(r"[a-z0-9]{4,}", p.lower()) if w not in _stop}) >= 2
-                    or bool(extract_numbers_normalized(p))
-                    for p in parts
+            if max_cited_hits >= len(s_terms):
+                continue
+            s_nums = extract_numbers_normalized(aug_s_clean)
+            s_entities = {w.lower() for w in re.findall(r"\b[A-Za-z0-9]+-[A-Za-z0-9]+\b", aug_s_clean)}
+            s_low = aug_s_clean.lower()
+            best_extra = None
+            best_extra_hits = max_cited_hits
+            for cand in retained_pool_aug:
+                if str(cand.id) in cited_ids_set:
+                    continue
+                c_txt = getattr(cand, "text", "") or ""
+                c_low = c_txt.lower()
+                if s_entities and not all(ent in c_low for ent in s_entities):
+                    continue
+                c_nums = extract_numbers_normalized(c_txt)
+                if s_nums and not (s_nums <= c_nums):
+                    continue
+                if detect_contradiction_against_evidence(answer=aug_s_clean, context=c_txt):
+                    continue
+                if any(
+                    re.search(rf"\b{m.group(1)}\s+{re.escape(m.group(2))}\b", s_low)
+                    for m in re.finditer(r"\b(is|are|was|were)\s+not\s+([a-z]{3,})\b", c_low)
                 ):
-                    for p in parts:
-                        claims.append((p, sent_regime))
-                else:
-                    claims.append((sent, sent_regime))
-
-            selected_by_id: dict[str, Any] = {}
-            all_claims_supported = bool(retained_pool)
-            for claim, claim_regime in claims:
-                claim_nums = extract_numbers_normalized(claim)
-                claim_terms = {
-                    w for w in re.findall(r"[a-z0-9]{4,}", claim.lower())
-                    if w not in _stop
-                }
-                best_chunk = None
-                best_key = (0, 0.0, 0.0)
-                for cand in retained_pool:
-                    cand_text = getattr(cand, "text", "") or ""
-                    cand_nums = extract_numbers_normalized(cand_text)
-                    if claim_nums and not (claim_nums <= cand_nums):
-                        from services.evaluation.benchmark_scorer import _verify_cited_derived_calculations
-                        derived_claim = _verify_cited_derived_calculations(
-                            answer=claim,
-                            ans_nums=claim_nums,
-                            context_nums=cand_nums,
-                            joined_context=cand_text,
-                        ) | _derived_ratio_numbers(cand_nums) | (_fb_cmp_derived if _fb_cmp_ok else set())
-                        if not ((claim_nums - derived_claim) <= cand_nums):
-                            continue
-                    if detect_contradiction_against_evidence(answer=claim, context=cand_text):
+                    continue
+                if re.search(r"\b(?:is|are|was|were)\s+not\s+([a-z]{3,})\b", s_low):
+                    neg_words = [m.group(1) for m in re.finditer(r"\b(?:is|are|was|were)\s+not\s+([a-z]{3,})\b", s_low)]
+                    if any(re.search(rf"\b(?:is|are|was|were)\s+{re.escape(nw)}\b", c_low) for nw in neg_words):
                         continue
-                    c_lower = cand_text.lower()
-                    claim_lower = claim.lower()
-                    if not re.search(r"\b(?:not|never|no)\b", claim_lower) and any(
-                        re.search(rf"\b{m.group(1)}\s+{re.escape(m.group(2))}\b", claim_lower)
-                        for m in re.finditer(r"\b(is|are|was|were)\s+not\s+([a-z]{3,})\b", c_lower)
-                    ):
-                        continue
-                    q_bind = bind_financial_query(state.get("query", ""))
-                    fin_claims = extract_financial_claims(claim)
-                    table_cells = (
-                        parse_financial_table_cells(cand_text)
-                        if fin_claims and getattr(cand, "element_type", "") != "TableRow"
-                        else []
-                    )
-                    if fin_claims and table_cells:
-                        derived_tbl = _derived_ratio_numbers(cand_nums)
-                        all_cells_ok = all(
-                            (str(fc.get("value") or "").rstrip("0").rstrip(".") in derived_tbl)
-                            or any(
-                                cell_matches_financial_claim(
-                                    cell,
-                                    fc,
-                                    target_metric=(q_bind.metric if q_bind and q_bind.is_active else None) or fc.get("metric"),
-                                    target_entity=(q_bind.entity if q_bind and q_bind.is_active else None) or fc.get("entity"),
-                                    required_duration=fc.get("duration_norm") or (q_bind.duration_norm if q_bind and q_bind.is_active else None),
-                                    required_date=fc.get("date_parsed") or (q_bind.date_parsed if q_bind and q_bind.is_active else None),
-                                    chunk_context=cand_text,
-                                )
-                                for cell in table_cells
-                            )
-                            for fc in fin_claims
-                        )
-                        if not all_cells_ok:
-                            continue
-                    cand_lines = [ln.strip() for ln in cand_text.splitlines() if ln.strip()]
-                    support_text = cand_text
-                    if (
-                        len(cand_lines) >= 2
-                        and len(cand_lines[0]) <= 120
-                        and not cand_lines[0].endswith((".", "!", "?"))
-                    ):
-                        # Exclude bare running headers/titles over unrelated body text
-                        support_text = "\n".join(cand_lines[1:])
-                    support_lower = support_text.lower()
-                    if claim_regime in ("inference", "training") and claim_terms:
-                        ev_sents = [
-                            es.strip().lower()
-                            for es in re.split(r"(?<=[.!?])\s+|\n+", support_text)
-                            if es.strip()
-                        ]
-                        sent_scores = [
-                            (sum(1 for t in claim_terms if re.search(rf"\b{re.escape(t)}\b", es)), es)
-                            for es in ev_sents
-                        ]
-                        max_sent_hits = max((sc for sc, _ in sent_scores), default=0)
-                        top_sents = [es for sc, es in sent_scores if sc == max_sent_hits and sc > 0]
-                        if top_sents:
-                            req_pat = (
-                                r"\binference\b"
-                                if claim_regime == "inference"
-                                else r"\b(?:training|pretraining)\b"
-                            )
-                            opp_pat = (
-                                r"\b(?:training|pretraining)\b"
-                                if claim_regime == "inference"
-                                else r"\binference\b"
-                            )
-                            if all(
-                                re.search(opp_pat, es) and not re.search(req_pat, es)
-                                for es in top_sents
-                            ):
-                                continue
-                    claim_faith = compute_faithfulness(claim, support_text) or 0.0
-                    content_hits = sum(1 for t in claim_terms if t in support_lower)
-                    whole_faith = compute_faithfulness(ans_for_verify, support_text) or 0.0
-                    if (claim_faith >= 0.25 or content_hits >= 2) and (content_hits >= 1 or claim_nums):
-                        cand_key = (content_hits, whole_faith, claim_faith)
-                        if cand_key > best_key:
-                            best_key = cand_key
-                            best_chunk = cand
-                if best_chunk is None:
-                    all_claims_supported = False
-                    break
-                selected_by_id[str(best_chunk.id)] = best_chunk
-            if all_claims_supported and selected_by_id:
-                query_text = state.get("query", "") or ""
-                query_entities = {
-                    w.lower()
-                    for w in re.findall(r"\b[A-Z][A-Za-z0-9-]{3,}\b", query_text)
-                    if w.lower() not in _stop and w.lower() not in {"does", "what", "when", "where", "which", "explain", "using", "both", "papers"}
-                }
-                answered_entities = {
-                    w.lower()
-                    for w in re.findall(r"\b[A-Z][A-Za-z0-9-]{3,}\b", ans_for_verify)
-                    if w.lower() in query_entities
-                }
-                selected_corpus = "\n".join(
-                    (getattr(c, "text", "") or "").lower()
-                    for c in selected_by_id.values()
-                )
-                if answered_entities and not all(ent in selected_corpus for ent in answered_entities):
-                    all_claims_supported = False
-            if all_claims_supported and selected_by_id:
-                final_cited_chunks = [c for c in retained_pool if str(c.id) in selected_by_id]
-            else:
-                ans = "NOT_FOUND"
-                final_cited_chunks = []
+                hits = sum(1 for t in s_terms if t in c_low)
+                if hits > best_extra_hits and hits >= min(3, len(s_terms)):
+                    best_extra_hits = hits
+                    best_extra = cand
+            if best_extra is not None:
+                final_cited_chunks.append(best_extra)
+                cited_ids_set.add(str(best_extra.id))
 
     if ans != "NOT_FOUND" and final_cited_chunks and len(subgoal_specs_llm) > 1:
         from services.evaluation.benchmark_scorer import _verify_cited_derived_calculations
@@ -2036,9 +2128,17 @@ def run_llm(state: PipelineState):
                     if "current ratio" in q_low and re.search(r"\bnot\s+current\s+ratio\b", c_low):
                         continue
                     if not (req_years or req_codes):
-                        # Require at least some content overlap when no year/code filter exists
-                        sg_toks = {t for t in re.findall(r"[a-z0-9]{4,}", q_low)}
-                        if sg_toks and not any(t in c_low for t in sg_toks):
+                        if re.match(
+                            r"^(?:is\s+(?:that|this)\s+(?:correct|true|accurate|right|valid)|confirm\b|verify\b|explain\s+(?:whether|why|using)\b)",
+                            q_low,
+                        ):
+                            matched_sg = True
+                            break
+                        # Require >=2 non-generic tokens from subgoal when >=2 exist
+                        _sg_gen = {"that", "this", "with", "from", "what", "when", "where", "which", "while", "models", "model", "paper", "papers", "shows", "wants", "using", "both", "explain"}
+                        sg_toks = {t for t in re.findall(r"[a-z0-9]{4,}", q_low) if t not in _sg_gen}
+                        need_hits = min(2, len(sg_toks))
+                        if sg_toks and sum(1 for t in sg_toks if t in c_low) < need_hits:
                             continue
                     matched_sg = True
                     break
@@ -2062,8 +2162,45 @@ def run_llm(state: PipelineState):
                     reqs_ok = False
 
         if not reqs_ok:
-            ans = "NOT_FOUND"
-            final_cited_chunks = []
+            if cmp_ok and not is_financial and not has_sheet_inventory:
+                fb_ans, fb_chunks = _run_verified_claim_fallback(ans)
+                if fb_ans != "NOT_FOUND" and fb_chunks:
+                    # Merge verified claim citations with valid model citations and re-check subgoal coverage
+                    merged_by_id = {str(c.id): c for c in final_cited_chunks}
+                    for fc in fb_chunks:
+                        merged_by_id[str(fc.id)] = fc
+                    final_cited_chunks = list(merged_by_id.values())
+                    recheck_ok = True
+                    for sg in subgoal_specs_llm:
+                        q_low = str(sg.get("query_text") or "").lower()
+                        if re.match(r"^(?:is\s+(?:that|this)\s+(?:correct|true|accurate|right|valid)|confirm\b|verify\b|explain\s+(?:whether|why|using)\b)", q_low):
+                            continue
+                        _sg_gen = {"that", "this", "with", "from", "what", "when", "where", "which", "while", "models", "model", "paper", "papers", "shows", "wants", "using", "both", "explain"}
+                        sg_toks = {t for t in re.findall(r"[a-z0-9]{4,}", q_low) if t not in _sg_gen}
+                        need_hits = min(2, len(sg_toks))
+                        if sg_toks and not any(
+                            sum(1 for t in sg_toks if t in (getattr(c, "text", "") or "").lower()) >= need_hits
+                            for c in final_cited_chunks
+                        ):
+                            recheck_ok = False
+                            break
+                    reqs_ok = recheck_ok
+            if not reqs_ok:
+                ans = "NOT_FOUND"
+                final_cited_chunks = []
+
+    if ans != "NOT_FOUND" and final_cited_chunks:
+        q_str = state.get("query", "") or ""
+        ans_clean = re.sub(r"\[[^\]]+\]", " ", str(ans)).strip()
+        if (
+            re.search(r"\b(?:is\s+(?:it|that|this)\s+(?:correct|true|accurate)|correct\s*\?)", q_str, re.IGNORECASE)
+            and re.search(r"\b\d+(?:\.\d+)?\b", q_str)
+            and len(ans_clean.split()) <= 8
+            and not extract_numbers_normalized(ans_clean)
+        ):
+            src_txt = (getattr(final_cited_chunks[0], "text", "") or "").strip()
+            if src_txt:
+                ans = f"{ans_clean.rstrip('.')}. {src_txt}"
 
     if ans == "NOT_FOUND" or not top_chunks:
         citation_utilization_rate = None

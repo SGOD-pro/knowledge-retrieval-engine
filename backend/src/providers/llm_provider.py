@@ -121,7 +121,7 @@ def generate_completion(
             "answer": factual_answer,
             "citations": cited if factual_answer != "NOT_FOUND" else [],
         }
-        return json.dumps(ans), {"input_tokens": 10, "output_tokens": 10}
+        return json.dumps(ans), {"input_tokens": 10, "output_tokens": 10, "stop_reason": "end_turn"}
 
     import time
     max_attempts = 5
@@ -145,17 +145,20 @@ def generate_completion(
 
             text = response["output"]["message"]["content"][0]["text"]
 
-            # Extract real token counts from Bedrock Converse response
+            # Extract real token counts and stop reason from Bedrock Converse response
             raw_usage = response.get("usage", {})
+            stop_reason = response.get("stopReason")
             usage = {
                 "input_tokens": raw_usage.get("inputTokens", 0),
                 "output_tokens": raw_usage.get("outputTokens", 0),
+                "stop_reason": stop_reason,
             }
 
             logger.info(
-                "llm_provider.tokens input=%d output=%d model=%s",
+                "llm_provider.tokens input=%d output=%d stop_reason=%s model=%s",
                 usage["input_tokens"],
                 usage["output_tokens"],
+                stop_reason,
                 get_llm_model(),
             )
 
@@ -185,6 +188,6 @@ def generate_completion(
                     "citations": chunk_ids[:1],
                 }
                 import json
-                return json.dumps(ans), {"input_tokens": 10, "output_tokens": 10}
+                return json.dumps(ans), {"input_tokens": 10, "output_tokens": 10, "stop_reason": "end_turn"}
             raise e
 
