@@ -64,6 +64,73 @@ def check_fidelity(
         logger.info("fidelity_check.tabular_bypass — skipping embedding gate")
         return 1.0
 
+    # --- Requirement check for active financial bindings (Diagram 07/08) ---
+    joined_ctx = "\n".join(context_chunks)
+    if "|" not in joined_ctx:
+        from services.retrieval.table_metric_binding import (
+            bind_financial_query,
+            classify_metric,
+            extract_financial_claims,
+            parse_financial_table_cells,
+        )
+
+        is_table_ctx = any(
+            c.get("date_parsed") is not None and c.get("duration_norm") is not None
+            for c in parse_financial_table_cells(joined_ctx)
+        )
+        fin_binding = bind_financial_query(query)
+        if fin_binding.is_active and not is_table_ctx:
+            joined_low = joined_ctx.lower()
+            if fin_binding.date_parsed and fin_binding.date_parsed[0] is not None:
+                req_year = str(fin_binding.date_parsed[0])
+                if req_year not in joined_low:
+                    raise CoverageError(f"Missing required period {req_year} in retained context.")
+
+            _non_entity = {
+                "what", "which", "when", "where", "how", "does", "did", "was", "were",
+                "the", "for", "and", "from", "with", "fiscal", "year", "annual", "total",
+                "quarter", "quarterly", "three", "six", "nine", "twelve", "months", "ended",
+                "january", "february", "march", "april", "may", "june", "july", "august",
+                "september", "october", "november", "december", "revenue", "sales",
+                "income", "profit", "margin", "turnover", "expenses", "operating", "net",
+                "consolidated", "financial", "statement", "filing", "report",
+            }
+            q_entities = {
+                w.lower()
+                for w in re.findall(r"\b([A-Z][A-Za-z0-9&-]{2,})\b", query)
+                if w.lower() not in _non_entity and not re.fullmatch(r"q[1-4]", w.lower())
+            }
+            for ent in q_entities:
+                if not re.search(rf"\b{re.escape(ent)}\b", joined_low):
+                    raise CoverageError(f"Missing required entity {ent} in retained context.")
+
+            expected_metrics = set(fin_binding.metrics) if getattr(fin_binding, "metrics", None) else set()
+            if fin_binding.metric:
+                expected_metrics.add(fin_binding.metric)
+            if expected_metrics:
+                metric_matched = False
+                for cl in extract_financial_claims(joined_ctx):
+                    clause_low = (cl.get("clause") or "").lower()
+                    cl_metric = cl.get("metric") or classify_metric(clause_low)
+                    if (
+                        cl_metric is None
+                        and (expected_metrics & {"net_sales", "revenue"})
+                        and re.search(r"\bturnover\b", clause_low)
+                        and not re.search(r"\b(?:employee|staff|workforce|inventory|asset|portfolio|labou?r)\s+turnover\b", clause_low)
+                        and not cl.get("is_percentage")
+                        and "%" not in str(cl.get("raw") or "")
+                    ):
+                        cl_metric = "net_sales" if "net_sales" in expected_metrics else "revenue"
+                    if cl_metric in expected_metrics:
+                        metric_matched = True
+                        break
+                if not metric_matched:
+                    ctx_metric = classify_metric(joined_ctx)
+                    if ctx_metric in expected_metrics:
+                        metric_matched = True
+                if not metric_matched:
+                    raise CoverageError("Missing required financial metric in retained context.")
+
     try:
         import numpy as np
 

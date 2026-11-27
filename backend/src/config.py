@@ -122,6 +122,7 @@ class Settings(BaseSettings):
 
     # LAYA Bounded Escalation Settings (Slice 5.1)
     LAYA_ENABLED: bool = False
+    DETERMINISTIC_LEXICAL_EXPANSION_ENABLED: bool = False
     LAYA_TIMEOUT_MS: int = 2500
     LAYA_MIN_DEADLINE_MS: int = 500
     LAYA_MAX_INPUT_TOKENS: int = 1000
