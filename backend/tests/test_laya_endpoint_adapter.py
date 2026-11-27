@@ -1222,7 +1222,7 @@ class TestCompiledPipelineEndpointRegressions(unittest.TestCase):
         self.assertTrue(tokens_compiled["within_estimated_limit"])
 
         # Negative Control: Oversized mandatory requirement fails closed before dispatch
-        huge_query = "Excessive query text " * 20
+        huge_query = "Excessive query text " * 40
         req_oversized = LayaEscalationRequest(
             query_id="q_probe_oversized",
             workspace_id="ws_latency_probe",
@@ -1276,3 +1276,14 @@ class TestLayaLiveEndpointSmoke(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_format_payload_filters_to_available_routes_and_clarifies_none() -> None:
+    """Adapter must advertise only req.available_routes and clarify 'none' during escalation."""
+    svc = LayaDecisionService(endpoint_url="https://example.com/v1/systemone", api_key="test-key")
+    req = _build_test_request("What was OrionBio's revenue for fiscal year 2028?")
+    payload = svc._format_endpoint_payload(req)
+    criteria = payload["questions"]["route"]["criteria"]
+    assert list(criteria.keys()) == ["lexical_expansion", "none"]
+    assert "absent" in criteria["none"].lower() or "do not expand" in criteria["none"].lower()
+    assert "No expansion needed" not in criteria["none"]

@@ -310,3 +310,84 @@ def test_run_benchmark_resolves_workspace_scoped_documents_offline(tmp_path: Pat
     assert manifest["total_questions"] == 1
     assert manifest["denominators"]["answerable_retrieval_questions"] == 1
 
+
+def test_run_benchmark_shuffle_seed_and_candidate_telemetry(tmp_path: Path):
+    """Verify shuffle_seed shuffles execution in memory while preserving suite hash and recording per-stage telemetry."""
+    ws = "ws_shuffle_test"
+    filename = "doc1.pdf"
+    scoped_did = generate_deterministic_doc_id(filename, ws)
+    dummy_suite = {
+        "test_suite_name": "shuffle_test",
+        "documents": [{"doc_id": scoped_did, "filename": filename}],
+        "questions": [
+            {"id": f"Q{i}", "category": "FACTUAL", "question": f"Question {i}?", "expected_answer": "42"}
+            for i in range(1, 7)
+        ],
+    }
+    suite_file = tmp_path / "test_suite.json"
+    suite_file.write_text(json.dumps(dummy_suite), encoding="utf-8")
+
+    dummy_gt = {
+        f"Q{i}": {"question_type": "retrieval", "relevant_evidence": [], "answer_contract": {"contract_type": "semantic"}}
+        for i in range(1, 7)
+    }
+    gt_file = tmp_path / "ground_truth.json"
+    gt_file.write_text(json.dumps(dummy_gt), encoding="utf-8")
+
+    mock_service_instance = MagicMock()
+
+    def _exec(req):
+        return {
+            "answer": "42",
+            "cached": False,
+            "status": "success",
+            "citations": [],
+            "retrieval_candidates": {
+                "bm25": ["b1"],
+                "vector": ["v1"],
+                "structural_candidate_ids": ["p1"],
+                "okf_candidate_ids": ["o1"],
+                "graph_candidate_ids": [],
+                "rrf": ["b1", "v1"],
+                "reranked": ["b1"],
+                "compressed_context": ["b1"],
+                "llm_citations": [],
+            },
+            "executed_path": "full",
+            "planned_path": "full",
+            "reranker_mode": "lexical",
+            "generation_calls": 1,
+        }
+
+    mock_service_instance.execute_query.side_effect = _exec
+    mock_repo_instance = MagicMock()
+    mock_repo_instance.get_all_chunks.return_value = [MagicMock(id="c1", document_id=scoped_did, page_number=1)]
+    mock_repo_instance.get_workspace_documents.return_value = {"documents": [{"id": scoped_did, "filename": filename}]}
+
+    with patch("scripts.run_canonical_60_benchmark.verify_live_providers"), \
+         patch("db.table_store.get_shared_table_store", return_value=MagicMock()), \
+         patch("scripts.run_canonical_60_benchmark.compute_corpus_manifest_hash", return_value=("hash456", {filename: "h1"})), \
+         patch("scripts.run_canonical_60_benchmark.QueryRepository", return_value=mock_repo_instance), \
+         patch("scripts.run_canonical_60_benchmark.QueryService", return_value=mock_service_instance), \
+         patch("scripts.run_canonical_60_benchmark.GROUND_TRUTH_FILE", gt_file), \
+         patch("scripts.run_canonical_60_benchmark.ROOT_DIR", tmp_path), \
+         patch("scripts.run_canonical_60_benchmark.BACKEND_DIR", tmp_path):
+        m_ord = run_benchmark(workspace_id=ws, allow_dirty=True, test_path="test_suite.json")
+        m_shuf = run_benchmark(workspace_id=ws, allow_dirty=True, test_path="test_suite.json", shuffle_seed=42)
+
+    assert m_ord["test_suite_sha256"] == m_shuf["test_suite_sha256"]
+    assert m_ord["shuffle_seed"] is None
+    assert m_shuf["shuffle_seed"] == 42
+    assert m_ord["question_order"] == ["Q1", "Q2", "Q3", "Q4", "Q5", "Q6"]
+    assert m_shuf["question_order"] != m_ord["question_order"]
+    assert sorted(m_shuf["question_order"]) == sorted(m_ord["question_order"])
+
+    details = json.loads((tmp_path / "reports" / m_shuf["commit_sha"] / m_shuf["timestamp"] / "query_details.json").read_text(encoding="utf-8"))
+    assert [d["id"] for d in details] == m_shuf["question_order"]
+    assert details[0]["execution_index"] == 1
+    assert details[0]["bm25_chunk_ids"] == ["b1"]
+    assert details[0]["vector_chunk_ids"] == ["v1"]
+    assert details[0]["structural_candidate_ids"] == ["p1"]
+    assert details[0]["okf_candidate_ids"] == ["o1"]
+    assert details[0]["rrf_chunk_ids"] == ["b1", "v1"]
+

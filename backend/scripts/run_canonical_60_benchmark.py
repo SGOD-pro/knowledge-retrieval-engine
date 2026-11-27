@@ -21,6 +21,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import random
 import re
 import subprocess
 import sys
@@ -315,6 +316,7 @@ def run_benchmark(
     test_path: str = "data/test.json",
     page_index: bool | None = None,
     okf: bool | None = None,
+    shuffle_seed: int | None = None,
 ) -> dict[str, Any]:
     """Execute canonical benchmark run.
 
@@ -353,7 +355,10 @@ def run_benchmark(
         with open(test_file, "r", encoding="utf-8") as f:
             test_data = json.load(f)
 
-        questions = test_data["questions"]
+        questions = list(test_data["questions"])
+        if shuffle_seed is not None:
+            random.Random(shuffle_seed).shuffle(questions)
+        question_order = [q["id"] for q in questions]
         documents_meta = test_data.get("documents", [])
 
         corpus_manifest_sha256, file_hashes = compute_corpus_manifest_hash(documents_meta)
@@ -634,6 +639,13 @@ def run_benchmark(
                 "bge_lambda_calls": resp.get("bge_lambda_calls", 0),
                 "reranker_remote_calls": resp.get("reranker_remote_calls", 0),
                 "generation_calls": gen_calls,
+                "execution_index": idx,
+                "bm25_chunk_ids": list(candidates.get("bm25", [])),
+                "vector_chunk_ids": list(candidates.get("vector", [])),
+                "structural_candidate_ids": list(candidates.get("structural_candidate_ids") or candidates.get("structural", [])),
+                "okf_candidate_ids": list(candidates.get("okf_candidate_ids") or candidates.get("okf", [])),
+                "graph_candidate_ids": list(candidates.get("graph_candidate_ids") or candidates.get("graph", [])),
+                "rrf_chunk_ids": list(candidates.get("rrf", [])),
                 "citations": top_citations,
                 # Offline evaluation inputs
                 "retained_evidence_items": serialized_retained_evidence,
@@ -724,6 +736,8 @@ def run_benchmark(
                 "okf_fusion_weight": float(getattr(settings, "OKF_FUSION_WEIGHT", 1.15)),
             },
             "cache_mode": "bypass_exact_and_semantic",
+            "shuffle_seed": shuffle_seed,
+            "question_order": question_order,
             "total_questions": total_q,
             "denominators": {
                 "total_questions": total_q,
@@ -846,6 +860,7 @@ if __name__ == "__main__":
     parser.add_argument("--test-path", default="data/test.json", help="Path to test.json evaluation suite")
     parser.add_argument("--page-index", action=argparse.BooleanOptionalAction, default=None, help="Enable or disable PageIndex structural retrieval")
     parser.add_argument("--okf", action=argparse.BooleanOptionalAction, default=None, help="Enable or disable OKF retrieval")
+    parser.add_argument("--shuffle-seed", type=int, default=None, help="Optional seed to shuffle question execution order in memory")
 
     args = parser.parse_args()
     res = run_benchmark(
@@ -856,5 +871,6 @@ if __name__ == "__main__":
         test_path=args.test_path,
         page_index=args.page_index,
         okf=args.okf,
+        shuffle_seed=args.shuffle_seed,
     )
     print(json.dumps(res["metrics"], indent=2))

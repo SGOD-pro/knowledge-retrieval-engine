@@ -455,6 +455,17 @@ class LayaDecisionService:
         - If mandatory content exceeds document budget, raises PayloadBudgetExceededError before dispatch.
         - Optional snippets are trimmed first to ensure total serialized payload <= 980 bytes.
         """
+        all_criteria = {
+            "lexical_expansion": "Keyword BM25 search for specific terms or exact phrases",
+            "dense_expansion": "Vector similarity search for semantic concepts",
+            "structural_expansion": "Navigate document structure or sections",
+            "graph_expansion": "Traverse knowledge graph entity links",
+            "structured_expansion": "Query structured table columns or database",
+            "none": "Evidence is fundamentally absent or unrecoverable; do not expand",
+        }
+        allowed = tuple(r for r in (req.available_routes or ()) if r in all_criteria)
+        filtered_criteria = {r: all_criteria[r] for r in allowed} if allowed else dict(all_criteria)
+
         base_skeleton: dict[str, Any] = {
             "state": {
                 "document": "",
@@ -463,14 +474,7 @@ class LayaDecisionService:
                 "route": {
                     "type": "choice",
                     "instructions": "Targeted retrieval expansion route to execute",
-                    "criteria": {
-                        "lexical_expansion": "Keyword BM25 search for specific terms or exact phrases",
-                        "dense_expansion": "Vector similarity search for semantic concepts",
-                        "structural_expansion": "Navigate document structure or sections",
-                        "graph_expansion": "Traverse knowledge graph entity links",
-                        "structured_expansion": "Query structured table columns or database",
-                        "none": "No expansion needed or evidence fundamentally missing",
-                    },
+                    "criteria": filtered_criteria,
                 },
                 "complexity": {
                     "type": "score",
