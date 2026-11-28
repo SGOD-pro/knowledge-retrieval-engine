@@ -1,21 +1,8 @@
-"""AWS infrastructure helpers — client/resource factory with profile routing.
+"""AWS infrastructure helpers — client/resource factory with unified AWS SDK credential chain.
 
-Profile routing rules:
-  - Local services  (DynamoDB, S3, SQS, SNS, ElastiCache, RDS):
-        dev  → profile=local, endpoint=http://localhost:4566 (FLOCI)
-        prod → no profile, standard boto3 session from IAM role
-  - Cloud services  (bedrock-runtime, lambda):
-        dev  → profile=aws, standard AWS endpoint
-        prod → no profile, standard boto3 session from IAM role
-  - BGE microservice:
-        # TODO: After deploy, call bge-embedding-lambda via profile=aws boto3.
-        # Currently routed through ingestion.embed_service._run_onnx (local ONNX).
-        # No changes needed here until the Lambda ARN is available.
-
-ENVIRONMENT values:
-  test  → infra calls should be mocked in tests; this module is patched out.
-  dev   → profile=local for local services, profile=aws for cloud services.
-  prod  → standard IAM role-based auth for everything.
+Routing rules:
+  - dev / prod -> standard AWS SDK credential chain (honoring AWS_PROFILE if set)
+  - test       -> offline mocks, or explicit AWS_ENDPOINT_URL if configured for emulator tests
 """
 
 import logging
@@ -28,31 +15,6 @@ from config import settings
 
 logger = logging.getLogger(__name__)
 
-# Services that run locally via FLOCI in dev mode
-_LOCAL_SERVICES = frozenset(
-    {
-        "dynamodb",
-        "s3",
-        "sqs",
-        "sns",
-        "rds",
-        "elasticache",
-    }
-)
-
-# Services that always use the real AWS endpoint (profile=aws in dev)
-_CLOUD_SERVICES = frozenset(
-    {
-        "bedrock-runtime",
-        "lambda",
-    }
-)
-
-_FLOCI_ENDPOINT = "http://localhost:4566"
-_AWS_PROFILE = "aws"
-_LOCAL_PROFILE = "local"
-_LOCAL_REGION = "us-east-1"
-
 _clients: dict = {}
 _resources: dict = {}
 
@@ -61,15 +23,6 @@ _RETRY_CONFIG = Config(
     read_timeout=30,
     retries={"max_attempts": 5, "mode": "adaptive"},
 )
-
-
-def _is_floci_available() -> bool:
-    import socket
-    try:
-        with socket.create_connection(("localhost", 4566), timeout=0.2):
-            return True
-    except OSError:
-        return False
 
 
 def _resolve_cloud_session(region_name: str | None = None) -> boto3.Session:
@@ -88,75 +41,34 @@ def _build_client(
 ):
     env = settings.ENVIRONMENT
     client_config = config or _RETRY_CONFIG
-
-    if service in _CLOUD_SERVICES:
-        session = _resolve_cloud_session(region_name)
-        logger.debug(
-            "aws.infra.client service=%s profile=%s region=%s",
-            service,
-            session.profile_name,
-            session.region_name,
-        )
-        return session.client(service, config=client_config)
-
-    if env == "dev" and _is_floci_available():
-        # Dev local services use local profile and endpoint
-        logger.debug(
-            "aws.infra.client service=%s profile=%s endpoint=%s",
-            service,
-            _LOCAL_PROFILE,
-            _FLOCI_ENDPOINT,
-        )
-        session = boto3.Session(profile_name=_LOCAL_PROFILE, region_name=_LOCAL_REGION)
-        return session.client(
-            service, endpoint_url=_FLOCI_ENDPOINT, config=client_config
-        )
-    else:
-        session = _resolve_cloud_session(region_name)
-        logger.debug(
-            "aws.infra.client service=%s env=%s profile=%s region=%s",
-            service,
-            env,
-            session.profile_name,
-            session.region_name,
-        )
-        return session.client(service, config=client_config)
+    session = _resolve_cloud_session(region_name)
+    explicit_endpoint = os.getenv("AWS_ENDPOINT_URL") if env == "test" else None
+    logger.debug(
+        "aws.infra.client service=%s env=%s profile=%s region=%s",
+        service,
+        env,
+        session.profile_name,
+        session.region_name,
+    )
+    if explicit_endpoint:
+        return session.client(service, endpoint_url=explicit_endpoint, config=client_config)
+    return session.client(service, config=client_config)
 
 
 def _build_resource(service: str):
     env = settings.ENVIRONMENT
-
-    if service in _CLOUD_SERVICES:
-        session = _resolve_cloud_session()
-        logger.debug(
-            "aws.infra.resource service=%s profile=%s region=%s",
-            service,
-            session.profile_name,
-            session.region_name,
-        )
-        return session.resource(service, config=_RETRY_CONFIG)
-
-    if env == "dev" and _is_floci_available():
-        logger.debug(
-            "aws.infra.resource service=%s profile=%s endpoint=%s",
-            service,
-            _LOCAL_PROFILE,
-            _FLOCI_ENDPOINT,
-        )
-        session = boto3.Session(profile_name=_LOCAL_PROFILE, region_name=_LOCAL_REGION)
-        return session.resource(
-            service, endpoint_url=_FLOCI_ENDPOINT, config=_RETRY_CONFIG
-        )
-    else:
-        session = _resolve_cloud_session()
-        logger.debug(
-            "aws.infra.resource service=%s env=%s profile=%s region=%s",
-            service,
-            env,
-            session.profile_name,
-            session.region_name,
-        )
-        return session.resource(service, config=_RETRY_CONFIG)
+    session = _resolve_cloud_session()
+    explicit_endpoint = os.getenv("AWS_ENDPOINT_URL") if env == "test" else None
+    logger.debug(
+        "aws.infra.resource service=%s env=%s profile=%s region=%s",
+        service,
+        env,
+        session.profile_name,
+        session.region_name,
+    )
+    if explicit_endpoint:
+        return session.resource(service, endpoint_url=explicit_endpoint, config=_RETRY_CONFIG)
+    return session.resource(service, config=_RETRY_CONFIG)
 
 
 def get_client(
@@ -167,9 +79,8 @@ def get_client(
     """Return a cached boto3 client for the given service.
 
     Routing:
-      dev  + local service  → FLOCI  (profile=local, localhost:4566)
-      dev  + cloud service  → Real AWS    (profile=aws)
-      prod                  → Real AWS    (IAM role)
+      dev / prod -> standard AWS SDK credential chain (honoring AWS_PROFILE if set)
+      test       -> offline mocks, or explicit AWS_ENDPOINT_URL if configured
     """
     cache_key = (
         f"{service}:{region_name}:{id(config)}"

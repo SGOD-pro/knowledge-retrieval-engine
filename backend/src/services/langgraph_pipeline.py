@@ -119,6 +119,7 @@ class PipelineState(TypedDict):
     reranker_mode: str
     reranker_telemetry: dict[str, Any]
     status: str | None
+    terminal_state: str | None
     error_code: str | None
     selected_strategies: dict[str, Any] | None
     retained_evidence_items: list[Any]
@@ -2381,6 +2382,400 @@ def run_llm(state: PipelineState):
             if src_txt:
                 ans = f"{ans_clean.rstrip('.')}. {src_txt}"
 
+    def _is_active_scoped_chunk(ch: Any, ws_id_val: str, b_repo_val: Any) -> bool:
+        c_ws = getattr(ch, "workspace_id", "") or ""
+        if ws_id_val and c_ws and c_ws != ws_id_val:
+            return False
+        c_doc = getattr(ch, "document_id", "") or ""
+        c_ver = getattr(ch, "document_version", None) or getattr(ch, "version", None)
+        if not c_doc:
+            return False
+        if getattr(ch, "page_number", None) is None and not getattr(ch, "location_reference", "") and not getattr(ch, "id", ""):
+            return False
+        if b_repo_val is not None and ws_id_val:
+            try:
+                if hasattr(b_repo_val, "has_tombstone") and b_repo_val.has_tombstone(ws_id_val, "source", c_doc):
+                    return False
+                snap = b_repo_val.get_document_snapshot(ws_id_val, c_doc)
+                if snap is None:
+                    return False
+                if c_ver and getattr(snap, "version", None) and str(snap.version) != str(c_ver):
+                    return False
+            except Exception:
+                return False
+        return True
+
+    def _verify_explicit_acronym_definition(
+        q_text: str,
+        cur_ans: Any,
+        cited_chunks: list[Any],
+        context_chunks: list[Any],
+        ws_id_val: str,
+        b_repo_val: Any,
+    ) -> tuple[Any, list[Any]]:
+        q_m = re.search(
+            r"\b(?:expanded name|full form|expansion|stand for|stands for|acronym|abbreviation)\b.*?\b([A-Z]{2,10})\b"
+            r"|\b([A-Z]{2,10})\b.*?\b(?:expanded name|full form|expansion|stand for|stands for|acronym|abbreviation)\b",
+            q_text,
+        )
+        if not q_m or str(cur_ans) == "NOT_FOUND":
+            return cur_ans, cited_chunks
+
+        acronym = q_m.group(1) or q_m.group(2)
+        if not acronym:
+            return cur_ans, cited_chunks
+
+        def _extract_expansions(txt: str) -> list[str]:
+            found: list[str] = []
+            # Pattern 1: Expansion (ACRONYM)
+            for m in re.finditer(
+                rf"([A-Z][A-Za-z0-9\-]+(?:\s+(?:[A-Z][A-Za-z0-9\-]+|of|for|and|in|on|to)){{1,7}})\s*\(\s*{re.escape(acronym)}\s*\)",
+                txt,
+            ):
+                cand = re.sub(r"^(?:The|A|An)\s+", "", m.group(1).strip())
+                if len(cand.split()) >= 2:
+                    found.append(cand)
+            # Pattern 2: ACRONYM (Expansion)
+            for m in re.finditer(
+                rf"\b{re.escape(acronym)}\s*\(\s*([A-Z][A-Za-z0-9\-]+(?:\s+(?:[A-Z][A-Za-z0-9\-]+|of|for|and|in|on|to)){{1,7}})\s*\)",
+                txt,
+            ):
+                cand = m.group(1).strip()
+                if len(cand.split()) >= 2:
+                    found.append(cand)
+            # Pattern 3: ACRONYM stands for / expands to / is short for Expansion
+            for m in re.finditer(
+                rf"\b{re.escape(acronym)}\b\s+(?:stands for|expands to|is short for)\s+([A-Z][A-Za-z0-9\-]+(?:\s+(?:[A-Z][A-Za-z0-9\-]+|of|for|and|in|on|to)){{1,7}})",
+                txt,
+            ):
+                cand = m.group(1).strip().rstrip(".,;")
+                if len(cand.split()) >= 2:
+                    found.append(cand)
+            return found
+
+        def _norm(s: str) -> str:
+            return re.sub(r"[\s\-]+", " ", s.lower()).strip()
+
+        by_norm: dict[str, tuple[str, Any]] = {}
+        for ch in context_chunks:
+            if not _is_active_scoped_chunk(ch, ws_id_val, b_repo_val):
+                continue
+            txt = getattr(ch, "text", "") or ""
+            for exp in _extract_expansions(txt):
+                nk = _norm(exp)
+                if nk not in by_norm:
+                    by_norm[nk] = (exp, ch)
+
+        if not by_norm:
+            return "NOT_FOUND", []
+
+        if len(by_norm) > 1:
+            qual_parts = [f"{exp} [{ch.id}]" for exp, ch in by_norm.values()]
+            return f"Conflicting definitions found for {acronym}: " + "; ".join(qual_parts), [ch for _, ch in by_norm.values()]
+
+        unique_norm, (unique_exp, support_ch) = next(iter(by_norm.items()))
+        ans_norm = _norm(str(cur_ans))
+        if unique_norm in ans_norm:
+            if [getattr(c, "id", None) for c in cited_chunks] == [support_ch.id]:
+                return cur_ans, cited_chunks
+            return cur_ans, [support_ch]
+        return unique_exp, [support_ch]
+
+    ans, final_cited_chunks = _verify_explicit_acronym_definition(
+        state.get("query", ""),
+        ans,
+        final_cited_chunks,
+        [c for c in top_chunks if str(c.id) in compressed_ids],
+        state.get("workspace_id", ""),
+        state.get("boundary_repo"),
+    )
+
+    def _verify_tabular_entity_support(
+        q_text: str,
+        cur_ans: Any,
+        cited_chunks: list[Any],
+        context_chunks: list[Any],
+        ws_id_val: str,
+        b_repo_val: Any,
+    ) -> tuple[Any, list[Any]]:
+        if str(cur_ans) == "NOT_FOUND":
+            return cur_ans, cited_chunks
+        target_chunks = cited_chunks or context_chunks
+        if not target_chunks:
+            return cur_ans, cited_chunks
+        is_tabular = any(
+            getattr(c, "element_type", None) in ("table_row", "cell", "table", "header_row", "row")
+            or getattr(c, "source_format", None) in ("csv", "xlsx", "xls")
+            for c in target_chunks
+        )
+        if not is_tabular:
+            return cur_ans, cited_chunks
+        _non_ent = {
+            "CSV", "PDF", "XLS", "XLSX", "JSON", "HTTP", "API", "USD", "INR",
+            "EPS", "GDP", "KPI", "RAG", "LLM", "KRE", "LAYA", "NOT", "AND",
+            "FOR", "THE", "WHO", "WHAT", "HOW", "WHEN", "WHERE", "WHICH",
+            "SYSTEM", "SANCTION", "FILLED", "VACANT", "TOTAL", "YEAR", "UNIT",
+        }
+        _non_ent_low = {w.lower() for w in _non_ent} | {
+            "table", "row", "rows", "column", "columns", "document", "documents",
+            "file", "files", "data", "post", "posts", "count", "number", "value",
+            "medical", "officer", "officers", "all", "each", "both", "this", "that",
+            "and", "or", "vs", "versus",
+        }
+        _non_entity_cols = {
+            "sl. no.", "sl no", "s. no.", "s no", "no.", "no",
+            "sanction", "filled", "vacant", "total", "year", "count", "unit", "percent",
+        }
+
+        def _extract_row_bound_entities(txt: str) -> list[str]:
+            ents: list[str] = []
+            for k, v in re.findall(r"\b([A-Za-z][A-Za-z0-9_ .-]{1,30}):\s*(.+?)(?=\.\s+[A-Z]|\.?$|;)", txt):
+                k_low = k.strip().lower()
+                v_clean = v.strip()
+                if k_low in _non_entity_cols or not v_clean:
+                    continue
+                if re.fullmatch(r"[\d,.\s%+-]+", v_clean):
+                    continue
+                ents.append(v_clean.lower())
+            return ents
+
+        all_ref = cited_chunks + [c for c in context_chunks if c not in cited_chunks]
+        has_bound_schema = any(
+            _extract_row_bound_entities(getattr(c, "text", "") or "")
+            for c in all_ref
+        )
+
+        q_ents: list[str] = []
+        for c in all_ref:
+            for be in _extract_row_bound_entities(getattr(c, "text", "") or ""):
+                if re.search(rf"\b{re.escape(be)}\b", q_text or "", re.IGNORECASE):
+                    if not any(be == e.lower() for e in q_ents):
+                        q_ents.append(be)
+
+        # Also capture all-caps entities (e.g. AYUSH systems: HOMOEOPATHY, UNANI, SIDDHA)
+        for tok in re.findall(r"\b([A-Z][A-Z0-9&-]{2,})\b", q_text or ""):
+            if tok not in _non_ent and not re.fullmatch(r"(?:Q[1-4]|FY\d{2,4})", tok):
+                tok_low = tok.lower()
+                if not any(tok_low in e.lower() for e in q_ents):
+                    q_ents.append(tok)
+
+        # Also capture lowercase/mixed-case target entity after prepositions (e.g., "for siddha")
+        for m in re.finditer(
+            r"\b(?:for|of|in)\s+(?:the\s+)?([A-Za-z][A-Za-z0-9&-]{2,}(?:\s+[A-Za-z0-9&-]{2,}){0,3})\s*(?:\?|$)",
+            q_text or "",
+            re.IGNORECASE,
+        ):
+            cand = m.group(1).strip()
+            cand_low = cand.lower()
+            if cand_low in _non_ent_low or any(cand_low in e.lower() for e in q_ents):
+                continue
+            if not any(w in _non_ent_low for w in cand_low.split()):
+                q_ents.append(cand)
+
+        if not q_ents:
+            return cur_ans, cited_chunks
+
+        def _chunk_matches_ent(ch: Any, ent_low: str) -> bool:
+            if not ent_low:
+                return True
+            txt = getattr(ch, "text", "") or ""
+            if has_bound_schema:
+                row_bes = _extract_row_bound_entities(txt)
+                if row_bes:
+                    return any(ent_low == be or re.search(rf"\b{re.escape(ent_low)}\b", be) for be in row_bes)
+            return bool(re.search(rf"\b{re.escape(ent_low)}\b", txt, re.IGNORECASE))
+
+        _CURRENCY_FAMILIES: dict[str, tuple[str, ...]] = {
+            "usd": (r"\b(?:usd|dollars?)\b", r"\$"),
+            "eur": (r"\b(?:eur|euros?)\b", r"€"),
+            "gbp": (r"\b(?:gbp|pounds?)\b", r"£"),
+            "inr": (r"\b(?:inr|rupees?|rs)\b", r"₹"),
+            "jpy": (r"\b(?:jpy|yen)\b", r"¥"),
+        }
+
+        _SCALE_FAMILIES: dict[str, str] = {
+            "thousand": r"\b(?:thousands?|thousandth)\b",
+            "million": r"\b(?:millions?|millionth)\b",
+            "billion": r"\b(?:billions?|billionth)\b",
+            "trillion": r"\b(?:trillions?|trillionth)\b",
+            "crore": r"\b(?:crores?)\b",
+            "lakh": r"\b(?:lakhs?)\b",
+        }
+
+        def _field_pattern(f_name: str) -> str:
+            f_low = f_name.strip().lower()
+            if f_low == "vacant":
+                return r"\b(?:vacant|vacancy|vacancies)\b"
+            if f_low in ("filled", "fill"):
+                return r"\bfill(?:ed|ing|s)?\b"
+            if f_low in ("sanction", "sanctioned"):
+                return r"\bsanction(?:ed|s)?\b"
+            if f_low in ("year", "years"):
+                return r"\byears?\b"
+            stem = re.sub(r"(?:ed|ing|s)$", "", f_low)
+            if len(stem) >= 3:
+                return rf"\b{re.escape(stem)}(?:ed|ing|s)?\b"
+            return rf"\b{re.escape(f_low)}\b"
+
+        _skip_field_keys = {
+            "sl. no.", "sl no", "s. no.", "s no", "no.", "no",
+            "row", "unit", "system", "entity", "company",
+        }
+
+        def _detect_currency(text: str) -> str | None:
+            t_clean = re.sub(r"[_-]", " ", text or "")
+            for c_fam, c_pats in _CURRENCY_FAMILIES.items():
+                if any(re.search(p, t_clean, re.IGNORECASE) for p in c_pats):
+                    return c_fam
+            return None
+
+        def _detect_scale(text: str) -> str | None:
+            t_clean = re.sub(r"[_-]", " ", text or "")
+            for s_fam, s_pat in _SCALE_FAMILIES.items():
+                if re.search(s_pat, t_clean, re.IGNORECASE):
+                    return s_fam
+            return None
+
+        q_curr = _detect_currency(q_text or "")
+        q_scale = _detect_scale(q_text or "")
+        ans_clean = re.sub(r"\[[^\]]+\]", " ", str(cur_ans))
+
+        def _clause_for_entity(ent_low: str) -> str:
+            if len(q_ents) <= 1:
+                return ans_clean
+            parts = [p.strip() for p in re.split(r"(?<=[.;])\s+|\s+\band\b\s+", ans_clean) if p.strip()]
+            matched = [p for p in parts if re.search(rf"\b{re.escape(ent_low)}\b", p, re.IGNORECASE)]
+            return " ".join(matched) if matched else ans_clean
+
+        def _row_supports_claim(ch: Any, ent_low: str, clause_txt: str) -> bool:
+            if not _chunk_matches_ent(ch, ent_low):
+                return False
+            c_txt = getattr(ch, "text", "") or ""
+            c_nums = extract_numbers_normalized(c_txt)
+            clause_nums = extract_numbers_normalized(clause_txt)
+            if clause_nums and not (clause_nums <= c_nums):
+                return False
+
+            fvals: dict[str, set[str]] = {}
+            fraw: dict[str, str] = {}
+            for k, v in re.findall(r"\b([A-Za-z][A-Za-z0-9_ .-]{1,30}):\s*(.+?)(?=\.\s+[A-Z]|\.?$|;)", c_txt):
+                k_low = k.strip().lower()
+                v_clean = v.strip()
+                fraw[k_low] = v_clean
+                nums = extract_numbers_normalized(v_clean)
+                if nums:
+                    fvals.setdefault(k_low, set()).update(nums)
+
+            row_unit = str(
+                getattr(ch, "unit", None)
+                or (getattr(ch, "metadata", None) or {}).get("unit")
+                or fraw.get("unit")
+                or ""
+            ).strip()
+            if not row_unit:
+                m_u = re.search(r"\bUNIT:\s*([A-Za-z0-9_%$-]+)", c_txt, re.IGNORECASE)
+                if m_u:
+                    row_unit = m_u.group(1).strip()
+
+            effective_curr = _detect_currency(row_unit) or q_curr
+            if effective_curr:
+                clause_curr = _detect_currency(clause_txt)
+                if clause_curr and clause_curr != effective_curr:
+                    return False
+
+            effective_scale = _detect_scale(row_unit) or q_scale
+            if effective_scale:
+                clause_scale = _detect_scale(clause_txt)
+                if clause_scale and clause_scale != effective_scale:
+                    return False
+
+            row_num_fields = {k: v for k, v in fvals.items() if k not in _skip_field_keys}
+            if row_num_fields:
+                target_q_fields = [
+                    k for k in row_num_fields
+                    if re.search(_field_pattern(k), q_text or "", re.IGNORECASE)
+                ]
+
+                clause_num_matches = list(re.finditer(r"\b(\d+(?:\.\d+)?)\b", clause_txt))
+                unassociated_nums: set[str] = set()
+
+                for m in clause_num_matches:
+                    val = m.group(1)
+                    if re.fullmatch(r"(?:19|20)\d{2}", val):
+                        if "year" in row_num_fields and val not in row_num_fields["year"]:
+                            return False
+                        continue
+
+                    n_start = m.start()
+                    n_end = m.end()
+                    win_start = max(0, n_start - 35)
+                    win_end = min(len(clause_txt), n_end + 35)
+                    window = clause_txt[win_start:win_end]
+
+                    best_field: str | None = None
+                    best_dist = 999
+                    for fk in row_num_fields:
+                        if fk == "year":
+                            continue
+                        pat = _field_pattern(fk)
+                        for f_m in re.finditer(pat, window, re.IGNORECASE):
+                            m_start = win_start + f_m.start()
+                            m_end = win_start + f_m.end()
+                            dist = min(abs(m_start - n_end), abs(n_start - m_end))
+                            if dist < best_dist and dist <= 25:
+                                best_dist = dist
+                                best_field = fk
+
+                    if best_field is not None:
+                        if val not in row_num_fields[best_field]:
+                            return False
+                    else:
+                        unassociated_nums.add(val)
+
+                if target_q_fields and unassociated_nums:
+                    allowed_field_nums: set[str] = set()
+                    for qf in target_q_fields:
+                        allowed_field_nums.update(row_num_fields[qf])
+
+                    if not (unassociated_nums <= allowed_field_nums):
+                        return False
+
+            return True
+
+        if cited_chunks:
+            valid_cited = [
+                ch for ch in cited_chunks
+                if _is_active_scoped_chunk(ch, ws_id_val, b_repo_val)
+                and any(_row_supports_claim(ch, e.lower(), _clause_for_entity(e.lower())) for e in q_ents)
+            ]
+            if valid_cited and all(
+                any(_row_supports_claim(ch, e.lower(), _clause_for_entity(e.lower())) for ch in valid_cited)
+                for e in q_ents
+            ):
+                return cur_ans, valid_cited
+
+        # Replace unsupported/missing tabular citation only when a unique active row supports entity, field, and value
+        supporting: list[Any] = []
+        for ch in context_chunks:
+            if not _is_active_scoped_chunk(ch, ws_id_val, b_repo_val):
+                continue
+            if not all(_row_supports_claim(ch, e.lower(), _clause_for_entity(e.lower())) for e in q_ents):
+                continue
+            supporting.append(ch)
+
+        if len(supporting) == 1:
+            return cur_ans, [supporting[0]]
+        return "NOT_FOUND", []
+
+    ans, final_cited_chunks = _verify_tabular_entity_support(
+        state.get("query", ""),
+        ans,
+        final_cited_chunks,
+        [c for c in top_chunks if str(c.id) in compressed_ids],
+        state.get("workspace_id", ""),
+        state.get("boundary_repo"),
+    )
+
     if ans == "NOT_FOUND" or not top_chunks:
         citation_utilization_rate = None
         faithfulness = None
@@ -2674,12 +3069,28 @@ def run_laya_escalation(state: PipelineState) -> dict[str, Any]:
             )
         )
 
+    # Derive session-aware eligible routes from active workspace snapshot & settings
+    eligible_routes: list[str] = ["lexical_expansion"]
+    try:
+        snaps_for_routes = boundary_repo.list_document_snapshots(ws_id) if boundary_repo else []
+    except Exception:
+        snaps_for_routes = []
+    if any(getattr(s, "page_index_status", None) == "ready" for s in snaps_for_routes):
+        eligible_routes.append("structural_expansion")
+    if (
+        getattr(settings, "GRAPH_ENABLED", False)
+        and getattr(snapshot_context, "kg_manifest_id", None)
+        and missing_dimension == "relationship"
+    ):
+        eligible_routes.append("graph_expansion")
+    eligible_routes.append("none")
+
     escalation_req = LayaEscalationRequest(
         query_id=f"q_{uuid.uuid4().hex[:12]}",
         workspace_id=ws_id,
         query=state.get("query", ""),
         missing_requirement=req_desc,
-        available_routes=("lexical_expansion", "none"),
+        available_routes=tuple(eligible_routes),
         retrieved_summary=tuple(summaries),
         caller_deadline_ms=max(0.0, (escalation_deadline_t - time.perf_counter()) * 1000.0),
     )
@@ -3457,7 +3868,24 @@ def end_fast_path(state: PipelineState):
             "stage_timings": {**existing, "fast_path_ms": latency_ms},
         }
 
-    if verified_ans and verified_chunk:
+    from services.retrieval.planner import compute_complexity
+
+    _, q_flags = compute_complexity(query)
+    is_ineligible_for_fast_emit = (
+        q_flags.get("relationship_flag", False)
+        or q_flags.get("comparison_flag", False)
+        or q_flags.get("negation_flag", False)
+        or q_flags.get("synthesis_flag", False)
+        or q_flags.get("aggregation_flag", False)
+        or q_flags.get("temporal_flag", False)
+        or bool(
+            re.search(
+                r"\b(?:confirm|verify|accurate|is it true|contradict|anomalous|safe to interpret|not|never)\b|,\s*right\??",
+                query.lower(),
+            )
+        )
+    )
+    if verified_ans and verified_chunk and not is_ineligible_for_fast_emit:
         ws_id = state.get("workspace_id", "")
         b_repo = state.get("boundary_repo")
         if b_repo is None:
@@ -3860,6 +4288,7 @@ class ResponseObject:
         self.usage = state.get("usage", {"input_tokens": 0, "output_tokens": 0})
         self.execution_result = state.get("execution_result", None)
         self.status = state.get("status", "success")
+        self.terminal_state = state.get("terminal_state")
         self.error_code = state.get("error_code")
         self.retained_evidence_items = state.get("retained_evidence_items", [])
         self.selected_strategies = state.get("selected_strategies", {})

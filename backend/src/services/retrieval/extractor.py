@@ -236,7 +236,13 @@ def extract_verified_fact(query: str, chunks: list[Chunk]) -> tuple[str | None, 
             # If the value itself is in the query, it was a filter, not the target
             if val_clean in q_lower:
                 continue
-            if len(k_clean) >= 3 and (k_clean in q_lower or any(kw in q_lower for kw in k_clean.split() if len(kw) > 3)):
+            if len(k_clean) >= 3 and (
+                k_clean in q_lower
+                or (
+                    len(k_clean.split()) == 1
+                    and any(kw in q_lower for kw in k_clean.split() if len(kw) > 3)
+                )
+            ):
                 target_candidates.append((k, str(v).strip()))
 
         if len(target_candidates) == 1:

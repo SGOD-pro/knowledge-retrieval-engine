@@ -528,6 +528,21 @@ class StructuredQueryService:
                 total_rows=total_rows,
             )
 
+        # 5b. Pattern 2b: Binary Formula / Premise Verification (e.g. "A minus B equals C")
+        if bool(re.search(r'\b(?:minus|plus)\b', q_lower)):
+            return self._execute_formula_verification(
+                query=query,
+                table_id=table_id,
+                workspace_id=workspace_id,
+                document_id=document_id,
+                version=version,
+                schema=schema,
+                total_rows=total_rows,
+            )
+
+        if bool(re.search(r',\s*right\??', q_lower)) or "check against" in q_lower:
+            raise UnsupportedQueryError(f"Premise verification query '{query[:60]}' cannot be answered by a blind aggregate")
+
         # 6. Pattern 3: Standard Aggregates (sum, avg, count)
         if bool(re.search(r'\b(?:total|sum|average|avg|count)\b|\bhow many (?:rows|records|entries|items)\b', q_lower)):
             return self._execute_aggregate(
@@ -538,6 +553,57 @@ class StructuredQueryService:
                 version=version,
                 schema=schema,
                 total_rows=total_rows,
+            )
+
+        # 7. Pattern 4: Column Ratio / Percentage (e.g. "percentage of <denom> ... <num>")
+        if bool(re.search(r'\b(?:percentage|percent|ratio)\b', q_lower)):
+            return self._execute_column_ratio(
+                query=query,
+                table_id=table_id,
+                workspace_id=workspace_id,
+                document_id=document_id,
+                version=version,
+                schema=schema,
+                total_rows=total_rows,
+            )
+
+        # 7b. Pattern 4b: Exact Single-Row / Filtered Metric Lookup (e.g. "how many ... vacant in <entity>")
+        if bool(re.search(r'\b(?:how many|how much|what is|what are|find|get|give)\b', q_lower)):
+            filter_cands = self._extract_explicit_filter_requirements(query, table_id=table_id, schema=schema)
+            if filter_cands:
+                exclude_metric_cols = {
+                    c.col_index for c in schema.columns
+                    if c.name.lower() in ("year", "date", "period", "time") or "year" in c.name.lower()
+                }
+                try:
+                    self._find_target_metric_column(
+                        query=query,
+                        schema=schema,
+                        exclude_col_indices=exclude_metric_cols,
+                    )
+                    return self._execute_aggregate(
+                        query=query,
+                        table_id=table_id,
+                        workspace_id=workspace_id,
+                        document_id=document_id,
+                        version=version,
+                        schema=schema,
+                        total_rows=total_rows,
+                        is_lookup=True,
+                    )
+                except UnsupportedQueryError:
+                    pass
+
+        # 8. Pattern 5: Ambiguous "how many <metric>" without filter or all-rows qualifier
+        if bool(re.search(r'\bhow many\b', q_lower)) and not bool(
+            re.search(r'\b(?:total|sum|all|across|every|combined|overall|altogether)\b', q_lower)
+        ):
+            self._raise_if_ambiguous_scope(
+                query=query,
+                table_id=table_id,
+                workspace_id=workspace_id,
+                version=version,
+                schema=schema,
             )
 
         raise UnsupportedQueryError(f"Query '{query[:60]}' could not be resolved to structured operator")
@@ -665,6 +731,14 @@ class StructuredQueryService:
             if t_lower and t_lower not in SKIP_FILTER_WORDS and not re.fullmatch(r'20\d{2}|19\d{2}', target):
                 if not table_name or (t_lower != table_name and t_lower not in (table_csv, table_xlsx)):
                     explicit_requirements.append(target.strip())
+
+        # 1b. "in <Entity>" trailing entity phrase (e.g., "vacant in SIDDHA?", "in NATURE CURE & YOGA?")
+        for m_in in re.finditer(r'\bin\s+([A-Z][A-Za-z0-9& -]{2,})\s*(?:\?|$)', query):
+            t_in = m_in.group(1).strip()
+            t_in_low = t_in.lower()
+            if t_in_low not in SKIP_FILTER_WORDS and not re.fullmatch(r'20\d{2}|19\d{2}', t_in):
+                if not table_name or (t_in_low != table_name and t_in_low not in (table_csv, table_xlsx)):
+                    explicit_requirements.append(t_in)
 
         # 2. Quoted strings
         for q_str in re.findall(r'["\']([^"\']+)["\']', query):
@@ -1386,9 +1460,12 @@ class StructuredQueryService:
         version: str,
         schema: TableSchema,
         total_rows: int,
+        is_lookup: bool = False,
     ) -> StructuredQueryResult:
         q_lower = query.lower()
-        if bool(re.search(r'\bcount\b|\bhow many (?:rows|records|entries|items)\b', q_lower)):
+        if is_lookup:
+            op = AggregateOp.SUM
+        elif bool(re.search(r'\bcount\b|\bhow many (?:rows|records|entries|items)\b', q_lower)):
             op = AggregateOp.COUNT
         elif bool(re.search(r'\b(?:sum|total)\b', q_lower)):
             op = AggregateOp.SUM
@@ -1431,19 +1508,31 @@ class StructuredQueryService:
             version=version,
         )
 
+        if is_lookup and count > 1:
+            raise AmbiguousBindingError(
+                f"Multiple matching rows ({count}) found in table '{table_id}' for filters {pred_vals}; "
+                f"please specify a qualifier (e.g. year) or request an explicit aggregate."
+            )
+
+        col_unit = next((c.unit for c in schema.columns if c.col_index == col_idx), None)
+        effective_op = "lookup" if is_lookup else op.value
         if count == 0:
-            res_val = Decimal(0) if op in (AggregateOp.COUNT, AggregateOp.SUM) else None
+            res_val = Decimal(0) if (not is_lookup and op in (AggregateOp.COUNT, AggregateOp.SUM)) else None
             if op == AggregateOp.COUNT:
                 answer_text = f"No rows matched the requested filters in table '{table_id}' (0 matching rows). Count is 0."
             else:
                 answer_text = f"The table '{table_id}' does not contain matching rows for the requested filters (0 matching rows)."
         else:
             res_val = val
-            answer_text = f"The {op.value} for {col_name} is {res_val}."
+            unit_suffix = f" {col_unit}" if col_unit else ""
+            if is_lookup:
+                answer_text = f"The {col_name} is {res_val}{unit_suffix}."
+            else:
+                answer_text = f"The {op.value} for {col_name} is {res_val}{unit_suffix}."
 
         return StructuredQueryResult(
             answer_text=answer_text,
-            operator=op.value,
+            operator=effective_op,
             target_column=col_name,
             predicate_columns=pred_cols,
             predicate_values=pred_vals,
@@ -1451,6 +1540,347 @@ class StructuredQueryService:
             total_rows_in_table=total_rows,
             result_value=res_val,
             secondary_value=None,
+            row_ids=r_ids,
+            row_indices=r_idx,
+            selection_hash=digest,
+            schema_binding_confidence=0.95,
+            overall_confidence=0.95,
+            table_id=table_id,
+            document_id=document_id,
+            document_version=version,
+            workspace_id=workspace_id,
+            unit=col_unit,
+        )
+
+    def _execute_column_ratio(
+        self,
+        query: str,
+        table_id: str,
+        workspace_id: str,
+        document_id: str,
+        version: str,
+        schema: TableSchema,
+        total_rows: int,
+    ) -> StructuredQueryResult:
+        """Compute deterministic ratio or percentage between two numeric columns over filtered rows."""
+        q_lower = query.lower()
+        q_tokens = re.findall(r"[a-z0-9_]+", q_lower)
+        numeric_dtypes = {"integer", "decimal", "percentage", "currency"}
+        skip_names = {"year", "date", "period", "time", "sl", "sl. no.", "id", "index"}
+
+        matched_cols: list[tuple[int, Any]] = []
+        for col in schema.columns:
+            dtype_str = self._normalize_dtype(col.inferred_dtype)
+            c_lower = col.name.lower().strip()
+            if dtype_str not in numeric_dtypes or c_lower in skip_names or "year" in c_lower:
+                continue
+            c_toks = [t for t in re.findall(r"[a-z0-9]+", c_lower) if len(t) >= 3]
+            best_pos: int | None = None
+            for idx, qt in enumerate(q_tokens):
+                for ct in c_toks:
+                    if qt == ct or (len(ct) >= 4 and qt.startswith(ct[:5])) or (len(qt) >= 4 and ct.startswith(qt[:5])):
+                        best_pos = idx if best_pos is None else min(best_pos, idx)
+            if best_pos is not None:
+                matched_cols.append((best_pos, col))
+
+        if len(matched_cols) < 2:
+            raise UnsupportedQueryError(f"Query '{query[:60]}' could not bind two numeric columns for ratio/percentage")
+
+        matched_cols.sort(key=lambda item: item[0])
+        is_percent = bool(re.search(r"\b(?:percentage|percent)\b", q_lower))
+        if is_percent and re.search(r"\b(?:percentage|percent)\s+of\b", q_lower) and "as a percentage of" not in q_lower:
+            denom_col = matched_cols[0][1]
+            num_col = matched_cols[1][1]
+        else:
+            num_col = matched_cols[0][1]
+            denom_col = matched_cols[1][1]
+
+        predicates, pred_cols, pred_vals = self._extract_and_bind_predicates(
+            query=query,
+            table_id=table_id,
+            workspace_id=workspace_id,
+            version=version,
+            schema=schema,
+            target_col_idx=None,
+        )
+
+        rows = self.store.query_rows(
+            table_id=table_id,
+            workspace_id=workspace_id,
+            predicates=predicates,
+            version=version,
+        )
+        r_ids = [r.row_id for r in rows]
+        r_idx = [r.row_index for r in rows]
+        digest = hashlib.sha256(f"{table_id}:{version}:{','.join(r_ids)}".encode("utf-8")).hexdigest()[:16]
+
+        if not rows:
+            return StructuredQueryResult(
+                answer_text=f"The table '{table_id}' does not contain matching rows for the requested filters (0 matching rows).",
+                operator="percentage" if is_percent else "ratio",
+                target_column=f"{num_col.name}/{denom_col.name}",
+                predicate_columns=pred_cols,
+                predicate_values=pred_vals,
+                selection_count=0,
+                total_rows_in_table=total_rows,
+                result_value=None,
+                secondary_value=None,
+                row_ids=[],
+                row_indices=[],
+                selection_hash=digest,
+                schema_binding_confidence=0.95,
+                overall_confidence=0.95,
+                table_id=table_id,
+                document_id=document_id,
+                document_version=version,
+                workspace_id=workspace_id,
+                unit="percent" if is_percent else "ratio",
+            )
+
+        def _cell_decimal(row: Any, col_index: int) -> Decimal:
+            raw = row.cells[col_index].normalized_value
+            if raw is None:
+                raw = row.cells[col_index].raw_value
+            if isinstance(raw, Decimal):
+                return raw
+            return Decimal(str(raw).replace(",", "").strip())
+
+        num_sum = sum((_cell_decimal(r, num_col.col_index) for r in rows), Decimal("0"))
+        denom_sum = sum((_cell_decimal(r, denom_col.col_index) for r in rows), Decimal("0"))
+
+        if denom_sum == 0:
+            return StructuredQueryResult(
+                answer_text=f"Cannot compute {'percentage' if is_percent else 'ratio'} of {num_col.name} over {denom_col.name}: denominator sum is 0.",
+                operator="percentage" if is_percent else "ratio",
+                target_column=f"{num_col.name}/{denom_col.name}",
+                predicate_columns=pred_cols,
+                predicate_values=pred_vals,
+                selection_count=len(rows),
+                total_rows_in_table=total_rows,
+                result_value=None,
+                secondary_value=None,
+                row_ids=r_ids,
+                row_indices=r_idx,
+                selection_hash=digest,
+                schema_binding_confidence=0.95,
+                overall_confidence=0.95,
+                table_id=table_id,
+                document_id=document_id,
+                document_version=version,
+                workspace_id=workspace_id,
+                unit="percent" if is_percent else "ratio",
+            )
+
+        dec_match = re.search(r"\bround\s+to\s+(\d+)\s+decimal", q_lower)
+        places = int(dec_match.group(1)) if dec_match else (2 if is_percent else 4)
+        raw_val = (num_sum / denom_sum) * (Decimal("100") if is_percent else Decimal("1"))
+        quant = Decimal("1") if places == 0 else Decimal("1." + "0" * places).normalize()
+        # Use fixed decimal places for clean rounding
+        quant = Decimal("10") ** (-places)
+        rounded_val = raw_val.quantize(quant)
+        unit_suffix = "%" if is_percent else ""
+        answer_text = f"The {'percentage' if is_percent else 'ratio'} of {num_col.name} to {denom_col.name} is {rounded_val}{unit_suffix} ({num_sum} / {denom_sum})."
+
+        return StructuredQueryResult(
+            answer_text=answer_text,
+            operator="percentage" if is_percent else "ratio",
+            target_column=f"{num_col.name}/{denom_col.name}",
+            predicate_columns=pred_cols,
+            predicate_values=pred_vals,
+            selection_count=len(rows),
+            total_rows_in_table=total_rows,
+            result_value=rounded_val,
+            secondary_value=num_sum,
+            row_ids=r_ids,
+            row_indices=r_idx,
+            selection_hash=digest,
+            schema_binding_confidence=0.95,
+            overall_confidence=0.95,
+            table_id=table_id,
+            document_id=document_id,
+            document_version=version,
+            workspace_id=workspace_id,
+            unit="percent" if is_percent else "ratio",
+        )
+
+    def _raise_if_ambiguous_scope(
+        self,
+        query: str,
+        table_id: str,
+        workspace_id: str,
+        version: str,
+        schema: TableSchema,
+    ) -> None:
+        """Raise AmbiguousBindingError when an aggregate/count query omits both filter and all-row scope."""
+        predicates, _, _ = self._extract_and_bind_predicates(
+            query=query,
+            table_id=table_id,
+            workspace_id=workspace_id,
+            version=version,
+            schema=schema,
+            target_col_idx=None,
+        )
+        if predicates:
+            return
+        # If the query names a specific capitalized filter entity (e.g. "in SIDDHA"), it is not an omitted scope
+        col_words = {w for c in schema.columns for w in re.findall(r"[a-z0-9]+", c.name.lower())}
+        for m in re.finditer(r"\b(?:in|for|from)\s+([A-Z][A-Za-z0-9_&\-]{2,})\b", query):
+            ent = m.group(1).strip()
+            if ent.lower() not in col_words and ent.lower() not in {"the", "all", "each", "every"}:
+                return
+        probe_rows = self.store.query_rows(
+            table_id=table_id,
+            workspace_id=workspace_id,
+            predicates=[],
+            limit=500,
+            version=version,
+        )
+        for col in schema.columns:
+            dtype_str = self._normalize_dtype(col.inferred_dtype)
+            c_lower = col.name.lower().strip()
+            if dtype_str != "string" or c_lower in {"id", "index", "sl. no."}:
+                continue
+            distinct_vals: list[str] = []
+            seen: set[str] = set()
+            for r in probe_rows:
+                val = str(r.cells[col.col_index].normalized_value or r.cells[col.col_index].raw_value or "").strip()
+                if val and val.lower() not in seen:
+                    seen.add(val.lower())
+                    distinct_vals.append(val)
+            if len(distinct_vals) > 1:
+                raise AmbiguousBindingError(
+                    f"Query does not specify which {col.name} ({', '.join(distinct_vals[:10])}) or whether you want the total across all rows."
+                )
+
+    def _execute_formula_verification(
+        self,
+        query: str,
+        table_id: str,
+        workspace_id: str,
+        document_id: str,
+        version: str,
+        schema: TableSchema,
+        total_rows: int,
+    ) -> StructuredQueryResult:
+        """Bind row-keyed operands, compute binary arithmetic deterministically, and verify against referenced cell."""
+        q_lower = query.lower()
+        op_match = re.search(r"\b(minus|plus)\b", q_lower)
+        if not op_match:
+            raise UnsupportedQueryError(f"Query '{query[:60]}' has no supported binary arithmetic operator")
+        op_word = op_match.group(1)
+        op_pos = op_match.start()
+        is_minus = op_word == "minus"
+
+        predicates, pred_cols, pred_vals = self._extract_and_bind_predicates(
+            query=query,
+            table_id=table_id,
+            workspace_id=workspace_id,
+            version=version,
+            schema=schema,
+            target_col_idx=None,
+        )
+        rows = self.store.query_rows(
+            table_id=table_id,
+            workspace_id=workspace_id,
+            predicates=predicates,
+            version=version,
+        )
+        if not rows:
+            raise UnsupportedQueryError(f"No rows matched filters for formula verification in '{table_id}'")
+
+        numeric_dtypes = {"integer", "decimal", "percentage", "currency"}
+        skip_names = {"year", "date", "period", "time", "sl", "sl. no.", "id", "index"}
+        val_col = next(
+            (
+                c for c in schema.columns
+                if self._normalize_dtype(c.inferred_dtype) in numeric_dtypes
+                and c.name.lower().strip() not in skip_names
+                and "year" not in c.name.lower()
+            ),
+            None,
+        )
+        if val_col is None:
+            raise UnsupportedQueryError(f"No numeric value column found in '{table_id}'")
+
+        # Find the string label column whose values match operands in the query
+        bound_col_names = {pc.lower() for pc in pred_cols}
+        label_col = None
+        matched_vars: list[tuple[int, str, Any, Decimal]] = []
+        for col in schema.columns:
+            if self._normalize_dtype(col.inferred_dtype) != "string" or col.name.lower() in bound_col_names:
+                continue
+            cand_matches: list[tuple[int, str, Any, Decimal]] = []
+            seen_labels: set[str] = set()
+            for r in rows:
+                lbl = str(r.cells[col.col_index].normalized_value or r.cells[col.col_index].raw_value or "").strip()
+                if not lbl or lbl.lower() in seen_labels:
+                    continue
+                pos = q_lower.find(lbl.lower())
+                if pos != -1:
+                    raw_num = r.cells[val_col.col_index].normalized_value
+                    if raw_num is None:
+                        raw_num = r.cells[val_col.col_index].raw_value
+                    try:
+                        dec_num = raw_num if isinstance(raw_num, Decimal) else Decimal(str(raw_num).replace(",", "").strip())
+                    except Exception:
+                        continue
+                    seen_labels.add(lbl.lower())
+                    cand_matches.append((pos, lbl, r, dec_num))
+            if len(cand_matches) >= 2:
+                label_col = col
+                matched_vars = cand_matches
+                break
+
+        if label_col is None or len(matched_vars) < 2:
+            raise UnsupportedQueryError(f"Could not bind binary arithmetic operands in '{table_id}'")
+
+        before_op = [m for m in matched_vars if m[0] < op_pos]
+        after_op = [m for m in matched_vars if m[0] > op_pos]
+        if not before_op or not after_op:
+            raise UnsupportedQueryError(f"Could not align operands around '{op_word}' in '{query[:60]}'")
+
+        left = max(before_op, key=lambda m: m[0])
+        right = min(after_op, key=lambda m: m[0])
+        others = [m for m in matched_vars if m[1] not in (left[1], right[1])]
+        target = others[0] if len(others) == 1 else None
+
+        computed = (left[3] - right[3]) if is_minus else (left[3] + right[3])
+        used_rows = [left[2], right[2]] + ([target[2]] if target else [])
+        r_ids = [r.row_id for r in used_rows]
+        r_idx = [r.row_index for r in used_rows]
+        digest = hashlib.sha256(f"{table_id}:{version}:{','.join(r_ids)}".encode("utf-8")).hexdigest()[:16]
+
+        if target is not None:
+            diff = abs(target[3] - computed)
+            if computed == target[3]:
+                answer_text = (
+                    f"Yes: {left[1]} ({left[3]}) {'minus' if is_minus else 'plus'} {right[1]} ({right[3]}) "
+                    f"equals {computed}, matching {target[1]} ({target[3]})."
+                )
+            else:
+                answer_text = (
+                    f"No: {left[1]} ({left[3]}) {'minus' if is_minus else 'plus'} {right[1]} ({right[3]}) "
+                    f"is {computed}, whereas {target[1]} reports {target[3]} (difference: {diff})."
+                )
+            target_col_label = f"{left[1]} {'-' if is_minus else '+'} {right[1]} vs {target[1]}"
+            secondary_val = target[3]
+        else:
+            answer_text = (
+                f"{left[1]} ({left[3]}) {'minus' if is_minus else 'plus'} {right[1]} ({right[3]}) equals {computed}."
+            )
+            target_col_label = f"{left[1]} {'-' if is_minus else '+'} {right[1]}"
+            secondary_val = None
+
+        return StructuredQueryResult(
+            answer_text=answer_text,
+            operator="formula_verification",
+            target_column=target_col_label,
+            predicate_columns=pred_cols,
+            predicate_values=pred_vals,
+            selection_count=len(used_rows),
+            total_rows_in_table=total_rows,
+            result_value=computed,
+            secondary_value=secondary_val,
             row_ids=r_ids,
             row_indices=r_idx,
             selection_hash=digest,

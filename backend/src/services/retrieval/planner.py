@@ -304,12 +304,14 @@ class Planner:
             bool(re.search(r'\b(?:earliest|latest|min|max|minimum|maximum)\b', q_lower))
             or bool(re.search(r'\bhow did (?:total )?\w+ change from \d{4} to \d{4}\b', q_lower))
             or bool(re.search(r'\b(?:change from \d{4} to \d{4}|total income change)\b', q_lower))
-            or bool(re.search(r'\b(?:total|sum|average|avg|count)\b|\bhow many (?:rows|records|entries|items)\b', q_lower))
+            or bool(re.search(r'\b(?:total|sum|average|avg|count|percentage|percent|ratio)\b|\bhow many\b', q_lower))
+            or (is_tabular_file_explicit and bool(re.search(r'\b(?:what is|what are|how much|find|get|give)\b', q_lower)))
         )
         has_table_or_file = not is_internal_doc_table and (
             flags["format_flag"]
             or bool(re.search(r'\b(?:csv|table|survay|survey|dataset|workbook|rows?|records?)\b', q_lower))
             or bool(re.search(r'\bfrom \d{4} to \d{4}\b', q_lower))
+            or bool(re.search(r'\b(?:percentage|percent|ratio)\b|\bhow many\b|\btotal\b.*\b(?:across|all)\b', q_lower))
         )
         if is_structured_candidate and has_table_or_file:
             return Plan(
@@ -390,18 +392,27 @@ class Planner:
             # If similarity to simple is greater, tentatively use fast path
             # but still override for data-extraction queries.
             centroid_suggests_fast = sim_simple > sim_synth
-            # Block fast path for complex analytical queries even if centroid says simple
+            # Block fast path for complex analytical, negation, or premise-verification queries even if centroid says simple
+            is_premise_check = bool(
+                re.search(r"\b(?:confirm|verify|accurate|is it true|contradict|anomalous|safe to interpret)\b|,\s*right\??", query.lower())
+            )
             hard_block = (
                 flags["aggregation_flag"]
                 or flags["numeric_flag"]
                 or flags["format_flag"]
                 or flags["temporal_flag"]
                 or flags["comparison_flag"]
+                or flags["negation_flag"]
+                or flags["relationship_flag"]
                 or flags["synthesis_flag"]
+                or is_premise_check
             )
             fast_path = centroid_suggests_fast and not hard_block
         else:
             # Fallback if embedding fails
+            is_premise_check = bool(
+                re.search(r"\b(?:confirm|verify|accurate|is it true|contradict|anomalous|safe to interpret)\b|,\s*right\??", query.lower())
+            )
             fast_path = not (
                 flags["temporal_flag"]
                 or flags["comparison_flag"]
@@ -411,6 +422,7 @@ class Planner:
                 or flags["aggregation_flag"]
                 or flags["numeric_flag"]
                 or flags["format_flag"]
+                or is_premise_check
             )
 
         if fast_path:

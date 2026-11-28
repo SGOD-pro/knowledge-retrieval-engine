@@ -1681,8 +1681,8 @@ def test_compiled_pipeline_production_snapshot_no_kg_manifest():
     """Verify production application path resolves baseline-ready document without KG manifest when snapshot is not caller-injected."""
     ws_id = "ws_prod_snapshot_no_kg"
     from db.database import CloudRepository
-    from src.db.workspace_boundary_repo import get_workspace_boundary_repo
-    from src.schemas.contracts.boundary import DocumentSnapshot
+    from db.workspace_boundary_repo import get_workspace_boundary_repo
+    from schemas.contracts.boundary import DocumentSnapshot
     from datetime import datetime, timezone
 
     repo = CloudRepository()
@@ -1764,6 +1764,7 @@ def test_compiled_pipeline_production_snapshot_no_kg_manifest():
                     response = pipeline.run(
                         query="What was quarterly revenue for plain docs?",
                         workspace_id=ws_id,
+                        force_full_path=True,
                         laya_enabled=True,
                         laya_client=mock_client,
                         verifier=mock_verifier,
@@ -1815,8 +1816,8 @@ def test_compiled_pipeline_slow_retrieval_deadline_retains_capacity():
     ws_id = "ws_slow_retrieval"
     ctrl = LayaProviderConcurrencyController(max_concurrency=1, max_queue=2)
     from db.database import CloudRepository
-    from src.db.workspace_boundary_repo import get_workspace_boundary_repo
-    from src.schemas.contracts.boundary import DocumentSnapshot
+    from db.workspace_boundary_repo import get_workspace_boundary_repo
+    from schemas.contracts.boundary import DocumentSnapshot
     from services.retrieval.fidelity_check import CoverageError
     from datetime import datetime, timezone
 
@@ -1917,8 +1918,8 @@ def test_compiled_pipeline_slow_reranking_deadline_retains_capacity():
     ws_id = "ws_slow_reranking"
     ctrl = LayaProviderConcurrencyController(max_concurrency=1, max_queue=2)
     from db.database import CloudRepository
-    from src.db.workspace_boundary_repo import get_workspace_boundary_repo
-    from src.schemas.contracts.boundary import DocumentSnapshot
+    from db.workspace_boundary_repo import get_workspace_boundary_repo
+    from schemas.contracts.boundary import DocumentSnapshot
     from services.retrieval.fidelity_check import CoverageError
     from datetime import datetime, timezone
 
@@ -2015,8 +2016,8 @@ def test_compiled_pipeline_slow_compression_retains_capacity_and_suppresses_late
     ws_id = "ws_slow_compression"
     ctrl = LayaProviderConcurrencyController(max_concurrency=1, max_queue=2)
     from db.database import CloudRepository
-    from src.db.workspace_boundary_repo import get_workspace_boundary_repo
-    from src.schemas.contracts.boundary import DocumentSnapshot
+    from db.workspace_boundary_repo import get_workspace_boundary_repo
+    from schemas.contracts.boundary import DocumentSnapshot
     from services.retrieval.fidelity_check import CoverageError
     from datetime import datetime, timezone
 
@@ -2119,8 +2120,8 @@ def test_compiled_pipeline_slow_fidelity_retains_capacity_and_suppresses_late_re
     ws_id = "ws_slow_fidelity"
     ctrl = LayaProviderConcurrencyController(max_concurrency=1, max_queue=2)
     from db.database import CloudRepository
-    from src.db.workspace_boundary_repo import get_workspace_boundary_repo
-    from src.schemas.contracts.boundary import DocumentSnapshot
+    from db.workspace_boundary_repo import get_workspace_boundary_repo
+    from schemas.contracts.boundary import DocumentSnapshot
     from services.retrieval.fidelity_check import CoverageError
     from datetime import datetime, timezone
 
@@ -2223,8 +2224,8 @@ def test_compiled_pipeline_slow_synthesis_retains_capacity_suppresses_late_resul
     ctrl = LayaProviderConcurrencyController(max_concurrency=1, max_queue=2)
     ledger = LayaBudgetLedger()
     from db.database import CloudRepository
-    from src.db.workspace_boundary_repo import get_workspace_boundary_repo
-    from src.schemas.contracts.boundary import DocumentSnapshot
+    from db.workspace_boundary_repo import get_workspace_boundary_repo
+    from schemas.contracts.boundary import DocumentSnapshot
     from services.retrieval.fidelity_check import CoverageError
     from datetime import datetime, timezone
 
@@ -2452,8 +2453,8 @@ def test_compiled_pipeline_provenance_conflicts_rejected_and_positive_control_ex
     """Verify compiled pipeline rejects chunks with conflicting metadata across workspace, doc, version, and accepts control."""
     ws_id = "ws_pipeline_provenance"
     from db.database import CloudRepository
-    from src.db.workspace_boundary_repo import get_workspace_boundary_repo
-    from src.schemas.contracts.boundary import DocumentSnapshot
+    from db.workspace_boundary_repo import get_workspace_boundary_repo
+    from schemas.contracts.boundary import DocumentSnapshot
     from services.retrieval.fidelity_check import CoverageError
     from datetime import datetime, timezone
 
@@ -2599,8 +2600,8 @@ def test_compiled_pipeline_default_timing_expired_phase_zero_verifier_dispatch()
     """Verify default production timing enforces 2500ms phase ceiling, causing 0 verifier dispatch when expired."""
     ws_id = "ws_default_timing_expired"
     from db.database import CloudRepository
-    from src.db.workspace_boundary_repo import get_workspace_boundary_repo
-    from src.schemas.contracts.boundary import DocumentSnapshot
+    from db.workspace_boundary_repo import get_workspace_boundary_repo
+    from schemas.contracts.boundary import DocumentSnapshot
     from services.retrieval.fidelity_check import CoverageError
     from datetime import datetime, timezone
 
@@ -2706,8 +2707,8 @@ def test_compiled_pipeline_default_timing_slow_verification_retains_capacity_and
     ws_id = "ws_default_timing_slow_ver"
     ctrl = LayaProviderConcurrencyController(max_concurrency=1, max_queue=2)
     from db.database import CloudRepository
-    from src.db.workspace_boundary_repo import get_workspace_boundary_repo
-    from src.schemas.contracts.boundary import DocumentSnapshot
+    from db.workspace_boundary_repo import get_workspace_boundary_repo
+    from schemas.contracts.boundary import DocumentSnapshot
     from services.retrieval.fidelity_check import CoverageError
     from datetime import datetime, timezone
 

@@ -19,7 +19,7 @@ def is_bedrock_reranker_enabled() -> bool:
     provider = os.environ.get("RERANKER_PROVIDER") or getattr(settings, "RERANKER_PROVIDER", "bedrock")
     if provider in ("lexical", "bm25", "bm25plus"):
         return False
-    return bool(getattr(settings, "BEDROCK_RERANKER_ENABLED", True)) or provider == "bedrock"
+    return bool(getattr(settings, "BEDROCK_RERANKER_ENABLED", True))
 
 
 def get_reranker_model() -> str:

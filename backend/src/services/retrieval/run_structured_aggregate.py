@@ -69,12 +69,15 @@ def build_structured_evidence_ref(
         "selection_hash": result.selection_hash,
         "result_value": str(result.result_value) if result.result_value is not None else None,
         "secondary_value": str(result.secondary_value) if result.secondary_value is not None else None,
+        "unit": result.unit,
         "schema_binding_confidence": result.schema_binding_confidence,
         "location_reference": f"{result.selection_count} row(s) from {result.table_id}",
         "strategy": "structured_table",
         "text": result.answer_text,
         "text_snippet": result.answer_text[:200],
     }
+    if result.operator == "lookup":
+        ref["row_ids"] = list(result.row_ids)
     if document_filename:
         ref["document_filename"] = document_filename
     return ref
@@ -103,6 +106,7 @@ def execute(state: dict[str, Any]) -> dict[str, Any]:
             "final_answer": "NOT_FOUND",
             "executed_path": "structured_aggregate_incomplete",
             "status": "error",
+            "terminal_state": "RETRIEVAL_INCOMPLETE",
             "error_code": "incomplete_data",
             "error": f"Table data is incomplete: {e}",
             "reranker_mode": RerankerMode.BYPASSED.value,
@@ -115,6 +119,7 @@ def execute(state: dict[str, Any]) -> dict[str, Any]:
             "final_answer": f"Clarification needed: {e}",
             "executed_path": "structured_aggregate_ambiguous",
             "status": "clarification_needed",
+            "terminal_state": "CLARIFICATION_REQUIRED",
             "error_code": "ambiguous_binding",
             "error": str(e),
             "reranker_mode": RerankerMode.BYPASSED.value,
@@ -127,6 +132,7 @@ def execute(state: dict[str, Any]) -> dict[str, Any]:
             "final_answer": "ERROR",
             "executed_path": "structured_aggregate_storage_failure",
             "status": "error",
+            "terminal_state": "FAILED",
             "error_code": "storage_failure",
             "error": str(e),
             "reranker_mode": RerankerMode.BYPASSED.value,
@@ -147,8 +153,10 @@ def execute(state: dict[str, Any]) -> dict[str, Any]:
         logger.warning("structured_aggregate.unresolved_filter query='%s' error=%s", query[:60], e)
         return {
             "final_answer": "NOT_FOUND",
+            "citations": [],
             "executed_path": "structured_aggregate_unresolved_filter",
             "status": "error",
+            "terminal_state": "FAILED",
             "error_code": "unresolved_filter",
             "error": f"Required filter could not be resolved: {e}",
             "reranker_mode": RerankerMode.BYPASSED.value,
@@ -174,6 +182,7 @@ def execute(state: dict[str, Any]) -> dict[str, Any]:
     latency_ms = (time.perf_counter() - t0) * 1000.0
     record_structured_aggregate()
 
+    is_empty_non_count = (result.selection_count == 0 and result.operator != "count")
     is_refusal = (result.selection_count == 0)
     if is_refusal:
         citations = []
@@ -236,6 +245,7 @@ def execute(state: dict[str, Any]) -> dict[str, Any]:
         "execution_result": result,
         "executed_path": "structured_aggregate",
         "status": "success",
+        "terminal_state": "NO_SUPPORT" if is_empty_non_count else "COMPLETE",
         "is_refusal": is_refusal,
         "retrieval_candidates": {"structured_rows": result.row_ids},
         "reranker_mode": RerankerMode.BYPASSED.value,

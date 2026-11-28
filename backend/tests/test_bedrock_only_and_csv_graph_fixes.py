@@ -55,6 +55,59 @@ def test_openrouter_removed_from_settings_and_reranker():
     assert resolve_reranker_config("lexical") == {"provider": "lexical", "model": "bm25plus", "region": None}
 
 
+def test_disabling_remote_reranker_selects_bm25plus_without_remote_call(monkeypatch):
+    from config import settings
+    from providers.reranker_provider import rerank_documents
+
+    monkeypatch.setattr(settings, "BEDROCK_RERANKER_ENABLED", False)
+    monkeypatch.setattr(settings, "RERANKER_PROVIDER", "bedrock")
+    monkeypatch.delenv("BEDROCK_RERANKER_ENABLED", raising=False)
+    monkeypatch.delenv("RERANKER_PROVIDER", raising=False)
+
+    assert resolve_reranker_config() == {"provider": "lexical", "model": "bm25plus", "region": None}
+    with patch("providers.reranker_provider._get_bedrock_rerank_client") as mock_cli:
+        scores, tel = rerank_documents("revenue 2028", ["OrionBio 2028 revenue 740", "Unrelated"], return_telemetry=True)
+        assert len(scores) == 2
+        mock_cli.assert_not_called()
+        assert tel["provider"] == "lexical"
+        assert tel["model"] == "bm25plus"
+
+
+def test_normal_dev_aws_routing_ignores_floci_port_4566(monkeypatch):
+    from aws.infra import _build_client, _build_resource
+    from config import settings
+
+    monkeypatch.setattr(settings, "ENVIRONMENT", "dev")
+    monkeypatch.setattr(settings, "AWS_REGION", "ap-south-1")
+    monkeypatch.delenv("AWS_ENDPOINT_URL", raising=False)
+
+    created = []
+
+    class FakeSession:
+        def __init__(self, profile_name=None, region_name=None):
+            self.profile_name = profile_name
+            self.region_name = region_name
+
+        def client(self, service, **kwargs):
+            created.append(("client", service, self.region_name, kwargs.get("endpoint_url")))
+            return MagicMock()
+
+        def resource(self, service, **kwargs):
+            created.append(("resource", service, self.region_name, kwargs.get("endpoint_url")))
+            return MagicMock()
+
+    with patch("aws.infra.boto3.Session", side_effect=FakeSession):
+        _build_client("dynamodb")
+        _build_client("s3")
+        _build_resource("dynamodb")
+
+    assert created == [
+        ("client", "dynamodb", "ap-south-1", None),
+        ("client", "s3", "ap-south-1", None),
+        ("resource", "dynamodb", "ap-south-1", None),
+    ]
+
+
 def test_dev_and_prod_resource_isolation_and_explicit_overrides():
     dev_s = Settings(ENVIRONMENT="dev", _env_file=None)
     assert dev_s.DYNAMODB_TABLE_NAME == "kre-table-dev"

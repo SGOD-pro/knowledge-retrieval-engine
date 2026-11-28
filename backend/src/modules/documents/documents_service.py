@@ -4,6 +4,7 @@ import tempfile
 import uuid
 import mimetypes
 from pathlib import Path
+from typing import Any
 from fastapi import BackgroundTasks, HTTPException, Response, UploadFile
 
 from config import settings
@@ -81,6 +82,8 @@ class DocumentsService:
         """Resolve or extract OKF facts and return (status, entities_count, properties_count)."""
         suffix = Path(filename).suffix.lower()
         if suffix not in (".pdf", ".csv"):
+            return None, 0, 0
+        if not getattr(settings, "OKF_ENABLED", False):
             return None, 0, 0
         try:
             from ingestion.okf_builder import extract_and_persist_okf

@@ -1,6 +1,7 @@
 import hashlib
 import logging
 import time
+from typing import Any
 from config import CACHE_MIN_CONFIDENCE, CACHE_TTL_SECONDS
 from modules.query.query_repository import QueryRepository
 from schemas.models import QueryRequest, RerankerMode

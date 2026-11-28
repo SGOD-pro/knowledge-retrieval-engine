@@ -115,3 +115,84 @@ def test_grade_180_states_and_empty_selection():
         {"resolved_chunk_ids": set(), "resolved_documents": set(), "structured_targets": [], "unscorable_reasons": ["unsupported_locator_type:doc.pdf:['foo']"]},
     )
     assert g_unscorable["scorable"] is False
+
+
+def test_grade_180_multisource_structured_and_incorrect_claim_regressions():
+    # 1. Multi-source answer missing a required source must fail
+    resolved_multi = {
+        "resolved_chunk_ids": {"c_a", "c_b"},
+        "resolved_documents": {"doc_a.pdf", "doc_b.pdf"},
+        "per_doc_chunk_ids": {"doc_a.pdf": {"c_a"}, "doc_b.pdf": {"c_b"}},
+        "structured_documents": set(),
+        "structured_targets": [],
+        "unscorable_reasons": [],
+    }
+    g_missing_src = grade_180_record(
+        {"id": "Q_MULTI", "expected_state": "COMPLETE", "preferred_answer": "450 million"},
+        {"answer": "Revenue was $450 million.", "citations": [{"chunk_id": "c_a", "document_filename": "doc_a.pdf"}], "executed_path": "full"},
+        resolved_multi,
+    )
+    assert g_missing_src["grounded_correct"] is False
+    assert g_missing_src["reason"] == "citation_locator_mismatch"
+
+    # Valid alternate source / locator within expected_source_mode="any" stays eligible
+    g_alt_ok = grade_180_record(
+        {"id": "Q_ALT", "expected_state": "COMPLETE", "expected_source_mode": "any", "preferred_answer": "450 million"},
+        {"answer": "Revenue was $450 million.", "citations": [{"chunk_id": "c_b", "document_filename": "doc_b.pdf"}], "executed_path": "full"},
+        resolved_multi,
+    )
+    assert g_alt_ok["grounded_correct"] is True
+
+    # 2. Unrelated citation on a structured answer must fail
+    resolved_struct = {
+        "resolved_chunk_ids": set(),
+        "resolved_documents": {"survay.csv"},
+        "per_doc_chunk_ids": {},
+        "structured_documents": {"survay.csv"},
+        "structured_targets": [{"document": "survay.csv", "document_id": "d_csv", "locator": {"operation": "sum"}}],
+        "unscorable_reasons": [],
+    }
+    g_bad_struct = grade_180_record(
+        {"id": "Q_STRUCT", "expected_state": "COMPLETE", "preferred_answer": "901"},
+        {"answer": "The sum is 901.", "citations": [{"chunk_id": "c_other", "document_filename": "unrelated.pdf"}], "executed_path": "structured_aggregate"},
+        resolved_struct,
+    )
+    assert g_bad_struct["grounded_correct"] is False
+
+    # 3. Incorrect claim that repeats the expected numbers must fail
+    resolved_ok = {"resolved_chunk_ids": {"c1"}, "resolved_documents": {"doc.pdf"}, "per_doc_chunk_ids": {"doc.pdf": {"c1"}}, "structured_documents": set(), "structured_targets": [], "unscorable_reasons": []}
+    g_wrong_claim = grade_180_record(
+        {"id": "Q_CLAIM", "expected_state": "COMPLETE", "preferred_answer": "OrionBio annual revenue for FY2028 was $740 million."},
+        {"answer": "OrionBio employee headcount in FY2028 was 740, not revenue (which was $999 million).", "citations": [{"chunk_id": "c1", "document_filename": "doc.pdf"}], "executed_path": "full"},
+        resolved_ok,
+    )
+    assert g_wrong_claim["answer_correct"] is False
+    assert g_wrong_claim["grounded_correct"] is False
+
+
+def test_run_mixed_180_prechecks_locators_and_persists_evidence(tmp_path: Path, monkeypatch):
+    from scripts.run_mixed_180_benchmark import run_mixed_180
+
+    mock_b_repo = SimpleNamespace(list_document_snapshots=lambda ws: [])
+    monkeypatch.setattr("scripts.run_mixed_180_benchmark.get_workspace_boundary_repo", lambda: mock_b_repo)
+    monkeypatch.setattr("scripts.run_mixed_180_benchmark.QueryRepository", lambda: SimpleNamespace(get_all_chunks=lambda workspace_id=None: []))
+
+    sent_payloads = []
+
+    def fake_caller(payload):
+        sent_payloads.append(payload)
+        return {"answer": "I couldn't find any relevant passages.", "citations": [], "executed_path": "full"}
+
+    out_dir = tmp_path / "out_180"
+    summary = run_mixed_180(
+        workspace_id="ws_offline_180",
+        limit=5,
+        output_dir=out_dir,
+        query_caller=fake_caller,
+    )
+    assert (out_dir / "manifest.json").exists()
+    assert (out_dir / "mixed_180_results.json").exists()
+    # Questions with unresolved locators (missing snapshots) are marked ingestion_failure without paid calls
+    assert summary["failure_breakdown"]["ingestion_failures"] >= 1
+    for p in sent_payloads:
+        assert set(p.keys()) == {"query", "workspace_id", "cache", "benchmark_mode"}

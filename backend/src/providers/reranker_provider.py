@@ -26,11 +26,6 @@ from schemas.models import RerankerMode
 
 logger = logging.getLogger(__name__)
 
-# Rate limiter / token bucket state
-_rl_lock = threading.Lock()
-_last_request_time = 0.0
-REQUEST_INTERVAL_SECONDS = 0.2  # Max 5 requests per second
-
 _reranker_counter = {"reranker_calls": 0}
 _current_reranker_mode: contextvars.ContextVar[str] = contextvars.ContextVar(
     "current_reranker_mode", default=RerankerMode.BYPASSED.value
@@ -62,71 +57,6 @@ def get_last_reranker_telemetry() -> dict[str, Any]:
 
 def set_last_reranker_telemetry(data: dict[str, Any]) -> None:
     _current_reranker_telemetry.set(data)
-
-_session: requests.Session | None = None
-_session_lock = threading.Lock()
-
-
-def _get_session() -> requests.Session:
-    global _session
-    with _session_lock:
-        if _session is None:
-            _session = requests.Session()
-            adapter = requests.adapters.HTTPAdapter(
-                pool_connections=10,
-                pool_maxsize=20,
-                max_retries=0,
-            )
-            _session.mount("https://", adapter)
-            _session.mount("http://", adapter)
-        return _session
-
-
-def _wait_for_rate_limit():
-    global _last_request_time
-    with _rl_lock:
-        now = time.monotonic()
-        elapsed = now - _last_request_time
-        if elapsed < REQUEST_INTERVAL_SECONDS:
-            time.sleep(REQUEST_INTERVAL_SECONDS - elapsed)
-        _last_request_time = time.monotonic()
-
-
-# Circuit breaker state
-_circuit_breaker_tripped = False
-_circuit_breaker_reset_time = 0.0
-_circuit_breaker_half_open_interval = 300.0  # Probe request allowed every 5 minutes
-_circuit_breaker_last_probe = 0.0
-_circuit_breaker_lock = threading.Lock()
-
-
-def _is_circuit_open() -> bool:
-    global _circuit_breaker_tripped, _circuit_breaker_reset_time, _circuit_breaker_last_probe
-    with _circuit_breaker_lock:
-        if _circuit_breaker_tripped:
-            now = time.time()
-            if now > _circuit_breaker_reset_time:
-                _circuit_breaker_tripped = False
-                logger.info("reranker.circuit_breaker_reset — full cooldown elapsed")
-                return False
-            # Half-open: allow one probe request every 5 minutes
-            if now - _circuit_breaker_last_probe >= _circuit_breaker_half_open_interval:
-                _circuit_breaker_last_probe = now
-                logger.info("reranker.circuit_breaker_half_open — allowing probe request")
-                return False
-            return True
-        return False
-
-
-def _trip_circuit(cooldown_seconds: float = 3600.0):
-    global _circuit_breaker_tripped, _circuit_breaker_reset_time
-    with _circuit_breaker_lock:
-        _circuit_breaker_tripped = True
-        _circuit_breaker_reset_time = time.time() + cooldown_seconds
-        logger.warning(
-            "reranker.circuit_breaker_tripped for %.0fs — routing directly to lexical fallback",
-            cooldown_seconds,
-        )
 
 
 _bedrock_client: Any = None

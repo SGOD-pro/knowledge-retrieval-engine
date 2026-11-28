@@ -457,12 +457,12 @@ class LayaDecisionService:
         - Optional snippets are trimmed first to ensure total serialized payload <= 980 bytes.
         """
         all_criteria = {
-            "lexical_expansion": "Keyword BM25 search for specific terms or exact phrases",
-            "dense_expansion": "Vector similarity search for semantic concepts",
-            "structural_expansion": "Navigate document structure or sections",
-            "graph_expansion": "Traverse knowledge graph entity links",
-            "structured_expansion": "Query structured table columns or database",
-            "none": "Evidence is fundamentally absent or unrecoverable; do not expand",
+            "lexical_expansion": "BM25 keyword search for exact terms",
+            "dense_expansion": "Vector search for semantic concepts",
+            "structural_expansion": "Navigate ready PageIndex sections",
+            "graph_expansion": "Traverse verified KG entity links",
+            "structured_expansion": "Query structured table columns",
+            "none": "Evidence absent; do not expand",
         }
         allowed = tuple(r for r in (req.available_routes or ()) if r in all_criteria)
         filtered_criteria = {r: all_criteria[r] for r in allowed} if allowed else dict(all_criteria)
@@ -474,13 +474,8 @@ class LayaDecisionService:
             "questions": {
                 "route": {
                     "type": "choice",
-                    "instructions": "Targeted retrieval expansion route to execute",
+                    "instructions": "Select one expansion route",
                     "criteria": filtered_criteria,
-                },
-                "complexity": {
-                    "type": "score",
-                    "instructions": "How complex is this retrieval gap?",
-                    "criteria": ["simple", "moderate", "complex"],
                 },
             },
         }
@@ -491,11 +486,14 @@ class LayaDecisionService:
         # Reserve 16 bytes for JSON escaping of newlines/quotes
         doc_budget = max_total_bytes - wrapper_bytes - 16
 
+        req_desc = getattr(req.missing_requirement, "description", "") or ""
         mandatory_text = (
             f"Query: {req.query}\n"
             f"Gap detected: {req.missing_requirement.detected_gap}\n"
             f"Missing dimension: {req.missing_requirement.missing_dimension}"
         )
+        if req_desc and len(mandatory_text.encode("utf-8")) + len(req_desc.encode("utf-8")) + 16 <= doc_budget:
+            mandatory_text = f"{mandatory_text}\nRequirement: {req_desc}"
         mandatory_bytes = len(mandatory_text.encode("utf-8"))
 
         if mandatory_bytes > doc_budget:

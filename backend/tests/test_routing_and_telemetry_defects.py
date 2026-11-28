@@ -356,25 +356,22 @@ def test_reranker_telemetry_remote_success_and_fallback():
     """Verify reranker telemetry reports remote_success only on remote success and preserves fallback reporting."""
     docs = ["Doc chunk 1", "Doc chunk 2"]
 
-    # 1. Successful remote call
-    with patch("providers.reranker_provider._is_circuit_open", return_value=False), \
-         patch("providers.reranker_provider._openrouter_reranker", return_value=[0.9, 0.4]):
-        scores = rerank_documents("test query", docs)
+    # 1. Successful remote Bedrock call
+    with patch("providers.reranker_provider._bedrock_rerank_controller.run_bedrock_rerank", return_value=([0.9, 0.4], None, 12.5)):
+        scores = rerank_documents("test query", docs, provider="bedrock")
         assert len(scores) == 2
         assert get_last_reranker_mode() == "remote_success"
 
-    # 2. Circuit open fallback
-    with patch("providers.reranker_provider._is_circuit_open", return_value=True), \
-         patch("providers.reranker_provider._term_coverage_fallback", return_value=[0.5, 0.2]):
-        scores = rerank_documents("test query", docs)
+    # 2. Lexical configuration fallback
+    with patch("providers.reranker_provider._term_coverage_fallback", return_value=[0.5, 0.2]):
+        scores = rerank_documents("test query", docs, provider="lexical")
         assert len(scores) == 2
         assert get_last_reranker_mode() == "circuit_open_lexical_fallback"
 
     # 3. Remote call failure fallback
-    with patch("providers.reranker_provider._is_circuit_open", return_value=False), \
-         patch("providers.reranker_provider._openrouter_reranker", side_effect=Exception("API timeout")), \
+    with patch("providers.reranker_provider._bedrock_rerank_controller.run_bedrock_rerank", return_value=(None, "caller_timeout", 1500.0)), \
          patch("providers.reranker_provider._term_coverage_fallback", return_value=[0.3, 0.1]):
-        scores = rerank_documents("test query", docs)
+        scores = rerank_documents("test query", docs, provider="bedrock")
         assert len(scores) == 2
         assert get_last_reranker_mode() == "circuit_open_lexical_fallback"
 
@@ -559,33 +556,31 @@ def test_concurrent_reranker_telemetry_isolation():
     import threading
     import time
 
-    def mock_is_circuit_open(*args, **kwargs) -> bool:
+    def mock_bedrock_rerank(query: str, documents: list[str]):
         tname = threading.current_thread().name
-        return "fallback" in tname
-
-    def mock_openrouter(query: str, documents: list[str]) -> list[float]:
-        return [0.95] * len(documents)
+        if "fallback" in tname:
+            return None, "throttled", 5.0
+        return [0.95] * len(documents), None, 10.0
 
     def worker(worker_type: str) -> tuple[str, str]:
         threading.current_thread().name = f"thread_{worker_type}_{threading.get_ident()}"
         if worker_type == "remote":
             docs = ["chunk 1", "chunk 2"]
-            rerank_documents("sample query", docs)
+            rerank_documents("sample query", docs, provider="bedrock")
             time.sleep(0.01)
             return worker_type, get_last_reranker_mode()
         elif worker_type == "fallback":
             docs = ["chunk 1", "chunk 2"]
-            rerank_documents("sample query", docs)
+            rerank_documents("sample query", docs, provider="bedrock")
             time.sleep(0.01)
             return worker_type, get_last_reranker_mode()
         else:
-            rerank_documents("sample query", [])
+            rerank_documents("sample query", [], provider="bedrock")
             time.sleep(0.01)
             return worker_type, get_last_reranker_mode()
 
     task_types = ["remote", "fallback", "bypassed"] * 10
-    with patch("providers.reranker_provider._is_circuit_open", side_effect=mock_is_circuit_open), \
-         patch("providers.reranker_provider._openrouter_reranker", side_effect=mock_openrouter), \
+    with patch("providers.reranker_provider._bedrock_rerank_controller.run_bedrock_rerank", side_effect=mock_bedrock_rerank), \
          patch("providers.reranker_provider._term_coverage_fallback", return_value=[0.35, 0.25]):
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             outcomes = list(executor.map(worker, task_types))

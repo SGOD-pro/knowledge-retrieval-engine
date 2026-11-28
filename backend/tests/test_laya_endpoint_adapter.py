@@ -585,8 +585,37 @@ class TestLayaEndpointAdapter(unittest.TestCase):
 
     @patch("requests.post")
     def test_endpoint_payload_budget_exceeded_rejects_before_dispatch(self, mock_post: MagicMock) -> None:
-        """When mandatory query content alone cannot fit, escalation fails closed before HTTP dispatch."""
-        huge_query = "Excessive query text " * 30  # > 400 bytes of mandatory content
+        """Valid payloads <= 980 bytes dispatch; oversized mandatory payloads (> 980 bytes) fail closed before HTTP dispatch."""
+        valid_req = LayaEscalationRequest(
+            query_id="q_payload_valid",
+            workspace_id="ws_default",
+            query="What was the fiscal revenue in 2026?",
+            missing_requirement=MissingRequirementDescription(
+                requirement_id="req_003a",
+                missing_dimension="exact_term",
+                description="Valid query gap",
+                failed_stage="run_fidelity_coverage",
+                detected_gap="Missing revenue coverage",
+            ),
+            available_routes=("lexical_expansion", "none"),
+            retrieved_summary=(),
+            caller_deadline_ms=2500.0,
+        )
+        valid_wire = self.service._format_endpoint_payload(valid_req)
+        self.assertLessEqual(len(json.dumps(valid_wire).encode("utf-8")), 980)
+        mock_post.return_value = MagicMock(
+            status_code=200,
+            json=lambda: {
+                "route": "lexical_expansion",
+                "parameters": {"route_type": "lexical_expansion", "query_terms": ["revenue"]},
+                "confidence": 0.9,
+            },
+        )
+        self.service.decide(valid_req, 2000.0, LayaBudgetLedger())
+        mock_post.assert_called_once()
+        mock_post.reset_mock()
+
+        huge_query = "Excessive query text " * 45  # > 980 bytes final UTF-8 wire size
         req = LayaEscalationRequest(
             query_id="q_payload_oversized",
             workspace_id="ws_default",

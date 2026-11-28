@@ -90,6 +90,8 @@ def resolve_180_locators(
     """
     resolved_ids: set[str] = set()
     resolved_docs: set[str] = set()
+    per_doc_chunk_ids: dict[str, set[str]] = {}
+    structured_docs: set[str] = set()
     structured_targets: list[dict[str, Any]] = []
     unscorable_reasons: list[str] = []
 
@@ -118,6 +120,7 @@ def resolve_180_locators(
             if hits:
                 resolved_ids.update(hits)
                 resolved_docs.add(doc_name)
+                per_doc_chunk_ids.setdefault(doc_name, set()).update(hits)
             else:
                 unscorable_reasons.append(f"unresolved_pdf_page:{doc_name}:page={pg}")
 
@@ -133,6 +136,7 @@ def resolve_180_locators(
             if hits:
                 resolved_ids.update(hits)
                 resolved_docs.add(doc_name)
+                per_doc_chunk_ids.setdefault(doc_name, set()).update(hits)
             else:
                 unscorable_reasons.append(f"unresolved_slide:{doc_name}:slide={sl}")
 
@@ -147,14 +151,17 @@ def resolve_180_locators(
             if hits:
                 resolved_ids.update(hits)
                 resolved_docs.add(doc_name)
+                per_doc_chunk_ids.setdefault(doc_name, set()).update(hits)
             else:
                 unscorable_reasons.append(f"unresolved_docx_section:{doc_name}:section={sp}")
 
         elif loc.get("operation") == "sheet_inventory":
             inv = getattr(snap, "sheet_inventory", None)
             if inv and getattr(inv, "complete", False):
-                resolved_ids.add(f"{active_did}:sheet_inventory:{active_ver}")
+                inv_id = f"{active_did}:sheet_inventory:{active_ver}"
+                resolved_ids.add(inv_id)
                 resolved_docs.add(doc_name)
+                per_doc_chunk_ids.setdefault(doc_name, set()).add(inv_id)
             else:
                 unscorable_reasons.append(f"missing_sheet_inventory:{doc_name}")
 
@@ -171,15 +178,18 @@ def resolve_180_locators(
                 if hits:
                     resolved_ids.update(hits)
                     resolved_docs.add(doc_name)
+                    per_doc_chunk_ids.setdefault(doc_name, set()).update(hits)
                 else:
                     unscorable_reasons.append(f"unresolved_cell:{doc_name}:{sheet}:{loc['cell']}")
             else:
                 structured_targets.append({"document": doc_name, "document_id": active_did, "locator": loc})
                 resolved_docs.add(doc_name)
+                structured_docs.add(doc_name)
 
         elif any(k in loc for k in ("filter", "column", "columns", "operation", "selection")):
             structured_targets.append({"document": doc_name, "document_id": active_did, "locator": loc})
             resolved_docs.add(doc_name)
+            structured_docs.add(doc_name)
 
         else:
             unscorable_reasons.append(f"unsupported_locator_type:{doc_name}:{sorted(loc.keys())}")
@@ -187,6 +197,8 @@ def resolve_180_locators(
     return {
         "resolved_chunk_ids": resolved_ids,
         "resolved_documents": resolved_docs,
+        "per_doc_chunk_ids": per_doc_chunk_ids,
+        "structured_documents": structured_docs,
         "structured_targets": structured_targets,
         "unscorable_reasons": unscorable_reasons,
     }
@@ -286,18 +298,35 @@ def grade_180_record(
     pref_nums = extract_numbers_normalized(pref_ans)
     ans_nums = extract_numbers_normalized(ans)
     if pref_nums:
-        ans_ok = pref_nums <= ans_nums
+        extra_conflict_nums = set() if exp_state == "PARTIAL" else (ans_nums - pref_nums)
+        ans_ok = (pref_nums <= ans_nums) and not extra_conflict_nums and bool(content_match(ans, pref_ans))
     else:
         ans_ok = bool(content_match(ans, pref_ans))
 
     rel_ids = set(resolved.get("resolved_chunk_ids") or set())
     rel_docs = set(resolved.get("resolved_documents") or set())
+    per_doc_ids: dict[str, set[str]] = dict(resolved.get("per_doc_chunk_ids") or {})
+    struct_docs = set(resolved.get("structured_documents") or set())
     has_struct = bool(resolved.get("structured_targets"))
 
-    if rel_ids and cited_ids & rel_ids:
+    if len(rel_docs) > 1 and bench_item.get("expected_source_mode") != "any":
+        # Multi-source questions require every expected source to be backed by a valid citation
         cit_ok = True
-    elif has_struct and executed_path in ("structured_aggregate", "deterministic_math", "deterministic_sheet_inventory") and (not rel_docs or (cited_docs & rel_docs) or len(citations) > 0):
+        for doc_name in rel_docs:
+            doc_ids = per_doc_ids.get(doc_name, set())
+            if doc_ids and (cited_ids & doc_ids):
+                continue
+            if doc_name in struct_docs and executed_path in ("structured_aggregate", "deterministic_math", "deterministic_sheet_inventory") and (not citations or doc_name in cited_docs):
+                continue
+            cit_ok = False
+            break
+    elif rel_ids and (cited_ids & rel_ids):
         cit_ok = True
+    elif has_struct and executed_path in ("structured_aggregate", "deterministic_math", "deterministic_sheet_inventory"):
+        if not citations:
+            cit_ok = True
+        else:
+            cit_ok = bool(rel_docs) and bool(cited_docs & rel_docs) and (cited_docs <= rel_docs)
     else:
         cit_ok = False
 
