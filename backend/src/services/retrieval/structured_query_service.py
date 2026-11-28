@@ -355,7 +355,7 @@ class StructuredQueryService:
         # Document table indicators: references to numbered tables/figures/charts in narrative papers/reports
         is_tabular_explicit = bool(
             re.search(r'\.(?:csv|xlsx?|tsv)\b', q_lower)
-            or re.search(r'\b(?:spreadsheet|survay|survey|dataset|workbook)\b', q_lower)
+            or re.search(r'\b(?:spreadsheet|survey|dataset|workbook|table|tabular|sheet)\b', q_lower)
         )
         is_doc_ref = bool(
             re.search(r'\b(?:table|figure|fig\.|chart)\s+\d+\b', q_lower)

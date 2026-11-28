@@ -109,11 +109,14 @@ def verify_coverage(
 
     # 1. Verify Evaluator Gold Data Isolation
     if q_only_p.exists():
-        q_only_items = json.loads(q_only_p.read_text(encoding="utf-8"))
+        q_only_raw = json.loads(q_only_p.read_text(encoding="utf-8"))
+        q_only_items = q_only_raw.get("questions", []) if isinstance(q_only_raw, dict) else q_only_raw
         for item in q_only_items:
-            if "expected_sources" in item or "preferred_answer" in item or "expected_state" in item:
+            keys = set(item.keys())
+            if keys != {"id", "question"}:
+                defects.append(f"Invalid keys in questions-only file for question {item.get('id')}: {sorted(keys)}")
+            if any(k in item for k in ("expected_sources", "preferred_answer", "expected_state", "locator", "answer")):
                 defects.append(f"Gold data leaked into questions-only file for question {item.get('id')}")
-                break
 
     # 2. Verify Document Snapshots and Source Hashes
     boundary_repo = boundary_repo or get_workspace_boundary_repo()
@@ -208,7 +211,40 @@ def verify_coverage(
         except Exception as e:
             defects.append(f"TableStore query failed for '{t_name}': {e}")
 
-    # 4. Verify Authoritative Locator Instances for Scorable Questions
+    # 4. Verify Authoritative Locator Instances and Resolve Actual Evidence Locations
+    from services.evaluation.mixed_180_evaluator import resolve_180_locators
+
+    chunks: list[Any] = []
+    try:
+        from modules.documents.documents_repository import DocumentsRepository
+        d_repo = DocumentsRepository()
+        chunks = d_repo.list_chunks_by_workspace(workspace_id)
+    except Exception:
+        pass
+
+    unresolved_items: list[dict[str, Any]] = []
+    resolved_count = 0
+    for q in questions:
+        qid = q["id"]
+        exp_st = q.get("expected_state")
+        exp_srcs = q.get("expected_sources") or []
+        if not exp_srcs and exp_st in ("NO_SUPPORT", "CLARIFICATION_REQUIRED", "FAILED"):
+            resolved_count += 1
+            continue
+
+        res_loc = resolve_180_locators(exp_srcs, chunks, snapshots_by_source)
+        reasons = list(res_loc.get("unscorable_reasons") or [])
+        if reasons:
+            unresolved_items.append({
+                "id": qid,
+                "expected_state": exp_st,
+                "unscorable_reasons": reasons,
+            })
+            if exp_st in ("COMPLETE", "PARTIAL") and snapshots_list:
+                defects.append(f"Question {qid} ({exp_st}) has unresolved evidence locations: {reasons}")
+        else:
+            resolved_count += 1
+
     scorable_questions = [q for q in questions if q.get("expected_state") in ("COMPLETE", "PARTIAL")]
     unscorable_questions = [q for q in questions if q.get("expected_state") not in ("COMPLETE", "PARTIAL")]
 
@@ -292,6 +328,9 @@ def verify_coverage(
         "total_scorable_locators": total_scorable_locators,
         "locators_by_type": dict(locators_by_type),
         "unscorable_states": dict(unscorable_states),
+        "unresolved_items": unresolved_items,
+        "unresolved_count": len(unresolved_items),
+        "resolved_count": resolved_count,
         "defects": defects,
         "status": "VERIFIED" if passed else "FAILED",
     }

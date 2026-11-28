@@ -66,8 +66,15 @@ def compare_manifests(
     cand_metrics = candidate_manifest.get("metrics", candidate_manifest)
     base_metrics = baseline_manifest.get("metrics", baseline_manifest)
 
-    def _diff(key: str) -> float:
-        return round(float(cand_metrics.get(key, 0.0)) - float(base_metrics.get(key, 0.0)), 4)
+    def _diff(key: str) -> float | str:
+        cv = cand_metrics.get(key)
+        bv = base_metrics.get(key)
+        if cv is None or bv is None or cv == "unmeasured" or bv == "unmeasured":
+            return "unmeasured"
+        try:
+            return round(float(cv) - float(bv), 4)
+        except (ValueError, TypeError):
+            return "unmeasured"
 
     deltas = {
         "overall_accuracy_delta": _diff("overall_accuracy"),

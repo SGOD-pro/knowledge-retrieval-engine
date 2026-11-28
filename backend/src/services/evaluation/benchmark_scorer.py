@@ -415,8 +415,19 @@ def content_match(chunk_text: str, expected_answer: str) -> bool:
     exp_pct_matches = pct_regex.findall(expected_answer)
 
     # When candidate is a concise percentage or numeric response, evaluate via concise percentage matching
-    if is_concise_percentage_candidate(chunk_text) and exp_pct_matches:
-        return is_concise_percentage_match(chunk_text, expected_answer)
+    # only when expected answer targets a single percentage without other distinct required numbers
+    if is_concise_percentage_candidate(chunk_text) and len(exp_pct_matches) == 1:
+        cleaned_exp_check = re.sub(r"(?<=\d),(?=\d)", "", expected_answer)
+        all_exp_nums_check = re.findall(r"[-+]?\b\d+(?:\.\d+)?\b", cleaned_exp_check)
+        other_nums = []
+        for n in all_exp_nums_check:
+            try:
+                if abs(Decimal(n) - Decimal(exp_pct_matches[0].replace(",", ""))) > Decimal("0.001"):
+                    other_nums.append(n)
+            except InvalidOperation:
+                pass
+        if not other_nums:
+            return is_concise_percentage_match(chunk_text, expected_answer)
 
     # When expected answer requests a single percentage, block fall-through on negation or control violations
     if len(exp_pct_matches) == 1:
@@ -430,13 +441,13 @@ def content_match(chunk_text: str, expected_answer: str) -> bool:
         except InvalidOperation:
             pass
 
-    exp_nums = set(re.findall(r"\b\d+(?:\.\d+)?%?\b", expected_answer))
+    exp_nums = set(re.findall(r"[-+]?\b\d+(?:\.\d+)?%?\b", expected_answer))
     expected_tokens = set(tokenize(expected_answer))
 
     if not expected_tokens and not exp_nums:
         return False
 
-    chunk_nums = set(re.findall(r"\b\d+(?:\.\d+)?%?\b", chunk_text))
+    chunk_nums = set(re.findall(r"[-+]?\b\d+(?:\.\d+)?%?\b", chunk_text))
     if exp_nums and not expected_tokens:
         return len(exp_nums & chunk_nums) == len(exp_nums)
 

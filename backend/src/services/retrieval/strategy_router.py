@@ -52,6 +52,7 @@ class StrategyRouter:
         plan: QueryPlan | None = None,
         workspace_metadata: dict[str, Any] | None = None,
         available_indexed_artifacts: dict[str, Any] | None = None,
+        workspace_id: str | None = None,
     ) -> SelectedStrategies:
         """Analyze query and metadata to select evidence retrieval strategies."""
         q_lower = query.lower()
@@ -72,7 +73,7 @@ class StrategyRouter:
         is_qualitative = bool(re.search(r"\b(describe|explain|discuss|opinion|morale|sentiment|narrative|qualitative)\b", q_lower))
         is_tabular_file_explicit = bool(
             re.search(r'\.(?:csv|xlsx?|tsv)\b', q_lower)
-            or re.search(r'\b(?:spreadsheet|survay|survey|dataset|workbook)\b', q_lower)
+            or re.search(r'\b(?:spreadsheet|survey|dataset|workbook|table|tabular|sheet)\b', q_lower)
         )
         is_document_content_ref = bool(
             re.search(r'\b(?:table|figure|fig\.|chart)\s+\d+\b', q_lower)
@@ -80,11 +81,19 @@ class StrategyRouter:
         )
         is_internal_doc_table = is_document_content_ref and not is_tabular_file_explicit
 
-        table_keywords = r"\b(total\s+(?:of|across|in|for|amount|income|revenue|sales|expenditure|expenses|number|count|assets|value|cost|tax|profit|funding|budget|headcount|rows?|records?)|sum of|average|mean of|earliest and latest|how did.*change from|percentage change|difference between|min\b|max\b|minimum|maximum|highest\s+(?:value|amount|number|rate)|lowest\s+(?:value|amount|number|rate))\b"
+        table_keywords = r"\b(total\s+(?:of|across|in|for|amount|number|count|value|cost|profit|budget|headcount|rows?|records?|\w+)|sum of|average|avg|mean of|earliest and latest|how did.*change (?:from|between)|percentage change|difference between|min\b|max\b|minimum|maximum|highest\s+(?:value|amount|number|rate)|lowest\s+(?:value|amount|number|rate))\b"
         has_table_agg = bool(re.search(table_keywords, q_lower))
         has_table_target = not is_internal_doc_table and bool(
-            re.search(r"\b(table|survey|dataset|sheet|spreadsheet|file|columns?|rows?|records?|fields?|industr(y|ies)|variable|code|income|expenditure|sales|year|date|period)\b|\.(?:csv|xlsx|tsv)", q_lower)
+            re.search(r"\b(table|tabular|survey|dataset|sheet|spreadsheet|file|columns?|rows?|records?|fields?|year|date|period)\b|\.(?:csv|xlsx?|tsv)", q_lower)
         )
+        if not has_table_target and not is_internal_doc_table and workspace_id:
+            try:
+                from db.table_store import get_shared_table_store
+                t_store = get_shared_table_store()
+                if t_store and t_store.list_tables(workspace_id):
+                    has_table_target = True
+            except Exception:
+                pass
         plan_is_structured = bool(
             plan and not is_internal_doc_table and (
                 getattr(plan, "use_structured_aggregate", False)

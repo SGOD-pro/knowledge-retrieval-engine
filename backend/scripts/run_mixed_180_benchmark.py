@@ -29,6 +29,7 @@ from db.workspace_boundary_repo import get_workspace_boundary_repo
 from modules.query.query_repository import QueryRepository
 from providers.bedrock_models import get_embedding_model, get_llm_model
 from services.evaluation.mixed_180_evaluator import (
+    SCORER_VERSION,
     grade_180_record,
     load_engine_requests,
     resolve_180_locators,
@@ -209,6 +210,12 @@ def run_mixed_180(
                 results.append(grade)
                 continue
 
+            # Verify that gold fields never reach the runtime query API
+            disallowed_gold_keys = {"expected_sources", "preferred_answer", "expected_state", "locator", "ground_truth", "gold"}
+            leaked_in_req = set(req_item.keys()) & disallowed_gold_keys
+            if leaked_in_req:
+                raise ValueError(f"Gold fields leaked into request item: {leaked_in_req}")
+
             # Send ONLY question text and normal query parameters to the runtime
             payload = {
                 "query": req_item["question"],
@@ -216,6 +223,9 @@ def run_mixed_180(
                 "cache": False,
                 "benchmark_mode": True,
             }
+            leaked_in_payload = set(payload.keys()) & disallowed_gold_keys
+            if leaked_in_payload:
+                raise ValueError(f"Gold fields leaked into query payload: {leaked_in_payload}")
             t0 = time.perf_counter()
             http_error: str | None = None
             resp: dict[str, Any] = {}
@@ -280,6 +290,39 @@ def run_mixed_180(
         else 1.0
     )
 
+    # Compute retrieval metrics from recorded evidence where available
+    import math
+
+    recalls: list[float] = []
+    precisions: list[float] = []
+    mrrs: list[float] = []
+    ndcgs: list[float] = []
+
+    for r in scorable:
+        cands = r.get("retrieval_candidates")
+        if isinstance(cands, list) and cands:
+            cand_ids = [c if isinstance(c, str) else str(c.get("chunk_id", "")) for c in cands]
+            resolved_for_q = resolved_by_qid.get(r["id"], {})
+            target_ids = set(resolved_for_q.get("resolved_chunk_ids") or [])
+            if target_ids:
+                top5 = cand_ids[:5]
+                top3 = cand_ids[:3]
+                recalls.append(1.0 if any(cid in target_ids for cid in top5) else 0.0)
+                precisions.append(sum(1 for cid in top3 if cid in target_ids) / 3.0)
+                mrr_val = 0.0
+                for rank, cid in enumerate(top5, 1):
+                    if cid in target_ids:
+                        mrr_val = 1.0 / rank
+                        break
+                mrrs.append(mrr_val)
+                dcg = sum(1.0 / math.log2(rank + 1) for rank, cid in enumerate(top5, 1) if cid in target_ids)
+                ndcgs.append(min(1.0, dcg / 1.0))
+
+    grounded_recall_5 = round(sum(recalls) / len(recalls), 4) if recalls else "unmeasured"
+    precision_3 = round(sum(precisions) / len(precisions), 4) if precisions else "unmeasured"
+    mrr_5 = round(sum(mrrs) / len(mrrs), 4) if mrrs else "unmeasured"
+    ndcg_5 = round(sum(ndcgs) / len(ndcgs), 4) if ndcgs else "unmeasured"
+
     summary = {
         # Baseline reference and comparator requirement fields
         "commit_sha": effective_head,
@@ -288,7 +331,7 @@ def run_mixed_180(
         "corpus_manifest_sha256": corpus_manifest_sha256,
         "workspace_id": workspace_id,
         "runner_version": "2.3.0",
-        "scorer_version": "1.0.0",
+        "scorer_version": SCORER_VERSION,
         "embedding_model": get_embedding_model(),
         "llm_model": get_llm_model(),
         "reranker_policy": get_reranker_policy(),
@@ -308,10 +351,10 @@ def run_mixed_180(
             "answer_text_accuracy": ans_text_acc,
             "grounded_accuracy": grounded_acc,
             "refusal_accuracy": refusal_acc,
-            "grounded_recall_at_5": 0.0,
-            "precision_at_3": 0.0,
-            "mrr_at_5": 0.0,
-            "ndcg_at_5": 0.0,
+            "grounded_recall_at_5": grounded_recall_5,
+            "precision_at_3": precision_3,
+            "mrr_at_5": mrr_5,
+            "ndcg_at_5": ndcg_5,
             "llm_activation_rate": round(
                 sum(
                     1

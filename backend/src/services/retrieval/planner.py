@@ -51,7 +51,7 @@ def extract_entities(query: str) -> list[str]:
             if clean and clean.lower() not in stop_words_lower and clean not in entities:
                 entities.append(clean)
 
-        # Look for filenames (e.g. survay.csv, 2412.20875v1.pdf)
+        # Look for filenames (e.g. dataset.csv, 2412.20875v1.pdf)
         filenames = re.findall(r'\b[\w.-]+\.(?:csv|xls|xlsx|pdf|json|txt|md|doc|docx|pptx)\b', query, re.IGNORECASE)
         for fname in filenames:
             if fname not in entities:
@@ -259,7 +259,12 @@ def compute_complexity(query: str) -> tuple[float, dict[str, bool | int]]:
 class Planner:
     """Deterministic Query Planner using Semantic Centroids."""
 
-    def route(self, query: str, query_embedding: list[float] | None = None) -> Plan:
+    def route(
+        self,
+        query: str,
+        query_embedding: list[float] | None = None,
+        workspace_id: str | None = None,
+    ) -> Plan:
         score, flags = compute_complexity(query)
 
         # Rule 2 — RELATIONSHIP PATH
@@ -292,7 +297,7 @@ class Planner:
 
         is_tabular_file_explicit = bool(
             re.search(r'\.(?:csv|xlsx?|tsv)\b', q_lower)
-            or re.search(r'\b(?:spreadsheet|survay|survey|dataset|workbook)\b', q_lower)
+            or re.search(r'\b(?:spreadsheet|survey|dataset|workbook|table|tabular|sheet)\b', q_lower)
         )
         is_document_content_ref = bool(
             re.search(r'\b(?:table|figure|fig\.|chart)\s+\d+\b', q_lower)
@@ -302,17 +307,26 @@ class Planner:
 
         is_structured_candidate = not (is_multi_doc or is_premise_check or is_internal_doc_table) and (
             bool(re.search(r'\b(?:earliest|latest|min|max|minimum|maximum)\b', q_lower))
-            or bool(re.search(r'\bhow did (?:total )?\w+ change from \d{4} to \d{4}\b', q_lower))
-            or bool(re.search(r'\b(?:change from \d{4} to \d{4}|total income change)\b', q_lower))
+            or bool(re.search(r'\bhow did (?:total )?\w+ change (?:from|between) \d{4} (?:to|and) \d{4}\b', q_lower))
+            or bool(re.search(r'\b(?:change (?:from|between) \d{4} (?:to|and) \d{4}|total income change)\b', q_lower))
             or bool(re.search(r'\b(?:total|sum|average|avg|count|percentage|percent|ratio)\b|\bhow many\b', q_lower))
             or (is_tabular_file_explicit and bool(re.search(r'\b(?:what is|what are|how much|find|get|give)\b', q_lower)))
         )
         has_table_or_file = not is_internal_doc_table and (
             flags["format_flag"]
-            or bool(re.search(r'\b(?:csv|table|survay|survey|dataset|workbook|rows?|records?)\b', q_lower))
-            or bool(re.search(r'\bfrom \d{4} to \d{4}\b', q_lower))
+            or bool(re.search(r'\b(?:csv|table|tabular|survey|dataset|workbook|sheet|spreadsheet|rows?|records?)\b', q_lower))
+            or bool(re.search(r'\b(?:from|between) \d{4} (?:to|and) \d{4}\b', q_lower))
             or bool(re.search(r'\b(?:percentage|percent|ratio)\b|\bhow many\b|\btotal\b.*\b(?:across|all)\b', q_lower))
         )
+        if not has_table_or_file and not is_internal_doc_table and workspace_id:
+            try:
+                from db.table_store import get_shared_table_store
+                t_store = get_shared_table_store()
+                if t_store and t_store.list_tables(workspace_id):
+                    has_table_or_file = True
+            except Exception:
+                pass
+
         if is_structured_candidate and has_table_or_file:
             return Plan(
                 fast_path=False,

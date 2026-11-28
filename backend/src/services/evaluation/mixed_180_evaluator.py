@@ -11,6 +11,116 @@ from typing import Any
 from services.evaluation.benchmark_scorer import content_match, extract_numbers_normalized
 
 SUPPORTED_STATES = frozenset({"COMPLETE", "NO_SUPPORT", "PARTIAL", "CLARIFICATION_REQUIRED", "FAILED"})
+SCORER_VERSION = "2.0.0"
+
+PARTIAL_LIMITATION_KEYWORDS = (
+    "partial",
+    "partially",
+    "incomplete",
+    "missing",
+    "limited to",
+    "only covers",
+    "only available",
+    "data unavailable",
+    "unavailable",
+    "not available",
+    "gap",
+    "omits",
+    "excluding",
+    "does not include",
+    "only provides",
+    "only found",
+    "cannot confirm",
+    "not reported",
+    "no data",
+    "only for",
+)
+
+
+def _has_explicit_limitation_statement(ans: str) -> bool:
+    low = (ans or "").strip().lower()
+    return any(kw in low for kw in PARTIAL_LIMITATION_KEYWORDS)
+
+
+def extract_signed_numeric_claims(text: str) -> list[dict[str, Any]]:
+    """Extract numeric claims with signs, percentage flags, and negation status."""
+    if not text:
+        return []
+    cleaned = re.sub(r"(?<=\d),(?=\d)", "", text)
+    claims: list[dict[str, Any]] = []
+    pattern = re.compile(
+        r"(?P<prefix>\b(?:decrease|decreased|drop|dropped|fell|decline|declined|reduction|reduced|loss|down|increase|increased|rise|rose|growth|grew|gain|up)\b\s+(?:of\s+|by\s+)?)?"
+        r"(?P<neg>(?<!\d)[-–—]|negative\s+|minus\s+)?"
+        r"(?P<num>\b\d+(?:\.\d+)?)"
+        r"(?P<pct>%|percent\b)?",
+        re.IGNORECASE,
+    )
+    for m in pattern.finditer(cleaned):
+        raw_num = m.group("num")
+        try:
+            val = float(raw_num)
+        except ValueError:
+            continue
+        prefix = (m.group("prefix") or "").lower()
+        neg_sign = bool(m.group("neg"))
+        is_pct = bool(m.group("pct"))
+
+        is_decrease = any(w in prefix for w in ("decrease", "drop", "fell", "decline", "reduction", "loss", "down"))
+        is_increase = any(w in prefix for w in ("increase", "rise", "rose", "growth", "grew", "gain", "up"))
+
+        if neg_sign or is_decrease:
+            effective_sign = -1
+        elif is_increase:
+            effective_sign = 1
+        else:
+            effective_sign = 1
+
+        start_idx = max(0, m.start() - 30)
+        context = cleaned[start_idx:m.end()].lower()
+        is_negated = bool(re.search(r"\b(?:not|no|never|neither|n't)\b", context))
+
+        claims.append({
+            "value": val,
+            "sign": effective_sign,
+            "is_percentage": is_pct,
+            "is_negated": is_negated,
+            "raw": m.group(0),
+        })
+    return claims
+
+
+def verify_numeric_and_sign_agreement(pref_ans: str, ans: str) -> bool:
+    pref_claims = extract_signed_numeric_claims(pref_ans)
+    ans_claims = extract_signed_numeric_claims(ans)
+    if not pref_claims:
+        return True
+    if not ans_claims:
+        return False
+
+    for p_claim in pref_claims:
+        p_val = p_claim["value"]
+        p_sign = p_claim["sign"]
+        p_pct = p_claim["is_percentage"]
+
+        matched = False
+        for a_claim in ans_claims:
+            a_val = a_claim["value"]
+            a_sign = a_claim["sign"]
+            a_pct = a_claim["is_percentage"]
+            a_neg = a_claim["is_negated"]
+
+            tol = 0.05 if (p_pct or p_val < 1.0) else (0.01 if float(p_val).is_integer() else 0.05)
+            if abs(a_val - p_val) <= tol and a_pct == p_pct:
+                if a_sign != p_sign:
+                    return False
+                if a_neg:
+                    return False
+                matched = True
+                break
+        if not matched:
+            return False
+    return True
+
 
 
 def load_engine_requests(questions_only_path: Path) -> list[dict[str, str]]:
@@ -116,7 +226,12 @@ def resolve_180_locators(
 
         if "page" in loc:
             pg = int(loc["page"])
-            hits = {str(c.id) for c in doc_chunks if getattr(c, "page_number", None) == pg or f":page:{pg}:" in str(c.id)}
+            hits = {
+                str(c.id) for c in doc_chunks
+                if getattr(c, "page_number", None) == pg
+                or bool(re.search(rf"(?::|_)page:{pg}(?::|_|\b|$)", str(c.id), re.IGNORECASE))
+                or f":page:{pg}:" in str(c.id)
+            }
             if hits:
                 resolved_ids.update(hits)
                 resolved_docs.add(doc_name)
@@ -129,9 +244,9 @@ def resolve_180_locators(
             hits = {
                 str(c.id) for c in doc_chunks
                 if getattr(c, "page_number", None) == sl
-                or f":slide:{sl}" in str(c.id).lower()
-                or f":s{sl}" in str(c.id).lower()
-                or f"slide {sl}" in str(getattr(c, "location_reference", "") or "").lower()
+                or bool(re.search(rf"(?::|_)slide:{sl}(?::|_|\b|$)", str(c.id), re.IGNORECASE))
+                or bool(re.search(rf":s{sl}(?::|_|\b|$)", str(c.id), re.IGNORECASE))
+                or bool(re.search(rf"\bslide\s+{sl}\b", str(getattr(c, "location_reference", "") or ""), re.IGNORECASE))
             }
             if hits:
                 resolved_ids.update(hits)
@@ -145,8 +260,7 @@ def resolve_180_locators(
             hits = {
                 str(c.id) for c in doc_chunks
                 if getattr(c, "page_number", None) == sp
-                or f":p:{max(0, sp - 1)}" in str(c.id)
-                or f":p:{sp}" in str(c.id)
+                or bool(re.search(rf":p:(?:{sp}|{max(0, sp - 1)})(?::|_|\b|$)", str(c.id)))
             }
             if hits:
                 resolved_ids.update(hits)
@@ -271,7 +385,7 @@ def grade_180_record(
         }
 
     if exp_state == "CLARIFICATION_REQUIRED":
-        ans_ok = is_clar or is_ref
+        ans_ok = is_clar and not is_ref
         grd_ok = ans_ok
         return {
             "id": bench_item["id"],
@@ -280,7 +394,7 @@ def grade_180_record(
             "unscorable_reasons": [],
             "answer_correct": ans_ok,
             "grounded_correct": grd_ok,
-            "reason": "clarification_or_refusal_ok" if grd_ok else "missing_clarification",
+            "reason": "clarification_verified" if grd_ok else "missing_clarification",
         }
 
     # COMPLETE or PARTIAL
@@ -297,11 +411,12 @@ def grade_180_record(
 
     pref_nums = extract_numbers_normalized(pref_ans)
     ans_nums = extract_numbers_normalized(ans)
+    numeric_signs_ok = verify_numeric_and_sign_agreement(pref_ans, ans)
     if pref_nums:
         extra_conflict_nums = set() if exp_state == "PARTIAL" else (ans_nums - pref_nums)
-        ans_ok = (pref_nums <= ans_nums) and not extra_conflict_nums and bool(content_match(ans, pref_ans))
+        ans_ok = (pref_nums <= ans_nums) and not extra_conflict_nums and bool(content_match(ans, pref_ans)) and numeric_signs_ok
     else:
-        ans_ok = bool(content_match(ans, pref_ans))
+        ans_ok = bool(content_match(ans, pref_ans)) and numeric_signs_ok
 
     rel_ids = set(resolved.get("resolved_chunk_ids") or set())
     rel_docs = set(resolved.get("resolved_documents") or set())
@@ -311,12 +426,12 @@ def grade_180_record(
 
     if len(rel_docs) > 1 and bench_item.get("expected_source_mode") != "any":
         # Multi-source questions require every expected source to be backed by a valid citation
-        cit_ok = True
+        cit_ok = bool(citations)
         for doc_name in rel_docs:
             doc_ids = per_doc_ids.get(doc_name, set())
             if doc_ids and (cited_ids & doc_ids):
                 continue
-            if doc_name in struct_docs and executed_path in ("structured_aggregate", "deterministic_math", "deterministic_sheet_inventory") and (not citations or doc_name in cited_docs):
+            if doc_name in struct_docs and executed_path in ("structured_aggregate", "deterministic_math", "deterministic_sheet_inventory") and (citations and doc_name in cited_docs):
                 continue
             cit_ok = False
             break
@@ -324,17 +439,50 @@ def grade_180_record(
         cit_ok = True
     elif has_struct and executed_path in ("structured_aggregate", "deterministic_math", "deterministic_sheet_inventory"):
         if not citations:
-            cit_ok = True
+            cit_ok = False
         else:
             cit_ok = bool(rel_docs) and bool(cited_docs & rel_docs) and (cited_docs <= rel_docs)
     else:
         cit_ok = False
 
+    # Enforce field and row precision when specified
+    if cit_ok and citations and has_struct:
+        for struct_t in resolved.get("structured_targets") or []:
+            loc = struct_t.get("locator") or {}
+            exp_cols: list[str] = []
+            if "column" in loc:
+                exp_cols.append(str(loc["column"]).lower())
+            if "columns" in loc:
+                exp_cols.extend([str(c).lower() for c in loc["columns"]])
+            if exp_cols:
+                for cit in citations:
+                    cited_col = str(cit.get("column") or cit.get("field") or cit.get("target_column") or "").lower()
+                    if cited_col and not any(ec == cited_col or ec in cited_col or cited_col in ec for ec in exp_cols):
+                        cit_ok = False
+                        break
+            exp_cell = loc.get("cell")
+            if exp_cell and cit_ok:
+                exp_row = _cell_row_index(exp_cell)
+                for cit in citations:
+                    c_id = str(cit.get("chunk_id") or "")
+                    c_loc = str(cit.get("location_reference") or "")
+                    if exp_row is not None:
+                        row_m = re.findall(r"row\s*(\d+)", f"{c_id} {c_loc}".lower())
+                        if row_m and not any(int(r) in (exp_row, max(1, exp_row - 1)) for r in row_m):
+                            cit_ok = False
+                            break
+
     if exp_state == "PARTIAL":
         # Partial expects honest acknowledgment of missing/unavailable parts or partial answer
-        grd_ok = bool(citations) and cit_ok and ans_ok
+        has_limit = _has_explicit_limitation_statement(ans)
+        grd_ok = bool(citations) and cit_ok and ans_ok and has_limit
+        if not has_limit and ans_ok and cit_ok:
+            reason = "missing_partial_limitation"
+        else:
+            reason = "grounded_and_verified" if grd_ok else ("citation_locator_mismatch" if ans_ok else "answer_mismatch")
     else:
         grd_ok = ans_ok and cit_ok
+        reason = "grounded_and_verified" if grd_ok else ("citation_locator_mismatch" if ans_ok else "answer_mismatch")
 
     return {
         "id": bench_item["id"],
@@ -343,5 +491,5 @@ def grade_180_record(
         "unscorable_reasons": [],
         "answer_correct": ans_ok,
         "grounded_correct": grd_ok,
-        "reason": "grounded_and_verified" if grd_ok else ("citation_locator_mismatch" if ans_ok else "answer_mismatch"),
+        "reason": reason,
     }

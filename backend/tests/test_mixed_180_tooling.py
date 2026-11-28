@@ -194,7 +194,7 @@ def test_manifest_comparator_contract():
         "corpus_manifest_sha256": "corpus_sha_mock",
         "workspace_id": "ws_mixed_180_baseline",
         "runner_version": "2.3.0",
-        "scorer_version": "1.0.0",
+        "scorer_version": "2.0.0",
         "embedding_model": "amazon.titan-embed-text-v2:0",
         "llm_model": "apac.amazon.nova-lite-v1:0",
         "reranker_policy": "lexical_bm25_plus",
@@ -235,3 +235,18 @@ def test_manifest_comparator_contract():
     assert cmp_fail["comparable"] is False
     assert cmp_fail["status"] == NOT_COMPARABLE_MESSAGE
     assert any("runner_version" in m for m in cmp_fail["mismatches"])
+
+    # Incompatible scorer version (e.g. 2.0.0 vs 1.0.0) must be rejected
+    v1_baseline = copy.deepcopy(candidate_manifest)
+    v1_baseline["scorer_version"] = "1.0.0"
+    cmp_v1 = compare_manifests(candidate_manifest, v1_baseline)
+    assert cmp_v1["comparable"] is False
+    assert cmp_v1["status"] == NOT_COMPARABLE_MESSAGE
+    assert any("scorer_version" in m for m in cmp_v1["mismatches"])
+
+    # Unmeasured retrieval metrics delta handling
+    unmeasured_manifest = copy.deepcopy(candidate_manifest)
+    unmeasured_manifest["metrics"]["grounded_recall_at_5"] = "unmeasured"
+    cmp_unm = compare_manifests(unmeasured_manifest, unmeasured_manifest)
+    assert cmp_unm["comparable"] is True
+    assert cmp_unm["deltas"]["grounded_recall_at_5_delta"] == "unmeasured"

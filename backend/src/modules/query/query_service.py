@@ -240,7 +240,7 @@ class QueryService:
             try:
                 from services.retrieval.planner import planner
 
-                plan = planner.route(req.query)
+                plan = planner.route(req.query, workspace_id=req.workspace_id)
                 is_full = (not plan.fast_path) or getattr(req, "force_full_path", False)
 
                 if is_full and not getattr(plan, "use_structured_aggregate", False):
@@ -572,7 +572,7 @@ class QueryService:
         await asyncio.sleep(0.06)
 
         from services.retrieval.planner import planner
-        plan = planner.route(req.query)
+        plan = planner.route(req.query, workspace_id=req.workspace_id)
         is_fast = plan.fast_path
 
         yield {

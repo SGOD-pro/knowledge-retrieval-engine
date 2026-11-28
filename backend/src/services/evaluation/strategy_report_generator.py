@@ -192,7 +192,7 @@ def generate_strategy_matrix_markdown(
 - **LexicalBM25Strategy** provides complementary exact-match token retrieval for identifiers, ticker codes, and specific section headings.
 
 ### 2. Which strategy is best for table aggregation?
-- **StructuredTableStrategy** is uniquely capable of deterministic aggregation (`sum`, `min_max`, `compare`, `percentage_change`) across 60,000+ row datasets (e.g. `survay.csv`).
+- **StructuredTableStrategy** is uniquely capable of deterministic aggregation (`sum`, `min_max`, `compare`, `percentage_change`) across 60,000+ row datasets.
 - Chunk-based strategies (`vector_rerank`, `bm25`) fail on full-table aggregates due to top-k truncation window limits.
 
 ### 3. Which strategy is best for multi-hop?

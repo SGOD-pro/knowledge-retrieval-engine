@@ -237,13 +237,13 @@ def route_query(state: PipelineState):
     from services.retrieval.strategy_router import StrategyRouter
 
     # 1. Route query deterministically without remote embedding calls
-    plan = planner.route(state["query"])
+    plan = planner.route(state["query"], workspace_id=state.get("workspace_id"))
     if state.get("force_full_path", False):
         from dataclasses import replace
         plan = replace(plan, fast_path=False, use_structured_aggregate=False)
 
     router = StrategyRouter()
-    selected_strategies = router.route(state["query"], plan=plan)
+    selected_strategies = router.route(state["query"], plan=plan, workspace_id=state.get("workspace_id", "default"))
 
     is_structured = getattr(plan, "use_structured_aggregate", False) or ("structured_table" in selected_strategies.primary)
 
